@@ -1,0 +1,39 @@
+# Compiled Binaries
+bin/
+dist/
+build/
+*.exe
+*.out
+cloud-backend/server
+kiosk-daemon/daemon
+
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Local Databases & Print Spool Files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.pdf
+!docs/*.pdf
+spool/
+tmp/
+
+# OS & Editor Files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Dependencies & Tooling
+node_modules/
+.dart_tool/
+__pycache__/
+*.pyc
+.venv/
