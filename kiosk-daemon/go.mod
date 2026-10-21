@@ -3,6 +3,7 @@ module xeroxgo/kiosk-daemon
 go 1.26.9
 
 require (
+	github.com/gosnmp/gosnmp v1.45.0
 	modernc.org/sqlite v1.60.1
 	xeroxgo/pkg/contracts v0.0.0
 )
