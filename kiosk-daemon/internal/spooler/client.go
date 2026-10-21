@@ -41,6 +41,7 @@ type ClientConfig struct {
 	IdleQRContent string
 	ScreenSink    ui_ipc.Sink
 	HTTPClient    *http.Client
+	MockHealth    func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -117,6 +118,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	cfg.HTTPClient = httpClient
 
+	poller := cfg.MockHealth
+	if poller == nil {
+		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return printer.PollHealth(ctx, estimatedSheets)
+		}
+	}
+
 	return &Client{
 		cfg:               cfg,
 		normalizedURL:     normalizedURL,
@@ -126,9 +134,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		maxBackoff:        30 * time.Second,
 		heartbeatInterval: 15 * time.Second,
 		maxDownloadBytes:  250 * 1024 * 1024,
-		healthPoller: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			return printer.PollHealth(ctx, estimatedSheets)
-		},
+		healthPoller:      poller,
 	}, nil
 }
 

@@ -1,0 +1,42 @@
+# XeroxGo Kiosk Spooler & HDMI Display Daemon systemd Unit
+#
+# NOTE: The Raspberry Pi OS deployment must ensure the HDMI display output
+# is configured for 1920x1080 resolution with a 32-bit BGRA framebuffer on /dev/fb0.
+
+[Unit]
+Description=XeroxGo Kiosk Spooler & HDMI Display Daemon
+Documentation=https://github.com/xeroxgo/xeroxgo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WatchdogSec=10
+Restart=always
+RestartSec=5
+
+User=kiosk
+Group=kiosk
+SupplementaryGroups=video input
+
+EnvironmentFile=-/etc/default/xeroxgo-kiosk
+
+ExecStart=/usr/local/bin/xeroxgo-kiosk \
+  --cloud-url=${XEROXGO_CLOUD_WS_URL:-ws://127.0.0.1:8080/ws} \
+  --kiosk-id=${XEROXGO_KIOSK_ID:-kiosk-001} \
+  --state-db=/var/kiosk/state.db \
+  --download-dir=/var/kiosk/jobs \
+  --framebuffer=/dev/fb0 \
+  --printer-addr=192.168.99.2:9100
+
+# Security hardening and sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/var/kiosk /dev/fb0
+DeviceAllow=/dev/fb0 rw
+
+[Install]
+WantedBy=multi-user.target
