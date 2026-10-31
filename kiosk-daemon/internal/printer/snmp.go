@@ -77,22 +77,31 @@ func (s *realSnmpSession) Close() error {
 
 type sessionFactory func(ctx context.Context) (snmpSession, error)
 
+func realSessionFactoryWithTarget(target string) sessionFactory {
+	return func(ctx context.Context) (snmpSession, error) {
+		if target == "" {
+			target = defaultTarget
+		}
+		client := &gosnmp.GoSNMP{
+			Target:    target,
+			Port:      defaultPort,
+			Community: defaultCommunity,
+			Version:   gosnmp.Version2c,
+			Timeout:   defaultTimeout,
+			Retries:   defaultRetries,
+			Context:   ctx,
+		}
+
+		if err := client.Connect(); err != nil {
+			return nil, fmt.Errorf("failed to connect to printer at %s:%d: %w", target, defaultPort, err)
+		}
+
+		return &realSnmpSession{client: client}, nil
+	}
+}
+
 func realSessionFactory(ctx context.Context) (snmpSession, error) {
-	client := &gosnmp.GoSNMP{
-		Target:    defaultTarget,
-		Port:      defaultPort,
-		Community: defaultCommunity,
-		Version:   gosnmp.Version2c,
-		Timeout:   defaultTimeout,
-		Retries:   defaultRetries,
-		Context:   ctx,
-	}
-
-	if err := client.Connect(); err != nil {
-		return nil, fmt.Errorf("failed to connect to printer at %s:%d: %w", defaultTarget, defaultPort, err)
-	}
-
-	return &realSnmpSession{client: client}, nil
+	return realSessionFactoryWithTarget(defaultTarget)(ctx)
 }
 
 func offlineHealth(estimatedSheets int, errMsg string) contracts.PrinterHealth {
@@ -327,9 +336,17 @@ func pollHealthWithFactory(
 	}
 }
 
+func PollHealthTarget(
+	ctx context.Context,
+	target string,
+	estimatedSheets int,
+) contracts.PrinterHealth {
+	return pollHealthWithFactory(ctx, estimatedSheets, realSessionFactoryWithTarget(target))
+}
+
 func PollHealth(
 	ctx context.Context,
 	estimatedSheets int,
 ) contracts.PrinterHealth {
-	return pollHealthWithFactory(ctx, estimatedSheets, realSessionFactory)
+	return PollHealthTarget(ctx, defaultTarget, estimatedSheets)
 }

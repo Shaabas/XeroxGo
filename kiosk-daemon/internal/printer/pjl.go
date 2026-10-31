@@ -184,7 +184,7 @@ func parsePJLStatus(
 			}
 
 			if err == io.EOF {
-				if writeCompleted.Load() {
+				if writeCompleted.Load() || gotJobEnd {
 					return nil
 				}
 				return io.ErrUnexpectedEOF

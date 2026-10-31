@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -120,8 +121,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	poller := cfg.MockHealth
 	if poller == nil {
+		targetHost := "192.168.99.2"
+		if h, _, err := net.SplitHostPort(cfg.PrinterAddr); err == nil && h != "" {
+			targetHost = h
+		} else if strings.TrimSpace(cfg.PrinterAddr) != "" {
+			targetHost = strings.TrimSpace(cfg.PrinterAddr)
+		}
 		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			return printer.PollHealth(ctx, estimatedSheets)
+			return printer.PollHealthTarget(ctx, targetHost, estimatedSheets)
 		}
 	}
 

@@ -5,12 +5,14 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +29,10 @@ import (
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
 )
+
+//go:embed static
+var staticEmbedFS embed.FS
+
 
 type serverConfig struct {
 	addr               string
@@ -47,449 +53,473 @@ type appServer struct {
 const portalHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>XeroxGo — Mobile Print Portal</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --accent-hover: #0284c7;
-      --success: #22c55e;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      line-height: 1.5;
-      padding: 16px;
-      display: flex;
-      justify-content: center;
-    }
-    .container {
-      width: 100%;
-      max-width: 480px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-    header {
-      text-align: center;
-      padding: 12px 0;
-    }
-    header h1 {
-      font-size: 28px;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-      color: var(--accent);
-    }
-    .badge {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-size: 12px;
-      font-weight: 600;
-      background: rgba(56, 189, 248, 0.15);
-      color: var(--accent);
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      margin-top: 6px;
-    }
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-    }
-    .card-title {
-      font-size: 17px;
-      font-weight: 700;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 8px;
-      color: var(--text);
-    }
-    .form-group {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    label {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    input[type="file"], select, input[type="number"] {
-      width: 100%;
-      padding: 10px 12px;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text);
-      font-size: 14px;
-    }
-    input[type="file"]:focus, select:focus, input[type="number"]:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    .btn {
-      width: 100%;
-      padding: 12px;
-      border: none;
-      border-radius: 8px;
-      font-size: 15px;
-      font-weight: 700;
-      cursor: pointer;
-      text-align: center;
-      transition: background 0.15s ease;
-    }
-    .btn-primary {
-      background: var(--accent);
-      color: #0f172a;
-    }
-    .btn-primary:hover { background: var(--accent-hover); }
-    .btn-success {
-      background: var(--success);
-      color: #0f172a;
-    }
-    .btn-success:hover { background: #16a34a; }
-    .btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-    .info-row {
-      display: flex;
-      justify-content: space-between;
-      font-size: 14px;
-      padding: 4px 0;
-    }
-    .info-label { color: var(--muted); }
-    .info-val { font-weight: 600; color: var(--text); }
-    .price-total {
-      font-size: 20px;
-      color: var(--accent);
-      font-weight: 800;
-      border-top: 1px dashed var(--border);
-      padding-top: 8px;
-      margin-top: 4px;
-    }
-    .code-display {
-      font-family: monospace;
-      font-size: 26px;
-      letter-spacing: 4px;
-      text-align: center;
-      padding: 10px;
-      background: #0f172a;
-      border-radius: 8px;
-      border: 1px solid var(--accent);
-      color: var(--accent);
-      font-weight: bold;
-    }
-    .progress-bar-bg {
-      width: 100%;
-      height: 10px;
-      background: #0f172a;
-      border-radius: 5px;
-      overflow: hidden;
-      border: 1px solid var(--border);
-    }
-    .progress-bar-fill {
-      height: 100%;
-      width: 0%;
-      background: var(--accent);
-      transition: width 0.3s ease;
-    }
-    .status-pill {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 700;
-      text-align: center;
-    }
-    .status-PENDING_PAYMENT { background: #d97706; color: #fff; }
-    .status-PAID_WAITING { background: #2563eb; color: #fff; }
-    .status-DISPATCHED { background: #7c3aed; color: #fff; }
-    .status-SPOOLING { background: #0284c7; color: #fff; }
-    .status-PRINTING { background: #059669; color: #fff; }
-    .status-COMPLETED { background: var(--success); color: #0f172a; }
-    .status-PAUSED_ERROR { background: var(--danger); color: #fff; }
-    .alert {
-      padding: 10px 12px;
-      border-radius: 8px;
-      font-size: 13px;
-    }
-    .alert-error {
-      background: rgba(239, 68, 68, 0.15);
-      border: 1px solid var(--danger);
-      color: #fca5a5;
-    }
-    .hidden { display: none !important; }
-  </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>XeroxGO - Campus Print Portal</title>
+  <meta name="description" content="XeroxGO - Instant campus print portal. Upload, customize, and print documents directly from your phone." />
+
+  <!-- PWA & Mobile Web App Meta -->
+  <meta name="theme-color" content="#2563EB" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="XeroxGO" />
+
+  <!-- Icons & Manifest -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="/static/assets/favicon.svg" />
+  <link rel="icon" type="image/png" sizes="48x48" href="/static/assets/favicon-48x48.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/assets/favicon-32x32.png" />
+  <link rel="apple-touch-icon" href="/static/assets/apple-touch-icon.png" />
+
+  <link rel="stylesheet" href="/static/css/portal.css" />
+  <script src="/static/vendor/pdf-lib.min.js"></script>
+  <script type="module">
+    import * as pdfjsLib from '/static/vendor/pdf.min.mjs';
+    window.pdfjsLib = pdfjsLib;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/vendor/pdf.worker.min.mjs';
+  </script>
+  <script src="/static/js/portal.js" defer></script>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>XeroxGo</h1>
-      <div class="badge">Kiosk: <span id="kiosk-id-label">{{.KioskID}}</span></div>
+  <div class="app-container" data-kiosk-id="{{.KioskID}}" data-dev-mode="{{.DevMode}}" data-price-per-sheet-paise="{{.PricePerSheetPaise}}">
+    <!-- Header -->
+    <header class="header" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.25rem 1rem 0.75rem;">
+      <div class="logo-container" style="display:flex; align-items:center; justify-content:center; margin-bottom:0.35rem;">
+        <img
+          src="/static/assets/xeroxgo-full-logo-transparent.png"
+          alt="XeroxGO"
+          class="logo-img"
+          style="height:34px; width:min(100%, 340px); object-fit:contain;"
+        />
+      </div>
+      <p class="header-subtitle" style="margin:0; color:var(--text-secondary); font-size:0.95rem;">
+        Upload, Print, Collect - It's that simple!
+      </p>
     </header>
 
-    <!-- Upload Section -->
-    <div class="card" id="upload-card">
-      <div class="card-title">1. Upload Document</div>
-      <form id="upload-form">
-        <div class="form-group">
-          <label for="file-input">Select PDF</label>
-          <input type="file" id="file-input" accept=".pdf" required>
+    <!-- Top Floating PWA Install Banner -->
+    <div id="pwa-install-banner" class="pwa-install-banner animate-slide-down hidden">
+      <div class="pwa-banner-left">
+        <div class="pwa-icon-wrapper">
+          <img src="/static/assets/xeroxgo-logo-transparent.png" alt="XeroxGO" class="pwa-banner-icon" />
         </div>
-        <div class="form-group">
-          <label for="copies-input">Copies</label>
-          <input type="number" id="copies-input" min="1" max="99" value="1" required>
+        <div class="pwa-banner-text">
+          <div class="pwa-banner-title">Install XeroxGO App</div>
+          <div class="pwa-banner-desc">Fast, full-screen printing right from your phone</div>
         </div>
-        <div class="form-group">
-          <label for="duplex-select">Print Side</label>
-          <select id="duplex-select">
-            <option value="SIMPLEX">Single-sided (Simplex)</option>
-            <option value="DUPLEX_LONG_EDGE">Double-sided (Long Edge)</option>
-            <option value="DUPLEX_SHORT_EDGE">Double-sided (Short Edge)</option>
-          </select>
-        </div>
-        <button type="submit" class="btn btn-primary" id="upload-btn">Upload & Calculate Price</button>
-      </form>
-      <div id="upload-error" class="alert alert-error hidden"></div>
+      </div>
+      <div class="pwa-banner-actions">
+        <button id="pwa-install-btn" class="pwa-install-btn" type="button" title="Install App">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Install
+        </button>
+        <button id="pwa-dismiss-btn" class="pwa-dismiss-btn" type="button" aria-label="Dismiss">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
     </div>
 
-    <!-- Pricing & Payment Section -->
-    <div class="card hidden" id="order-card">
-      <div class="card-title">2. Order Summary</div>
-      <div class="form-group">
-        <label>Display Code</label>
-        <div class="code-display" id="display-code">----</div>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Logical Pages:</span>
-        <span class="info-val" id="summary-pages">-</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Physical Sheets:</span>
-        <span class="info-val" id="summary-sheets">-</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Copies:</span>
-        <span class="info-val" id="summary-copies">-</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Rate per sheet:</span>
-        <span class="info-val" id="summary-rate">-</span>
-      </div>
-      <div class="info-row price-total">
-        <span>Total Payable:</span>
-        <span id="summary-total">-</span>
-      </div>
-
-      {{if .DevMode}}
-      <button class="btn btn-success" id="pay-btn">Simulate Payment (Dev Mode)</button>
-      {{else}}
-      <div class="alert" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;">
-        Standard payment gateway integration active. Complete payment via provider app.
-      </div>
-      {{end}}
-      <div id="payment-error" class="alert alert-error hidden"></div>
+    <!-- Mini Install Pill (shown if dismissed) -->
+    <div id="pwa-mini-pill" class="hidden" style="display:flex; justify-content:center; margin:0.5rem 0;">
+      <button id="pwa-pill-btn" type="button" class="pwa-header-pill-btn" style="box-shadow:0 2px 6px rgba(37,99,235,0.08);">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+        Install XeroxGO App
+      </button>
     </div>
 
-    <!-- Live Status Section -->
-    <div class="card hidden" id="status-card">
-      <div class="card-title">3. Print Status</div>
-      <div class="info-row" style="align-items: center;">
-        <span class="info-label">Current State:</span>
-        <span class="status-pill" id="status-pill">PENDING</span>
+    <!-- Promo Banner Carousel -->
+    <div id="promo-banner" class="banner-container">
+      <div id="banner-track" class="banner-track">
+        <div class="banner-slide" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
+          <div class="banner-title">Quick &amp; Easy</div>
+          <div class="banner-desc">Direct UPI payment. No coins, no cash needed.</div>
+        </div>
+        <div class="banner-slide" style="background: linear-gradient(135deg, #065F46 0%, #10B981 50%, #059669 100%);">
+          <div class="banner-title">High Quality Prints</div>
+          <div class="banner-desc">Crisp laser documents ready in seconds.</div>
+        </div>
+        <div class="banner-slide" style="background: linear-gradient(135deg, #581C87 0%, #7C3AED 50%, #D97706 100%);">
+          <div class="banner-title">Skip The Queue</div>
+          <div class="banner-desc">Pick up your print job with your 4-digit code.</div>
+        </div>
       </div>
-      <div class="progress-bar-bg">
-        <div class="progress-bar-fill" id="progress-fill"></div>
+      <button id="banner-close-btn" class="banner-close" type="button" aria-label="Close banner">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+      <div id="banner-dots" class="banner-indicators">
+        <div class="indicator active"></div>
+        <div class="indicator"></div>
+        <div class="indicator"></div>
       </div>
-      <div class="info-row">
-        <span class="info-label">Printed Pages:</span>
-        <span class="info-val" id="progress-pages">0 / 0</span>
+    </div>
+
+    <!-- 1. Upload Document Section -->
+    <div id="upload-section" style="margin-top:1.25rem;">
+      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">1. Upload Document</h2>
+      <div class="card" style="margin-top:0;">
+        <div id="upload-area" class="upload-area">
+          <input type="file" id="file-input" accept=".pdf" style="display:none;" />
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="upload-icon" style="margin:0 auto 0.5rem; display:block;">
+            <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
+          </svg>
+          <div class="upload-text">Click to upload or drag and drop</div>
+          <div class="upload-subtext">Supported format: PDF</div>
+          <div class="upload-subtext">Max size: 25 MB</div>
+        </div>
+
+        <div id="file-preview-card" class="file-preview animate-slide-up hidden" style="flex-direction:column; align-items:stretch; gap:0.75rem;">
+          <div style="display:flex; align-items:center; justify-content:space-between;">
+            <div class="file-info">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              <div>
+                <div id="file-name-display" class="file-name" style="font-weight:700; font-size:1rem;">-</div>
+                <div id="file-meta-display" class="file-meta">-</div>
+              </div>
+            </div>
+            <button id="remove-file-btn" class="remove-btn" type="button" title="Remove file">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+          </div>
+          <div style="display:flex; gap:0.5rem; margin-top:0.25rem;">
+            <button id="btn-view-doc" type="button" class="btn" style="flex:1; padding:0.45rem 0.75rem; border-radius:var(--radius-md); border:1px solid var(--border-color); background:#F8FAFC; color:var(--text-primary); font-weight:600; font-size:0.85rem; display:inline-flex; align-items:center; justify-content:center; gap:0.35rem; cursor:pointer;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+              View
+            </button>
+            <button id="btn-edit-pages" type="button" class="btn" style="flex:1; padding:0.45rem 0.75rem; border-radius:var(--radius-md); border:1px solid var(--primary-color); background:rgba(37,99,235,0.05); color:var(--primary-color); font-weight:600; font-size:0.85rem; display:inline-flex; align-items:center; justify-content:center; gap:0.35rem; cursor:pointer;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+              Edit Pages
+            </button>
+          </div>
+        </div>
+        <div id="upload-alert" class="alert alert-error hidden"></div>
       </div>
-      <div class="info-row">
-        <span class="info-label">Printed Sheets:</span>
-        <span class="info-val" id="progress-sheets">0 / 0</span>
+    </div>
+
+    <!-- 2. Select Print Options Section -->
+    <div id="print-options-section" style="margin-top:2rem;">
+      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">2. Select Print Options</h2>
+      <div class="card" style="margin-top:0;">
+        <h3 style="font-size:1.25rem; font-weight:700; margin-bottom:1.75rem; color:var(--text-primary);">Print Options</h3>
+
+        <!-- Page Selection -->
+        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          Page Selection
+        </div>
+        <div class="option-group" style="margin-bottom:1.25rem;">
+          <button id="btn-page-selection-all" type="button" class="option-btn active" style="padding:0.75rem;">
+            <div style="color:var(--text-primary); font-weight:600;">All Pages</div>
+          </button>
+          <button id="btn-page-selection-custom" type="button" class="option-btn" style="padding:0.75rem;">
+            <div style="color:var(--text-primary); font-weight:600;">Custom Range</div>
+          </button>
+        </div>
+
+        <div id="custom-range-box" class="hidden" style="margin-bottom:1.75rem;">
+          <input
+            id="custom-range-input"
+            type="text"
+            placeholder="e.g. 1-3, 5"
+            style="width:100%; padding:0.75rem; border-radius:var(--radius-md); border:1px solid var(--border-color); font-size:1rem; font-family:inherit;"
+          />
+          <div id="custom-range-feedback" style="color:var(--text-secondary); font-size:0.875rem; margin-top:0.4rem;">
+            Enter pages to print
+          </div>
+        </div>
+
+        <!-- Number of Copies -->
+        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          Number of Copies
+        </div>
+        <div class="counter" style="justify-content:flex-start; margin-bottom:1.75rem;">
+          <button id="copies-dec" class="counter-btn" type="button" style="border-radius:8px;">-</button>
+          <div id="copies-val" class="counter-value" style="width:40px; font-weight:800;">1</div>
+          <button id="copies-inc" class="counter-btn" type="button" style="border-radius:8px;">+</button>
+        </div>
+
+        <!-- Print Mode -->
+        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>
+          Print Mode
+        </div>
+        <div class="option-group" style="margin-bottom:1.75rem;">
+          <button id="btn-mode-bw" type="button" class="option-btn active" style="flex-direction:row; justify-content:center; padding:1rem;">
+            <div style="display:flex; align-items:center; gap:0.75rem;">
+              <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #64748B, #334155);"></div>
+              <div style="text-align:left;">
+                <div style="color:var(--text-primary); font-weight:600;">B&amp;W</div>
+                <div style="font-size:0.875rem; color:var(--text-secondary);">₹5.00/sheet</div>
+              </div>
+            </div>
+          </button>
+          <button id="btn-mode-color" type="button" class="option-btn" disabled style="flex-direction:row; justify-content:center; padding:1rem; opacity:0.55; cursor:not-allowed;" title="Monochrome kiosk — Color not supported">
+            <div style="display:flex; align-items:center; gap:0.75rem;">
+              <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #F59E0B, #3B82F6);"></div>
+              <div style="text-align:left;">
+                <div style="color:var(--text-primary); font-weight:600;">Color</div>
+                <div style="font-size:0.75rem; color:var(--text-secondary);">B&amp;W Only Kiosk</div>
+              </div>
+            </div>
+          </button>
+        </div>
+
+        <!-- Print Sides -->
+        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+          Print Sides
+        </div>
+        <div class="option-group" style="margin-bottom:1.75rem;">
+          <button id="btn-side-single" type="button" class="option-btn active" style="padding:1rem;">
+            <div style="border:2px solid var(--text-primary); width:32px; height:42px; border-radius:8px; margin-bottom:0.75rem;"></div>
+            <div style="color:var(--text-primary); font-weight:600;">Single Side</div>
+          </button>
+          <button id="btn-side-double" type="button" class="option-btn" style="padding:1rem;">
+            <div style="position:relative; width:38px; height:42px; margin-bottom:0.75rem;">
+              <div style="position:absolute; top:0; left:0; border:2px solid var(--text-primary); width:32px; height:42px; border-radius:8px; opacity:0.25;"></div>
+              <div style="position:absolute; top:4px; left:4px; border:2px solid var(--text-primary); width:32px; height:42px; border-radius:8px; background-color:white;"></div>
+            </div>
+            <div style="color:var(--text-primary); font-weight:600;">Double Side</div>
+            <div style="font-size:0.75rem; color:var(--secondary-color); font-weight:700; margin-top:0.25rem;">Save paper!</div>
+          </button>
+        </div>
+
+        <!-- Pages Per Sheet -->
+        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
+          Pages Per Sheet
+        </div>
+        <div class="option-group" style="margin-bottom:0.5rem; display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); gap:0.5rem;">
+          <button id="btn-nup-1" type="button" class="option-btn active" style="padding:0.75rem 0.5rem; text-align:center;">
+            <div style="color:var(--text-primary); font-weight:600; font-size:0.9rem;">1 page/sheet</div>
+            <div style="font-size:0.75rem; color:var(--text-secondary); margin-top:0.15rem;">Standard A4 layout</div>
+          </button>
+          <button id="btn-nup-2" type="button" class="option-btn" disabled style="padding:0.75rem 0.5rem; text-align:center; opacity:0.5; cursor:not-allowed;" title="2-up layout handled via standard document formatting">
+            <div style="color:var(--text-primary); font-weight:600; font-size:0.9rem;">2 pages/sheet</div>
+            <div style="font-size:0.75rem; color:var(--text-secondary); margin-top:0.15rem;">1-Up Only</div>
+          </button>
+        </div>
       </div>
-      <div id="status-error-reason" class="alert alert-error hidden"></div>
+    </div>
+
+    <!-- 3. Review & Pay Section -->
+    <div id="review-section" style="margin-top:2rem; margin-bottom:2rem;">
+      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">3. Review &amp; Pay</h2>
+      <div id="review-card" class="card" style="margin-top:0; padding:1.25rem;">
+        <div style="background-color:#F8FAFC; border-radius:var(--radius-md); padding:1.15rem; border:1px solid var(--border-color); margin-bottom:1.25rem;">
+          <div style="margin-bottom:0.75rem;">
+            <div id="summary-file-name" style="font-weight:700; font-size:1.05rem; color:var(--text-primary); word-break:break-all;">-</div>
+            <div id="summary-pages" style="font-size:0.875rem; color:var(--text-secondary); margin-top:0.2rem;">-</div>
+          </div>
+          <div style="height:1px; background-color:var(--border-color); margin:0.75rem 0;"></div>
+          <div style="display:flex; flex-direction:column; gap:0.35rem; margin-bottom:1.1rem;">
+            <div id="summary-options" style="font-weight:600; font-size:0.95rem; color:var(--text-primary);">B&amp;W · Single Side · 1 page/sheet</div>
+            <div id="summary-copies" style="font-size:0.875rem; color:var(--text-secondary);">1 copy</div>
+          </div>
+          <button id="btn-edit-settings" type="button" style="display:inline-flex; align-items:center; gap:0.4rem; padding:0.45rem 0.85rem; border-radius:var(--radius-md); border:1px solid var(--primary-color); background:rgba(37,99,235,0.06); color:var(--primary-color); font-weight:600; font-size:0.85rem; cursor:pointer;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+            Edit Settings
+          </button>
+          <div style="height:1px; background-color:var(--border-color); margin:1rem 0;"></div>
+          <div style="display:flex; align-items:center; justify-content:space-between;">
+            <span style="font-size:1rem; font-weight:600; color:var(--text-secondary);">Total Price</span>
+            <span id="summary-price" style="font-size:1.6rem; font-weight:800; color:var(--primary-color);">₹0</span>
+          </div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:1.25rem;">
+          <div>
+            <label for="user-name-input" style="display:block; margin-bottom:0.4rem; font-weight:600; font-size:0.9rem; color:var(--text-primary);">
+              Your Name (Optional)
+            </label>
+            <input
+              id="user-name-input"
+              type="text"
+              placeholder="Enter your name"
+              style="width:100%; padding:0.75rem; border-radius:var(--radius-md); border:1px solid var(--border-color); font-size:1rem; font-family:inherit;"
+            />
+          </div>
+
+          <div id="upload-progress-card" class="hidden" style="background:#FFFFFF; border-radius:var(--radius-lg); border:1px solid var(--border-color); padding:1.25rem 1rem; text-align:center;">
+            <div class="progress-bar-bg" style="margin-bottom:0.75rem;">
+              <div id="upload-progress-bar" class="progress-bar-fill" style="width:40%;"></div>
+            </div>
+            <p style="font-weight:600; color:var(--text-primary); margin:0; font-size:0.9rem;">Sending your document...</p>
+          </div>
+
+          <button id="btn-pay-upi" type="button" class="btn btn-primary" style="padding:0.85rem; font-size:0.95rem; font-weight:700; gap:0.5rem;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+            Pay with UPI &amp; Print
+          </button>
+        </div>
+        <div id="review-alert" class="alert alert-error hidden"></div>
+      </div>
+    </div>
+
+    <!-- 4. Live Print Status & Order Tracking Section -->
+    <div id="status-section" class="hidden" style="margin-top:1.5rem; margin-bottom:2rem;">
+      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">Print Order Status</h2>
+      <div class="card" style="margin-top:0; padding:1.25rem; display:flex; flex-direction:column; gap:1.25rem;">
+        <div>
+          <label style="display:block; margin-bottom:0.4rem; font-weight:600; font-size:0.85rem; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.5px;">
+            Your Kiosk Pickup Code
+          </label>
+          <div id="status-display-code" class="code-display">----</div>
+          <div style="font-size:0.8rem; color:var(--text-secondary); text-align:center; margin-top:0.35rem;">
+            Enter this 4-digit code on the kiosk screen if prompted.
+          </div>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-weight:600; color:var(--text-secondary); font-size:0.95rem;">Current Status</span>
+          <span id="status-badge" class="status-pill status-PENDING_PAYMENT">PENDING_PAYMENT</span>
+        </div>
+
+        <div>
+          <div class="progress-bar-bg">
+            <div id="status-progress-fill" class="progress-bar-fill" style="width:0%;"></div>
+          </div>
+          <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-secondary); margin-top:0.5rem;">
+            <span>Pages: <strong id="status-pages-text" style="color:var(--text-primary);">0 / 0</strong></span>
+            <span>Sheets: <strong id="status-sheets-text" style="color:var(--text-primary);">0 / 0</strong></span>
+          </div>
+        </div>
+
+        {{if .DevMode}}
+        <button id="dev-simulate-payment-btn" type="button" class="btn btn-primary" style="background:#10B981; border:none; padding:0.75rem; font-weight:700;">
+          Simulate Payment (Dev Mode)
+        </button>
+        {{end}}
+
+        <div id="status-success-alert" class="alert alert-success hidden" style="font-weight:600; text-align:center;">
+          🎉 Print job completed! Please collect your document from the printer tray.
+        </div>
+        <div id="status-error-alert" class="alert alert-error hidden"></div>
+      </div>
+    </div>
+
+    <!-- PWA Install Guide Modal (for iOS and non-native browsers) -->
+    <div id="pwa-guide-modal" class="modal-overlay hidden">
+      <div class="pwa-ios-modal animate-scale-up" onclick="event.stopPropagation();">
+        <div class="pwa-ios-modal-header">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <img src="/static/assets/xeroxgo-logo-transparent.png" alt="XeroxGO" style="height:26px; width:auto;" />
+            <h3 style="font-size:1.15rem; font-weight:700; margin:0; color:var(--text-primary);">Install XeroxGO App</h3>
+          </div>
+          <button id="pwa-modal-close-btn" class="remove-btn" type="button" aria-label="Close modal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <p style="font-size:0.88rem; color:#475569; margin-bottom:1.25rem; line-height:1.4;">
+          Install XeroxGO on your phone for instant 1-tap printing:
+        </p>
+        <div class="pwa-ios-steps">
+          <div class="pwa-ios-step">
+            <div class="pwa-step-number">1</div>
+            <div class="pwa-step-content">
+              <span>Tap the browser <strong>Share</strong> icon (iOS) or <strong>Menu (⋮)</strong> (Android)</span>
+            </div>
+          </div>
+          <div class="pwa-ios-step">
+            <div class="pwa-step-number">2</div>
+            <div class="pwa-step-content">
+              <span>Select <strong>"Add to Home Screen"</strong> or <strong>"Install App"</strong></span>
+            </div>
+          </div>
+          <div class="pwa-ios-step">
+            <div class="pwa-step-number">3</div>
+            <div class="pwa-step-content">
+              <span>Confirm <strong>"Add"</strong> to launch XeroxGO in full-screen anytime</span>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:1.5rem;">
+          <button id="pwa-modal-gotit-btn" type="button" class="btn btn-primary" style="width:100%; padding:0.75rem; font-weight:700;">
+            Got it, Thanks!
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Document Review & Page Editor Modal -->
+    <div id="editor-modal-overlay" class="modal-overlay hidden">
+      <div class="editor-modal animate-scale-up" onclick="event.stopPropagation();">
+        <!-- Modal Header -->
+        <div style="padding:1rem 1.25rem; border-bottom:1px solid var(--border-color); display:flex; align-items:center; justify-content:space-between; background:#F8FAFC;">
+          <div style="display:flex; align-items:center; gap:0.5rem; overflow:hidden;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            <span id="editor-modal-title" style="font-weight:700; font-size:1rem; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Document Preview</span>
+          </div>
+          <button id="editor-modal-close-btn" class="remove-btn" type="button" aria-label="Close modal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
+        <!-- Modal Toolbar -->
+        <div style="padding:0.75rem 1.25rem; border-bottom:1px solid var(--border-color); display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:0.5rem; background:#FFFFFF;">
+          <!-- Pager Controls -->
+          <div style="display:flex; align-items:center; gap:0.35rem;">
+            <button id="btn-prev-page" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Previous Page">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+            </button>
+            <span id="modal-page-indicator" style="font-size:0.82rem; font-weight:600; color:#334155; min-width:85px; text-align:center;">Page 1 of 1</span>
+            <button id="btn-next-page" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Next Page">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            </button>
+            <button id="btn-toggle-include" type="button" style="margin-left:0.5rem; display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:12px; font-size:0.75rem; font-weight:700; border:none; background:#DCFCE7; color:#166534; cursor:pointer;">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Included
+            </button>
+          </div>
+
+          <!-- Zoom Controls -->
+          <div style="display:flex; align-items:center; gap:0.35rem;">
+            <button id="btn-zoom-out" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Zoom Out">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+            </button>
+            <button id="btn-zoom-reset" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:3px 8px; font-size:0.75rem; font-weight:600; cursor:pointer;" title="Reset Zoom">
+              100%
+            </button>
+            <button id="btn-zoom-in" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Zoom In">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+            </button>
+            <button id="btn-fullscreen" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer; margin-left:0.25rem;" title="Fullscreen Preview">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Canvas Preview Area -->
+        <div style="position:relative; background-color:#F1F5F9; min-height:260px; max-height:48vh; display:flex; align-items:center; justify-content:center; overflow:auto; padding:1rem;">
+          <div id="canvas-loading-spinner" class="hidden" style="display:flex; flex-direction:column; align-items:center; gap:0.5rem; color:#64748B;">
+            <svg class="spin" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+            <span style="font-size:0.85rem;">Rendering page preview...</span>
+          </div>
+          <canvas id="main-preview-canvas" style="display:block; max-width:100%; height:auto; border-radius:4px; box-shadow:0 4px 12px rgba(0,0,0,0.12); background-color:#FFFFFF;"></canvas>
+        </div>
+
+        <!-- Action Strip & Thumbnail Carousel -->
+        <div style="padding:0.75rem 1.25rem; background:#FFFFFF; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:0.5rem;">
+          <div style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:0.5rem;">
+            <div style="display:flex; gap:0.35rem;">
+              <button id="btn-select-all" type="button" style="font-size:0.78rem; font-weight:600; padding:4px 8px; border-radius:4px; border:1px solid #93C5FD; background:#FFFFFF; cursor:pointer;">Select All</button>
+              <button id="btn-deselect-all" type="button" style="font-size:0.78rem; font-weight:600; padding:4px 8px; border-radius:4px; border:1px solid #93C5FD; background:#FFFFFF; cursor:pointer;">Deselect All</button>
+              <button id="btn-rotate-all" type="button" style="font-size:0.78rem; font-weight:600; padding:4px 8px; border-radius:4px; border:1px solid #93C5FD; background:#FFFFFF; cursor:pointer; display:flex; align-items:center; gap:3px;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><polyline points="21 3 21 8 16 8"/></svg>
+                Rotate All
+              </button>
+            </div>
+            <div style="display:flex; align-items:center; gap:0.35rem;">
+              <span style="font-size:0.78rem; font-weight:600; color:#1E40AF;">Range:</span>
+              <input id="modal-custom-range-input" type="text" placeholder="e.g. 1-3, 5" style="width:100px; padding:3px 6px; border-radius:4px; border:1px solid #93C5FD; font-size:0.78rem; font-family:monospace;" />
+            </div>
+          </div>
+          <!-- Horizontal Thumbnails -->
+          <div id="thumbnail-carousel" style="display:flex; gap:0.65rem; overflow-x:auto; padding-bottom:0.5rem; padding-top:0.25rem;"></div>
+        </div>
+      </div>
     </div>
   </div>
-
-  <script>
-    (function() {
-      const kioskID = "{{.KioskID}}";
-      let activeOrderID = null;
-      let pollTimer = null;
-
-      const uploadForm = document.getElementById("upload-form");
-      const fileInput = document.getElementById("file-input");
-      const copiesInput = document.getElementById("copies-input");
-      const duplexSelect = document.getElementById("duplex-select");
-      const uploadBtn = document.getElementById("upload-btn");
-      const uploadError = document.getElementById("upload-error");
-
-      const orderCard = document.getElementById("order-card");
-      const displayCode = document.getElementById("display-code");
-      const summaryPages = document.getElementById("summary-pages");
-      const summarySheets = document.getElementById("summary-sheets");
-      const summaryCopies = document.getElementById("summary-copies");
-      const summaryRate = document.getElementById("summary-rate");
-      const summaryTotal = document.getElementById("summary-total");
-      const payBtn = document.getElementById("pay-btn");
-      const paymentError = document.getElementById("payment-error");
-
-      const statusCard = document.getElementById("status-card");
-      const statusPill = document.getElementById("status-pill");
-      const progressFill = document.getElementById("progress-fill");
-      const progressPages = document.getElementById("progress-pages");
-      const progressSheets = document.getElementById("progress-sheets");
-      const statusErrorReason = document.getElementById("status-error-reason");
-
-      function formatPaise(paise) {
-        return "₹" + (paise / 100).toFixed(2);
-      }
-
-      uploadForm.addEventListener("submit", async function(e) {
-        e.preventDefault();
-        uploadError.classList.add("hidden");
-        uploadError.textContent = "";
-
-        const file = fileInput.files[0];
-        if (!file) {
-          uploadError.textContent = "Please select a PDF file.";
-          uploadError.classList.remove("hidden");
-          return;
-        }
-
-        const formData = new FormData();
-        formData.append("file", file);
-        formData.append("copies", copiesInput.value);
-        formData.append("duplex", duplexSelect.value);
-
-        uploadBtn.disabled = true;
-        uploadBtn.textContent = "Processing...";
-
-        try {
-          const resp = await fetch("/api/k/" + encodeURIComponent(kioskID) + "/upload", {
-            method: "POST",
-            body: formData
-          });
-
-          if (!resp.ok) {
-            const errText = await resp.text();
-            throw new Error(errText || "Upload failed (" + resp.status + ")");
-          }
-
-          const data = await resp.json();
-          activeOrderID = data.order_id;
-
-          displayCode.textContent = data.display_code;
-          summaryPages.textContent = data.total_pages;
-          summarySheets.textContent = data.total_sheets;
-          summaryCopies.textContent = data.copies;
-          summaryRate.textContent = formatPaise(data.price_per_sheet_paise);
-          summaryTotal.textContent = formatPaise(data.total_price_paise);
-
-          orderCard.classList.remove("hidden");
-          statusCard.classList.remove("hidden");
-          updateStatusUI(data.status, 0, data.total_pages, 0, data.total_sheets, "");
-
-          startPolling(activeOrderID);
-        } catch (err) {
-          uploadError.textContent = err.message || "Failed to process PDF.";
-          uploadError.classList.remove("hidden");
-        } finally {
-          uploadBtn.disabled = false;
-          uploadBtn.textContent = "Upload & Calculate Price";
-        }
-      });
-
-      if (payBtn) {
-        payBtn.addEventListener("click", async function() {
-          if (!activeOrderID) return;
-          paymentError.classList.add("hidden");
-          payBtn.disabled = true;
-
-          try {
-            const resp = await fetch("/api/orders/" + encodeURIComponent(activeOrderID) + "/simulate-payment", {
-              method: "POST"
-            });
-            if (!resp.ok) {
-              const errText = await resp.text();
-              throw new Error(errText || "Payment simulation failed");
-            }
-            const data = await resp.json();
-            updateStatusUI(data.status, 0, 0, 0, 0, "");
-          } catch (err) {
-            paymentError.textContent = err.message;
-            paymentError.classList.remove("hidden");
-            payBtn.disabled = false;
-          }
-        });
-      }
-
-      function startPolling(orderID) {
-        if (pollTimer) clearInterval(pollTimer);
-        pollTimer = setInterval(async function() {
-          try {
-            const resp = await fetch("/api/orders/" + encodeURIComponent(orderID) + "/status");
-            if (!resp.ok) return;
-            const data = await resp.json();
-
-            updateStatusUI(
-              data.status,
-              data.pages_printed,
-              data.total_pages,
-              data.sheets_printed,
-              data.total_sheets,
-              data.error_reason
-            );
-
-            if (data.status === "COMPLETED" || data.status === "PAUSED_ERROR" || data.status === "FAILED_REFUNDABLE") {
-              if (data.status === "COMPLETED") {
-                clearInterval(pollTimer);
-              }
-            }
-          } catch (_) {}
-        }, 1200);
-      }
-
-      function updateStatusUI(status, pages, totalPages, sheets, totalSheets, errReason) {
-        statusPill.textContent = status;
-        statusPill.className = "status-pill status-" + status;
-
-        if (totalPages > 0) {
-          progressPages.textContent = pages + " / " + totalPages;
-          const pct = Math.min(100, Math.round((pages / totalPages) * 100));
-          progressFill.style.width = pct + "%";
-        }
-        if (totalSheets > 0) {
-          progressSheets.textContent = sheets + " / " + totalSheets;
-        }
-
-        if (errReason) {
-          statusErrorReason.textContent = errReason;
-          statusErrorReason.classList.remove("hidden");
-        } else {
-          statusErrorReason.classList.add("hidden");
-        }
-      }
-    })();
-  </script>
 </body>
 </html>`
 
@@ -502,7 +532,7 @@ func randomHex(bytesLen int) (string, error) {
 }
 
 func randomDisplayCode() (string, error) {
-	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	const charset = "0123456789"
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -696,11 +726,15 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scheme := "http"
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-		scheme = "https"
+	baseURL := os.Getenv("XEROXGO_PUBLIC_URL")
+	if baseURL == "" {
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
 	}
-	baseURL := fmt.Sprintf("%s://%s", scheme, r.Host)
+	baseURL = strings.TrimRight(baseURL, "/")
 	downloadURL := generateSignedDownloadURL(baseURL, orderID, s.cfg.downloadSecret, 24*time.Hour)
 
 	cmd := contracts.PrintJobCommand{
@@ -1084,7 +1118,11 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 func main() {
 	addr := os.Getenv("XEROXGO_CLOUD_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		if p := os.Getenv("PORT"); p != "" {
+			addr = ":" + p
+		} else {
+			addr = ":8080"
+		}
 	}
 
 	dbPath := os.Getenv("XEROXGO_CLOUD_DB")
@@ -1173,6 +1211,21 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.handleHealthz)
 	mux.HandleFunc("/k/", app.handlePortal)
+
+	subFS, err := fs.Sub(staticEmbedFS, "static")
+	if err != nil {
+		log.Fatalf("failed to create sub fs: %v", err)
+	}
+	staticFileServer := http.FileServer(http.FS(subFS))
+	mux.Handle("/static/", http.StripPrefix("/static/", staticFileServer))
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/static/assets/favicon.svg", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/manifest.webmanifest", func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Path = "/assets/manifest.webmanifest"
+		staticFileServer.ServeHTTP(w, r)
+	})
+
 	mux.HandleFunc("/api/k/", app.handleUpload)
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path

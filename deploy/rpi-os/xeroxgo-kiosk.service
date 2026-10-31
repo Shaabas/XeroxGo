@@ -27,7 +27,7 @@ ExecStart=/usr/local/bin/xeroxgo-kiosk \
   --state-db=/var/kiosk/state.db \
   --download-dir=/var/kiosk/jobs \
   --framebuffer=/dev/fb0 \
-  --printer-addr=192.168.99.2:9100
+  --printer-addr=${XEROXGO_PRINTER_ADDR:-192.168.99.2:9100}
 
 # Security hardening and sandboxing
 NoNewPrivileges=true

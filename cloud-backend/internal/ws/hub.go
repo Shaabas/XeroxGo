@@ -3,6 +3,7 @@ package ws
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -81,6 +82,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.sessions[kioskID] = sess
 	h.mu.Unlock()
+	log.Printf("[HUB] Kiosk connected: %q (client IP: %s)", kioskID, r.RemoteAddr)
 
 	defer func() {
 		h.mu.Lock()
@@ -89,6 +91,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.mu.Unlock()
 		close(sess.closed)
+		log.Printf("[HUB] Kiosk disconnected: %q", kioskID)
 		_ = conn.Close(websocket.StatusNormalClosure, "session ended")
 	}()
 

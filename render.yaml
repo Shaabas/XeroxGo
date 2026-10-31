@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: xeroxgo-cloud
+    env: docker
+    plan: starter
+    dockerfilePath: Dockerfile
+    disk:
+      name: xeroxgo-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: XEROXGO_DEV_MODE
+        value: "0"
+      - key: XEROXGO_PRICE_PER_SHEET_PAISE
+        value: "500"
+      - key: XEROXGO_DOWNLOAD_SECRET
+        generateValue: true
+      - key: XEROXGO_WEBHOOK_SECRET
+        generateValue: true

@@ -418,7 +418,7 @@ func TestPersistenceOfMultipleJobs(t *testing.T) {
 		t.Fatalf("SaveJob C failed: %v", err)
 	}
 
-	baseTime := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	baseTime := time.Now().UTC()
 
 	// Update job A at T+10
 	eventA := contracts.JobProgressEvent{
