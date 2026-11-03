@@ -539,3 +539,47 @@ func TestFramebufferSinkWritesCompleteImage(t *testing.T) {
 		}
 	}
 }
+
+func TestFramebufferSinkRGB565Scaled(t *testing.T) {
+	tmpDir := t.TempDir()
+	fbPath := filepath.Join(tmpDir, "fb_720p_16bpp.raw")
+
+	if err := os.WriteFile(fbPath, []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create fb file: %v", err)
+	}
+
+	geom := FBGeometry{
+		Width:        1280,
+		Height:       720,
+		BitsPerPixel: 16,
+		Stride:       2560,
+	}
+
+	// 1920x1080 canvas filled with solid red (255, 0, 0)
+	img := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	for y := 0; y < ScreenHeight; y++ {
+		for x := 0; x < ScreenWidth; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 255, G: 0, B: 0, A: 255})
+		}
+	}
+
+	sink := FramebufferSinkWithGeometry(fbPath, geom)
+	if err := sink(img); err != nil {
+		t.Fatalf("FramebufferSinkWithGeometry failed: %v", err)
+	}
+
+	data, err := os.ReadFile(fbPath)
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+
+	expectedLen := 720 * 2560
+	if len(data) != expectedLen {
+		t.Fatalf("file size mismatch: got %d, want %d", len(data), expectedLen)
+	}
+
+	// Red in RGB565 is 0xF800, which in little-endian bytes is [0x00, 0xF8]
+	if data[0] != 0x00 || data[1] != 0xF8 {
+		t.Fatalf("pixel 0 mismatch: got [%x %x], want [00 f8]", data[0], data[1])
+	}
+}

@@ -9,12 +9,14 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
+	xdraw "golang.org/x/image/draw"
 )
 
 const (
@@ -503,8 +505,98 @@ func FilePreviewSink(pngPath string) Sink {
 	}
 }
 
-// FramebufferSink streams a 1920x1080 RGBA image as 32-bit BGRA directly to an existing fb device/file.
+// FBGeometry describes the physical or virtual display properties of a framebuffer device.
+type FBGeometry struct {
+	Width        int
+	Height       int
+	BitsPerPixel int
+	Stride       int
+}
+
+// DetectFramebufferGeometry reads hardware resolution and format from /sys/class/graphics/<fb>
+// or falls back to standard 1920x1080 32bpp if sysfs is unavailable.
+func DetectFramebufferGeometry(fbPath string) FBGeometry {
+	geom := FBGeometry{
+		Width:        ScreenWidth,
+		Height:       ScreenHeight,
+		BitsPerPixel: 32,
+		Stride:       ScreenWidth * 4,
+	}
+
+	fbName := filepath.Base(fbPath)
+	sysDir := filepath.Join("/sys/class/graphics", fbName)
+	if _, err := os.Stat(sysDir); err != nil {
+		return geom
+	}
+
+	// 1. Read virtual_size (e.g. "1280,720")
+	if vsBytes, err := os.ReadFile(filepath.Join(sysDir, "virtual_size")); err == nil {
+		parts := strings.Split(strings.TrimSpace(string(vsBytes)), ",")
+		if len(parts) == 2 {
+			w, errW := strconv.Atoi(parts[0])
+			h, errH := strconv.Atoi(parts[1])
+			if errW == nil && errH == nil && w > 0 && h > 0 {
+				geom.Width = w
+				geom.Height = h
+			}
+		}
+	}
+
+	// 2. Read bits_per_pixel (e.g. "16" or "32")
+	if bppBytes, err := os.ReadFile(filepath.Join(sysDir, "bits_per_pixel")); err == nil {
+		if bpp, err := strconv.Atoi(strings.TrimSpace(string(bppBytes))); err == nil && bpp > 0 {
+			geom.BitsPerPixel = bpp
+		}
+	}
+
+	// 3. Read stride or line_length (e.g. "2560")
+	stridePath := filepath.Join(sysDir, "stride")
+	if _, err := os.Stat(stridePath); os.IsNotExist(err) {
+		stridePath = filepath.Join(sysDir, "line_length")
+	}
+	if strBytes, err := os.ReadFile(stridePath); err == nil {
+		if stride, err := strconv.Atoi(strings.TrimSpace(string(strBytes))); err == nil && stride > 0 {
+			geom.Stride = stride
+		}
+	}
+
+	bytesPerPixel := geom.BitsPerPixel / 8
+	if bytesPerPixel < 1 {
+		bytesPerPixel = 2
+	}
+	if geom.Stride < geom.Width*bytesPerPixel {
+		geom.Stride = geom.Width * bytesPerPixel
+	}
+
+	return geom
+}
+
+// FramebufferSink streams a 1920x1080 RGBA image to a framebuffer device,
+// automatically detecting screen geometry, scaling if needed, and encoding to the target pixel format.
 func FramebufferSink(fbPath string) Sink {
+	geom := DetectFramebufferGeometry(fbPath)
+	return FramebufferSinkWithGeometry(fbPath, geom)
+}
+
+// FramebufferSinkWithGeometry allows explicit geometry override.
+func FramebufferSinkWithGeometry(fbPath string, geom FBGeometry) Sink {
+	if geom.Width <= 0 {
+		geom.Width = ScreenWidth
+	}
+	if geom.Height <= 0 {
+		geom.Height = ScreenHeight
+	}
+	if geom.BitsPerPixel <= 0 {
+		geom.BitsPerPixel = 32
+	}
+	bytesPerPixel := geom.BitsPerPixel / 8
+	if bytesPerPixel < 1 {
+		bytesPerPixel = 2
+	}
+	if geom.Stride < geom.Width*bytesPerPixel {
+		geom.Stride = geom.Width * bytesPerPixel
+	}
+
 	return func(img *image.RGBA) (returnErr error) {
 		if strings.TrimSpace(fbPath) == "" {
 			return fmt.Errorf("fbPath cannot be empty")
@@ -528,17 +620,55 @@ func FramebufferSink(fbPath string) Sink {
 			}
 		}()
 
-		rowBuf := make([]byte, ScreenWidth*4)
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			rowPix := img.Pix[(y-bounds.Min.Y)*img.Stride+bounds.Min.X*4 : (y-bounds.Min.Y)*img.Stride+bounds.Min.X*4+ScreenWidth*4]
-			for x := 0; x < ScreenWidth; x++ {
-				inIdx := x * 4
-				outIdx := x * 4
+		// Seek to beginning of framebuffer if possible
+		_, _ = f.Seek(0, 0)
 
-				rowBuf[outIdx+0] = rowPix[inIdx+2] // B
-				rowBuf[outIdx+1] = rowPix[inIdx+1] // G
-				rowBuf[outIdx+2] = rowPix[inIdx+0] // R
-				rowBuf[outIdx+3] = rowPix[inIdx+3] // A
+		// Scale canvas if screen resolution differs from 1920x1080
+		renderImg := img
+		if geom.Width != ScreenWidth || geom.Height != ScreenHeight {
+			scaled := image.NewRGBA(image.Rect(0, 0, geom.Width, geom.Height))
+			xdraw.BiLinear.Scale(scaled, scaled.Bounds(), img, img.Bounds(), draw.Over, nil)
+			renderImg = scaled
+		}
+
+		rowBuf := make([]byte, geom.Stride)
+		for y := 0; y < geom.Height; y++ {
+			// Clear row buffer for any hardware padding
+			for i := range rowBuf {
+				rowBuf[i] = 0
+			}
+
+			if geom.BitsPerPixel == 16 {
+				// Convert to 16-bit RGB565 (5 bits red, 6 bits green, 5 bits blue)
+				rowOffset := y * renderImg.Stride
+				for x := 0; x < geom.Width; x++ {
+					inIdx := rowOffset + x*4
+					r := renderImg.Pix[inIdx+0]
+					g := renderImg.Pix[inIdx+1]
+					b := renderImg.Pix[inIdx+2]
+
+					r5 := uint16(r >> 3)
+					g6 := uint16(g >> 2)
+					b5 := uint16(b >> 3)
+					rgb565 := (r5 << 11) | (g6 << 5) | b5
+
+					// Little-endian
+					outIdx := x * 2
+					rowBuf[outIdx+0] = byte(rgb565 & 0xFF)
+					rowBuf[outIdx+1] = byte(rgb565 >> 8)
+				}
+			} else {
+				// 32-bit BGRA
+				rowOffset := y * renderImg.Stride
+				for x := 0; x < geom.Width; x++ {
+					inIdx := rowOffset + x*4
+					outIdx := x * 4
+
+					rowBuf[outIdx+0] = renderImg.Pix[inIdx+2] // B
+					rowBuf[outIdx+1] = renderImg.Pix[inIdx+1] // G
+					rowBuf[outIdx+2] = renderImg.Pix[inIdx+0] // R
+					rowBuf[outIdx+3] = renderImg.Pix[inIdx+3] // A
+				}
 			}
 
 			written := 0

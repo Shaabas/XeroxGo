@@ -207,6 +207,8 @@ func main() {
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
 	cupsPrinter := flag.String("cups-printer", "", "CUPS queue name (e.g. DCPT310). When set, jobs are sent via CUPS instead of raw TCP port 9100")
 	framebuffer := flag.String("framebuffer", "/dev/fb0", "Linux framebuffer device path")
+	screenRes := flag.String("screen-res", "", "Override screen resolution WIDTHxHEIGHT (e.g. 1280x720). Defaults to auto-detect")
+	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	flag.Parse()
 
@@ -247,7 +249,34 @@ func main() {
 		}
 		screenSink = ui_ipc.FilePreviewSink(*previewPNG)
 	} else {
-		screenSink = ui_ipc.FramebufferSink(*framebuffer)
+		geom := ui_ipc.DetectFramebufferGeometry(*framebuffer)
+		if *screenRes != "" {
+			parts := strings.Split(*screenRes, "x")
+			if len(parts) == 2 {
+				if w, err := strconv.Atoi(parts[0]); err == nil && w > 0 {
+					geom.Width = w
+				}
+				if h, err := strconv.Atoi(parts[1]); err == nil && h > 0 {
+					geom.Height = h
+				}
+				bytesPerPixel := geom.BitsPerPixel / 8
+				if bytesPerPixel < 1 {
+					bytesPerPixel = 2
+				}
+				geom.Stride = geom.Width * bytesPerPixel
+			}
+		}
+		if *screenBPP > 0 {
+			geom.BitsPerPixel = *screenBPP
+			bytesPerPixel := geom.BitsPerPixel / 8
+			if bytesPerPixel < 1 {
+				bytesPerPixel = 2
+			}
+			geom.Stride = geom.Width * bytesPerPixel
+		}
+		log.Printf("XeroxGo display: output=%s, resolution=%dx%d, bpp=%d, stride=%d",
+			*framebuffer, geom.Width, geom.Height, geom.BitsPerPixel, geom.Stride)
+		screenSink = ui_ipc.FramebufferSinkWithGeometry(*framebuffer, geom)
 	}
 
 	var rootWg sync.WaitGroup
