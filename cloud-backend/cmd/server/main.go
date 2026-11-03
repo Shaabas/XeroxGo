@@ -1125,7 +1125,10 @@ func main() {
 		}
 	}
 
-	dbPath := os.Getenv("XEROXGO_CLOUD_DB")
+	dbPath := os.Getenv("DATABASE_URL")
+	if dbPath == "" {
+		dbPath = os.Getenv("XEROXGO_CLOUD_DB")
+	}
 	if dbPath == "" {
 		dbPath = "./data/xeroxgo-cloud.db"
 	}
@@ -1153,8 +1156,11 @@ func main() {
 		}
 	}
 
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		log.Fatalf("failed to create db directory: %v", err)
+	isPostgres := strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://")
+	if !isPostgres {
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+			log.Fatalf("failed to create db directory: %v", err)
+		}
 	}
 	if err := os.MkdirAll(jobsDir, 0700); err != nil {
 		log.Fatalf("failed to create jobs directory: %v", err)
@@ -1243,9 +1249,24 @@ func main() {
 	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
 	mux.HandleFunc("/ws", hub.ServeHTTP)
 
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: corsHandler,
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

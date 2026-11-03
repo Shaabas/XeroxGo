@@ -1,0 +1,36 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/api/:match*",
+      "destination": "https://xeroxgo-cloud.onrender.com/api/:match*"
+    },
+    {
+      "source": "/k/:kiosk_id",
+      "destination": "/"
+    },
+    {
+      "source": "/k/:kiosk_id/",
+      "destination": "/"
+    },
+    {
+      "source": "/healthz",
+      "destination": "https://xeroxgo-cloud.onrender.com/healthz"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        }
+      ]
+    }
+  ]
+}

@@ -38,11 +38,13 @@ type ClientConfig struct {
 	KioskID       string
 	StateStore    *state.Store
 	PrinterAddr   string
+	CUPSQueue     string
 	DownloadDir   string
 	IdleQRContent string
 	ScreenSink    ui_ipc.Sink
 	HTTPClient    *http.Client
 	MockHealth    func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockCUPSPrint func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -95,8 +97,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.StateStore == nil {
 		return nil, errors.New("client config: state store cannot be nil")
 	}
-	if strings.TrimSpace(cfg.PrinterAddr) == "" {
-		return nil, errors.New("client config: printer address cannot be empty")
+	if strings.TrimSpace(cfg.PrinterAddr) == "" && strings.TrimSpace(cfg.CUPSQueue) == "" {
+		return nil, errors.New("client config: either printer address or CUPS queue must be provided")
 	}
 	if strings.TrimSpace(cfg.DownloadDir) == "" {
 		return nil, errors.New("client config: download directory cannot be empty")
@@ -121,14 +123,21 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	poller := cfg.MockHealth
 	if poller == nil {
-		targetHost := "192.168.99.2"
-		if h, _, err := net.SplitHostPort(cfg.PrinterAddr); err == nil && h != "" {
-			targetHost = h
-		} else if strings.TrimSpace(cfg.PrinterAddr) != "" {
-			targetHost = strings.TrimSpace(cfg.PrinterAddr)
-		}
-		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			return printer.PollHealthTarget(ctx, targetHost, estimatedSheets)
+		if strings.TrimSpace(cfg.CUPSQueue) != "" {
+			cupsQ := strings.TrimSpace(cfg.CUPSQueue)
+			poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return printer.PollCUPSHealth(ctx, cupsQ, estimatedSheets)
+			}
+		} else {
+			targetHost := "192.168.99.2"
+			if h, _, err := net.SplitHostPort(cfg.PrinterAddr); err == nil && h != "" {
+				targetHost = h
+			} else if strings.TrimSpace(cfg.PrinterAddr) != "" {
+				targetHost = strings.TrimSpace(cfg.PrinterAddr)
+			}
+			poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return printer.PollHealthTarget(ctx, targetHost, estimatedSheets)
+			}
 		}
 	}
 
@@ -562,8 +571,19 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		}
 	}
 
-	if err := printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage); err != nil {
-		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printing failed: %v", err))
+	var printErr error
+	if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+		if c.cfg.MockCUPSPrint != nil {
+			printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
+		} else {
+			printErr = printer.PrintPDFWithCUPS(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
+		}
+	} else {
+		printErr = printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage)
+	}
+
+	if printErr != nil {
+		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printing failed: %v", printErr))
 		return
 	}
 

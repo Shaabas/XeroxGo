@@ -205,6 +205,7 @@ func main() {
 	stateDB := flag.String("state-db", "/var/kiosk/state.db", "SQLite state database path")
 	downloadDir := flag.String("download-dir", "/var/kiosk/jobs", "Directory for downloaded PDF jobs")
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
+	cupsPrinter := flag.String("cups-printer", "", "CUPS queue name (e.g. DCPT310). When set, jobs are sent via CUPS instead of raw TCP port 9100")
 	framebuffer := flag.String("framebuffer", "/dev/fb0", "Linux framebuffer device path")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	flag.Parse()
@@ -282,6 +283,7 @@ func main() {
 		KioskID:       *kioskID,
 		StateStore:    stateStore,
 		PrinterAddr:   actualPrinterAddr,
+		CUPSQueue:     *cupsPrinter,
 		DownloadDir:   *downloadDir,
 		IdleQRContent: *idleQRContent,
 		ScreenSink:    screenSink,
@@ -297,7 +299,11 @@ func main() {
 	startSystemdWatchdog(ctx, &rootWg)
 	_ = sendSystemdNotify("READY=1")
 
-	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, printer=%s)", *kioskID, *cloudURL, actualPrinterAddr)
+	targetDesc := actualPrinterAddr
+	if *cupsPrinter != "" {
+		targetDesc = "cups:" + *cupsPrinter
+	}
+	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s)", *kioskID, *cloudURL, targetDesc)
 
 	if err := client.Run(ctx); err != nil {
 		log.Printf("spooler client exited with error: %v", err)

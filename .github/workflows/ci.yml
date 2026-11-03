@@ -1,0 +1,50 @@
+name: XeroxGo CI & GitOps Deployment
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify:
+    name: Verification Gates (Gate 1 - 5)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Install Runtime Dependencies (qpdf, ghostscript)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf ghostscript
+
+      - name: Run Verification Gates
+        run: ./scripts/verify_gate.sh
+
+  deploy-frontend:
+    name: Deploy Frontend to Vercel
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Vercel Production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -n "$VERCEL_TOKEN" ]; then
+            npx vercel deploy frontend --prod --yes --token="$VERCEL_TOKEN"
+          else
+            echo "VERCEL_TOKEN secret not configured; skipping automated Vercel deploy."
+          fi

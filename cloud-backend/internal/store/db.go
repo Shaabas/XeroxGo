@@ -7,12 +7,32 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 	"xeroxgo/pkg/contracts"
 )
 
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect string
+}
+
+func (s *Store) rebind(query string) string {
+	if s == nil || s.dialect != "postgres" {
+		return query
+	}
+	var b strings.Builder
+	b.Grow(len(query) + 16)
+	paramIdx := 1
+	for i := 0; i < len(query); i++ {
+		if query[i] == '?' {
+			b.WriteString(fmt.Sprintf("$%d", paramIdx))
+			paramIdx++
+		} else {
+			b.WriteByte(query[i])
+		}
+	}
+	return b.String()
 }
 
 type Order struct {
@@ -24,11 +44,84 @@ type Order struct {
 	UpdatedAt  time.Time
 }
 
-// Open opens a SQLite database at dbPath, verifies durability pragmas,
-// initializes schema tables, and returns a Store.
+// Open opens a database at dbPath. If dbPath starts with "postgres://" or "postgresql://",
+// it connects to a PostgreSQL instance (e.g. Supabase). Otherwise it connects to SQLite,
+// verifies durability pragmas, initializes schema tables, and returns a Store.
 func Open(dbPath string) (*Store, error) {
 	if strings.TrimSpace(dbPath) == "" {
 		return nil, fmt.Errorf("open store: dbPath cannot be empty")
+	}
+
+	isPostgres := strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://")
+	if isPostgres {
+		db, err := sql.Open("pgx", dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("open store: postgres: %w", err)
+		}
+		db.SetMaxOpenConns(25)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(5 * time.Minute)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: postgres ping failed: %w", err)
+		}
+
+		schema := `
+CREATE TABLE IF NOT EXISTS orders (
+    order_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE,
+    kiosk_id TEXT NOT NULL,
+    display_code TEXT NOT NULL,
+    status TEXT NOT NULL,
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS print_configs (
+    order_id TEXT PRIMARY KEY
+        REFERENCES orders(order_id) ON DELETE CASCADE,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
+    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
+    copies INTEGER NOT NULL CHECK (copies > 0),
+    duplex TEXT NOT NULL,
+    start_from_page INTEGER NOT NULL CHECK (start_from_page >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS pricing (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    price_per_sheet_paise BIGINT NOT NULL
+        CHECK (price_per_sheet_paise > 0),
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payment_webhooks (
+    webhook_id TEXT PRIMARY KEY,
+    received_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS job_progress (
+    job_id TEXT PRIMARY KEY
+        REFERENCES orders(job_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    pages_printed INTEGER NOT NULL CHECK (pages_printed >= 0),
+    sheets_printed INTEGER NOT NULL CHECK (sheets_printed >= 0),
+    error_reason TEXT NOT NULL DEFAULT '',
+    timestamp_ns BIGINT NOT NULL
+);
+`
+		if _, err := db.Exec(schema); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: postgres schema init: %w", err)
+		}
+
+		return &Store{db: db, dialect: "postgres"}, nil
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -90,9 +183,9 @@ CREATE TABLE IF NOT EXISTS orders (
     kiosk_id TEXT NOT NULL,
     display_code TEXT NOT NULL,
     status TEXT NOT NULL,
-    price_paise INTEGER NOT NULL CHECK (price_paise >= 0),
-    created_at_ns INTEGER NOT NULL,
-    updated_at_ns INTEGER NOT NULL
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS print_configs (
@@ -109,14 +202,14 @@ CREATE TABLE IF NOT EXISTS print_configs (
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise INTEGER NOT NULL
+    price_per_sheet_paise BIGINT NOT NULL
         CHECK (price_per_sheet_paise > 0),
-    updated_at_ns INTEGER NOT NULL
+    updated_at_ns BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS payment_webhooks (
     webhook_id TEXT PRIMARY KEY,
-    received_at_ns INTEGER NOT NULL
+    received_at_ns BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS job_progress (
@@ -127,7 +220,7 @@ CREATE TABLE IF NOT EXISTS job_progress (
     pages_printed INTEGER NOT NULL CHECK (pages_printed >= 0),
     sheets_printed INTEGER NOT NULL CHECK (sheets_printed >= 0),
     error_reason TEXT NOT NULL DEFAULT '',
-    timestamp_ns INTEGER NOT NULL
+    timestamp_ns BIGINT NOT NULL
 );
 `
 	if _, err := db.Exec(schema); err != nil {
@@ -135,7 +228,7 @@ CREATE TABLE IF NOT EXISTS job_progress (
 		return nil, fmt.Errorf("open store: create schema: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, dialect: "sqlite"}, nil
 }
 
 // Close closes the underlying SQLite database connection.
@@ -220,10 +313,10 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, s.rebind(`
 INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-`,
+`),
 		order.OrderID,
 		order.Command.JobID,
 		order.Command.KioskID,
@@ -237,10 +330,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 		return fmt.Errorf("create order: insert into orders: %w", err)
 	}
 
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, s.rebind(`
 INSERT INTO print_configs (order_id, download_url, sha256_checksum, total_pages, total_sheets, copies, duplex, start_from_page)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-`,
+`),
 		order.OrderID,
 		order.Command.DownloadURL,
 		order.Command.SHA256Checksum,
@@ -285,7 +378,7 @@ JOIN print_configs p ON o.order_id = p.order_id
 WHERE o.order_id = ?;
 `
 
-	row := s.db.QueryRowContext(ctx, query, orderID)
+	row := s.db.QueryRowContext(ctx, s.rebind(query), orderID)
 
 	var (
 		resOrderID    string
@@ -372,11 +465,11 @@ func (s *Store) UpdateOrderStatus(ctx context.Context, orderID string, status co
 
 	updatedNS := time.Now().UTC().UnixNano()
 
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE order_id = ?;
-`, string(status), updatedNS, orderID)
+`), string(status), updatedNS, orderID)
 	if err != nil {
 		return fmt.Errorf("update order status: %w", err)
 	}
@@ -416,7 +509,7 @@ ON CONFLICT(id) DO UPDATE SET
     price_per_sheet_paise = excluded.price_per_sheet_paise,
     updated_at_ns = excluded.updated_at_ns;
 `
-	_, err := s.db.ExecContext(ctx, query, pricePaise, updatedNS)
+	_, err := s.db.ExecContext(ctx, s.rebind(query), pricePaise, updatedNS)
 	if err != nil {
 		return fmt.Errorf("set price: %w", err)
 	}
@@ -471,7 +564,7 @@ INSERT INTO payment_webhooks (webhook_id, received_at_ns)
 VALUES (?, ?)
 ON CONFLICT(webhook_id) DO NOTHING;
 `
-	res, err := s.db.ExecContext(ctx, query, webhookID, receivedNS)
+	res, err := s.db.ExecContext(ctx, s.rebind(query), webhookID, receivedNS)
 	if err != nil {
 		return false, fmt.Errorf("record webhook: %w", err)
 	}
@@ -536,7 +629,7 @@ FROM orders o
 JOIN print_configs p ON o.order_id = p.order_id
 WHERE o.job_id = ?;
 `
-	err = tx.QueryRowContext(ctx, queryOrder, event.JobID).Scan(&orderKioskID, &totalPages, &totalSheets)
+	err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderKioskID, &totalPages, &totalSheets)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("update job progress: job %q not found in orders", event.JobID)
 	}
@@ -559,7 +652,7 @@ WHERE o.job_id = ?;
 
 	// 4. Check existing progress timestamp to reject older/stale events
 	var existingTimestampNS int64
-	err = tx.QueryRowContext(ctx, "SELECT timestamp_ns FROM job_progress WHERE job_id = ?;", event.JobID).Scan(&existingTimestampNS)
+	err = tx.QueryRowContext(ctx, s.rebind("SELECT timestamp_ns FROM job_progress WHERE job_id = ?;"), event.JobID).Scan(&existingTimestampNS)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("update job progress: query existing progress: %w", err)
 	}
@@ -579,7 +672,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     error_reason = excluded.error_reason,
     timestamp_ns = excluded.timestamp_ns;
 `
-	_, err = tx.ExecContext(ctx, upsertProgress,
+	_, err = tx.ExecContext(ctx, s.rebind(upsertProgress),
 		event.JobID,
 		event.KioskID,
 		string(event.Status),
@@ -593,11 +686,11 @@ ON CONFLICT(job_id) DO UPDATE SET
 	}
 
 	// 6. Update associated order's status and updated_at_ns
-	_, err = tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE job_id = ?;
-`, string(event.Status), eventNS, event.JobID)
+`), string(event.Status), eventNS, event.JobID)
 	if err != nil {
 		return fmt.Errorf("update job progress: update order status: %w", err)
 	}
@@ -639,7 +732,7 @@ WHERE job_id = ?;
 		timestampNS   int64
 	)
 
-	err := s.db.QueryRowContext(ctx, query, jobID).Scan(
+	err := s.db.QueryRowContext(ctx, s.rebind(query), jobID).Scan(
 		&resJobID,
 		&kioskID,
 		&statusStr,

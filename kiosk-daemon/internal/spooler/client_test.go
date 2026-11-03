@@ -1284,3 +1284,127 @@ func TestClientCancellationStopsOwnedGoroutines(t *testing.T) {
 		t.Fatal("client.Run did not terminate promptly after context cancellation")
 	}
 }
+
+func TestClientProcessesCUPSJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "kiosk_cups.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	pdfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pdfContent)
+	}))
+	defer pdfServer.Close()
+
+	var cupsPrinted atomic.Bool
+	var cupsQueueUsed string
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		cupsQueueUsed = queue
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		cupsPrinted.Store(true)
+		return nil
+	}
+
+	jobCmd := contracts.PrintJobCommand{
+		JobID:          "job-cups-001",
+		KioskID:        "kiosk-cups",
+		DisplayCode:    "5566",
+		DownloadURL:    pdfServer.URL + "/cups.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	var progressEvents []contracts.JobProgressEvent
+	var eventsMu sync.Mutex
+
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+
+		// Push print job
+		_ = wsjson.Write(r.Context(), conn, map[string]interface{}{
+			"type": "job",
+			"job":  jobCmd,
+		})
+
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+			if msg.Type == "progress" && msg.Progress != nil {
+				eventsMu.Lock()
+				progressEvents = append(progressEvents, *msg.Progress)
+				eventsMu.Unlock()
+			}
+		}
+	}))
+	defer cloudServer.Close()
+
+	cloudWSURL := "ws" + strings.TrimPrefix(cloudServer.URL, "http")
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      cloudWSURL,
+		KioskID:       "kiosk-cups",
+		StateStore:    store,
+		CUPSQueue:     "DCPT310",
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/kiosk-cups",
+		ScreenSink:    noopSink,
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient with CUPS queue failed: %v", err)
+	}
+
+	client.minBackoff = 20 * time.Millisecond
+	client.maxBackoff = 50 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = client.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(4 * time.Second)
+	completed := false
+	for time.Now().Before(deadline) {
+		if cupsPrinted.Load() {
+			inc, err := store.GetIncompleteJob(ctx)
+			if err == nil && inc == nil {
+				completed = true
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !cupsPrinted.Load() {
+		t.Fatal("expected CUPS print job to be executed")
+	}
+	if cupsQueueUsed != "DCPT310" {
+		t.Fatalf("expected CUPS queue DCPT310, got %q", cupsQueueUsed)
+	}
+	if !completed {
+		t.Fatal("expected job to reach COMPLETED status in store")
+	}
+}
