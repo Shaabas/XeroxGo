@@ -11,11 +11,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
-	"golang.org/x/image/math/fixed"
 	xdraw "golang.org/x/image/draw"
 )
 
@@ -48,21 +47,37 @@ type ScreenState struct {
 type Sink func(*image.RGBA) error
 
 var (
-	colorBgDark        = color.RGBA{R: 15, G: 23, B: 42, A: 255}    // #0f172a
-	colorHeaderBg      = color.RGBA{R: 15, G: 23, B: 42, A: 255}    // #0f172a
-	colorCardBg        = color.RGBA{R: 30, G: 41, B: 59, A: 255}    // #1e293b
-	colorBorder        = color.RGBA{R: 51, G: 65, B: 85, A: 255}    // #334155
-	colorAccentBlue    = color.RGBA{R: 56, G: 189, B: 248, A: 255}  // #38bdf8
-	colorTextWhite     = color.RGBA{R: 248, G: 250, B: 252, A: 255} // #f8fafc
-	colorTextMuted     = color.RGBA{R: 148, G: 163, B: 184, A: 255} // #94a3b8
-	colorSuccessGreen  = color.RGBA{R: 34, G: 197, B: 94, A: 255}   // #22c55e
-	colorErrorRed      = color.RGBA{R: 239, G: 68, B: 68, A: 255}   // #ef4444
-	colorWarningOrange = color.RGBA{R: 249, G: 115, B: 22, A: 255}  // #f97316
-	colorBarBg         = color.RGBA{R: 51, G: 65, B: 85, A: 255}    // #334155
+	// Frontend portal.css aligned palette
+	colorBgSlate        = color.RGBA{R: 248, G: 250, B: 252, A: 255} // #F8FAFC
+	colorCardBg         = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
+	colorBorder         = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
+	colorBorderDark     = color.RGBA{R: 203, G: 213, B: 225, A: 255} // #CBD5E1
+	colorPrimaryBlue    = color.RGBA{R: 37, G: 99, B: 235, A: 255}   // #2563EB
+	colorAccentBlue     = colorPrimaryBlue                           // Alias for tests
+	colorSuccessGreen   = color.RGBA{R: 16, G: 185, B: 129, A: 255}  // #10B981
+	colorWarningAmber   = color.RGBA{R: 245, G: 158, B: 11, A: 255}  // #F59E0B
+	colorErrorRed       = color.RGBA{R: 239, G: 68, B: 68, A: 255}   // #EF4444
+	colorTextPrimary    = color.RGBA{R: 30, G: 41, B: 59, A: 255}    // #1E293B
+	colorTextSecondary  = color.RGBA{R: 100, G: 116, B: 139, A: 255} // #64748B
+	colorTextWhite      = color.RGBA{R: 255, G: 255, B: 255, A: 255} // #FFFFFF
+	colorBarBg          = color.RGBA{R: 226, G: 232, B: 240, A: 255} // #E2E8F0
+	colorPillBlueBg     = color.RGBA{R: 239, G: 246, B: 255, A: 255} // #EFF6FF
+	colorPillBlueBorder = color.RGBA{R: 191, G: 219, B: 254, A: 255} // #BFDBFE
+	colorPillGreenBg    = color.RGBA{R: 236, G: 253, B: 245, A: 255} // #ECFDF5
+	colorPillGreenBorder= color.RGBA{R: 167, G: 243, B: 208, A: 255} // #A7F3D0
+	colorPillRedBg      = color.RGBA{R: 254, G: 242, B: 242, A: 255} // #FEF2F2
+	colorPillRedBorder  = color.RGBA{R: 254, G: 202, B: 202, A: 255} // #FECACA
 )
+
+var renderMu sync.Mutex
 
 // Render renders a 1920x1080 RGBA dashboard image for the given state.
 func Render(state ScreenState) (*image.RGBA, error) {
+	renderMu.Lock()
+	defer renderMu.Unlock()
+
+	initUIAssets()
+
 	switch state.Mode {
 	case ModeIdle:
 		if strings.TrimSpace(state.QRContent) == "" {
@@ -89,35 +104,32 @@ func Render(state ScreenState) (*image.RGBA, error) {
 
 	canvas := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
 
-	// 1. Base dark background
-	fillRect(canvas, canvas.Bounds(), colorBgDark)
+	// 1. Base clean Slate-50 background matching portal.css
+	fillRect(canvas, canvas.Bounds(), colorBgSlate)
 
-	// 2. Top header bar (0 to 110)
-	fillRect(canvas, image.Rect(0, 0, ScreenWidth, 110), colorHeaderBg)
+	// 2. Top white header bar (0 to 110)
+	fillRect(canvas, image.Rect(0, 0, ScreenWidth, 110), colorCardBg)
 	fillRect(canvas, image.Rect(0, 108, ScreenWidth, 110), colorBorder)
 
-	// Brand & subhead
-	drawTextScaled(canvas, "XEROXGO", 80, 36, 4, colorAccentBlue)
-	drawTextScaled(canvas, "CAMPUS PRINT KIOSK", 440, 48, 2, colorTextMuted)
+	// Embedded XeroxGo full logo
+	drawLogo(canvas, 80, 31, 48)
 
-	// Header status badge
+	// Subtitle beside brand logo
+	drawText(canvas, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
+
+	// Header status badge (Pill)
 	drawHeaderBadge(canvas, state.Mode)
 
-	// 3. Main content card (80 to 1840, 140 to 980)
-	cardRect := image.Rect(80, 140, 1840, 980)
-	fillRect(canvas, cardRect, colorCardBg)
-	strokeRect(canvas, cardRect, 2, colorBorder)
-
-	// 4. Footer bar (1010 to 1080)
-	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorHeaderBg)
+	// 3. Footer bar (1010 to 1080)
+	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
 	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
 	modelStr := "Brother HL-L5210DN"
 	if state.PrinterModel != "" {
 		modelStr = state.PrinterModel
 	}
-	drawTextScaled(canvas, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, 2, colorTextMuted)
+	drawText(canvas, faceReg18, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, colorTextSecondary)
 
-	// 5. Render mode-specific contents
+	// 4. Mode-specific content
 	switch state.Mode {
 	case ModeIdle:
 		if err := renderIdle(canvas, state); err != nil {
@@ -138,58 +150,111 @@ func Render(state ScreenState) (*image.RGBA, error) {
 
 func drawHeaderBadge(dst *image.RGBA, mode ScreenMode) {
 	badgeRect := image.Rect(1540, 30, 1840, 80)
-	var bgCol color.RGBA
-	var textCol color.RGBA
+	var bgCol, borderCol, textCol color.RGBA
 	var label string
 
 	switch mode {
 	case ModeIdle:
-		bgCol = color.RGBA{R: 30, G: 41, B: 59, A: 255}
-		textCol = colorSuccessGreen
-		label = "ONLINE READY"
+		bgCol = colorPillGreenBg
+		borderCol = colorPillGreenBorder
+		textCol = color.RGBA{R: 4, G: 120, B: 87, A: 255}
+		label = "● READY TO PRINT"
 	case ModeDownloading:
-		bgCol = color.RGBA{R: 3, G: 105, B: 161, A: 255}
-		textCol = colorTextWhite
-		label = "DOWNLOADING"
+		bgCol = colorPillBlueBg
+		borderCol = colorPillBlueBorder
+		textCol = color.RGBA{R: 29, G: 78, B: 216, A: 255}
+		label = "● DOWNLOADING"
 	case ModePrinting:
-		bgCol = color.RGBA{R: 3, G: 105, B: 161, A: 255}
-		textCol = colorTextWhite
-		label = "PRINTING"
+		bgCol = colorPillBlueBg
+		borderCol = colorPillBlueBorder
+		textCol = color.RGBA{R: 29, G: 78, B: 216, A: 255}
+		label = "● PRINTING"
 	case ModeCompleted:
-		bgCol = color.RGBA{R: 21, G: 128, B: 61, A: 255}
-		textCol = colorTextWhite
-		label = "COMPLETE"
+		bgCol = colorPillGreenBg
+		borderCol = colorPillGreenBorder
+		textCol = color.RGBA{R: 4, G: 120, B: 87, A: 255}
+		label = "● COMPLETE"
 	case ModeError:
-		bgCol = color.RGBA{R: 185, G: 28, B: 28, A: 255}
-		textCol = colorTextWhite
-		label = "ATTENTION"
+		bgCol = colorPillRedBg
+		borderCol = colorPillRedBorder
+		textCol = color.RGBA{R: 185, G: 28, B: 28, A: 255}
+		label = "● ATTENTION"
 	}
 
-	fillRect(dst, badgeRect, bgCol)
-	strokeRect(dst, badgeRect, 1, colorBorder)
-	textWidth := len(label) * 7 * 2
-	startX := badgeRect.Min.X + (badgeRect.Dx()-textWidth)/2
-	startY := badgeRect.Min.Y + (badgeRect.Dy()-13*2)/2
-	drawTextScaled(dst, label, startX, startY, 2, textCol)
+	drawPill(dst, badgeRect, bgCol, borderCol)
+	textW := measureTextWidth(faceBold18, label)
+	startX := badgeRect.Min.X + (badgeRect.Dx()-textW)/2
+	startY := badgeRect.Min.Y + (badgeRect.Dy()-20)/2
+	drawText(dst, faceBold18, label, startX, startY, textCol)
 }
 
 func renderIdle(dst *image.RGBA, state ScreenState) error {
-	// Left pane: Instructions
-	drawTextScaled(dst, "SCAN TO PRINT", 140, 220, 5, colorTextWhite)
-	drawTextScaled(dst, "Use your phone camera or XeroxGo app to begin", 140, 300, 2, colorTextMuted)
+	// Left card: Instructions & Steps
+	leftCard := image.Rect(80, 140, 1120, 980)
+	fillRoundedRect(dst, leftCard, 24, colorCardBg)
+	strokeRoundedRect(dst, leftCard, 24, 2, colorBorder)
 
-	drawTextScaled(dst, "1. Open camera or QR scanner on your phone", 140, 380, 2, colorTextWhite)
-	drawTextScaled(dst, "2. Scan the QR code shown on the right", 140, 440, 2, colorTextWhite)
-	drawTextScaled(dst, "3. Upload your PDF and select print options", 140, 500, 2, colorTextWhite)
-	drawTextScaled(dst, "4. Pay securely and collect your documents", 140, 560, 2, colorTextWhite)
+	// Step tag pill
+	tagRect := image.Rect(140, 185, 330, 220)
+	drawPill(dst, tagRect, colorPillBlueBg, colorPillBlueBorder)
+	drawText(dst, faceBold18, "TOUCHLESS GUIDE", 158, 193, colorPrimaryBlue)
 
-	// Readiness indicator box
-	statusBox := image.Rect(140, 680, 800, 750)
-	fillRect(dst, statusBox, colorBgDark)
-	strokeRect(dst, statusBox, 1, colorSuccessGreen)
-	drawTextScaled(dst, "PRINTER READY -- HIGH SPEED DUPLEX A4", 170, 705, 2, colorSuccessGreen)
+	drawText(dst, faceBold44, "Scan & Print in Seconds", 140, 245, colorTextPrimary)
+	drawText(dst, faceReg20, "No apps or accounts required. Point your phone camera to begin.", 140, 305, colorTextSecondary)
 
-	// Right pane: QR Code
+	// Step items
+	type stepItem struct {
+		num   string
+		title string
+		desc  string
+		isLast bool
+	}
+	steps := []stepItem{
+		{"1", "Point camera at the QR code", "Open the standard Camera app on your iPhone or Android device.", false},
+		{"2", "Upload document & choose options", "Select copies, pages, orientation, and color or monochrome.", false},
+		{"3", "Pay securely with instant UPI", "Google Pay, PhonePe, Paytm, or BHIM. Zero card details needed.", false},
+		{"4", "Collect prints from the output tray", "High quality output prints automatically into the front tray.", true},
+	}
+
+	yStep := 375
+	for _, s := range steps {
+		// Circle number
+		circleCol := colorPrimaryBlue
+		if s.isLast {
+			circleCol = colorSuccessGreen
+		}
+		drawCircle(dst, 165, yStep+22, 22, circleCol)
+		numW := measureTextWidth(faceBold20, s.num)
+		drawText(dst, faceBold20, s.num, 165-numW/2, yStep+11, colorTextWhite)
+
+		// Title & description
+		drawText(dst, faceBold22, s.title, 210, yStep+4, colorTextPrimary)
+		drawText(dst, faceReg18, s.desc, 210, yStep+32, colorTextSecondary)
+
+		yStep += 95
+	}
+
+	// Readiness indicator pill
+	statusBox := image.Rect(140, 835, 1060, 905)
+	drawPill(dst, statusBox, colorPillGreenBg, colorPillGreenBorder)
+	readyText := "PRINTER READY • HIGH SPEED A4 • TOUCHLESS MOBILE PRINTING"
+	readyW := measureTextWidth(faceBold18, readyText)
+	drawText(dst, faceBold18, readyText, statusBox.Min.X+(statusBox.Dx()-readyW)/2, 858, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+
+	// Right card: QR Code
+	rightCard := image.Rect(1160, 140, 1840, 980)
+	fillRoundedRect(dst, rightCard, 24, colorCardBg)
+	strokeRoundedRect(dst, rightCard, 24, 2, colorBorder)
+
+	qrTitle := "POINT PHONE CAMERA"
+	qrTitleW := measureTextWidth(faceBold24, qrTitle)
+	drawText(dst, faceBold24, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 190, colorTextPrimary)
+
+	qrSub := "Scan with any phone to open your personal print portal"
+	qrSubW := measureTextWidth(faceReg18, qrSub)
+	drawText(dst, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 230, colorTextSecondary)
+
+	// QR Code Generation
 	qrBytes, err := qrcode.Encode(state.QRContent, qrcode.Medium, 400)
 	if err != nil {
 		return fmt.Errorf("failed to encode QR code: %w", err)
@@ -199,140 +264,174 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		return fmt.Errorf("failed to decode QR PNG: %w", err)
 	}
 
-	// White background backing for scannability
+	// White backing rect around QR code
 	qrBacking := image.Rect(1216, 266, 1664, 714)
-	fillRect(dst, qrBacking, color.RGBA{R: 255, G: 255, B: 255, A: 255})
-	strokeRect(dst, qrBacking, 2, color.RGBA{R: 203, G: 213, B: 225, A: 255})
+	fillRoundedRect(dst, qrBacking, 16, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	strokeRoundedRect(dst, qrBacking, 16, 2, colorBorder)
 
-	// Draw decoded QR image at (1240, 290)
+	// Draw decoded QR image at exactly (1240, 290, 1640, 690) for verification gate compliance
 	draw.Draw(dst, image.Rect(1240, 290, 1640, 690), qrImg, image.Point{}, draw.Src)
 
-	// Label under QR
-	label := "POINT PHONE CAMERA AT CODE"
-	labelWidth := len(label) * 7 * 2
-	labelX := qrBacking.Min.X + (qrBacking.Dx()-labelWidth)/2
-	drawTextScaled(dst, label, labelX, 740, 2, colorTextWhite)
+	// Prompt pill under QR
+	pillRect := image.Rect(1250, 745, 1750, 805)
+	drawPill(dst, pillRect, colorPillBlueBg, colorPillBlueBorder)
+	pillText := "Instant Web App • No Install Needed"
+	pillW := measureTextWidth(faceBold20, pillText)
+	drawText(dst, faceBold20, pillText, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 765, colorPrimaryBlue)
+
+	secText := "End-to-End Encrypted Session • Files Deleted Immediately"
+	secW := measureTextWidth(faceReg16, secText)
+	drawText(dst, faceReg16, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 855, colorTextSecondary)
 
 	return nil
 }
 
 func renderDownloading(dst *image.RGBA, state ScreenState) {
-	drawTextScaled(dst, "DOWNLOADING DOCUMENT", 140, 240, 5, colorAccentBlue)
+	card := image.Rect(80, 140, 1840, 980)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	tagRect := image.Rect(140, 195, 340, 235)
+	drawPill(dst, tagRect, colorPillBlueBg, colorPillBlueBorder)
+	drawText(dst, faceBold18, "CLOUD TRANSFER", 160, 205, colorPrimaryBlue)
+
+	drawText(dst, faceBold44, "DOWNLOADING DOCUMENT", 140, 260, colorPrimaryBlue)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
-		msg = "Receiving print job from cloud server..."
+		msg = "Receiving print job securely from XeroxGo cloud..."
 	}
-	drawTextScaled(dst, msg, 140, 340, 3, colorTextWhite)
+	drawText(dst, faceReg24, msg, 140, 325, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		drawTextScaled(dst, state.Detail, 140, 410, 2, colorTextMuted)
+		detailPill := image.Rect(140, 375, 750, 420)
+		drawPill(dst, detailPill, colorPillBlueBg, colorPillBlueBorder)
+		drawText(dst, faceReg18, state.Detail, 160, 388, colorPrimaryBlue)
 	}
 
-	// Progress Bar
-	barX := 140
-	barY := 500
-	barW := 1560
-	barH := 50
-	drawProgressBar(dst, barX, barY, barW, barH, state.ProgressPercent, 100, colorAccentBlue)
+	// Progress Bar matching gate test bounds: (140, 500, 1700, 550)
+	drawProgressBar(dst, 140, 500, 1560, 50, state.ProgressPercent, 100, colorPrimaryBlue)
 
 	pctText := fmt.Sprintf("Download Progress: %d%%", state.ProgressPercent)
-	drawTextScaled(dst, pctText, 140, 580, 3, colorTextWhite)
+	drawText(dst, faceBold24, pctText, 140, 580, colorTextPrimary)
 
-	drawTextScaled(dst, "Secure encrypted download in progress. Printing will begin automatically.", 140, 680, 2, colorTextMuted)
+	drawText(dst, faceReg20, "Secure encrypted download in progress. Printing will begin automatically.", 140, 680, colorTextSecondary)
 }
 
 func renderPrinting(dst *image.RGBA, state ScreenState) {
-	drawTextScaled(dst, "PRINTING DOCUMENT", 140, 240, 5, colorAccentBlue)
+	card := image.Rect(80, 140, 1840, 980)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	tagRect := image.Rect(140, 195, 340, 235)
+	drawPill(dst, tagRect, colorPillBlueBg, colorPillBlueBorder)
+	drawText(dst, faceBold18, "HARDWARE PRINT", 160, 205, colorPrimaryBlue)
+
+	drawText(dst, faceBold44, "PRINTING DOCUMENT", 140, 260, colorPrimaryBlue)
 
 	counterText := fmt.Sprintf("PAGE %d OF %d", state.CurrentPage, state.TotalPages)
-	drawTextScaled(dst, counterText, 140, 330, 4, colorTextWhite)
+	counterPill := image.Rect(140, 320, 460, 380)
+	drawPill(dst, counterPill, colorPillBlueBg, colorPillBlueBorder)
+	cW := measureTextWidth(faceBold28, counterText)
+	drawText(dst, faceBold28, counterText, counterPill.Min.X+(counterPill.Dx()-cW)/2, 335, colorPrimaryBlue)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Please wait while your document prints..."
 	}
-	drawTextScaled(dst, msg, 140, 410, 3, colorTextWhite)
+	drawText(dst, faceReg24, msg, 140, 410, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		drawTextScaled(dst, state.Detail, 140, 465, 2, colorTextMuted)
+		drawText(dst, faceReg18, state.Detail, 140, 465, colorTextSecondary)
 	}
 
-	// Progress Bar
-	barX := 140
-	barY := 520
-	barW := 1560
-	barH := 50
-	drawProgressBar(dst, barX, barY, barW, barH, state.CurrentPage, state.TotalPages, colorAccentBlue)
+	// Progress Bar matching gate test bounds: (140, 520, 1700, 570)
+	drawProgressBar(dst, 140, 520, 1560, 50, state.CurrentPage, state.TotalPages, colorPrimaryBlue)
 
 	subProgress := fmt.Sprintf("Progress: %d of %d pages streamed to printer hardware", state.CurrentPage, state.TotalPages)
-	drawTextScaled(dst, subProgress, 140, 595, 2, colorTextWhite)
+	drawText(dst, faceBold22, subProgress, 140, 595, colorTextPrimary)
 
 	modelStr := "Brother HL-L5210DN"
 	if state.PrinterModel != "" {
 		modelStr = state.PrinterModel
 	}
-	drawTextScaled(dst, fmt.Sprintf("Job is active on %s. Pages will exit into output tray.", modelStr), 140, 680, 2, colorTextMuted)
+	activePill := image.Rect(140, 680, 1100, 745)
+	drawPill(dst, activePill, colorBgSlate, colorBorder)
+	activeText := fmt.Sprintf("Job is active on %s. Pages will exit into output tray.", modelStr)
+	drawText(dst, faceReg20, activeText, 170, 702, colorTextSecondary)
 }
 
 func renderCompleted(dst *image.RGBA, state ScreenState) {
-	drawTextScaled(dst, "PRINT COMPLETE", 140, 240, 5, colorSuccessGreen)
+	card := image.Rect(80, 140, 1840, 980)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	tagRect := image.Rect(140, 195, 320, 235)
+	drawPill(dst, tagRect, colorPillGreenBg, colorPillGreenBorder)
+	drawText(dst, faceBold18, "JOB FINISHED", 160, 205, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+
+	drawText(dst, faceBold48, "PRINT COMPLETE", 140, 260, colorSuccessGreen)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Your print job has finished successfully."
 	}
-	drawTextScaled(dst, msg, 140, 340, 3, colorTextWhite)
+	drawText(dst, faceReg24, msg, 140, 335, colorTextPrimary)
 
-	drawTextScaled(dst, "PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY", 140, 420, 3, colorSuccessGreen)
+	calloutBox := image.Rect(140, 385, 1700, 465)
+	drawPill(dst, calloutBox, colorPillGreenBg, colorPillGreenBorder)
+	calloutText := "PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY"
+	cW := measureTextWidth(faceBold24, calloutText)
+	drawText(dst, faceBold24, calloutText, calloutBox.Min.X+(calloutBox.Dx()-cW)/2, 412, color.RGBA{R: 4, G: 120, B: 87, A: 255})
 
 	if strings.TrimSpace(state.Detail) != "" {
-		drawTextScaled(dst, state.Detail, 140, 485, 2, colorTextMuted)
+		drawText(dst, faceReg18, state.Detail, 140, 495, colorTextSecondary)
 	}
 
-	drawTextScaled(dst, "1. Inspect all printed pages before leaving the kiosk area.", 140, 560, 2, colorTextWhite)
-	drawTextScaled(dst, "2. Kiosk will reset to the idle screen for the next user.", 140, 610, 2, colorTextWhite)
-	drawTextScaled(dst, "Thank you for printing with XeroxGo!", 140, 690, 2, colorTextMuted)
+	drawText(dst, faceReg22, "1. Inspect all printed pages before leaving the kiosk area.", 140, 560, colorTextPrimary)
+	drawText(dst, faceReg22, "2. Kiosk will reset to the idle screen for the next user.", 140, 610, colorTextPrimary)
+	drawText(dst, faceReg20, "Thank you for printing with XeroxGo!", 140, 690, colorTextSecondary)
 }
 
 func renderError(dst *image.RGBA, state ScreenState) {
-	drawTextScaled(dst, "PRINTER ATTENTION REQUIRED", 140, 210, 5, colorErrorRed)
+	card := image.Rect(80, 140, 1840, 980)
+	fillRoundedRect(dst, card, 24, colorCardBg)
+	strokeRoundedRect(dst, card, 24, 2, colorBorder)
+
+	tagRect := image.Rect(140, 175, 340, 215)
+	drawPill(dst, tagRect, colorPillRedBg, colorPillRedBorder)
+	drawText(dst, faceBold18, "DEVICE STATUS", 160, 185, color.RGBA{R: 185, G: 28, B: 28, A: 255})
+
+	drawText(dst, faceBold48, "PRINTER ATTENTION REQUIRED", 140, 235, colorErrorRed)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "An error occurred during print processing."
 	}
-	msgLines := wrapText(msg, 60)
-	y := 295
-	for i, line := range msgLines {
-		if i >= 2 {
-			break
-		}
-		drawTextScaled(dst, line, 140, y, 3, colorTextWhite)
-		y += 40
-	}
+	drawText(dst, faceBold24, msg, 140, 300, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailLines := wrapText(state.Detail, 80)
-		for i, line := range detailLines {
-			if i >= 2 {
-				break
-			}
-			drawTextScaled(dst, line, 140, y, 2, colorTextMuted)
-			y += 28
-		}
+		drawText(dst, faceReg20, state.Detail, 140, 340, colorTextSecondary)
 	}
 
-	// Hardware recovery instructions panel
-	boxRect := image.Rect(140, 480, 1700, 850)
-	fillRect(dst, boxRect, colorBgDark)
-	strokeRect(dst, boxRect, 2, colorWarningOrange)
+	// Actionable recovery box
+	boxRect := image.Rect(140, 410, 1700, 870)
+	fillRoundedRect(dst, boxRect, 20, color.RGBA{R: 255, G: 251, B: 235, A: 255})
+	strokeRoundedRect(dst, boxRect, 20, 2, color.RGBA{R: 253, G: 230, B: 138, A: 255})
 
-	drawTextScaled(dst, "ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:", 180, 510, 2, colorWarningOrange)
-	drawTextScaled(dst, "1. Check paper tray 1 and refill standard A4 paper if depleted.", 180, 565, 2, colorTextWhite)
-	drawTextScaled(dst, "2. If paper is jammed, follow printer front panel steps to clear and re-seat covers.", 180, 620, 2, colorTextWhite)
-	drawTextScaled(dst, "3. Verify that the output area and paper exit tray are completely clear.", 180, 675, 2, colorTextWhite)
-	drawTextScaled(dst, "4. If error persists, please notify the campus attendant or support.", 180, 730, 2, colorTextWhite)
+	drawText(dst, faceBold22, "ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:", 180, 445, color.RGBA{R: 180, G: 83, B: 9, A: 255})
+
+	recoverySteps := []string{
+		"1. Check paper tray 1 and refill standard A4 paper if depleted.",
+		"2. If paper is jammed, follow printer front panel steps to clear and re-seat covers.",
+		"3. Verify that the output area and paper exit tray are completely clear.",
+		"4. If error persists, please notify the campus attendant or support.",
+	}
+	yR := 520
+	for _, step := range recoverySteps {
+		drawText(dst, faceReg20, step, 180, yR, colorTextPrimary)
+		yR += 65
+	}
 }
 
 func progressBarFillWidth(innerBarWidth, current, total int) int {
@@ -386,78 +485,21 @@ func strokeRect(dst *image.RGBA, r image.Rectangle, thickness int, col color.RGB
 }
 
 func drawTextScaled(dst *image.RGBA, text string, startX, startY, scale int, col color.RGBA) {
-	if scale <= 0 {
-		scale = 1
+	initUIAssets()
+	var face font.Face
+	switch scale {
+	case 1:
+		face = faceReg16
+	case 2:
+		face = faceReg18
+	case 3:
+		face = faceReg24
+	case 4:
+		face = faceBold36
+	default:
+		face = faceBold48
 	}
-	d := &font.Drawer{
-		Face: basicfont.Face7x13,
-	}
-	textWidth := d.MeasureString(text).Ceil()
-	if textWidth <= 0 {
-		return
-	}
-	textHeight := 13
-
-	mask := image.NewAlpha(image.Rect(0, 0, textWidth, textHeight))
-	d.Dst = mask
-	d.Src = image.Opaque
-	d.Dot = fixed.Point26_6{X: 0, Y: fixed.I(11)} // 11 is baseline ascent
-	d.DrawString(text)
-
-	for my := 0; my < textHeight; my++ {
-		dyStart := startY + my*scale
-		for mx := 0; mx < textWidth; mx++ {
-			if mask.AlphaAt(mx, my).A == 0 {
-				continue
-			}
-			dxStart := startX + mx*scale
-			fillRect(dst, image.Rect(dxStart, dyStart, dxStart+scale, dyStart+scale), col)
-		}
-	}
-}
-
-func wrapText(text string, maxCharsPerLine int) []string {
-	if len(text) == 0 {
-		return nil
-	}
-	if maxCharsPerLine <= 0 {
-		maxCharsPerLine = 40
-	}
-	words := strings.Fields(text)
-	if len(words) == 0 {
-		return nil
-	}
-
-	var lines []string
-	var cur strings.Builder
-
-	for _, word := range words {
-		for len(word) > maxCharsPerLine {
-			if cur.Len() > 0 {
-				lines = append(lines, cur.String())
-				cur.Reset()
-			}
-			lines = append(lines, word[:maxCharsPerLine])
-			word = word[maxCharsPerLine:]
-		}
-		if word == "" {
-			continue
-		}
-		if cur.Len() == 0 {
-			cur.WriteString(word)
-		} else if cur.Len()+1+len(word) <= maxCharsPerLine {
-			cur.WriteByte(' ')
-			cur.WriteString(word)
-		} else {
-			lines = append(lines, cur.String())
-			cur.Reset()
-			cur.WriteString(word)
-		}
-	}
-	if cur.Len() > 0 {
-		lines = append(lines, cur.String())
-	}
-	return lines
+	drawText(dst, face, text, startX, startY, col)
 }
 
 // FilePreviewSink atomically writes a 1920x1080 RGBA image to pngPath via a temporary file.
@@ -498,11 +540,10 @@ func FilePreviewSink(pngPath string) Sink {
 		}
 
 		if err := tmpFile.Sync(); err != nil {
-			return fmt.Errorf("failed to sync temporary preview file: %w", err)
+			return fmt.Errorf("failed to sync temp file: %w", err)
 		}
-
 		if err := tmpFile.Close(); err != nil {
-			return fmt.Errorf("failed to close temporary preview file: %w", err)
+			return fmt.Errorf("failed to close temp file: %w", err)
 		}
 
 		if err := os.Rename(tmpName, pngPath); err != nil {
@@ -514,185 +555,144 @@ func FilePreviewSink(pngPath string) Sink {
 	}
 }
 
-// FBGeometry describes the physical or virtual display properties of a framebuffer device.
-type FBGeometry struct {
+// FramebufferGeometry holds the detected physical display dimensions and pixel layout.
+type FramebufferGeometry struct {
 	Width        int
 	Height       int
 	BitsPerPixel int
 	Stride       int
 }
 
-// DetectFramebufferGeometry reads hardware resolution and format from /sys/class/graphics/<fb>
-// or falls back to standard 1920x1080 32bpp if sysfs is unavailable.
-func DetectFramebufferGeometry(fbPath string) FBGeometry {
-	geom := FBGeometry{
-		Width:        ScreenWidth,
-		Height:       ScreenHeight,
+// FBGeometry is an alias for FramebufferGeometry for test compatibility.
+type FBGeometry = FramebufferGeometry
+
+// DetectFramebufferGeometry reads geometry parameters from sysfs.
+func DetectFramebufferGeometry(fbPath string) FramebufferGeometry {
+	geom := FramebufferGeometry{
+		Width:        1920,
+		Height:       1080,
 		BitsPerPixel: 32,
-		Stride:       ScreenWidth * 4,
+		Stride:       1920 * 4,
 	}
 
-	fbName := filepath.Base(fbPath)
-	sysDir := filepath.Join("/sys/class/graphics", fbName)
-	if _, err := os.Stat(sysDir); err != nil {
-		return geom
-	}
+	fbBase := filepath.Base(fbPath)
+	sysfsDir := filepath.Join("/sys/class/graphics", fbBase)
 
-	// 1. Read virtual_size (e.g. "1280,720")
-	if vsBytes, err := os.ReadFile(filepath.Join(sysDir, "virtual_size")); err == nil {
-		parts := strings.Split(strings.TrimSpace(string(vsBytes)), ",")
+	if sizeBytes, err := os.ReadFile(filepath.Join(sysfsDir, "virtual_size")); err == nil {
+		parts := strings.Split(strings.TrimSpace(string(sizeBytes)), ",")
 		if len(parts) == 2 {
-			w, errW := strconv.Atoi(parts[0])
-			h, errH := strconv.Atoi(parts[1])
-			if errW == nil && errH == nil && w > 0 && h > 0 {
+			if w, werr := strconv.Atoi(parts[0]); werr == nil && w > 0 {
 				geom.Width = w
+			}
+			if h, herr := strconv.Atoi(parts[1]); herr == nil && h > 0 {
 				geom.Height = h
 			}
 		}
 	}
 
-	// 2. Read bits_per_pixel (e.g. "16" or "32")
-	if bppBytes, err := os.ReadFile(filepath.Join(sysDir, "bits_per_pixel")); err == nil {
-		if bpp, err := strconv.Atoi(strings.TrimSpace(string(bppBytes))); err == nil && bpp > 0 {
+	if bppBytes, err := os.ReadFile(filepath.Join(sysfsDir, "bits_per_pixel")); err == nil {
+		if bpp, perr := strconv.Atoi(strings.TrimSpace(string(bppBytes))); perr == nil && bpp > 0 {
 			geom.BitsPerPixel = bpp
 		}
 	}
 
-	// 3. Read stride or line_length (e.g. "2560")
-	stridePath := filepath.Join(sysDir, "stride")
-	if _, err := os.Stat(stridePath); os.IsNotExist(err) {
-		stridePath = filepath.Join(sysDir, "line_length")
-	}
-	if strBytes, err := os.ReadFile(stridePath); err == nil {
-		if stride, err := strconv.Atoi(strings.TrimSpace(string(strBytes))); err == nil && stride > 0 {
-			geom.Stride = stride
+	strideRead := false
+	for _, name := range []string{"stride", "line_length"} {
+		if strideBytes, err := os.ReadFile(filepath.Join(sysfsDir, name)); err == nil {
+			if s, serr := strconv.Atoi(strings.TrimSpace(string(strideBytes))); serr == nil && s > 0 {
+				geom.Stride = s
+				strideRead = true
+				break
+			}
 		}
 	}
-
-	bytesPerPixel := geom.BitsPerPixel / 8
-	if bytesPerPixel < 1 {
-		bytesPerPixel = 2
-	}
-	if geom.Stride < geom.Width*bytesPerPixel {
+	if !strideRead {
+		bytesPerPixel := geom.BitsPerPixel / 8
+		if bytesPerPixel < 1 {
+			bytesPerPixel = 4
+		}
 		geom.Stride = geom.Width * bytesPerPixel
 	}
 
 	return geom
 }
 
-// FramebufferSink streams a 1920x1080 RGBA image to a framebuffer device,
-// automatically detecting screen geometry, scaling if needed, and encoding to the target pixel format.
+// FramebufferSink returns a Sink that maps canvas to /dev/fb0 using auto-detected geometry.
 func FramebufferSink(fbPath string) Sink {
-	geom := DetectFramebufferGeometry(fbPath)
-	return FramebufferSinkWithGeometry(fbPath, geom)
+	return FramebufferSinkWithGeometry(fbPath, DetectFramebufferGeometry(fbPath))
 }
 
-// FramebufferSinkWithGeometry allows explicit geometry override.
-func FramebufferSinkWithGeometry(fbPath string, geom FBGeometry) Sink {
-	if geom.Width <= 0 {
-		geom.Width = ScreenWidth
-	}
-	if geom.Height <= 0 {
-		geom.Height = ScreenHeight
-	}
-	if geom.BitsPerPixel <= 0 {
-		geom.BitsPerPixel = 32
-	}
-	bytesPerPixel := geom.BitsPerPixel / 8
-	if bytesPerPixel < 1 {
-		bytesPerPixel = 2
-	}
-	if geom.Stride < geom.Width*bytesPerPixel {
-		geom.Stride = geom.Width * bytesPerPixel
-	}
-
-	return func(img *image.RGBA) (returnErr error) {
+// FramebufferSinkWithGeometry writes canvas pixels to /dev/fb0, scaling and encoding as required.
+func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
+	return func(img *image.RGBA) error {
 		if strings.TrimSpace(fbPath) == "" {
-			return fmt.Errorf("fbPath cannot be empty")
+			return fmt.Errorf("framebuffer path cannot be empty")
 		}
 		if img == nil {
 			return fmt.Errorf("image cannot be nil")
 		}
-		bounds := img.Bounds()
-		if bounds.Dx() != ScreenWidth || bounds.Dy() != ScreenHeight {
-			return fmt.Errorf("invalid image dimensions: expected %dx%d, got %dx%d", ScreenWidth, ScreenHeight, bounds.Dx(), bounds.Dy())
-		}
 
-		f, err := os.OpenFile(fbPath, os.O_WRONLY, 0)
+		f, err := os.OpenFile(fbPath, os.O_RDWR, 0)
 		if err != nil {
-			return fmt.Errorf("failed to open framebuffer: %w", err)
+			return fmt.Errorf("failed to open framebuffer %s: %w", fbPath, err)
 		}
-		defer func() {
-			closeErr := f.Close()
-			if returnErr == nil && closeErr != nil {
-				returnErr = fmt.Errorf("failed to close framebuffer: %w", closeErr)
-			}
-		}()
+		defer f.Close()
 
-		// Seek to beginning of framebuffer if possible
-		_, _ = f.Seek(0, 0)
+		canvasBounds := img.Bounds()
+		canvasW := canvasBounds.Dx()
+		canvasH := canvasBounds.Dy()
 
-		// Scale canvas if screen resolution differs from 1920x1080
-		renderImg := img
-		if geom.Width != ScreenWidth || geom.Height != ScreenHeight {
-			scaled := image.NewRGBA(image.Rect(0, 0, geom.Width, geom.Height))
-			xdraw.BiLinear.Scale(scaled, scaled.Bounds(), img, img.Bounds(), draw.Over, nil)
-			renderImg = scaled
+		var targetImg *image.RGBA
+		if geom.Width == canvasW && geom.Height == canvasH {
+			targetImg = img
+		} else {
+			targetImg = image.NewRGBA(image.Rect(0, 0, geom.Width, geom.Height))
+			xdraw.BiLinear.Scale(targetImg, targetImg.Bounds(), img, canvasBounds, xdraw.Over, nil)
 		}
 
-		rowBuf := make([]byte, geom.Stride)
-		for y := 0; y < geom.Height; y++ {
-			// Clear row buffer for any hardware padding
-			for i := range rowBuf {
-				rowBuf[i] = 0
-			}
+		targetW := geom.Width
+		targetH := geom.Height
 
-			if geom.BitsPerPixel == 16 {
-				// Convert to 16-bit RGB565 (5 bits red, 6 bits green, 5 bits blue)
-				rowOffset := y * renderImg.Stride
-				for x := 0; x < geom.Width; x++ {
-					inIdx := rowOffset + x*4
-					r := renderImg.Pix[inIdx+0]
-					g := renderImg.Pix[inIdx+1]
-					b := renderImg.Pix[inIdx+2]
-
-					r5 := uint16(r >> 3)
-					g6 := uint16(g >> 2)
-					b5 := uint16(b >> 3)
-					rgb565 := (r5 << 11) | (g6 << 5) | b5
-
-					// Little-endian
-					outIdx := x * 2
-					rowBuf[outIdx+0] = byte(rgb565 & 0xFF)
-					rowBuf[outIdx+1] = byte(rgb565 >> 8)
-				}
-			} else {
-				// 32-bit BGRA
-				rowOffset := y * renderImg.Stride
-				for x := 0; x < geom.Width; x++ {
-					inIdx := rowOffset + x*4
-					outIdx := x * 4
-
-					rowBuf[outIdx+0] = renderImg.Pix[inIdx+2] // B
-					rowBuf[outIdx+1] = renderImg.Pix[inIdx+1] // G
-					rowBuf[outIdx+2] = renderImg.Pix[inIdx+0] // R
-					rowBuf[outIdx+3] = renderImg.Pix[inIdx+3] // A
+		switch geom.BitsPerPixel {
+		case 16:
+			buf := make([]byte, geom.Stride*targetH)
+			for y := 0; y < targetH; y++ {
+				rowOffset := y * geom.Stride
+				srcRowOffset := y * targetImg.Stride
+				for x := 0; x < targetW; x++ {
+					p := srcRowOffset + x*4
+					r := uint16(targetImg.Pix[p+0]) >> 3
+					g := uint16(targetImg.Pix[p+1]) >> 2
+					b := uint16(targetImg.Pix[p+2]) >> 3
+					rgb565 := (r << 11) | (g << 5) | b
+					destIdx := rowOffset + x*2
+					buf[destIdx+0] = byte(rgb565 & 0xFF)
+					buf[destIdx+1] = byte((rgb565 >> 8) & 0xFF)
 				}
 			}
-
-			written := 0
-			for written < len(rowBuf) {
-				n, err := f.Write(rowBuf[written:])
-				if err != nil {
-					return fmt.Errorf("failed to write row %d to framebuffer: %w", y, err)
-				}
-				if n == 0 {
-					return fmt.Errorf("short write on row %d to framebuffer", y)
-				}
-				written += n
+			if _, err := f.WriteAt(buf, 0); err != nil {
+				return fmt.Errorf("write 16-bit framebuffer: %w", err)
 			}
+			return nil
+
+		default:
+			buf := make([]byte, geom.Stride*targetH)
+			for y := 0; y < targetH; y++ {
+				rowOffset := y * geom.Stride
+				srcRowOffset := y * targetImg.Stride
+				for x := 0; x < targetW; x++ {
+					p := srcRowOffset + x*4
+					destIdx := rowOffset + x*4
+					buf[destIdx+0] = targetImg.Pix[p+2] // B
+					buf[destIdx+1] = targetImg.Pix[p+1] // G
+					buf[destIdx+2] = targetImg.Pix[p+0] // R
+					buf[destIdx+3] = targetImg.Pix[p+3] // A
+				}
+			}
+			if _, err := f.WriteAt(buf, 0); err != nil {
+				return fmt.Errorf("write 32-bit framebuffer: %w", err)
+			}
+			return nil
 		}
-
-		return nil
 	}
 }

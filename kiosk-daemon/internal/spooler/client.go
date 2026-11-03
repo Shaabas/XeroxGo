@@ -768,7 +768,7 @@ func (c *Client) downloadAndVerify(ctx context.Context, cmd contracts.PrintJobCo
 				if pct > 100 {
 					pct = 100
 				}
-				if pct > lastPct {
+				if (pct-lastPct >= 10 || pct == 100) && pct > lastPct {
 					lastPct = pct
 					_ = c.renderScreen(ui_ipc.ScreenState{
 						Mode:            ui_ipc.ModeDownloading,
