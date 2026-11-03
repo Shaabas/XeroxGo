@@ -35,18 +35,20 @@ type wireMessage struct {
 
 // ClientConfig holds the runtime dependencies and parameters for the kiosk spooler client.
 type ClientConfig struct {
-	CloudURL      string
-	KioskID       string
-	StateStore    *state.Store
-	PrinterAddr   string
-	CUPSQueue     string
-	PrinterModel  string
-	DownloadDir   string
-	IdleQRContent string
-	ScreenSink    ui_ipc.Sink
-	HTTPClient    *http.Client
-	MockHealth    func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
-	MockCUPSPrint func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
+	CloudURL                 string
+	KioskID                  string
+	StateStore               *state.Store
+	PrinterAddr              string
+	CUPSQueue                string
+	PrinterModel             string
+	DownloadDir              string
+	IdleQRContent            string
+	CompletedDisplayDuration time.Duration
+	ErrorDisplayDuration     time.Duration
+	ScreenSink               ui_ipc.Sink
+	HTTPClient               *http.Client
+	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -62,6 +64,9 @@ type Client struct {
 	jobQueue   chan contracts.PrintJobCommand
 	activeMu   sync.Mutex
 	activeJobs map[string]bool
+
+	idleMu    sync.Mutex
+	idleTimer *time.Timer
 
 	minBackoff        time.Duration
 	maxBackoff        time.Duration
@@ -143,6 +148,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		}
 	}
 
+	if cfg.CompletedDisplayDuration <= 0 {
+		cfg.CompletedDisplayDuration = 7 * time.Second
+	}
+	if cfg.ErrorDisplayDuration <= 0 {
+		cfg.ErrorDisplayDuration = 10 * time.Second
+	}
+
 	return &Client{
 		cfg:               cfg,
 		normalizedURL:     normalizedURL,
@@ -158,6 +170,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 // Run executes the spooler client loops until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
+	defer func() {
+		c.idleMu.Lock()
+		if c.idleTimer != nil {
+			c.idleTimer.Stop()
+			c.idleTimer = nil
+		}
+		c.idleMu.Unlock()
+	}()
+
 	// 1. Initial idle screen transition
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:      ui_ipc.ModeIdle,
@@ -386,6 +407,13 @@ func (c *Client) jobWorker(ctx context.Context) {
 }
 
 func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) {
+	c.idleMu.Lock()
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+		c.idleTimer = nil
+	}
+	c.idleMu.Unlock()
+
 	log.Printf("[SPOOLER] Processing job %s: downloading from %s", cmd.JobID, cmd.DownloadURL)
 	// 1. Initial screen transition to DOWNLOADING
 	_ = c.renderScreen(ui_ipc.ScreenState{
@@ -624,6 +652,8 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 		Message:         "Print complete",
 		Detail:          "Job ID: " + cmd.JobID,
 	})
+
+	c.scheduleResetToIdle(c.cfg.CompletedDisplayDuration)
 }
 
 func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobCommand, pagesPrinted, sheetsPrinted int, reason string) {
@@ -644,6 +674,35 @@ func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobComma
 		Mode:    ui_ipc.ModeError,
 		Message: reason,
 		Detail:  "Job ID: " + cmd.JobID,
+	})
+
+	c.scheduleResetToIdle(c.cfg.ErrorDisplayDuration)
+}
+
+func (c *Client) scheduleResetToIdle(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.idleMu.Lock()
+	defer c.idleMu.Unlock()
+
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+	}
+
+	c.idleTimer = time.AfterFunc(d, func() {
+		c.activeMu.Lock()
+		activeCount := len(c.activeJobs)
+		c.activeMu.Unlock()
+
+		if activeCount == 0 {
+			log.Printf("[SPOOLER] Resetting screen to idle state for next user")
+			_ = c.renderScreen(ui_ipc.ScreenState{
+				Mode:      ui_ipc.ModeIdle,
+				QRContent: c.cfg.IdleQRContent,
+				Message:   "Ready to print",
+			})
+		}
 	})
 }
 

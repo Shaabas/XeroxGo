@@ -1408,3 +1408,116 @@ func TestClientProcessesCUPSJob(t *testing.T) {
 		t.Fatal("expected job to reach COMPLETED status in store")
 	}
 }
+
+func TestClientResetsToIdleAfterCompletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "state.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	_, pdfContent, pdfChecksum := createThreePageFixture(t, tmpDir)
+
+	dlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer dlServer.Close()
+
+	var cupsPrinted atomic.Bool
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		cupsPrinted.Store(true)
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		// Send job command
+		jobCmd := contracts.PrintJobCommand{
+			JobID:          "job-idle-reset",
+			KioskID:        "kiosk-idle",
+			DownloadURL:    dlServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = wsjson.Write(r.Context(), conn, map[string]interface{}{
+			"type": "job",
+			"job":  jobCmd,
+		})
+
+		// Read progress events until canceled
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	cfg := ClientConfig{
+		CloudURL:                 wsURL,
+		KioskID:                  "kiosk-idle",
+		StateStore:               store,
+		CUPSQueue:                "DCPT310",
+		DownloadDir:              tmpDir,
+		IdleQRContent:            "https://kiosk.test/idle",
+		CompletedDisplayDuration: 50 * time.Millisecond,
+		ScreenSink:               func(*image.RGBA) error { return nil },
+		MockCUPSPrint:            mockCUPS,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Wait for idle screen reset after completion
+	deadline := time.Now().Add(2 * time.Second)
+	resetSeen := false
+	for time.Now().Before(deadline) {
+		client.renderHistoryMu.Lock()
+		history := make([]ui_ipc.ScreenState, len(client.renderHistory))
+		copy(history, client.renderHistory)
+		client.renderHistoryMu.Unlock()
+
+		if len(history) >= 4 {
+			last := history[len(history)-1]
+			if last.Mode == ui_ipc.ModeIdle && last.QRContent == "https://kiosk.test/idle" {
+				resetSeen = true
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !resetSeen {
+		t.Fatal("expected kiosk screen to reset to ModeIdle after completion duration")
+	}
+}
