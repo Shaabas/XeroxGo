@@ -197,6 +197,33 @@ func handleMockPrinterConn(conn net.Conn, downloadDir string) {
 	_, _ = conn.Write([]byte("@PJL USTATUS JOB\r\nEND\r\n\f"))
 }
 
+func suppressConsoleCursor() {
+	// 1. Disable cursor blinking in kernel fbcon sysfs if available
+	_ = os.WriteFile("/sys/class/graphics/fbcon/cursor_blink", []byte("0\n"), 0644)
+
+	// 2. Hide cursor on virtual terminals via VT100 escape sequence
+	for _, dev := range []string{"/dev/tty1", "/dev/tty0", "/dev/console"} {
+		if f, err := os.OpenFile(dev, os.O_WRONLY, 0); err == nil {
+			_, _ = f.Write([]byte("\x1b[?25l"))
+			_ = f.Close()
+		}
+	}
+
+	// 3. Fallback to setterm command if installed
+	_ = exec.Command("setterm", "--cursor", "off", "--blank", "0", "--powerdown", "0").Run()
+}
+
+func restoreConsoleCursor() {
+	for _, dev := range []string{"/dev/tty1", "/dev/tty0", "/dev/console"} {
+		if f, err := os.OpenFile(dev, os.O_WRONLY, 0); err == nil {
+			_, _ = f.Write([]byte("\x1b[?25h"))
+			_ = f.Close()
+		}
+	}
+	_ = os.WriteFile("/sys/class/graphics/fbcon/cursor_blink", []byte("1\n"), 0644)
+	_ = exec.Command("setterm", "--cursor", "on").Run()
+}
+
 func main() {
 	mockPrinter := flag.Bool("mock-printer", false, "Run in mock printer mode on local loopback without physical device")
 	previewPNG := flag.String("preview-png", "", "Path to write preview PNG instead of writing to framebuffer")
@@ -278,6 +305,7 @@ func main() {
 		}
 		log.Printf("XeroxGo display: output=%s, resolution=%dx%d, bpp=%d, stride=%d",
 			*framebuffer, geom.Width, geom.Height, geom.BitsPerPixel, geom.Stride)
+		suppressConsoleCursor()
 		screenSink = ui_ipc.FramebufferSinkWithGeometry(*framebuffer, geom)
 	}
 
@@ -356,5 +384,6 @@ func main() {
 		cleanupMock()
 	}
 	rootWg.Wait()
+	restoreConsoleCursor()
 	log.Printf("XeroxGo kiosk daemon shut down cleanly.")
 }
