@@ -233,13 +233,22 @@ func main() {
 	downloadDir := flag.String("download-dir", "/var/kiosk/jobs", "Directory for downloaded PDF jobs")
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
 	cupsPrinter := flag.String("cups-printer", "", "CUPS queue name (e.g. DCPT310). When set, jobs are sent via CUPS instead of raw TCP port 9100")
+	cupsQueue := flag.String("cups-queue", "", "Alias for -cups-printer")
 	printerModel := flag.String("printer-model", "", "Printer model name displayed on screen (default: Brother DCP-T310 for CUPS, Brother HL-L5210DN for PJL)")
 	completedTimeout := flag.Duration("completed-timeout", 7*time.Second, "Duration to display completion screen before returning to idle QR screen")
 	framebuffer := flag.String("framebuffer", "/dev/fb0", "Linux framebuffer device path")
 	screenRes := flag.String("screen-res", "", "Override screen resolution WIDTHxHEIGHT (e.g. 1280x720). Defaults to auto-detect")
 	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
+	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
 	flag.Parse()
+
+	if *cupsPrinter == "" && *cupsQueue != "" {
+		*cupsPrinter = *cupsQueue
+	}
+	if *idleQRContent == "" && *idleQR != "" {
+		*idleQRContent = *idleQR
+	}
 
 	if strings.TrimSpace(*kioskID) == "" {
 		log.Fatalf("Fatal: --kiosk-id cannot be empty")
