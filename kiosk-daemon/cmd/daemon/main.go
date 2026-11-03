@@ -206,6 +206,7 @@ func main() {
 	downloadDir := flag.String("download-dir", "/var/kiosk/jobs", "Directory for downloaded PDF jobs")
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
 	cupsPrinter := flag.String("cups-printer", "", "CUPS queue name (e.g. DCPT310). When set, jobs are sent via CUPS instead of raw TCP port 9100")
+	printerModel := flag.String("printer-model", "", "Printer model name displayed on screen (default: Brother DCP-T310 for CUPS, Brother HL-L5210DN for PJL)")
 	framebuffer := flag.String("framebuffer", "/dev/fb0", "Linux framebuffer device path")
 	screenRes := flag.String("screen-res", "", "Override screen resolution WIDTHxHEIGHT (e.g. 1280x720). Defaults to auto-detect")
 	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
@@ -307,12 +308,22 @@ func main() {
 		}
 	}
 
+	effectivePrinterModel := strings.TrimSpace(*printerModel)
+	if effectivePrinterModel == "" {
+		if strings.TrimSpace(*cupsPrinter) != "" {
+			effectivePrinterModel = "Brother DCP-T310"
+		} else {
+			effectivePrinterModel = "Brother HL-L5210DN"
+		}
+	}
+
 	clientCfg := spooler.ClientConfig{
 		CloudURL:      *cloudURL,
 		KioskID:       *kioskID,
 		StateStore:    stateStore,
 		PrinterAddr:   actualPrinterAddr,
 		CUPSQueue:     *cupsPrinter,
+		PrinterModel:  effectivePrinterModel,
 		DownloadDir:   *downloadDir,
 		IdleQRContent: *idleQRContent,
 		ScreenSink:    screenSink,
@@ -332,7 +343,7 @@ func main() {
 	if *cupsPrinter != "" {
 		targetDesc = "cups:" + *cupsPrinter
 	}
-	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s)", *kioskID, *cloudURL, targetDesc)
+	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s, model=%s)", *kioskID, *cloudURL, targetDesc, effectivePrinterModel)
 
 	if err := client.Run(ctx); err != nil {
 		log.Printf("spooler client exited with error: %v", err)

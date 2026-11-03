@@ -42,6 +42,7 @@ type ScreenState struct {
 	ProgressPercent int
 	CurrentPage     int
 	TotalPages      int
+	PrinterModel    string
 }
 
 type Sink func(*image.RGBA) error
@@ -110,7 +111,11 @@ func Render(state ScreenState) (*image.RGBA, error) {
 	// 4. Footer bar (1010 to 1080)
 	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorHeaderBg)
 	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
-	drawTextScaled(canvas, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother HL-L5210DN", 80, 1035, 2, colorTextMuted)
+	modelStr := "Brother HL-L5210DN"
+	if state.PrinterModel != "" {
+		modelStr = state.PrinterModel
+	}
+	drawTextScaled(canvas, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, 2, colorTextMuted)
 
 	// 5. Render mode-specific contents
 	switch state.Mode {
@@ -263,7 +268,11 @@ func renderPrinting(dst *image.RGBA, state ScreenState) {
 	subProgress := fmt.Sprintf("Progress: %d of %d pages streamed to printer hardware", state.CurrentPage, state.TotalPages)
 	drawTextScaled(dst, subProgress, 140, 595, 2, colorTextWhite)
 
-	drawTextScaled(dst, "Job is active on Brother HL-L5210DN. Pages will exit into top tray.", 140, 680, 2, colorTextMuted)
+	modelStr := "Brother HL-L5210DN"
+	if state.PrinterModel != "" {
+		modelStr = state.PrinterModel
+	}
+	drawTextScaled(dst, fmt.Sprintf("Job is active on %s. Pages will exit into output tray.", modelStr), 140, 680, 2, colorTextMuted)
 }
 
 func renderCompleted(dst *image.RGBA, state ScreenState) {

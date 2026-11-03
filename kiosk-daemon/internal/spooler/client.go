@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,6 +40,7 @@ type ClientConfig struct {
 	StateStore    *state.Store
 	PrinterAddr   string
 	CUPSQueue     string
+	PrinterModel  string
 	DownloadDir   string
 	IdleQRContent string
 	ScreenSink    ui_ipc.Sink
@@ -348,6 +350,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 	c.activeJobs[cmd.JobID] = true
 	c.activeMu.Unlock()
+	log.Printf("[SPOOLER] Queued print job %s (pages=%d, sheets=%d, copies=%d, duplex=%s)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets, cmd.Copies, cmd.Duplex)
 
 	select {
 	case c.jobQueue <- cmd:
@@ -383,6 +386,7 @@ func (c *Client) jobWorker(ctx context.Context) {
 }
 
 func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) {
+	log.Printf("[SPOOLER] Processing job %s: downloading from %s", cmd.JobID, cmd.DownloadURL)
 	// 1. Initial screen transition to DOWNLOADING
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:            ui_ipc.ModeDownloading,
@@ -573,12 +577,14 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 	var printErr error
 	if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+		log.Printf("[SPOOLER] Sending job %s to CUPS queue %s", cmd.JobID, c.cfg.CUPSQueue)
 		if c.cfg.MockCUPSPrint != nil {
 			printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
 		} else {
 			printErr = printer.PrintPDFWithCUPS(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
 		}
 	} else {
+		log.Printf("[SPOOLER] Streaming job %s to PJL printer %s", cmd.JobID, c.cfg.PrinterAddr)
 		printErr = printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage)
 	}
 
@@ -598,6 +604,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 }
 
 func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) {
+	log.Printf("[SPOOLER] Job %s successfully printed (%d pages, %d sheets)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets)
 	evt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
@@ -620,6 +627,7 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 }
 
 func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobCommand, pagesPrinted, sheetsPrinted int, reason string) {
+	log.Printf("[SPOOLER] Job %s error: %s", cmd.JobID, reason)
 	evt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
@@ -741,6 +749,10 @@ func (c *Client) downloadAndVerify(ctx context.Context, cmd contracts.PrintJobCo
 }
 
 func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
+	if state.PrinterModel == "" && c.cfg.PrinterModel != "" {
+		state.PrinterModel = c.cfg.PrinterModel
+	}
+
 	c.renderHistoryMu.Lock()
 	c.renderHistory = append(c.renderHistory, state)
 	c.renderHistoryMu.Unlock()

@@ -176,6 +176,37 @@ func TestPrintPDFWithCUPS_LPError(t *testing.T) {
 	}
 }
 
+func TestPrintPDFWithCUPS_QueueStoppedError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "lp":
+			return []byte("request id is DCPT310-55 (1 file(s))\n"), nil
+		case "lpstat":
+			if len(args) > 0 && args[0] == "-p" {
+				return []byte("printer DCPT310 is stopped; reason: Filter failed"), nil
+			}
+			return []byte("DCPT310-55 username 1024 Tue Nov 3 20:30:00 2026\n"), nil
+		default:
+			return []byte(""), nil
+		}
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-fail",
+		Copies:      1,
+		TotalSheets: 1,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/var/kiosk/job-fail.pdf", nil, 5*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "stopped/disabled") {
+		t.Fatalf("expected stopped/disabled error, got %v", err)
+	}
+}
+
 func TestPrintPDFWithCUPS_CancellationCancelsJob(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 

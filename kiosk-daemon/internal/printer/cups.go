@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -78,11 +79,11 @@ func PrintPDFWithCUPSCustom(
 		lpArgs = append(lpArgs, "-o", "sides=two-sided-long-edge")
 	case contracts.DuplexShortEdge:
 		lpArgs = append(lpArgs, "-o", "sides=two-sided-short-edge")
-	default:
-		lpArgs = append(lpArgs, "-o", "sides=one-sided")
 	}
 
 	lpArgs = append(lpArgs, pdfPath)
+
+	log.Printf("[CUPS] Submitting print job %s to queue %q: lp %s", cmd.JobID, queue, strings.Join(lpArgs, " "))
 
 	// 2. Submit print job via lp
 	out, err := runner(ctx, "lp", lpArgs...)
@@ -96,6 +97,7 @@ func PrintPDFWithCUPSCustom(
 		return fmt.Errorf("unable to parse CUPS request id from lp output: %q", strings.TrimSpace(outputStr))
 	}
 	cupsJobID := match[1]
+	log.Printf("[CUPS] Job %s assigned CUPS request ID: %s", cmd.JobID, cupsJobID)
 
 	// 3. Monitor CUPS job until completed or context canceled
 	ticker := time.NewTicker(pollInterval)
@@ -119,10 +121,21 @@ func PrintPDFWithCUPSCustom(
 
 			// If the job is no longer listed in not-completed, it finished printing
 			if !strings.Contains(string(statOut), cupsJobID) {
+				log.Printf("[CUPS] Job %s (CUPS ID %s) completed printing", cmd.JobID, cupsJobID)
 				if onPage != nil {
 					onPage(cmd.TotalSheets)
 				}
 				return nil
+			}
+
+			// Check if the printer queue itself is disabled or stopped
+			pStatOut, pStatErr := runner(ctx, "lpstat", "-p", queue)
+			if pStatErr == nil {
+				pRaw := strings.ToLower(string(pStatOut))
+				if strings.Contains(pRaw, "disabled") || strings.Contains(pRaw, "stopped") {
+					log.Printf("[CUPS] Error: printer queue %q is stopped/disabled: %s", queue, strings.TrimSpace(string(pStatOut)))
+					return fmt.Errorf("CUPS printer %q is stopped/disabled: %s", queue, strings.TrimSpace(string(pStatOut)))
+				}
 			}
 
 			// Job is still active in the queue
