@@ -50,7 +50,7 @@ func sampleOrder(orderID, jobID, kioskID string) store.Order {
 	}
 }
 
-func connectTestKiosk(t *testing.T, serverURL, kioskID string) (*websocket.Conn, context.CancelFunc) {
+func connectTestKiosk(t *testing.T, hub *Hub, serverURL, kioskID string) (*websocket.Conn, context.CancelFunc) {
 	t.Helper()
 	u, err := url.Parse(serverURL)
 	if err != nil {
@@ -74,6 +74,16 @@ func connectTestKiosk(t *testing.T, serverURL, kioskID string) (*websocket.Conn,
 		cancel()
 	})
 
+	if hub != nil {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if hub.IsConnected(kioskID) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
 	return conn, cancel
 }
 
@@ -84,7 +94,7 @@ func TestHubRegistersAndSendsJob(t *testing.T) {
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
-	conn, _ := connectTestKiosk(t, server.URL, "kiosk-001")
+	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-001")
 
 	cmd := contracts.PrintJobCommand{
 		JobID:          "job-test-001",
@@ -135,7 +145,7 @@ func TestHubPersistsProgress(t *testing.T) {
 		t.Fatalf("failed to create seed order: %v", err)
 	}
 
-	conn, _ := connectTestKiosk(t, server.URL, "kiosk-p-1")
+	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-p-1")
 
 	ts := time.Date(2026, time.October, 21, 14, 0, 0, 0, time.UTC)
 	progressMsg := wireMessage{
@@ -191,7 +201,7 @@ func TestHubRejectsMismatchedKioskProgress(t *testing.T) {
 	}
 
 	// Connect as kiosk-001
-	conn, _ := connectTestKiosk(t, server.URL, "kiosk-001")
+	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-001")
 
 	// Try to submit progress claiming to be for kiosk-002
 	ts := time.Now().UTC()
@@ -232,7 +242,7 @@ func TestHubTracksLatestHealth(t *testing.T) {
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
-	conn, _ := connectTestKiosk(t, server.URL, "kiosk-health-1")
+	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-health-1")
 
 	health1 := contracts.PrinterHealth{
 		Online:            true,
@@ -316,7 +326,7 @@ func TestHubConnectionCleanup(t *testing.T) {
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
-	conn, cancelConn := connectTestKiosk(t, server.URL, "kiosk-cleanup-1")
+	conn, cancelConn := connectTestKiosk(t, hub, server.URL, "kiosk-cleanup-1")
 
 	cmd := contracts.PrintJobCommand{
 		JobID:         "job-cleanup-1",
@@ -363,8 +373,8 @@ func TestHubConcurrentConnections(t *testing.T) {
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
-	conn1, _ := connectTestKiosk(t, server.URL, "kiosk-A")
-	conn2, _ := connectTestKiosk(t, server.URL, "kiosk-B")
+	conn1, _ := connectTestKiosk(t, hub, server.URL, "kiosk-A")
+	conn2, _ := connectTestKiosk(t, hub, server.URL, "kiosk-B")
 
 	cmdA := contracts.PrintJobCommand{
 		JobID:         "job-A",

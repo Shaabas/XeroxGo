@@ -204,6 +204,17 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 	return nil
 }
 
+// IsConnected returns whether the specified kiosk currently has an active WebSocket session.
+func (h *Hub) IsConnected(kioskID string) bool {
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	sess, ok := h.sessions[kioskID]
+	return ok && sess != nil
+}
+
 // LatestHealth returns the most recent cached printer health observation for a kiosk.
 func (h *Hub) LatestHealth(kioskID string) (contracts.PrinterHealth, bool) {
 	if h == nil {
