@@ -1,0 +1,66 @@
+# XeroxGo Kiosk Plymouth Script
+# Minimalist, silent boot splash (Android-style centered logo with smooth fade-in)
+
+# 1. Solid pure black background (no gradients, no borders)
+Window.SetBackgroundTopColor(0.0, 0.0, 0.0);
+Window.SetBackgroundBottomColor(0.0, 0.0, 0.0);
+
+# 2. Query display geometry
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+
+# 3. Load XeroxGo brand logo
+raw_logo = Image("logo.png");
+orig_width = raw_logo.GetWidth();
+orig_height = raw_logo.GetHeight();
+
+# 4. Compute proportional dimensions for display (target ~35% of display width)
+target_width = screen_width * 0.35;
+if (target_width > 680) target_width = 680;
+if (target_width < 340) target_width = 340;
+
+aspect = orig_height / orig_width;
+target_height = target_width * aspect;
+
+# Scale if significantly different from baseline, otherwise render 1:1
+if (Math.Abs(orig_width - target_width) > 16) {
+    logo_image = raw_logo.Scale(target_width, target_height);
+} else {
+    logo_image = raw_logo;
+    target_width = orig_width;
+    target_height = orig_height;
+}
+
+# 5. Position sprite directly at screen center
+logo_sprite = Sprite(logo_image);
+logo_x = (screen_width / 2) - (target_width / 2);
+logo_y = (screen_height / 2) - (target_height / 2);
+
+logo_sprite.SetX(logo_x);
+logo_sprite.SetY(logo_y);
+logo_sprite.SetZ(10);
+
+# 6. Smooth Android-style fade-in
+opacity = 0.0;
+logo_sprite.SetOpacity(opacity);
+
+fun refresh_callback () {
+    if (opacity < 1.0) {
+        opacity = opacity + 0.05;
+        if (opacity > 1.0) opacity = 1.0;
+        logo_sprite.SetOpacity(opacity);
+    }
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# 7. Clean fade-out upon kiosk handover
+fun quit_callback () {
+    logo_sprite.SetOpacity(0);
+}
+Plymouth.SetQuitFunction(quit_callback);
+
+# 8. Suppress all console / system messages so screen remains 100% clean
+fun message_callback (text) {
+    # Intentionally empty: suppress all text and system messages
+}
+Plymouth.SetMessageFunction(message_callback);
