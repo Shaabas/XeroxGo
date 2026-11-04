@@ -1310,13 +1310,18 @@ func main() {
 
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" {
+		if origin != "" && isAllowedOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {
+			if origin != "" && !isAllowedOrigin(origin) {
+				http.Error(w, "Forbidden origin", http.StatusForbidden)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -1350,4 +1355,41 @@ func main() {
 			log.Printf("graceful shutdown error: %v", err)
 		}
 	}
+}
+
+// isAllowedOrigin checks if an incoming Origin header is permitted for CORS requests.
+func isAllowedOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+
+	// Canonical production and staging domains
+	if origin == "https://xeroxgo.vercel.app" || origin == "https://campusprint.vercel.app" {
+		return true
+	}
+
+	// Local development origins
+	if origin == "http://localhost:3000" || origin == "http://localhost:8080" || origin == "http://localhost:5173" ||
+		origin == "http://127.0.0.1:3000" || origin == "http://127.0.0.1:8080" || origin == "http://127.0.0.1:5173" {
+		return true
+	}
+
+	// Preview deployments on Vercel
+	if strings.HasPrefix(origin, "https://campusprint-") && strings.HasSuffix(origin, ".vercel.app") {
+		return true
+	}
+	if strings.HasPrefix(origin, "https://xeroxgo-") && strings.HasSuffix(origin, ".vercel.app") {
+		return true
+	}
+
+	// Custom allowed origins configured via environment variable
+	if custom := os.Getenv("XEROXGO_ALLOWED_ORIGINS"); custom != "" {
+		for _, o := range strings.Split(custom, ",") {
+			if strings.TrimSpace(o) == origin {
+				return true
+			}
+		}
+	}
+
+	return false
 }

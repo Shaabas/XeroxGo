@@ -189,6 +189,106 @@
       window.location.reload();
     });
 
+    // --- Change Password Modal Controller ---
+    const changePasswordNavBtn = document.getElementById('change-password-nav-btn');
+    const passwordModal = document.getElementById('password-modal');
+    const passwordModalCloseBtn = document.getElementById('password-modal-close-btn');
+    const passwordModalCancelBtn = document.getElementById('password-modal-cancel-btn');
+    const passwordForm = document.getElementById('password-form');
+    const pwdCurrentInput = document.getElementById('pwd-current');
+    const pwdNewInput = document.getElementById('pwd-new');
+    const pwdConfirmInput = document.getElementById('pwd-confirm');
+    const passwordModalError = document.getElementById('password-modal-error');
+    const passwordModalSubmitBtn = document.getElementById('password-modal-submit-btn');
+
+    function closePasswordModal() {
+      if (!passwordModal) return;
+      passwordModal.classList.add('hidden');
+      if (passwordForm) passwordForm.reset();
+      if (passwordModalError) {
+        passwordModalError.classList.add('hidden');
+        passwordModalError.textContent = '';
+      }
+    }
+
+    if (changePasswordNavBtn && passwordModal) {
+      changePasswordNavBtn.addEventListener('click', () => {
+        closePasswordModal();
+        passwordModal.classList.remove('hidden');
+        if (pwdCurrentInput) pwdCurrentInput.focus();
+      });
+    }
+
+    if (passwordModalCloseBtn) {
+      passwordModalCloseBtn.addEventListener('click', closePasswordModal);
+    }
+    if (passwordModalCancelBtn) {
+      passwordModalCancelBtn.addEventListener('click', closePasswordModal);
+    }
+    if (passwordModal) {
+      passwordModal.addEventListener('click', (e) => {
+        if (e.target === passwordModal) closePasswordModal();
+      });
+    }
+
+    if (passwordForm) {
+      passwordForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        passwordModalError.classList.add('hidden');
+        passwordModalError.textContent = '';
+
+        const currentPassword = pwdCurrentInput.value;
+        const newPassword = pwdNewInput.value;
+        const confirmPassword = pwdConfirmInput.value;
+
+        if (newPassword.length < 8) {
+          passwordModalError.textContent = 'New password must be at least 8 characters long.';
+          passwordModalError.classList.remove('hidden');
+          pwdNewInput.focus();
+          return;
+        }
+
+        if (newPassword !== confirmPassword) {
+          passwordModalError.textContent = 'New passwords do not match.';
+          passwordModalError.classList.remove('hidden');
+          pwdConfirmInput.focus();
+          return;
+        }
+
+        passwordModalSubmitBtn.disabled = true;
+        passwordModalSubmitBtn.textContent = 'Updating...';
+
+        try {
+          const res = await apiRequest('/api/admin/password', {
+            method: 'POST',
+            body: {
+              current_password: currentPassword,
+              new_password: newPassword
+            }
+          });
+          const data = await parseResponseJSON(res);
+          if (res.ok && data.ok) {
+            closePasswordModal();
+            showToast('Password changed successfully. Please sign in again.');
+            localStorage.removeItem('xeroxgo_admin_token');
+            authToken = '';
+            setTimeout(() => {
+              window.location.reload();
+            }, 1200);
+          } else {
+            passwordModalError.textContent = data.error || 'Failed to update password.';
+            passwordModalError.classList.remove('hidden');
+          }
+        } catch (err) {
+          passwordModalError.textContent = 'Error: ' + err.message;
+          passwordModalError.classList.remove('hidden');
+        } finally {
+          passwordModalSubmitBtn.disabled = false;
+          passwordModalSubmitBtn.textContent = 'Update Password';
+        }
+      });
+    }
+
     // --- Tab Navigation ---
     function switchNavTab(tabName) {
       activeNavTab = tabName;

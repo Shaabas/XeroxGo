@@ -175,8 +175,8 @@ func (s *Store) UpdateAdminPassword(ctx context.Context, username, oldPassword, 
 	if s == nil || s.db == nil {
 		return fmt.Errorf("update password: store is closed or nil")
 	}
-	if len(newPassword) < 6 {
-		return fmt.Errorf("update password: new password must be at least 6 characters")
+	if len(newPassword) < 8 {
+		return fmt.Errorf("update password: new password must be at least 8 characters")
 	}
 
 	ok, err := s.AuthenticateAdmin(ctx, username, oldPassword)
@@ -194,7 +194,13 @@ func (s *Store) UpdateAdminPassword(ctx context.Context, username, oldPassword, 
 
 	nowNs := time.Now().UTC().UnixNano()
 	q := s.rebind("UPDATE admin_users SET password_hash = ?, updated_at_ns = ? WHERE username = ?")
-	_, err = s.db.ExecContext(ctx, q, newHash, nowNs, username)
+	if _, err := s.db.ExecContext(ctx, q, newHash, nowNs, username); err != nil {
+		return fmt.Errorf("update password: %w", err)
+	}
+
+	// Invalidate all existing sessions for this user upon password change
+	revokeQ := s.rebind("DELETE FROM admin_sessions WHERE username = ?")
+	_, err = s.db.ExecContext(ctx, revokeQ, username)
 	return err
 }
 

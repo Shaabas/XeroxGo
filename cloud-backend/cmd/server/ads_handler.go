@@ -29,14 +29,35 @@ func isRateLimited(ip string) bool {
 	now := time.Now()
 	cutoff := now.Add(-15 * time.Minute)
 
-	// Clean up old attempts
+	// Clean up old attempts for requesting IP
 	var recent []time.Time
 	for _, t := range loginAttempts[ip] {
 		if t.After(cutoff) {
 			recent = append(recent, t)
 		}
 	}
-	loginAttempts[ip] = recent
+	if len(recent) > 0 {
+		loginAttempts[ip] = recent
+	} else {
+		delete(loginAttempts, ip)
+	}
+
+	// Defensive memory safeguard: prevent unbounded map growth
+	if len(loginAttempts) > 2000 {
+		for k, times := range loginAttempts {
+			var valid []time.Time
+			for _, t := range times {
+				if t.After(cutoff) {
+					valid = append(valid, t)
+				}
+			}
+			if len(valid) == 0 {
+				delete(loginAttempts, k)
+			} else {
+				loginAttempts[k] = valid
+			}
+		}
+	}
 
 	// Allow max 5 failed attempts per 15 minutes
 	return len(recent) >= 5
@@ -297,6 +318,12 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, http.StatusBadRequest, "title is required")
 				return
 			}
+			if link := strings.TrimSpace(ad.LinkURL); link != "" {
+				if !strings.HasPrefix(link, "http://") && !strings.HasPrefix(link, "https://") {
+					writeJSONError(w, http.StatusBadRequest, "target link URL must begin with http:// or https://")
+					return
+				}
+			}
 
 			if err := app.db.SaveAd(r.Context(), ad); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save ad: %v", err))
@@ -351,6 +378,12 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 			if strings.TrimSpace(ad.Title) == "" {
 				writeJSONError(w, http.StatusBadRequest, "title is required")
 				return
+			}
+			if link := strings.TrimSpace(ad.LinkURL); link != "" {
+				if !strings.HasPrefix(link, "http://") && !strings.HasPrefix(link, "https://") {
+					writeJSONError(w, http.StatusBadRequest, "target link URL must begin with http:// or https://")
+					return
+				}
 			}
 			if err := app.db.SaveAd(r.Context(), ad); err != nil {
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to update ad: %v", err))

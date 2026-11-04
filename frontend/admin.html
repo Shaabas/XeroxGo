@@ -7,7 +7,7 @@
   <meta name="description" content="XeroxGO Admin Dashboard - Real-time management and kiosk synchronization." />
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
   <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png" />
-  <link rel="stylesheet" href="/css/admin.css?v=3" />
+  <link rel="stylesheet" href="/css/admin.css?v=4" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -54,6 +54,7 @@
           <div id="user-info" style="font-size:0.875rem; font-weight:600; color:var(--text-muted); display:flex; align-items:center; gap:0.5rem;">
             <span id="user-name">admin</span>
           </div>
+          <button id="change-password-nav-btn" class="btn-secondary" style="font-size:0.8125rem; padding:0.4rem 0.75rem;" type="button">Change Password</button>
           <button id="logout-btn" class="btn-logout" type="button">Sign Out</button>
         </div>
       </div>
@@ -340,6 +341,41 @@
       </div>
     </div>
 
+    <!-- Change Password Modal -->
+    <div id="password-modal" class="modal-overlay hidden">
+      <div class="modal-card" style="max-width:440px;">
+        <div class="panel-header" style="margin-bottom:1.25rem;">
+          <h2 class="panel-title">Change Password</h2>
+          <button id="password-modal-close-btn" class="btn-icon" type="button" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <form id="password-form">
+          <div id="password-modal-error" class="auth-error-box hidden" style="margin-bottom:1rem;" role="alert"></div>
+
+          <div class="form-group">
+            <label class="form-label" for="pwd-current">Current Password</label>
+            <input id="pwd-current" class="form-input" type="password" required autocomplete="current-password" placeholder="••••••••" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="pwd-new">New Password</label>
+            <input id="pwd-new" class="form-input" type="password" required minlength="8" autocomplete="new-password" placeholder="Min 8 characters" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="pwd-confirm">Confirm New Password</label>
+            <input id="pwd-confirm" class="form-input" type="password" required minlength="8" autocomplete="new-password" placeholder="Repeat new password" />
+          </div>
+
+          <div class="modal-actions" style="margin-top:1.5rem;">
+            <button id="password-modal-cancel-btn" class="btn-secondary" type="button">Cancel</button>
+            <button id="password-modal-submit-btn" class="btn-primary" type="submit">Update Password</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
     <!-- Ad Editor Modal -->
     <div id="ad-modal" class="modal-overlay hidden">
       <div class="modal-card">
@@ -470,6 +506,6 @@
     </div>
   </template>
 
-  <script src="/js/admin.js?v=3"></script>
+  <script src="/js/admin.js?v=4"></script>
 </body>
 </html>

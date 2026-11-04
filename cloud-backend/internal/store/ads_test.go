@@ -179,3 +179,57 @@ func TestAdsAndAdminAuth(t *testing.T) {
 	}
 }
 
+func TestUpdateAdminPasswordRevokesSessions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_auth.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.BootstrapAdmin(ctx, "admin", "initialpwd1"); err != nil {
+		t.Fatalf("BootstrapAdmin failed: %v", err)
+	}
+
+	// Create session
+	token, _, err := s.CreateAdminSession(ctx, "admin")
+	if err != nil {
+		t.Fatalf("CreateAdminSession failed: %v", err)
+	}
+	if user, ok := s.ValidateAdminSession(ctx, token); !ok || user != "admin" {
+		t.Fatalf("session should be valid initially")
+	}
+
+	// Password < 8 characters should fail
+	if err := s.UpdateAdminPassword(ctx, "admin", "initialpwd1", "short"); err == nil {
+		t.Fatalf("expected error for password < 8 characters")
+	}
+
+	// Update password with valid length
+	if err := s.UpdateAdminPassword(ctx, "admin", "initialpwd1", "newstrongpwd123"); err != nil {
+		t.Fatalf("UpdateAdminPassword failed: %v", err)
+	}
+
+	// Session must now be revoked
+	if _, ok := s.ValidateAdminSession(ctx, token); ok {
+		t.Fatalf("session should be revoked after password update")
+	}
+
+	// Old password must fail
+	oldOk, err := s.AuthenticateAdmin(ctx, "admin", "initialpwd1")
+	if err != nil || oldOk {
+		t.Fatalf("old password should fail")
+	}
+
+	// New password must succeed
+	newOk, err := s.AuthenticateAdmin(ctx, "admin", "newstrongpwd123")
+	if err != nil || !newOk {
+		t.Fatalf("new password should succeed")
+	}
+}
+

@@ -190,19 +190,32 @@ func (app *appServer) handleAdminOrdersExport(w http.ResponseWriter, r *http.Req
 	for _, item := range history.Orders {
 		amountINR := fmt.Sprintf("%.2f", float64(item.PricePaise)/100.0)
 		_ = writer.Write([]string{
-			item.OrderID,
-			item.JobID,
-			item.DisplayCode,
-			item.KioskID,
+			sanitizeCSVField(item.OrderID),
+			sanitizeCSVField(item.JobID),
+			sanitizeCSVField(item.DisplayCode),
+			sanitizeCSVField(item.KioskID),
 			item.CreatedAt.Format("2006-01-02 15:04:05"),
-			string(item.Status),
-			item.ColorMode,
+			sanitizeCSVField(string(item.Status)),
+			sanitizeCSVField(item.ColorMode),
 			strconv.Itoa(item.TotalPages),
 			strconv.Itoa(item.TotalSheets),
 			strconv.Itoa(item.Copies),
-			string(item.Duplex),
+			sanitizeCSVField(string(item.Duplex)),
 			amountINR,
-			item.ErrorReason,
+			sanitizeCSVField(item.ErrorReason),
 		})
 	}
+}
+
+// sanitizeCSVField prevents Formula Injection (CSV injection) in spreadsheet applications
+// by prefixing formula trigger characters (=, +, -, @, tab, CR) with a single quote.
+func sanitizeCSVField(s string) string {
+	if s == "" {
+		return ""
+	}
+	first := s[0]
+	if first == '=' || first == '+' || first == '-' || first == '@' || first == '\t' || first == '\r' {
+		return "'" + s
+	}
+	return s
 }

@@ -295,7 +295,7 @@
           slide.style.background = `linear-gradient(135deg, ${c0} 0%, ${c1} 50%, ${c2} 100%)`;
         }
 
-        if (ad.link_url) {
+        if (ad.link_url && (ad.link_url.startsWith('https://') || ad.link_url.startsWith('http://'))) {
           slide.style.cursor = 'pointer';
           slide.title = `Open ${ad.link_url}`;
           slide.addEventListener('click', () => {
