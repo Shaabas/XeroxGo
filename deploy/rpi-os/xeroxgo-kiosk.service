@@ -8,7 +8,7 @@ Description=XeroxGo Kiosk Spooler & HDMI Display Daemon
 Documentation=https://github.com/xeroxgo/xeroxgo
 After=network-online.target
 Wants=network-online.target
-Conflicts=getty@tty1.service plymouth-quit.service
+Conflicts=getty@tty1.service
 
 [Service]
 Type=simple
@@ -28,8 +28,8 @@ StandardInput=null
 StandardOutput=journal
 StandardError=journal
 
-# Seamless handover: freeze bootsplash on screen until kiosk daemon overwrites fb0
-ExecStartPre=-/usr/bin/plymouth quit --retain-splash
+# Seamless handover: dismiss Plymouth bootsplash so kiosk daemon can access fb0
+ExecStartPre=-/usr/bin/plymouth --quit
 
 EnvironmentFile=-/etc/default/xeroxgo-kiosk
 
