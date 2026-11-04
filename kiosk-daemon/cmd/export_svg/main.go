@@ -15,6 +15,42 @@ const (
 	height = 1080
 )
 
+type adSlideDef struct {
+	title  string
+	desc   string
+	c0     string
+	c1     string
+	c2     string
+	active int
+}
+
+var defaultSlides = []adSlideDef{
+	{
+		title:  "Quick &amp; Easy",
+		desc:   "Direct UPI payment. No coins, no cash needed.",
+		c0:     "#1E3A8A",
+		c1:     "#2563EB",
+		c2:     "#4F46E5",
+		active: 0,
+	},
+	{
+		title:  "High Quality Prints",
+		desc:   "Crisp laser documents ready in seconds.",
+		c0:     "#065F46",
+		c1:     "#10B981",
+		c2:     "#059669",
+		active: 1,
+	},
+	{
+		title:  "Skip The Queue",
+		desc:   "Pick up your print job with your 4-digit code.",
+		c0:     "#581C87",
+		c1:     "#7C3AED",
+		c2:     "#D97706",
+		active: 2,
+	},
+}
+
 func main() {
 	outDir := "design/figma"
 	if err := os.MkdirAll(outDir, 0755); err != nil {
@@ -23,11 +59,11 @@ func main() {
 
 	logoBytes, err := os.ReadFile("frontend/assets/xeroxgo-full-logo-transparent.png")
 	if err != nil {
-		logoBytes, _ = os.ReadFile("kiosk-daemon/internal/ui_ipc/assets/logo.png")
+		logoBytes, _ = os.ReadFile("frontend/assets/xeroxgo-logo.png")
 	}
 	logoB64 := base64.StdEncoding.EncodeToString(logoBytes)
 
-	// Generate QR code SVG or data uri
+	// Generate QR code PNG and base64 encode
 	qrPng, _ := qrcode.Encode("https://xeroxgo.vercel.app", qrcode.Medium, 400)
 	qrB64 := base64.StdEncoding.EncodeToString(qrPng)
 
@@ -36,11 +72,13 @@ func main() {
 		title    string
 		svg      string
 	}{
-		{"01_idle.svg", "Idle - Ready to Scan", buildIdleSVG(logoB64, qrB64)},
-		{"02_downloading.svg", "Downloading Job", buildDownloadingSVG(logoB64)},
-		{"03_printing.svg", "Printing Hardware Progress", buildPrintingSVG(logoB64)},
-		{"04_completed.svg", "Print Completed", buildCompletedSVG(logoB64)},
-		{"05_error.svg", "Attention & Hardware Alert", buildErrorSVG(logoB64)},
+		{"01_idle.svg", "Idle Screen (Slide 1 - Quick & Easy)", buildCurrentIdleSVG(logoB64, qrB64, defaultSlides[0], 1)},
+		{"01_idle_slide2.svg", "Idle Screen (Slide 2 - High Quality Prints)", buildCurrentIdleSVG(logoB64, qrB64, defaultSlides[1], 2)},
+		{"01_idle_slide3.svg", "Idle Screen (Slide 3 - Skip The Queue)", buildCurrentIdleSVG(logoB64, qrB64, defaultSlides[2], 3)},
+		{"02_downloading.svg", "Downloading Screen", buildDownloadingSVG(logoB64)},
+		{"03_printing.svg", "Printing Screen", buildPrintingSVG(logoB64)},
+		{"04_completed.svg", "Print Completed Screen", buildCompletedSVG(logoB64)},
+		{"05_error.svg", "Attention & Hardware Alert Screen", buildErrorSVG(logoB64)},
 	}
 
 	for _, s := range screens {
@@ -51,7 +89,7 @@ func main() {
 		fmt.Printf("Exported %s\n", path)
 	}
 
-	// Also generate unified multi-frame artboard
+	// Generate unified multi-frame artboard for Figma
 	masterArtboard := buildMasterArtboardSVG(screens)
 	artboardPath := filepath.Join(outDir, "all_screens_artboard.svg")
 	if err := os.WriteFile(artboardPath, []byte(masterArtboard), 0644); err != nil {
@@ -60,7 +98,7 @@ func main() {
 	fmt.Printf("Exported %s\n", artboardPath)
 }
 
-func svgHeader(title string) string {
+func svgHeader(title string, extraDefs string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <svg width="1920" height="1080" viewBox="0 0 1920 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
   <title>%s</title>
@@ -69,10 +107,10 @@ func svgHeader(title string) string {
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&amp;display=swap');
       text { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
     </style>
-  </defs>
+%s  </defs>
   <!-- Background Slate-50 -->
   <rect width="1920" height="1080" fill="#F8FAFC"/>
-`, title)
+`, title, extraDefs)
 }
 
 func buildCommonHeaderAndFooter(logoB64, badgeText, badgeBg, badgeBorder, badgeTextColor, model string) string {
@@ -80,7 +118,7 @@ func buildCommonHeaderAndFooter(logoB64, badgeText, badgeBg, badgeBorder, badgeT
   <!-- HEADER -->
   <g id="Header">
     <rect width="1920" height="110" fill="#FFFFFF"/>
-    <line x1="0" y1="110" x2="1920" y2="110" stroke="#E2E8F0" stroke-width="2"/>
+    <line x1="0" y1="108" x2="1920" y2="108" stroke="#E2E8F0" stroke-width="2"/>
     <image x="80" y="31" width="360" height="48" href="data:image/png;base64,%s" preserveAspectRatio="xMidYMid meet"/>
     <text x="480" y="62" fill="#64748B" font-size="18" font-weight="500">Campus Print Kiosk • Touchless Mobile Printing</text>
     
@@ -100,89 +138,123 @@ func buildCommonHeaderAndFooter(logoB64, badgeText, badgeBg, badgeBorder, badgeT
 `, logoB64, badgeBg, badgeBorder, badgeTextColor, badgeText, model)
 }
 
-func buildIdleSVG(logoB64, qrB64 string) string {
+func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) string {
 	var buf bytes.Buffer
-	buf.WriteString(svgHeader("XeroxGo Kiosk - Idle Screen"))
+	gradID := fmt.Sprintf("adGrad%d", slideNum)
+	extraDefs := fmt.Sprintf(`    <linearGradient id="%s" x1="0%%" y1="0%%" x2="100%%" y2="100%%">
+      <stop offset="0%%" stop-color="%s"/>
+      <stop offset="50%%" stop-color="%s"/>
+      <stop offset="100%%" stop-color="%s"/>
+    </linearGradient>
+`, gradID, slide.c0, slide.c1, slide.c2)
+
+	buf.WriteString(svgHeader(fmt.Sprintf("XeroxGo Kiosk - Idle Screen (Slide %d)", slideNum), extraDefs))
 	buf.WriteString(buildCommonHeaderAndFooter(logoB64, "● READY TO PRINT", "#ECFDF5", "#A7F3D0", "#047857", "Brother DCP-T310"))
 
-	buf.WriteString(`
-  <!-- MAIN CONTENT: TWO COLUMN CARDS -->
-  <g id="Cards">
-    <!-- Left Card: Guide -->
-    <g id="LeftCard">
-      <rect x="80" y="140" width="1040" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
+	// Indicators: Slide 1, 2, 3
+	dot1W, dot2W, dot3W := 10, 10, 10
+	dot1A, dot2A, dot3A := "0.45", "0.45", "0.45"
+	switch slide.active {
+	case 0:
+		dot1W = 44
+		dot1A = "1.0"
+	case 1:
+		dot2W = 44
+		dot2A = "1.0"
+	case 2:
+		dot3W = 44
+		dot3A = "1.0"
+	}
+
+	buf.WriteString(fmt.Sprintf(`
+  <!-- MAIN CONTENT: DUAL CARDS -->
+  <g id="IdleCards">
+    <!-- LEFT CARD: PROMOTIONAL AD BANNER CAROUSEL -->
+    <g id="LeftCard_AdSlide">
+      <rect x="37" y="140" width="1203" height="840" rx="24" fill="url(#%s)"/>
       
-      <!-- Tag Pill -->
-      <rect x="140" y="185" width="190" height="36" rx="18" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
-      <text x="235" y="209" fill="#2563EB" font-size="16" font-weight="700" text-anchor="middle">TOUCHLESS GUIDE</text>
+      <!-- Slide Content -->
+      <g id="SlideText" transform="translate(117, 450)">
+        <text x="0" y="0" fill="#FFFFFF" font-size="56" font-weight="800" letter-spacing="-0.02em">%s</text>
+        <text x="0" y="70" fill="#E2E8F0" font-size="28" font-weight="400">%s</text>
+      </g>
 
-      <text x="140" y="280" fill="#1E293B" font-size="44" font-weight="800">Scan &amp; Print in Seconds</text>
-      <text x="140" y="325" fill="#64748B" font-size="20" font-weight="400">No apps or accounts required. Point your phone camera to begin.</text>
+      <!-- Carousel Indicator Dots -->
+      <g id="CarouselIndicators" transform="translate(590, 885)">
+        <rect x="0" y="0" width="%d" height="10" rx="5" fill="#FFFFFF" opacity="%s"/>
+        <rect x="%d" y="0" width="%d" height="10" rx="5" fill="#FFFFFF" opacity="%s"/>
+        <rect x="%d" y="0" width="%d" height="10" rx="5" fill="#FFFFFF" opacity="%s"/>
+      </g>
+    </g>
 
-      <!-- Steps -->
-      <g id="Steps" transform="translate(140, 375)">
+    <!-- RIGHT CARD: QR CODE & MOBILE ONBOARDING -->
+    <g id="RightCard_QROnboarding">
+      <rect x="1268" y="140" width="612" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
+      
+      <!-- QR Title -->
+      <text x="1574" y="185" fill="#1E293B" font-size="18" font-weight="600" text-anchor="middle">Scan with any phone to open your personal print portal</text>
+
+      <!-- QR Code Image -->
+      <g id="QRCode" transform="translate(1374, 210)">
+        <image width="400" height="400" href="data:image/png;base64,%s" preserveAspectRatio="xMidYMid meet"/>
+      </g>
+
+      <!-- Action Pill with Website Link -->
+      <g id="ActionPill" transform="translate(1344, 615)">
+        <rect width="460" height="56" rx="28" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+        <text x="230" y="36" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
+      </g>
+
+      <!-- Numbered Steps -->
+      <g id="Steps" transform="translate(1344, 700)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
-          <circle cx="22" cy="22" r="22" fill="#2563EB"/>
-          <text x="22" y="29" fill="#FFFFFF" font-size="20" font-weight="700" text-anchor="middle">1</text>
-          <text x="65" y="20" fill="#1E293B" font-size="22" font-weight="700">Point camera at the QR code</text>
-          <text x="65" y="48" fill="#64748B" font-size="18" font-weight="400">Open the standard Camera app on your iPhone or Android device.</text>
+          <circle cx="16" cy="16" r="16" fill="#2563EB"/>
+          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">1</text>
+          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Point camera at the QR code</text>
         </g>
 
         <!-- Step 2 -->
-        <g id="Step2" transform="translate(0, 95)">
-          <circle cx="22" cy="22" r="22" fill="#2563EB"/>
-          <text x="22" y="29" fill="#FFFFFF" font-size="20" font-weight="700" text-anchor="middle">2</text>
-          <text x="65" y="20" fill="#1E293B" font-size="22" font-weight="700">Upload document &amp; choose options</text>
-          <text x="65" y="48" fill="#64748B" font-size="18" font-weight="400">Select copies, pages, orientation, and color or monochrome.</text>
+        <g id="Step2" transform="translate(0, 58)">
+          <circle cx="16" cy="16" r="16" fill="#2563EB"/>
+          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">2</text>
+          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Upload document &amp; choose options</text>
         </g>
 
         <!-- Step 3 -->
-        <g id="Step3" transform="translate(0, 190)">
-          <circle cx="22" cy="22" r="22" fill="#2563EB"/>
-          <text x="22" y="29" fill="#FFFFFF" font-size="20" font-weight="700" text-anchor="middle">3</text>
-          <text x="65" y="20" fill="#1E293B" font-size="22" font-weight="700">Pay securely with instant UPI</text>
-          <text x="65" y="48" fill="#64748B" font-size="18" font-weight="400">Google Pay, PhonePe, Paytm, or BHIM. Zero card details needed.</text>
+        <g id="Step3" transform="translate(0, 116)">
+          <circle cx="16" cy="16" r="16" fill="#2563EB"/>
+          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">3</text>
+          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Pay securely with instant UPI</text>
         </g>
 
         <!-- Step 4 -->
-        <g id="Step4" transform="translate(0, 285)">
-          <circle cx="22" cy="22" r="22" fill="#10B981"/>
-          <text x="22" y="29" fill="#FFFFFF" font-size="20" font-weight="700" text-anchor="middle">4</text>
-          <text x="65" y="20" fill="#1E293B" font-size="22" font-weight="700">Collect prints from the output tray</text>
-          <text x="65" y="48" fill="#64748B" font-size="18" font-weight="400">High quality output prints automatically into the front tray.</text>
+        <g id="Step4" transform="translate(0, 174)">
+          <circle cx="16" cy="16" r="16" fill="#10B981"/>
+          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">4</text>
+          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Collect prints from the output tray</text>
         </g>
       </g>
 
-      <!-- Readiness banner -->
-      <rect x="140" y="835" width="920" height="70" rx="35" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
-      <text x="600" y="878" fill="#047857" font-size="18" font-weight="700" text-anchor="middle">PRINTER READY • HIGH SPEED A4 • TOUCHLESS MOBILE PRINTING</text>
-    </g>
-
-    <!-- Right Card: QR Code -->
-    <g id="RightCard">
-      <rect x="1160" y="140" width="680" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
-      <text x="1500" y="210" fill="#1E293B" font-size="24" font-weight="700" text-anchor="middle">POINT PHONE CAMERA</text>
-      <text x="1500" y="245" fill="#64748B" font-size="18" font-weight="400" text-anchor="middle">Scan with any phone to open your personal print portal</text>
-
-      <!-- QR Card Box -->
-      <rect x="1216" y="266" width="448" height="448" rx="16" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
-      <image x="1240" y="290" width="400" height="400" href="data:image/png;base64,` + qrB64 + `" preserveAspectRatio="xMidYMid meet"/>
-
-      <!-- Action Pill -->
-      <rect x="1250" y="745" width="500" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-      <text x="1500" y="782" fill="#2563EB" font-size="20" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
-
-      <text x="1500" y="865" fill="#64748B" font-size="16" font-weight="500" text-anchor="middle">End-to-End Encrypted Session • Files Deleted Immediately</text>
+      <text x="1574" y="945" fill="#94A3B8" font-size="14" font-weight="500" text-anchor="middle">End-to-End Encrypted Session • Files Deleted Immediately</text>
     </g>
   </g>
-</svg>`)
+</svg>`,
+		gradID,
+		slide.title,
+		slide.desc,
+		dot1W, dot1A,
+		dot1W+14, dot2W, dot2A,
+		dot1W+14+dot2W+14, dot3W, dot3A,
+		qrB64,
+	))
+
 	return buf.String()
 }
 
 func buildDownloadingSVG(logoB64 string) string {
 	var buf bytes.Buffer
-	buf.WriteString(svgHeader("XeroxGo Kiosk - Downloading Screen"))
+	buf.WriteString(svgHeader("XeroxGo Kiosk - Downloading Screen", ""))
 	buf.WriteString(buildCommonHeaderAndFooter(logoB64, "● DOWNLOADING", "#EFF6FF", "#BFDBFE", "#1D4ED8", "Brother DCP-T310"))
 
 	buf.WriteString(`
@@ -215,7 +287,7 @@ func buildDownloadingSVG(logoB64 string) string {
 
 func buildPrintingSVG(logoB64 string) string {
 	var buf bytes.Buffer
-	buf.WriteString(svgHeader("XeroxGo Kiosk - Printing Screen"))
+	buf.WriteString(svgHeader("XeroxGo Kiosk - Printing Screen", ""))
 	buf.WriteString(buildCommonHeaderAndFooter(logoB64, "● PRINTING", "#EFF6FF", "#BFDBFE", "#1D4ED8", "Brother DCP-T310"))
 
 	buf.WriteString(`
@@ -253,7 +325,7 @@ func buildPrintingSVG(logoB64 string) string {
 
 func buildCompletedSVG(logoB64 string) string {
 	var buf bytes.Buffer
-	buf.WriteString(svgHeader("XeroxGo Kiosk - Completed Screen"))
+	buf.WriteString(svgHeader("XeroxGo Kiosk - Completed Screen", ""))
 	buf.WriteString(buildCommonHeaderAndFooter(logoB64, "● COMPLETE", "#ECFDF5", "#A7F3D0", "#047857", "Brother DCP-T310"))
 
 	buf.WriteString(`
@@ -285,7 +357,7 @@ func buildCompletedSVG(logoB64 string) string {
 
 func buildErrorSVG(logoB64 string) string {
 	var buf bytes.Buffer
-	buf.WriteString(svgHeader("XeroxGo Kiosk - Error Screen"))
+	buf.WriteString(svgHeader("XeroxGo Kiosk - Error Screen", ""))
 	buf.WriteString(buildCommonHeaderAndFooter(logoB64, "● ATTENTION", "#FEF2F2", "#FECACA", "#B91C1C", "Brother DCP-T310"))
 
 	buf.WriteString(`
@@ -322,16 +394,13 @@ func buildMasterArtboardSVG(screens []struct {
 	title    string
 	svg      string
 }) string {
-	// 5 screens in a 3-column / 2-row layout with 100px padding
-	// Canvas: width = 3 * 1920 + 4 * 100 = 6160
-	// Height = 2 * 1080 + 3 * 100 = 2460
 	const (
 		pad = 100
 		sw  = 1920
 		sh  = 1080
 	)
 	cols := 3
-	rows := 2
+	rows := (len(screens) + cols - 1) / cols
 	totalW := cols*sw + (cols+1)*pad
 	totalH := rows*sh + (rows+1)*pad
 
@@ -354,7 +423,6 @@ func buildMasterArtboardSVG(screens []struct {
 		x := pad + c*(sw+pad)
 		y := pad + r*(sh+pad)
 
-		// Title tag
 		buf.WriteString(fmt.Sprintf(`
   <g id="ScreenFrame_%d" transform="translate(%d, %d)">
     <text x="0" y="-30" fill="#94A3B8" font-size="28" font-weight="700">%s (%s)</text>
