@@ -11,14 +11,13 @@ Wants=network-online.target
 Conflicts=getty@tty1.service
 
 [Service]
-Type=notify
-WatchdogSec=10
+Type=simple
 Restart=always
-RestartSec=5
+RestartSec=3
 
 User=xg1
 Group=xg1
-SupplementaryGroups=video lp input
+SupplementaryGroups=video lp input tty
 
 # Terminal isolation: suppress cursor and screen blanking on HDMI
 TTYPath=/dev/tty1
@@ -28,7 +27,10 @@ TTYVTDisallocate=yes
 StandardInput=null
 StandardOutput=journal
 StandardError=journal
-ExecStartPre=/usr/bin/setterm --cursor off --blank 0 --powerdown 0
+
+# Seamless handover: cleanly dismiss Plymouth bootsplash before drawing to framebuffer
+ExecStartPre=-/usr/bin/plymouth --quit
+ExecStartPre=-/usr/bin/setterm --cursor off --blank 0 --powerdown 0
 
 EnvironmentFile=-/etc/default/xeroxgo-kiosk
 

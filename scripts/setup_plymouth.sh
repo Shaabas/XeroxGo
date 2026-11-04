@@ -140,3 +140,4 @@ echo ""
 echo "On next reboot, the Raspberry Pi will boot silently directly"
 echo "into the XeroxGo logo with no Raspberry Pi branding."
 echo "========================================================"
+

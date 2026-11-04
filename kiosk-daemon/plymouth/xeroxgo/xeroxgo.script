@@ -64,3 +64,4 @@ fun message_callback (text) {
     # Intentionally empty: suppress all text and system messages
 }
 Plymouth.SetMessageFunction(message_callback);
+

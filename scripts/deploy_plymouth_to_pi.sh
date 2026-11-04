@@ -35,3 +35,4 @@ ssh -t "${PI_HOST}" "sudo bash /tmp/xeroxgo-plymouth/scripts/setup_plymouth.sh"
 
 echo ""
 echo "=== Plymouth Deployment Finished ==="
+
