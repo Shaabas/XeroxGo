@@ -57,66 +57,68 @@ func hashToken(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// SeedDefaultAds seeds the 3 default promo cards if no ads exist yet in the database.
+// systemDefaultAds defines the immutable 3 standard XeroxGO promo cards.
+var systemDefaultAds = []contracts.AdItem{
+	{
+		ID:          "ad-quick-easy",
+		Title:       "Quick & Easy",
+		Description: "Direct UPI payment. No coins, no cash needed.",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#1E3A8A",
+		GradientC1:  "#2563EB",
+		GradientC2:  "#4F46E5",
+		SortOrder:   1,
+		IsActive:    true,
+	},
+	{
+		ID:          "ad-high-quality",
+		Title:       "High Quality Prints",
+		Description: "Crisp laser documents ready in seconds.",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#065F46",
+		GradientC1:  "#10B981",
+		GradientC2:  "#059669",
+		SortOrder:   2,
+		IsActive:    true,
+	},
+	{
+		ID:          "ad-skip-queue",
+		Title:       "Skip The Queue",
+		Description: "Pick up your print job with your 4-digit code.",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#581C87",
+		GradientC1:  "#7C3AED",
+		GradientC2:  "#D97706",
+		SortOrder:   3,
+		IsActive:    true,
+	},
+}
+
+// GetSystemDefaultAds returns a copy of the 3 immutable system default promo cards.
+func GetSystemDefaultAds() []contracts.AdItem {
+	now := time.Now().UTC()
+	res := make([]contracts.AdItem, len(systemDefaultAds))
+	for i, ad := range systemDefaultAds {
+		ad.UpdatedAt = now
+		res[i] = ad
+	}
+	return res
+}
+
+func isSystemDefaultAdID(id string) bool {
+	return id == "ad-quick-easy" || id == "ad-high-quality" || id == "ad-skip-queue"
+}
+
+// SeedDefaultAds cleans up legacy seeded default ad IDs from the custom ads table.
+// Default ads are now permanent system fallbacks and not stored as custom ads.
 func (s *Store) SeedDefaultAds(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("seed ads: store is closed or nil")
 	}
 
-	var count int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ads").Scan(&count); err != nil {
-		return fmt.Errorf("seed ads: check count: %w", err)
-	}
-	if count > 0 {
-		return nil
-	}
-
-	now := time.Now().UTC()
-	defaults := []contracts.AdItem{
-		{
-			ID:          "ad-quick-easy",
-			Title:       "Quick & Easy",
-			Description: "Direct UPI payment. No coins, no cash needed.",
-			Type:        contracts.AdTypeGradient,
-			GradientC0:  "#1E3A8A",
-			GradientC1:  "#2563EB",
-			GradientC2:  "#4F46E5",
-			SortOrder:   1,
-			IsActive:    true,
-			UpdatedAt:   now,
-		},
-		{
-			ID:          "ad-high-quality",
-			Title:       "High Quality Prints",
-			Description: "Crisp laser documents ready in seconds.",
-			Type:        contracts.AdTypeGradient,
-			GradientC0:  "#065F46",
-			GradientC1:  "#10B981",
-			GradientC2:  "#059669",
-			SortOrder:   2,
-			IsActive:    true,
-			UpdatedAt:   now,
-		},
-		{
-			ID:          "ad-skip-queue",
-			Title:       "Skip The Queue",
-			Description: "Pick up your print job with your 4-digit code.",
-			Type:        contracts.AdTypeGradient,
-			GradientC0:  "#581C87",
-			GradientC1:  "#7C3AED",
-			GradientC2:  "#D97706",
-			SortOrder:   3,
-			IsActive:    true,
-			UpdatedAt:   now,
-		},
-	}
-
-	for _, ad := range defaults {
-		if err := s.SaveAd(ctx, ad); err != nil {
-			return fmt.Errorf("seed ads: insert %s: %w", ad.ID, err)
-		}
-	}
-	return nil
+	q := s.rebind("DELETE FROM ads WHERE id IN ('ad-quick-easy', 'ad-high-quality', 'ad-skip-queue')")
+	_, err := s.db.ExecContext(ctx, q)
+	return err
 }
 
 // BootstrapAdmin creates the initial admin user if none exists.
@@ -251,14 +253,22 @@ func (s *Store) RevokeAdminSession(ctx context.Context, rawToken string) error {
 	return err
 }
 
-// GetActiveAds returns all currently active ads ordered by sort_order.
+// GetActiveAds returns all currently active custom ads.
+// If no custom ads are active, it falls back to the 3 immutable system default cards.
 func (s *Store) GetActiveAds(ctx context.Context) ([]contracts.AdItem, error) {
-	return s.fetchAdsQuery(ctx, "SELECT id, title, description, ad_type, image_url, gradient_c0, gradient_c1, gradient_c2, link_url, sort_order, is_active, updated_at_ns FROM ads WHERE is_active = 1 ORDER BY sort_order ASC, created_at_ns ASC")
+	customAds, err := s.fetchAdsQuery(ctx, "SELECT id, title, description, ad_type, image_url, gradient_c0, gradient_c1, gradient_c2, link_url, sort_order, is_active, updated_at_ns FROM ads WHERE is_active = 1 AND id NOT IN ('ad-quick-easy', 'ad-high-quality', 'ad-skip-queue') ORDER BY sort_order ASC, created_at_ns ASC")
+	if err != nil {
+		return nil, err
+	}
+	if len(customAds) == 0 {
+		return GetSystemDefaultAds(), nil
+	}
+	return customAds, nil
 }
 
-// GetAllAds returns all ads including inactive drafts ordered by sort_order.
+// GetAllAds returns all user-configured custom ads, excluding system default cards.
 func (s *Store) GetAllAds(ctx context.Context) ([]contracts.AdItem, error) {
-	return s.fetchAdsQuery(ctx, "SELECT id, title, description, ad_type, image_url, gradient_c0, gradient_c1, gradient_c2, link_url, sort_order, is_active, updated_at_ns FROM ads ORDER BY sort_order ASC, created_at_ns ASC")
+	return s.fetchAdsQuery(ctx, "SELECT id, title, description, ad_type, image_url, gradient_c0, gradient_c1, gradient_c2, link_url, sort_order, is_active, updated_at_ns FROM ads WHERE id NOT IN ('ad-quick-easy', 'ad-high-quality', 'ad-skip-queue') ORDER BY sort_order ASC, created_at_ns ASC")
 }
 
 func (s *Store) fetchAdsQuery(ctx context.Context, q string) ([]contracts.AdItem, error) {
@@ -316,6 +326,9 @@ func (s *Store) SaveAd(ctx context.Context, ad contracts.AdItem) error {
 	}
 	if strings.TrimSpace(ad.ID) == "" {
 		return fmt.Errorf("save ad: id cannot be empty")
+	}
+	if isSystemDefaultAdID(ad.ID) {
+		return fmt.Errorf("system default card IDs are reserved and cannot be modified")
 	}
 	if strings.TrimSpace(ad.Title) == "" {
 		return fmt.Errorf("save ad: title cannot be empty")
@@ -386,6 +399,9 @@ func (s *Store) SaveAd(ctx context.Context, ad contracts.AdItem) error {
 func (s *Store) DeleteAd(ctx context.Context, id string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("delete ad: store is closed or nil")
+	}
+	if isSystemDefaultAdID(id) {
+		return fmt.Errorf("system default cards are permanent and cannot be deleted")
 	}
 	q := s.rebind("DELETE FROM ads WHERE id = ?")
 	_, err := s.db.ExecContext(ctx, q, id)

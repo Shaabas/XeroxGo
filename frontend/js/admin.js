@@ -6,6 +6,37 @@
 (function () {
   'use strict';
 
+  // --- Immutable System Default Cards ---
+  const SYSTEM_DEFAULT_CARDS = [
+    {
+      id: 'ad-quick-easy',
+      title: 'Quick & Easy',
+      description: 'Direct UPI payment. No coins, no cash needed.',
+      type: 'gradient',
+      gradient_c0: '#1E3A8A',
+      gradient_c1: '#2563EB',
+      gradient_c2: '#4F46E5'
+    },
+    {
+      id: 'ad-high-quality',
+      title: 'High Quality Prints',
+      description: 'Crisp laser documents ready in seconds.',
+      type: 'gradient',
+      gradient_c0: '#065F46',
+      gradient_c1: '#10B981',
+      gradient_c2: '#059669'
+    },
+    {
+      id: 'ad-skip-queue',
+      title: 'Skip The Queue',
+      description: 'Pick up your print job with your 4-digit code.',
+      type: 'gradient',
+      gradient_c0: '#581C87',
+      gradient_c1: '#7C3AED',
+      gradient_c2: '#D97706'
+    }
+  ];
+
   // --- Safe Response Parsing Helper ---
   async function parseResponseJSON(res) {
     const text = await res.text();
@@ -253,10 +284,18 @@
     function renderAdList() {
       if (!ads || ads.length === 0) {
         adListEl.innerHTML = `
-          <div style="text-align:center; padding:3rem 1rem; color:var(--text-muted); border:1px dashed var(--border); border-radius:var(--radius-md);">
-            <p style="font-weight:600; margin-bottom:0.5rem;">No promotional ads configured</p>
-            <p style="font-size:0.875rem; margin-bottom:1rem;">Create your first card to display on kiosk and mobile.</p>
-            <button class="btn-primary" onclick="document.getElementById('create-ad-btn').click()">+ Create Ad</button>
+          <div class="ad-empty-fallback-box">
+            <div class="fallback-status-badge">
+              <span class="status-dot"></span>
+              System Default Fallback Active
+            </div>
+            <h3 style="font-size:1.15rem; font-weight:700; margin-bottom:0.4rem; color:var(--text-main);">No Custom Ads Configured</h3>
+            <p style="font-size:0.875rem; color:var(--text-muted); max-width:440px; margin:0 auto 1.5rem; line-height:1.5;">
+              The 3 standard XeroxGO promotional cards are currently live across all kiosk screens and mobile users. Default cards are permanent system fallbacks and cannot be deleted.
+            </p>
+            <button class="btn-primary" type="button" onclick="document.getElementById('create-ad-btn').click()" style="margin:0 auto;">
+              + Create First Custom Ad
+            </button>
           </div>`;
         return;
       }
@@ -432,35 +471,36 @@
 
     function initPreviewCarousel() {
       if (previewTimer) clearInterval(previewTimer);
-      const activeAds = ads.filter(a => a.is_active);
-      if (activeAds.length === 0) {
-        renderPreviewSlide({
-          title: 'XeroxGO Instant Print',
-          description: 'Upload, Print, Collect - Fast campus printing.',
-          type: 'gradient',
-          gradient_c0: '#1E3A8A',
-          gradient_c1: '#2563EB',
-          gradient_c2: '#4F46E5'
-        });
-        renderDots(1, 0);
-        return;
+      const activeCustomAds = ads.filter(a => a.is_active);
+      const displayAds = activeCustomAds.length > 0 ? activeCustomAds : SYSTEM_DEFAULT_CARDS;
+      const isShowingDefaults = activeCustomAds.length === 0;
+
+      const previewStatusPill = document.getElementById('preview-status-pill');
+      if (previewStatusPill) {
+        if (isShowingDefaults) {
+          previewStatusPill.textContent = 'System Defaults (Active)';
+          previewStatusPill.className = 'badge-tag badge-fallback-pill';
+        } else {
+          previewStatusPill.textContent = `${activeCustomAds.length} Custom Card${activeCustomAds.length > 1 ? 's' : ''} (Live)`;
+          previewStatusPill.className = 'badge-tag badge-live-pill';
+        }
       }
 
       currentPreviewIdx = 0;
-      renderPreviewSlide(activeAds[currentPreviewIdx]);
-      renderDots(activeAds.length, currentPreviewIdx);
+      renderPreviewSlide(displayAds[currentPreviewIdx]);
+      renderDots(displayAds.length, currentPreviewIdx, displayAds);
 
-      if (activeAds.length > 1) {
+      if (displayAds.length > 1) {
         previewTimer = setInterval(() => {
           if (isEditingInModal) return; // Freeze while editing
-          currentPreviewIdx = (currentPreviewIdx + 1) % activeAds.length;
-          renderPreviewSlide(activeAds[currentPreviewIdx]);
-          renderDots(activeAds.length, currentPreviewIdx);
+          currentPreviewIdx = (currentPreviewIdx + 1) % displayAds.length;
+          renderPreviewSlide(displayAds[currentPreviewIdx]);
+          renderDots(displayAds.length, currentPreviewIdx, displayAds);
         }, 4000);
       }
     }
 
-    function renderDots(count, activeIdx) {
+    function renderDots(count, activeIdx, displayAdsList) {
       mobilePreviewDots.innerHTML = Array.from({ length: count }, (_, i) => `
         <span class="preview-dot ${i === activeIdx ? 'active' : ''}" data-idx="${i}"></span>
       `).join('');
@@ -468,11 +508,11 @@
       mobilePreviewDots.querySelectorAll('.preview-dot').forEach(dot => {
         dot.addEventListener('click', () => {
           const idx = parseInt(dot.dataset.idx, 10);
-          const activeAds = ads.filter(a => a.is_active);
-          if (activeAds[idx]) {
+          const list = displayAdsList || (ads.filter(a => a.is_active).length > 0 ? ads.filter(a => a.is_active) : SYSTEM_DEFAULT_CARDS);
+          if (list[idx]) {
             currentPreviewIdx = idx;
-            renderPreviewSlide(activeAds[idx]);
-            renderDots(activeAds.length, idx);
+            renderPreviewSlide(list[idx]);
+            renderDots(list.length, idx, list);
           }
         });
       });

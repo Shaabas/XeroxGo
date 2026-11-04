@@ -72,8 +72,17 @@ func TestAdsAndAdminAuth(t *testing.T) {
 		t.Fatalf("token should be invalid after revoke")
 	}
 
-	// 4. Test SaveAd & Reorder
-	newAd := contracts.AdItem{
+	// 4. Test SaveAd & Reorder & Fallback Behavior
+	// Before any custom ad is added, GetAllAds must be 0 and GetActiveAds must be the 3 defaults.
+	allAdsBefore, err := s.GetAllAds(ctx)
+	if err != nil {
+		t.Fatalf("GetAllAds failed: %v", err)
+	}
+	if len(allAdsBefore) != 0 {
+		t.Fatalf("expected 0 custom ads before save, got %d", len(allAdsBefore))
+	}
+
+	newAd1 := contracts.AdItem{
 		ID:          "ad-custom-1",
 		Title:       "Special Event",
 		Description: "Free printing day!",
@@ -81,31 +90,80 @@ func TestAdsAndAdminAuth(t *testing.T) {
 		GradientC0:  "#FF0000",
 		GradientC1:  "#00FF00",
 		GradientC2:  "#0000FF",
-		SortOrder:   4,
+		SortOrder:   1,
 		IsActive:    true,
 	}
-	if err := s.SaveAd(ctx, newAd); err != nil {
+	if err := s.SaveAd(ctx, newAd1); err != nil {
 		t.Fatalf("SaveAd failed: %v", err)
+	}
+
+	newAd2 := contracts.AdItem{
+		ID:          "ad-custom-2",
+		Title:       "Campus Fest",
+		Description: "Discounts all week!",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#111111",
+		GradientC1:  "#222222",
+		GradientC2:  "#333333",
+		SortOrder:   2,
+		IsActive:    true,
+	}
+	if err := s.SaveAd(ctx, newAd2); err != nil {
+		t.Fatalf("SaveAd 2 failed: %v", err)
 	}
 
 	allAds, err := s.GetAllAds(ctx)
 	if err != nil {
 		t.Fatalf("GetAllAds failed: %v", err)
 	}
-	if len(allAds) != 4 {
-		t.Fatalf("expected 4 ads, got %d", len(allAds))
+	if len(allAds) != 2 {
+		t.Fatalf("expected 2 custom ads, got %d", len(allAds))
+	}
+
+	// Active ads must now be strictly the custom ads; default cards have disappeared.
+	activeWithCustom, err := s.GetActiveAds(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveAds failed: %v", err)
+	}
+	if len(activeWithCustom) != 2 {
+		t.Fatalf("expected 2 active custom ads (defaults disappeared), got %d", len(activeWithCustom))
 	}
 
 	// Reorder
-	if err := s.ReorderAds(ctx, []string{"ad-custom-1", "ad-quick-easy", "ad-high-quality", "ad-skip-queue"}); err != nil {
+	if err := s.ReorderAds(ctx, []string{"ad-custom-2", "ad-custom-1"}); err != nil {
 		t.Fatalf("ReorderAds failed: %v", err)
 	}
 	reordered, err := s.GetActiveAds(ctx)
 	if err != nil {
 		t.Fatalf("GetActiveAds failed: %v", err)
 	}
-	if reordered[0].ID != "ad-custom-1" {
-		t.Errorf("expected first ad after reorder to be 'ad-custom-1', got %s", reordered[0].ID)
+	if reordered[0].ID != "ad-custom-2" {
+		t.Errorf("expected first ad after reorder to be 'ad-custom-2', got %s", reordered[0].ID)
+	}
+
+	// Attempting to delete default card must fail
+	if err := s.DeleteAd(ctx, "ad-quick-easy"); err == nil {
+		t.Fatalf("DeleteAd on default card should fail")
+	}
+
+	// Delete both custom ads
+	if err := s.DeleteAd(ctx, "ad-custom-1"); err != nil {
+		t.Fatalf("DeleteAd custom 1 failed: %v", err)
+	}
+	if err := s.DeleteAd(ctx, "ad-custom-2"); err != nil {
+		t.Fatalf("DeleteAd custom 2 failed: %v", err)
+	}
+
+	// When all custom ads are deleted, GetActiveAds must immediately fall back to the 3 defaults!
+	fallbackAds, err := s.GetActiveAds(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveAds after delete failed: %v", err)
+	}
+	if len(fallbackAds) != 3 {
+		t.Fatalf("expected fallback to 3 default ads, got %d", len(fallbackAds))
+	}
+	if fallbackAds[0].Title != "Quick & Easy" {
+		t.Errorf("expected fallback first ad to be 'Quick & Easy', got %q", fallbackAds[0].Title)
 	}
 
 	// Delete
