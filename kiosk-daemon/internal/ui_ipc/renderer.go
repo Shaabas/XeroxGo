@@ -149,7 +149,7 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 	drawLogo(fullCanvas, 80, 31, 48)
 
 	// Subtitle beside brand logo
-	drawText(fullCanvas, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
+	drawText(fullCanvas, faceReg18, "Upload, Print, Collect - It's that simple!", 480, 46, colorTextSecondary)
 
 	// 4. Mode-specific content
 	switch state.Mode {
@@ -179,46 +179,6 @@ func Render(state ScreenState) (*image.RGBA, error) {
 		return nil, err
 	}
 	return dst, nil
-}
-
-func drawHeaderBadge(dst *image.RGBA, mode ScreenMode) {
-	badgeRect := image.Rect(1540, 30, 1840, 80)
-	var bgCol, borderCol, textCol color.RGBA
-	var label string
-
-	switch mode {
-	case ModeIdle:
-		bgCol = colorPillGreenBg
-		borderCol = colorPillGreenBorder
-		textCol = color.RGBA{R: 4, G: 120, B: 87, A: 255}
-		label = "● READY TO PRINT"
-	case ModeDownloading:
-		bgCol = colorPillBlueBg
-		borderCol = colorPillBlueBorder
-		textCol = color.RGBA{R: 29, G: 78, B: 216, A: 255}
-		label = "● DOWNLOADING"
-	case ModePrinting:
-		bgCol = colorPillBlueBg
-		borderCol = colorPillBlueBorder
-		textCol = color.RGBA{R: 29, G: 78, B: 216, A: 255}
-		label = "● PRINTING"
-	case ModeCompleted:
-		bgCol = colorPillGreenBg
-		borderCol = colorPillGreenBorder
-		textCol = color.RGBA{R: 4, G: 120, B: 87, A: 255}
-		label = "● COMPLETE"
-	case ModeError:
-		bgCol = colorPillRedBg
-		borderCol = colorPillRedBorder
-		textCol = color.RGBA{R: 185, G: 28, B: 28, A: 255}
-		label = "● ATTENTION"
-	}
-
-	drawPill(dst, badgeRect, bgCol, borderCol)
-	textW := measureTextWidth(faceBold18, label)
-	startX := badgeRect.Min.X + (badgeRect.Dx()-textW)/2
-	startY := badgeRect.Min.Y + (badgeRect.Dy()-20)/2
-	drawText(dst, faceBold18, label, startX, startY, textCol)
 }
 
 // AdSlide models a single promotional slide from the mobile frontend carousel.
@@ -535,7 +495,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	drawLogo(base, 80, 31, 48)
 
 	// Subtitle beside brand logo
-	drawText(base, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
+	drawText(base, faceReg18, "Upload, Print, Collect - It's that simple!", 480, 46, colorTextSecondary)
 
 	// 4. Right Card: QR Code + Onboarding Steps
 	rightCard := image.Rect(1268, 140, 1891, 980)
@@ -778,27 +738,27 @@ func renderDownloading(dst *image.RGBA, state ScreenState) {
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold44, "DOWNLOADING DOCUMENT", 140, 260, colorPrimaryBlue)
+	drawText(dst, faceBold44, "DOWNLOADING DOCUMENT", 140, 240, colorPrimaryBlue)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Receiving print job securely from XeroxGo cloud..."
 	}
-	drawText(dst, faceReg24, msg, 140, 325, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailPill := image.Rect(140, 380, 760, 426)
+		detailPill := image.Rect(140, 345, 760, 395)
 		drawPill(dst, detailPill, colorPillBlueBg, colorPillBlueBorder)
-		drawText(dst, faceReg18, state.Detail, 160, 393, colorPrimaryBlue)
+		drawText(dst, faceReg18, state.Detail, 165, 362, colorPrimaryBlue)
 	}
 
-	// Progress Bar matching edited SVG bounds: (140, 500, 1787, 550)
-	drawProgressBar(dst, 140, 500, 1647, 50, state.ProgressPercent, 100, colorPrimaryBlue)
+	// Progress Bar (140, 500, 1780, 550) - width 1640
+	drawProgressBar(dst, 140, 500, 1640, 50, state.ProgressPercent, 100, colorPrimaryBlue)
 
 	pctText := fmt.Sprintf("Download Progress: %d%%", state.ProgressPercent)
-	drawText(dst, faceBold24, pctText, 140, 580, colorTextPrimary)
+	drawText(dst, faceBold24, pctText, 140, 585, colorTextPrimary)
 
-	drawText(dst, faceReg20, "Secure encrypted download in progress. Printing will begin automatically.", 140, 625, colorTextSecondary)
+	drawText(dst, faceReg20, "Secure encrypted download in progress. Printing will begin automatically.", 140, 630, colorTextSecondary)
 }
 
 func renderPrinting(dst *image.RGBA, state ScreenState) {
@@ -806,38 +766,41 @@ func renderPrinting(dst *image.RGBA, state ScreenState) {
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold44, "PRINTING DOCUMENT", 140, 260, colorPrimaryBlue)
-
-	counterText := fmt.Sprintf("PAGE %d OF %d", state.CurrentPage, state.TotalPages)
-	counterPill := image.Rect(140, 325, 460, 385)
-	drawPill(dst, counterPill, colorPillBlueBg, colorPillBlueBorder)
-	cW := measureTextWidth(faceBold28, counterText)
-	drawText(dst, faceBold28, counterText, counterPill.Min.X+(counterPill.Dx()-cW)/2, 340, colorPrimaryBlue)
+	drawText(dst, faceBold44, "PRINTING DOCUMENT", 140, 240, colorPrimaryBlue)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Please wait while your document prints..."
 	}
-	drawText(dst, faceReg24, msg, 140, 415, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
+
+	// Counter Pill aligned in metadata row
+	counterText := fmt.Sprintf("PAGE %d OF %d", state.CurrentPage, state.TotalPages)
+	counterPill := image.Rect(140, 345, 380, 395)
+	drawPill(dst, counterPill, colorPillBlueBg, colorPillBlueBorder)
+	cW := measureTextWidth(faceBold22, counterText)
+	drawText(dst, faceBold22, counterText, counterPill.Min.X+(counterPill.Dx()-cW)/2, 360, colorPrimaryBlue)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		drawText(dst, faceReg18, state.Detail, 140, 465, colorTextSecondary)
+		detailPill := image.Rect(400, 345, 1020, 395)
+		drawPill(dst, detailPill, colorBgSlate, colorBorder)
+		drawText(dst, faceReg18, state.Detail, 420, 362, colorTextSecondary)
 	}
 
-	// Progress Bar matching gate test bounds: (140, 520, 1700, 570)
-	drawProgressBar(dst, 140, 520, 1560, 50, state.CurrentPage, state.TotalPages, colorPrimaryBlue)
+	// Progress Bar matching Downloading layout: (140, 500, 1780, 550)
+	drawProgressBar(dst, 140, 500, 1640, 50, state.CurrentPage, state.TotalPages, colorPrimaryBlue)
 
 	subProgress := fmt.Sprintf("Progress: %d of %d pages streamed to printer hardware", state.CurrentPage, state.TotalPages)
-	drawText(dst, faceBold22, subProgress, 140, 600, colorTextPrimary)
+	drawText(dst, faceBold24, subProgress, 140, 585, colorTextPrimary)
 
 	modelStr := "Brother HL-L5210DN"
 	if state.PrinterModel != "" {
 		modelStr = state.PrinterModel
 	}
-	activePill := image.Rect(140, 680, 1100, 745)
+	activePill := image.Rect(140, 640, 1100, 705)
 	drawPill(dst, activePill, colorBgSlate, colorBorder)
 	activeText := fmt.Sprintf("Job is active on %s. Pages will exit into output tray.", modelStr)
-	drawText(dst, faceReg20, activeText, 170, 702, colorTextSecondary)
+	drawText(dst, faceReg20, activeText, 170, 662, colorTextSecondary)
 }
 
 func renderCompleted(dst *image.RGBA, state ScreenState) {
@@ -845,27 +808,35 @@ func renderCompleted(dst *image.RGBA, state ScreenState) {
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold48, "PRINT COMPLETE", 140, 260, colorSuccessGreen)
+	drawText(dst, faceBold44, "PRINT COMPLETE", 140, 240, colorSuccessGreen)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Your print job has finished successfully."
 	}
-	drawText(dst, faceReg24, msg, 140, 335, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
 
-	calloutBox := image.Rect(140, 390, 1700, 470)
+	if strings.TrimSpace(state.Detail) != "" {
+		detailPill := image.Rect(140, 345, 760, 395)
+		drawPill(dst, detailPill, colorPillGreenBg, colorPillGreenBorder)
+		drawText(dst, faceReg18, state.Detail, 165, 362, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+	}
+
+	// Collection Hero Callout Banner
+	calloutBox := image.Rect(140, 430, 1780, 510)
 	drawPill(dst, calloutBox, colorPillGreenBg, colorPillGreenBorder)
 	calloutText := "PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY"
 	cW := measureTextWidth(faceBold24, calloutText)
-	drawText(dst, faceBold24, calloutText, calloutBox.Min.X+(calloutBox.Dx()-cW)/2, 417, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+	drawText(dst, faceBold24, calloutText, calloutBox.Min.X+(calloutBox.Dx()-cW)/2, 457, color.RGBA{R: 4, G: 120, B: 87, A: 255})
 
-	if strings.TrimSpace(state.Detail) != "" {
-		drawText(dst, faceReg18, state.Detail, 140, 505, colorTextSecondary)
-	}
+	// Instructions box
+	instBox := image.Rect(140, 540, 1780, 740)
+	fillRoundedRect(dst, instBox, 16, colorBgSlate)
+	strokeRoundedRect(dst, instBox, 16, 2, colorBorder)
 
-	drawText(dst, faceReg22, "1. Inspect all printed pages before leaving the kiosk area.", 140, 555, colorTextPrimary)
-	drawText(dst, faceReg22, "2. Kiosk will reset to the idle screen for the next user.", 140, 605, colorTextPrimary)
-	drawText(dst, faceReg20, "Thank you for printing with XeroxGo!", 140, 685, colorTextSecondary)
+	drawText(dst, faceReg22, "1. Inspect all printed pages before leaving the kiosk area.", 180, 580, colorTextPrimary)
+	drawText(dst, faceReg22, "2. Kiosk will reset to the idle screen for the next user.", 180, 630, colorTextPrimary)
+	drawText(dst, faceReg20, "Thank you for printing with XeroxGo!", 180, 680, colorTextSecondary)
 }
 
 func renderError(dst *image.RGBA, state ScreenState) {
@@ -873,24 +844,26 @@ func renderError(dst *image.RGBA, state ScreenState) {
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold48, "PRINTER ATTENTION REQUIRED", 140, 230, colorErrorRed)
+	drawText(dst, faceBold44, "PRINTER ATTENTION REQUIRED", 140, 240, colorErrorRed)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Printer paper tray 1 is empty or disconnected."
 	}
-	drawText(dst, faceBold24, msg, 140, 305, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		drawText(dst, faceReg20, state.Detail, 140, 350, colorTextSecondary)
+		detailPill := image.Rect(140, 345, 760, 395)
+		drawPill(dst, detailPill, colorPillRedBg, colorPillRedBorder)
+		drawText(dst, faceReg18, state.Detail, 165, 362, colorErrorRed)
 	}
 
 	// Actionable recovery box
-	boxRect := image.Rect(140, 410, 1775, 905)
+	boxRect := image.Rect(140, 430, 1780, 890)
 	fillRoundedRect(dst, boxRect, 20, color.RGBA{R: 255, G: 251, B: 235, A: 255})
 	strokeRoundedRect(dst, boxRect, 20, 2, color.RGBA{R: 253, G: 230, B: 138, A: 255})
 
-	drawText(dst, faceBold22, "ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:", 182, 445, color.RGBA{R: 180, G: 83, B: 9, A: 255})
+	drawText(dst, faceBold22, "ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:", 180, 475, color.RGBA{R: 180, G: 83, B: 9, A: 255})
 
 	recoverySteps := []string{
 		"1. Check paper tray 1 and refill standard A4 paper if depleted.",
@@ -898,10 +871,10 @@ func renderError(dst *image.RGBA, state ScreenState) {
 		"3. Verify that the output area and paper exit tray are completely clear.",
 		"4. If error persists, please notify the campus attendant or support.",
 	}
-	yR := 509
+	yR := 535
 	for _, step := range recoverySteps {
-		drawText(dst, faceReg20, step, 182, yR, colorTextPrimary)
-		yR += 70
+		drawText(dst, faceReg20, step, 180, yR, colorTextPrimary)
+		yR += 60
 	}
 }
 

@@ -113,22 +113,16 @@ func svgHeader(title string, extraDefs string) string {
 `, title, extraDefs)
 }
 
-func buildCommonHeader(logoB64, badgeText, badgeBg, badgeBorder, badgeTextColor string) string {
+func buildCommonHeader(logoB64 string) string {
 	return fmt.Sprintf(`
   <!-- HEADER -->
   <g id="Header">
     <rect width="1920" height="110" fill="#FFFFFF"/>
     <line x1="0" y1="108" x2="1920" y2="108" stroke="#E2E8F0" stroke-width="2"/>
     <image x="80" y="31" width="360" height="48" href="data:image/png;base64,%s" preserveAspectRatio="xMidYMid meet"/>
-    <text x="480" y="62" fill="#64748B" font-size="18" font-weight="500">Campus Print Kiosk • Touchless Mobile Printing</text>
-    
-    <!-- Status Badge -->
-    <g id="StatusBadge" transform="translate(1540, 30)">
-      <rect width="300" height="50" rx="25" fill="%s" stroke="%s" stroke-width="2"/>
-      <text x="150" y="31" fill="%s" font-size="18" font-weight="700" text-anchor="middle">%s</text>
-    </g>
+    <text x="480" y="62" fill="#64748B" font-size="18" font-weight="500">Upload, Print, Collect - It's that simple!</text>
   </g>
-`, logoB64, badgeBg, badgeBorder, badgeTextColor, badgeText)
+`, logoB64)
 }
 
 func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) string {
@@ -142,7 +136,7 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
 `, gradID, slide.c0, slide.c1, slide.c2)
 
 	buf.WriteString(svgHeader(fmt.Sprintf("XeroxGo Kiosk - Idle Screen (Slide %d)", slideNum), extraDefs))
-	buf.WriteString(buildCommonHeader(logoB64, "● READY TO PRINT", "#ECFDF5", "#A7F3D0", "#047857"))
+	buf.WriteString(buildCommonHeader(logoB64))
 
 	// Indicators: Slide 1, 2, 3
 	dot1W, dot2W, dot3W := 10, 10, 10
@@ -248,31 +242,28 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
 func buildDownloadingSVG(logoB64 string) string {
 	var buf bytes.Buffer
 	buf.WriteString(svgHeader("XeroxGo Kiosk - Downloading Screen", ""))
-	buf.WriteString(buildCommonHeader(logoB64, "● DOWNLOADING", "#EFF6FF", "#BFDBFE", "#1D4ED8"))
+	buf.WriteString(buildCommonHeader(logoB64))
 
 	buf.WriteString(`
   <!-- MAIN CARD -->
   <g id="DownloadingCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <rect x="140" y="195" width="200" height="40" rx="20" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
-    <text x="240" y="221" fill="#2563EB" font-size="18" font-weight="700" text-anchor="middle">CLOUD TRANSFER</text>
-
-    <text x="140" y="295" fill="#2563EB" font-size="44" font-weight="800">DOWNLOADING DOCUMENT</text>
-    <text x="140" y="345" fill="#1E293B" font-size="24" font-weight="400">Receiving print job securely from XeroxGo cloud...</text>
+    <text x="140" y="240" fill="#2563EB" font-size="44" font-weight="800">DOWNLOADING DOCUMENT</text>
+    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="500">Receiving print job securely from XeroxGo cloud...</text>
 
     <!-- Detail Pill -->
-    <rect x="140" y="380" width="620" height="46" rx="23" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
-    <text x="160" y="410" fill="#2563EB" font-size="18" font-weight="500">Job ID: xg-order-883921 • Document: Lecture_Notes_CS101.pdf</text>
+    <rect x="140" y="345" width="620" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+    <text x="165" y="377" fill="#2563EB" font-size="18" font-weight="500">Job ID: xg-order-883921 • Document: Lecture_Notes_CS101.pdf</text>
 
     <!-- Progress Bar -->
     <g id="ProgressBar" transform="translate(140, 500)">
-      <rect width="1560" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
-      <rect x="2" y="2" width="1058" height="46" rx="8" fill="#2563EB"/>
+      <rect width="1640" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
+      <rect x="2" y="2" width="1112" height="46" rx="8" fill="#2563EB"/>
     </g>
 
-    <text x="140" y="605" fill="#1E293B" font-size="24" font-weight="700">Download Progress: 68%</text>
-    <text x="140" y="700" fill="#64748B" font-size="20" font-weight="400">Secure encrypted download in progress. Printing will begin automatically.</text>
+    <text x="140" y="585" fill="#1E293B" font-size="24" font-weight="700">Download Progress: 68%</text>
+    <text x="140" y="630" fill="#64748B" font-size="20" font-weight="400">Secure encrypted download in progress. Printing will begin automatically.</text>
   </g>
 </svg>`)
 	return buf.String()
@@ -281,36 +272,35 @@ func buildDownloadingSVG(logoB64 string) string {
 func buildPrintingSVG(logoB64 string) string {
 	var buf bytes.Buffer
 	buf.WriteString(svgHeader("XeroxGo Kiosk - Printing Screen", ""))
-	buf.WriteString(buildCommonHeader(logoB64, "● PRINTING", "#EFF6FF", "#BFDBFE", "#1D4ED8"))
+	buf.WriteString(buildCommonHeader(logoB64))
 
 	buf.WriteString(`
   <!-- MAIN CARD -->
   <g id="PrintingCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <rect x="140" y="195" width="200" height="40" rx="20" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
-    <text x="240" y="221" fill="#2563EB" font-size="18" font-weight="700" text-anchor="middle">HARDWARE PRINT</text>
-
-    <text x="140" y="295" fill="#2563EB" font-size="44" font-weight="800">PRINTING DOCUMENT</text>
+    <text x="140" y="240" fill="#2563EB" font-size="44" font-weight="800">PRINTING DOCUMENT</text>
+    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="500">Please wait while your document prints...</text>
 
     <!-- Page Counter Pill -->
-    <rect x="140" y="325" width="320" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-    <text x="300" y="363" fill="#2563EB" font-size="28" font-weight="700" text-anchor="middle">PAGE 2 OF 5</text>
+    <rect x="140" y="345" width="240" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+    <text x="260" y="377" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">PAGE 2 OF 5</text>
 
-    <text x="140" y="435" fill="#1E293B" font-size="24" font-weight="400">Please wait while your document prints...</text>
-    <text x="140" y="480" fill="#64748B" font-size="18" font-weight="400">Job ID: xg-order-883921 • Duplex Simplex • 1 Copy</text>
+    <!-- Detail Pill -->
+    <rect x="400" y="345" width="580" height="50" rx="25" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.5"/>
+    <text x="425" y="377" fill="#64748B" font-size="18" font-weight="500">Job ID: xg-order-883921 • Duplex Simplex • 1 Copy</text>
 
     <!-- Progress Bar -->
-    <g id="ProgressBar" transform="translate(140, 520)">
-      <rect width="1560" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
-      <rect x="2" y="2" width="624" height="46" rx="8" fill="#2563EB"/>
+    <g id="ProgressBar" transform="translate(140, 500)">
+      <rect width="1640" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
+      <rect x="2" y="2" width="654" height="46" rx="8" fill="#2563EB"/>
     </g>
 
-    <text x="140" y="620" fill="#1E293B" font-size="22" font-weight="700">Progress: 2 of 5 pages streamed to printer hardware</text>
+    <text x="140" y="585" fill="#1E293B" font-size="24" font-weight="700">Progress: 2 of 5 pages streamed to printer hardware</text>
 
     <!-- Hardware Notice Pill -->
-    <rect x="140" y="680" width="960" height="65" rx="32" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="170" y="721" fill="#64748B" font-size="20" font-weight="400">Job is active on Brother DCP-T310. Pages will exit into output tray.</text>
+    <rect x="140" y="640" width="960" height="65" rx="32" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+    <text x="170" y="681" fill="#64748B" font-size="20" font-weight="400">Job is active on Brother DCP-T310. Pages will exit into output tray.</text>
   </g>
 </svg>`)
 	return buf.String()
@@ -319,29 +309,30 @@ func buildPrintingSVG(logoB64 string) string {
 func buildCompletedSVG(logoB64 string) string {
 	var buf bytes.Buffer
 	buf.WriteString(svgHeader("XeroxGo Kiosk - Completed Screen", ""))
-	buf.WriteString(buildCommonHeader(logoB64, "● COMPLETE", "#ECFDF5", "#A7F3D0", "#047857"))
+	buf.WriteString(buildCommonHeader(logoB64))
 
 	buf.WriteString(`
   <!-- MAIN CARD -->
   <g id="CompletedCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <rect x="140" y="195" width="180" height="40" rx="20" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1.5"/>
-    <text x="230" y="221" fill="#047857" font-size="18" font-weight="700" text-anchor="middle">JOB FINISHED</text>
+    <text x="140" y="240" fill="#10B981" font-size="44" font-weight="800">PRINT COMPLETE</text>
+    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="500">Your print job has finished successfully.</text>
 
-    <text x="140" y="295" fill="#10B981" font-size="48" font-weight="800">PRINT COMPLETE</text>
-    <text x="140" y="355" fill="#1E293B" font-size="24" font-weight="400">All 5 pages have been streamed and printed successfully.</text>
+    <!-- Detail Pill -->
+    <rect x="140" y="345" width="460" height="50" rx="25" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1.5"/>
+    <text x="165" y="377" fill="#047857" font-size="18" font-weight="500">Job ID: xg-order-883921 • Total Sheets: 5</text>
 
     <!-- Collection Callout Banner -->
-    <rect x="140" y="390" width="1560" height="80" rx="40" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
-    <text x="920" y="440" fill="#047857" font-size="24" font-weight="700" text-anchor="middle">PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY</text>
+    <rect x="140" y="430" width="1640" height="80" rx="20" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
+    <text x="960" y="480" fill="#047857" font-size="24" font-weight="700" text-anchor="middle">PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY</text>
 
-    <text x="140" y="520" fill="#64748B" font-size="18" font-weight="400">Job ID: xg-order-883921 • Total Sheets: 5</text>
-    
-    <g id="Instructions" transform="translate(140, 570)">
+    <!-- Instructions Box -->
+    <rect x="140" y="540" width="1640" height="200" rx="20" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+    <g id="Instructions" transform="translate(180, 595)">
       <text x="0" y="0" fill="#1E293B" font-size="22" font-weight="500">1. Inspect all printed pages before leaving the kiosk area.</text>
-      <text x="0" y="50" fill="#1E293B" font-size="22" font-weight="500">2. Kiosk will reset to the idle screen for the next user.</text>
-      <text x="0" y="130" fill="#64748B" font-size="20" font-weight="400">Thank you for printing with XeroxGo!</text>
+      <text x="0" y="45" fill="#1E293B" font-size="22" font-weight="500">2. Kiosk will reset to the idle screen for the next user.</text>
+      <text x="0" y="105" fill="#64748B" font-size="20" font-weight="400">Thank you for printing with XeroxGo!</text>
     </g>
   </g>
 </svg>`)
@@ -351,23 +342,23 @@ func buildCompletedSVG(logoB64 string) string {
 func buildErrorSVG(logoB64 string) string {
 	var buf bytes.Buffer
 	buf.WriteString(svgHeader("XeroxGo Kiosk - Error Screen", ""))
-	buf.WriteString(buildCommonHeader(logoB64, "● ATTENTION", "#FEF2F2", "#FECACA", "#B91C1C"))
+	buf.WriteString(buildCommonHeader(logoB64))
 
 	buf.WriteString(`
   <!-- MAIN CARD -->
   <g id="ErrorCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <rect x="140" y="175" width="200" height="40" rx="20" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
-    <text x="240" y="201" fill="#B91C1C" font-size="18" font-weight="700" text-anchor="middle">DEVICE STATUS</text>
+    <text x="140" y="240" fill="#EF4444" font-size="44" font-weight="800">PRINTER ATTENTION REQUIRED</text>
+    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="700">Printer paper tray 1 is empty or disconnected.</text>
 
-    <text x="140" y="260" fill="#EF4444" font-size="48" font-weight="800">PRINTER ATTENTION REQUIRED</text>
-    <text x="140" y="325" fill="#1E293B" font-size="24" font-weight="700">Printer paper tray 1 is empty or disconnected.</text>
-    <text x="140" y="365" fill="#64748B" font-size="20" font-weight="400">Error Code: CUPS_MEDIA_EMPTY • Job ID: xg-order-883921</text>
+    <!-- Detail Pill -->
+    <rect x="140" y="345" width="580" height="50" rx="25" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
+    <text x="165" y="377" fill="#DC2626" font-size="18" font-weight="500">Error Code: CUPS_MEDIA_EMPTY • Job ID: xg-order-883921</text>
 
     <!-- Recovery Box -->
-    <g id="RecoveryInstructions" transform="translate(140, 410)">
-      <rect width="1560" height="460" rx="20" fill="#FFFBEB" stroke="#FDE68A" stroke-width="2"/>
+    <g id="RecoveryInstructions" transform="translate(140, 430)">
+      <rect width="1640" height="460" rx="20" fill="#FFFBEB" stroke="#FDE68A" stroke-width="2"/>
       <text x="40" y="48" fill="#B45309" font-size="22" font-weight="700">ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:</text>
 
       <g transform="translate(40, 110)">

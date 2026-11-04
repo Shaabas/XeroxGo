@@ -5,7 +5,7 @@
 
 [Unit]
 Description=XeroxGo Kiosk Spooler & HDMI Display Daemon
-Documentation=https://github.com/xeroxgo/xeroxgo
+Documentation=https://github.com/Shaabas/XeroxGo
 After=network-online.target
 Wants=network-online.target
 Conflicts=getty@tty1.service
