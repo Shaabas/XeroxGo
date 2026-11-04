@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -137,7 +138,12 @@ func (app *appServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ok, err := app.db.AuthenticateAdmin(r.Context(), req.Username, req.Password)
-	if err != nil || !ok {
+	if err != nil {
+		log.Printf("[ERROR] AuthenticateAdmin failed for %s: %v", req.Username, err)
+		writeJSONError(w, http.StatusInternalServerError, "authentication database error")
+		return
+	}
+	if !ok {
 		recordFailedLogin(ip)
 		writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
 		return

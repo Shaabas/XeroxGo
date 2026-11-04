@@ -404,15 +404,10 @@ func (s *Store) ReorderAds(ctx context.Context, orderedIDs []string) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, s.rebind("UPDATE ads SET sort_order = ?, updated_at_ns = ? WHERE id = ?"))
-	if err != nil {
-		return fmt.Errorf("reorder ads: prepare: %w", err)
-	}
-	defer stmt.Close()
-
 	nowNs := time.Now().UTC().UnixNano()
+	q := s.rebind("UPDATE ads SET sort_order = ?, updated_at_ns = ? WHERE id = ?")
 	for i, id := range orderedIDs {
-		if _, err := stmt.ExecContext(ctx, i+1, nowNs, id); err != nil {
+		if _, err := tx.ExecContext(ctx, q, i+1, nowNs, id); err != nil {
 			return fmt.Errorf("reorder ads: exec %s: %w", id, err)
 		}
 	}

@@ -7,7 +7,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 	"xeroxgo/pkg/contracts"
 )
@@ -54,10 +55,14 @@ func Open(dbPath string) (*Store, error) {
 
 	isPostgres := strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://")
 	if isPostgres {
-		db, err := sql.Open("pgx", dbPath)
+		config, err := pgx.ParseConfig(dbPath)
 		if err != nil {
-			return nil, fmt.Errorf("open store: postgres: %w", err)
+			return nil, fmt.Errorf("open store: postgres parse config: %w", err)
 		}
+		// For connection poolers like Supabase transaction mode (PgBouncer/Supavisor),
+		// prepared statements must not be cached to avoid SQLSTATE 42P05.
+		config.DefaultQueryExecMode = pgx.QueryExecModeExec
+		db := stdlib.OpenDB(*config)
 		db.SetMaxOpenConns(25)
 		db.SetMaxIdleConns(5)
 		db.SetConnMaxLifetime(5 * time.Minute)
