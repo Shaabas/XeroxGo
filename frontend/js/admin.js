@@ -284,17 +284,11 @@
     function renderAdList() {
       if (!ads || ads.length === 0) {
         adListEl.innerHTML = `
-          <div class="ad-empty-fallback-box">
-            <div class="fallback-status-badge">
-              <span class="status-dot"></span>
-              System Default Fallback Active
-            </div>
-            <h3 style="font-size:1.15rem; font-weight:700; margin-bottom:0.4rem; color:var(--text-main);">No Custom Ads Configured</h3>
-            <p style="font-size:0.875rem; color:var(--text-muted); max-width:440px; margin:0 auto 1.5rem; line-height:1.5;">
-              The 3 standard XeroxGO promotional cards are currently live across all kiosk screens and mobile users. Default cards are permanent system fallbacks and cannot be deleted.
-            </p>
+          <div class="ad-empty-box">
+            <p style="font-size:0.95rem; font-weight:600; color:var(--text-main); margin-bottom:0.25rem;">No ads configured</p>
+            <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.25rem;">Default system cards will be displayed.</p>
             <button class="btn-primary" type="button" onclick="document.getElementById('create-ad-btn').click()" style="margin:0 auto;">
-              + Create First Custom Ad
+              + New Ad
             </button>
           </div>`;
         return;
@@ -323,9 +317,9 @@
               <div class="ad-info-title">${escapeHTML(ad.title)}</div>
               <div class="ad-info-desc">${escapeHTML(ad.description)}</div>
               <div class="ad-badges">
-                <span class="badge-tag ${isGradient ? 'badge-gradient' : 'badge-image'}">${isGradient ? 'Gradient' : 'Banner Image'}</span>
-                ${ad.link_url ? `<span class="badge-tag" style="background:#F1F5F9; color:#475569;" title="${escapeHTML(ad.link_url)}">Link Attached</span>` : ''}
-                ${ad.is_active ? '<span class="badge-tag" style="background:#ECFDF5; color:#065F46;">Live</span>' : '<span class="badge-tag" style="background:#FEF2F2; color:#991B1B;">Disabled</span>'}
+                <span class="badge-tag ${isGradient ? 'badge-gradient' : 'badge-image'}">${isGradient ? 'Gradient' : 'Image'}</span>
+                ${ad.link_url ? `<span class="badge-tag" style="background:#F1F5F9; color:#475569;" title="${escapeHTML(ad.link_url)}">Link</span>` : ''}
+                ${ad.is_active ? '<span class="badge-tag" style="background:#ECFDF5; color:#065F46;">Active</span>' : '<span class="badge-tag" style="background:#FEF2F2; color:#991B1B;">Disabled</span>'}
               </div>
             </div>
 
@@ -334,10 +328,10 @@
                 <input type="checkbox" class="toggle-active" data-id="${ad.id}" ${ad.is_active ? 'checked' : ''} />
                 <span class="slider"></span>
               </label>
-              <button class="btn-icon btn-edit" title="Edit Card" data-id="${ad.id}">
+              <button class="btn-icon btn-edit" title="Edit" data-id="${ad.id}">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
               </button>
-              <button class="btn-icon delete btn-delete" title="Delete Card" data-id="${ad.id}">
+              <button class="btn-icon delete btn-delete" title="Delete" data-id="${ad.id}">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
               </button>
             </div>
@@ -413,11 +407,11 @@
         });
 
         if (!res.ok) throw new Error('Failed to update status');
-        showToast(`Ad "${ad.title}" ${isActive ? 'activated' : 'paused'} and synchronized`);
+        showToast('Ad updated');
         renderAdList();
         initPreviewCarousel();
       } catch (err) {
-        showToast('Error updating status: ' + err.message);
+        showToast('Error: ' + err.message);
         await loadAds();
       }
     }
@@ -428,7 +422,7 @@
           method: 'DELETE'
         });
         if (!res.ok) throw new Error('Failed to delete ad');
-        showToast('Ad deleted and synchronized');
+        showToast('Ad deleted');
         await loadAds();
       } catch (err) {
         showToast('Error: ' + err.message);
@@ -443,16 +437,16 @@
           body: { order }
         });
         if (!res.ok) throw new Error('Failed to save order');
-        showToast('Ad sequence reordered and synchronized');
+        showToast('Order saved');
         renderAdList();
         initPreviewCarousel();
       } catch (err) {
-        showToast('Reorder failed: ' + err.message);
+        showToast('Error: ' + err.message);
         await loadAds();
       }
     }
 
-    // --- Live Preview Studio ---
+    // --- Preview Simulator ---
     tabMobileBtn.addEventListener('click', () => {
       activeTab = 'mobile';
       tabMobileBtn.classList.add('active');
@@ -473,18 +467,6 @@
       if (previewTimer) clearInterval(previewTimer);
       const activeCustomAds = ads.filter(a => a.is_active);
       const displayAds = activeCustomAds.length > 0 ? activeCustomAds : SYSTEM_DEFAULT_CARDS;
-      const isShowingDefaults = activeCustomAds.length === 0;
-
-      const previewStatusPill = document.getElementById('preview-status-pill');
-      if (previewStatusPill) {
-        if (isShowingDefaults) {
-          previewStatusPill.textContent = 'System Defaults (Active)';
-          previewStatusPill.className = 'badge-tag badge-fallback-pill';
-        } else {
-          previewStatusPill.textContent = `${activeCustomAds.length} Custom Card${activeCustomAds.length > 1 ? 's' : ''} (Live)`;
-          previewStatusPill.className = 'badge-tag badge-live-pill';
-        }
-      }
 
       currentPreviewIdx = 0;
       renderPreviewSlide(displayAds[currentPreviewIdx]);
@@ -537,7 +519,7 @@
     // --- Modal Form & Live Binding ---
     function openCreateModal() {
       isEditingInModal = true;
-      modalHeading.textContent = 'Create Promotional Card';
+      modalHeading.textContent = 'New Ad';
       adIdInput.value = '';
       adTitleInput.value = '';
       adDescInput.value = '';
@@ -557,7 +539,7 @@
 
     function openEditModal(ad) {
       isEditingInModal = true;
-      modalHeading.textContent = 'Edit Promotional Card';
+      modalHeading.textContent = 'Edit Ad';
       adIdInput.value = ad.id;
       adTitleInput.value = ad.title;
       adDescInput.value = ad.description;
@@ -696,12 +678,12 @@
         imagePreviewThumb.style.backgroundImage = `url('${data.image_url}')`;
         imagePreviewThumb.textContent = '';
         syncFormToLivePreview();
-        showToast('Banner graphic uploaded successfully');
+        showToast('Image uploaded');
       } catch (err) {
         alert('Upload error: ' + err.message);
       } finally {
         uploadImageBtn.disabled = false;
-        uploadImageBtn.textContent = 'Choose Banner Graphic...';
+        uploadImageBtn.textContent = 'Choose Graphic...';
       }
     });
 
@@ -710,7 +692,7 @@
       e.preventDefault();
       const saveBtn = document.getElementById('modal-save-btn');
       saveBtn.disabled = true;
-      saveBtn.textContent = 'Broadcasting...';
+      saveBtn.textContent = 'Saving...';
 
       const id = adIdInput.value;
       const type = document.querySelector('input[name="ad-type"]:checked')?.value || 'gradient';
@@ -748,13 +730,13 @@
         }
 
         closeModal();
-        showToast(`Ad "${payload.title}" saved and broadcasted to kiosks!`);
+        showToast('Ad saved');
         await loadAds();
       } catch (err) {
         alert('Error saving ad: ' + err.message);
       } finally {
         saveBtn.disabled = false;
-        saveBtn.textContent = 'Save & Broadcast';
+        saveBtn.textContent = 'Save';
       }
     });
 

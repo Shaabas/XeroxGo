@@ -97,4 +97,30 @@ func TestSupabaseIntegration(t *testing.T) {
 	if prog.Status != contracts.JobStatusCompleted || prog.PagesPrinted != 2 {
 		t.Fatalf("unexpected progress state: %+v", prog)
 	}
+
+	// 5. Promotional Ads Fallback Test
+	if err := s.SeedDefaultAds(ctx); err != nil {
+		t.Fatalf("SeedDefaultAds cleanup failed: %v", err)
+	}
+	allAds, err := s.GetAllAds(ctx)
+	if err != nil {
+		t.Fatalf("GetAllAds failed: %v", err)
+	}
+	t.Logf("Supabase custom ads count: %d", len(allAds))
+	for _, ad := range allAds {
+		t.Logf("  Custom Ad: id=%s title=%s", ad.ID, ad.Title)
+	}
+
+	activeAds, err := s.GetActiveAds(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveAds failed: %v", err)
+	}
+	if len(allAds) == 0 {
+		if len(activeAds) != 3 {
+			t.Fatalf("expected 3 default fallback ads when 0 custom ads, got %d", len(activeAds))
+		}
+		if activeAds[0].Title != "Quick & Easy" {
+			t.Errorf("expected default ad title 'Quick & Easy', got %s", activeAds[0].Title)
+		}
+	}
 }
