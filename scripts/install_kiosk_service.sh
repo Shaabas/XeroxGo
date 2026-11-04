@@ -95,3 +95,4 @@ echo "  View live logs: sudo journalctl -u xeroxgo-kiosk -f"
 echo "  Restart kiosk:  sudo systemctl restart xeroxgo-kiosk"
 echo "  Stop kiosk:     sudo systemctl stop xeroxgo-kiosk"
 echo "========================================================"
+
