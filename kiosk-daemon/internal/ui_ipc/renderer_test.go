@@ -97,8 +97,8 @@ func TestRenderIdleQRCode(t *testing.T) {
 		t.Fatalf("invalid canvas bounds: %v", img.Bounds())
 	}
 
-	// QR code is drawn at (1380, 225, 1780, 625)
-	qrBounds := image.Rect(1380, 225, 1780, 625)
+	// QR code is drawn at (1380, 210, 1780, 610)
+	qrBounds := image.Rect(1380, 210, 1780, 610)
 	darkCount := 0
 	lightCount := 0
 

@@ -120,11 +120,15 @@ func Render(state ScreenState) (*image.RGBA, error) {
 	// 3. Footer bar (1010 to 1080)
 	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
 	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
-	modelStr := "Brother HL-L5210DN"
-	if state.PrinterModel != "" {
-		modelStr = state.PrinterModel
+
+	// Clean footer: in user-edited designs, footer text is only shown during active printing
+	if state.Mode == ModePrinting {
+		modelStr := "Brother HL-L5210DN"
+		if state.PrinterModel != "" {
+			modelStr = state.PrinterModel
+		}
+		drawText(canvas, faceReg18, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, colorTextSecondary)
 	}
-	drawText(canvas, faceReg18, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, colorTextSecondary)
 
 	// 4. Mode-specific content
 	switch state.Mode {
@@ -196,10 +200,10 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	fillRoundedRect(dst, rightCard, 24, colorCardBg)
 	strokeRoundedRect(dst, rightCard, 24, 2, colorBorder)
 
-	// Title
-	qrTitle := "POINT PHONE CAMERA"
-	qrTitleW := measureTextWidth(faceBold24, qrTitle)
-	drawText(dst, faceBold24, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 175, colorTextPrimary)
+	// Headline above QR code
+	qrTitle := "Scan with any phone to open your personal print portal"
+	qrTitleW := measureTextWidth(faceReg18, qrTitle)
+	drawText(dst, faceReg18, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 172, colorTextPrimary)
 
 	// QR Code Generation
 	qrBytes, err := qrcode.Encode(state.QRContent, qrcode.Medium, 400)
@@ -211,21 +215,16 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		return fmt.Errorf("failed to decode QR PNG: %w", err)
 	}
 
-	// White backing rect around QR code
-	qrBacking := image.Rect(1370, 215, 1790, 635)
-	fillRoundedRect(dst, qrBacking, 16, color.RGBA{R: 255, G: 255, B: 255, A: 255})
-	strokeRoundedRect(dst, qrBacking, 16, 2, colorBorder)
-
-	// Draw decoded QR image centered in right card
-	qrBounds := image.Rect(1380, 225, 1780, 625)
+	// QR code is placed directly on the card without extra border box
+	qrBounds := image.Rect(1380, 210, 1780, 610)
 	draw.Draw(dst, qrBounds, qrImg, image.Point{}, draw.Src)
 
 	// Action pill under QR
-	pillRect := image.Rect(1350, 645, 1810, 705)
+	pillRect := image.Rect(1350, 597, 1808, 657)
 	drawPill(dst, pillRect, colorPillBlueBg, colorPillBlueBorder)
 	pillText := "Instant Web App • No Install Needed"
 	pillW := measureTextWidth(faceBold20, pillText)
-	drawText(dst, faceBold20, pillText, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 665, colorPrimaryBlue)
+	drawText(dst, faceBold20, pillText, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 617, colorPrimaryBlue)
 
 	// 4 Numbered Steps
 	steps := []struct {
@@ -235,21 +234,21 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	}{
 		{"1", "Point camera at the QR code", false},
 		{"2", "Upload document & choose options", false},
-		{"3", "Pay with instant UPI", false},
-		{"4", "Collect prints from the tray", true},
+		{"3", "Pay securely with instant UPI", false},
+		{"4", "Collect prints from the output tray", true},
 	}
-	yStep := 725
-	for _, s := range steps {
+	ySteps := []int{692, 750, 808, 867}
+	for i, s := range steps {
+		y := ySteps[i]
 		circleCol := colorPrimaryBlue
 		if s.isLast {
 			circleCol = colorSuccessGreen
 		}
-		drawCircle(dst, 1385, yStep+15, 16, circleCol)
+		drawCircle(dst, 1404, y+14, 15, circleCol)
 		numW := measureTextWidth(faceBold18, s.num)
-		drawText(dst, faceBold18, s.num, 1385-numW/2, yStep+5, colorTextWhite)
+		drawText(dst, faceBold18, s.num, 1404-numW/2, y+4, colorTextWhite)
 
-		drawText(dst, faceBold20, s.title, 1415, yStep+4, colorTextPrimary)
-		yStep += 58
+		drawText(dst, faceBold20, s.title, 1440, y+4, colorTextPrimary)
 	}
 
 	return nil
@@ -274,8 +273,8 @@ func renderDownloading(dst *image.RGBA, state ScreenState) {
 		drawText(dst, faceReg18, state.Detail, 160, 393, colorPrimaryBlue)
 	}
 
-	// Progress Bar matching gate test bounds: (140, 500, 1700, 550)
-	drawProgressBar(dst, 140, 500, 1560, 50, state.ProgressPercent, 100, colorPrimaryBlue)
+	// Progress Bar matching edited SVG bounds: (140, 500, 1787, 550)
+	drawProgressBar(dst, 140, 500, 1647, 50, state.ProgressPercent, 100, colorPrimaryBlue)
 
 	pctText := fmt.Sprintf("Download Progress: %d%%", state.ProgressPercent)
 	drawText(dst, faceBold24, pctText, 140, 580, colorTextPrimary)
@@ -380,7 +379,7 @@ func renderError(dst *image.RGBA, state ScreenState) {
 		"3. Verify that the output area and paper exit tray are completely clear.",
 		"4. If error persists, please notify the campus attendant or support.",
 	}
-	yR := 513
+	yR := 509
 	for _, step := range recoverySteps {
 		drawText(dst, faceReg20, step, 182, yR, colorTextPrimary)
 		yR += 70
