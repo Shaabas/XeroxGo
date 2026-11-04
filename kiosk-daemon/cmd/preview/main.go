@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ func main() {
 			name: "01_idle.png",
 			state: ui_ipc.ScreenState{
 				Mode:         ui_ipc.ModeIdle,
-				QRContent:    "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
+				QRContent:    "https://xeroxgo.vercel.app",
 				PrinterModel: "Brother DCP-T310",
 				AdSlideIndex: 0,
 			},
@@ -32,7 +33,7 @@ func main() {
 			name: "01_idle_slide2.png",
 			state: ui_ipc.ScreenState{
 				Mode:         ui_ipc.ModeIdle,
-				QRContent:    "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
+				QRContent:    "https://xeroxgo.vercel.app",
 				PrinterModel: "Brother DCP-T310",
 				AdSlideIndex: 1,
 			},
@@ -41,7 +42,7 @@ func main() {
 			name: "01_idle_slide3.png",
 			state: ui_ipc.ScreenState{
 				Mode:         ui_ipc.ModeIdle,
-				QRContent:    "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
+				QRContent:    "https://xeroxgo.vercel.app",
 				PrinterModel: "Brother DCP-T310",
 				AdSlideIndex: 2,
 			},
@@ -50,7 +51,7 @@ func main() {
 			name: "01_idle_transition.png",
 			state: ui_ipc.ScreenState{
 				Mode:           ui_ipc.ModeIdle,
-				QRContent:      "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
+				QRContent:      "https://xeroxgo.vercel.app",
 				PrinterModel:   "Brother DCP-T310",
 				AdSlideIndex:   1,
 				TransitionFrom: 0,
@@ -101,10 +102,14 @@ func main() {
 		},
 	}
 
+	var idleScreen image.Image
 	for _, s := range states {
 		img, err := ui_ipc.Render(s.state)
 		if err != nil {
 			panic(fmt.Sprintf("render %s failed: %v", s.name, err))
+		}
+		if s.name == "01_idle.png" {
+			idleScreen = img
 		}
 		path := filepath.Join(outDir, s.name)
 		f, err := os.Create(path)
@@ -116,5 +121,44 @@ func main() {
 		}
 		_ = f.Close()
 		fmt.Printf("Generated %s\n", path)
+	}
+
+	// Export individual standalone cards for design inspection
+	cards := []struct {
+		name string
+		img  image.Image
+	}{
+		{"card_ad_slide1.png", ui_ipc.GetAdSlideImage(0)},
+		{"card_ad_slide2.png", ui_ipc.GetAdSlideImage(1)},
+		{"card_ad_slide3.png", ui_ipc.GetAdSlideImage(2)},
+	}
+
+	if idleScreen != nil {
+		type subImager interface {
+			SubImage(r image.Rectangle) image.Image
+		}
+		if si, ok := idleScreen.(subImager); ok {
+			qrCard := si.SubImage(image.Rect(1268, 140, 1891, 980))
+			cards = append(cards, struct {
+				name string
+				img  image.Image
+			}{"card_qr_portal.png", qrCard})
+		}
+	}
+
+	for _, c := range cards {
+		if c.img == nil {
+			continue
+		}
+		path := filepath.Join(outDir, c.name)
+		f, err := os.Create(path)
+		if err != nil {
+			panic(err)
+		}
+		if err := png.Encode(f, c.img); err != nil {
+			panic(err)
+		}
+		_ = f.Close()
+		fmt.Printf("Generated card: %s\n", path)
 	}
 }

@@ -1196,6 +1196,24 @@ func main() {
 		}
 	}
 
+	// Initialize default promo ads & bootstrap admin user
+	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer bootstrapCancel()
+	if err := storeDB.SeedDefaultAds(bootstrapCtx); err != nil {
+		log.Printf("[WARN] Failed to seed default ads: %v", err)
+	}
+	adminUser := os.Getenv("XEROXGO_ADMIN_USER")
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	adminPass := os.Getenv("XEROXGO_ADMIN_PASSWORD")
+	if adminPass == "" {
+		adminPass = "xeroxgo2026"
+	}
+	if err := storeDB.BootstrapAdmin(bootstrapCtx, adminUser, adminPass); err != nil {
+		log.Printf("[WARN] Failed to bootstrap admin: %v", err)
+	}
+
 	hub := ws.NewHub(storeDB)
 
 	cfg := &serverConfig{
@@ -1248,6 +1266,25 @@ func main() {
 	})
 	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
 	mux.HandleFunc("/ws", hub.ServeHTTP)
+
+	// Public Ads API
+	mux.HandleFunc("/api/ads", app.handlePublicAds)
+	mux.HandleFunc("/api/ads/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/ads/images/") {
+			app.handleServeAdImage(w, r)
+			return
+		}
+		app.handlePublicAds(w, r)
+	})
+
+	// Protected Admin Dashboard API
+	mux.HandleFunc("/api/admin/login", app.handleAdminLogin)
+	mux.HandleFunc("/api/admin/logout", app.handleAdminLogout)
+	mux.HandleFunc("/api/admin/me", app.handleAdminMe)
+	mux.HandleFunc("/api/admin/password", app.handleAdminPassword)
+	mux.HandleFunc("/api/admin/upload-image", app.handleAdminUploadImage)
+	mux.HandleFunc("/api/admin/ads", app.handleAdminAds)
+	mux.HandleFunc("/api/admin/ads/", app.handleAdminAds)
 
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")

@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net"
@@ -31,6 +33,7 @@ type wireMessage struct {
 	Progress *contracts.JobProgressEvent `json:"progress,omitempty"`
 	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
 	Error    string                      `json:"error,omitempty"`
+	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 }
 
 // ClientConfig holds the runtime dependencies and parameters for the kiosk spooler client.
@@ -43,6 +46,7 @@ type ClientConfig struct {
 	PrinterModel             string
 	DownloadDir              string
 	IdleQRContent            string
+	AdsCachePath             string
 	IdleCarouselInterval     time.Duration
 	CompletedDisplayDuration time.Duration
 	ErrorDisplayDuration     time.Duration
@@ -83,6 +87,9 @@ type Client struct {
 	currentModeMu sync.Mutex
 	currentMode   ui_ipc.ScreenMode
 	adSlideIndex  int
+
+	renderMu sync.Mutex
+	canvas   *image.RGBA
 
 	healthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 }
@@ -160,7 +167,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg.ErrorDisplayDuration = 10 * time.Second
 	}
 
-	return &Client{
+	if cfg.AdsCachePath == "" {
+		cfg.AdsCachePath = "/var/kiosk/ads_cache.json"
+	}
+	if cached, err := loadAdsCache(cfg.AdsCachePath); err == nil && len(cached) > 0 {
+		log.Printf("[SPOOLER] Loaded %d promotional ads from local cache %s", len(cached), cfg.AdsCachePath)
+		ui_ipc.ConfigureAds(cached)
+	}
+
+	client := &Client{
 		cfg:               cfg,
 		normalizedURL:     normalizedURL,
 		jobQueue:          make(chan contracts.PrintJobCommand, 16),
@@ -170,7 +185,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		heartbeatInterval: 15 * time.Second,
 		maxDownloadBytes:  250 * 1024 * 1024,
 		healthPoller:      poller,
-	}, nil
+	}
+
+	go client.fetchInitialAds()
+
+	return client, nil
 }
 
 // Run executes the spooler client loops until the context is canceled.
@@ -290,6 +309,8 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 		}
 		if msg.Type == "job" && msg.Job != nil {
 			c.handleIncomingJob(*msg.Job)
+		} else if msg.Type == "sync_ads" && len(msg.Ads) > 0 {
+			c.handleSyncAds(msg.Ads)
 		}
 	}
 
@@ -845,14 +866,21 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 	c.currentMode = state.Mode
 	c.currentModeMu.Unlock()
 
-	img, err := ui_ipc.Render(state)
-	if err != nil {
+	c.renderMu.Lock()
+	defer c.renderMu.Unlock()
+
+	targetW, targetH := ui_ipc.GetTargetResolution()
+	if c.canvas == nil || c.canvas.Bounds().Dx() != targetW || c.canvas.Bounds().Dy() != targetH {
+		c.canvas = image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+	}
+
+	if err := ui_ipc.RenderTo(c.canvas, state); err != nil {
 		c.lastRenderErrMu.Lock()
 		c.lastRenderErr = err
 		c.lastRenderErrMu.Unlock()
 		return err
 	}
-	if err := c.cfg.ScreenSink(img); err != nil {
+	if err := c.cfg.ScreenSink(c.canvas); err != nil {
 		c.lastRenderErrMu.Lock()
 		c.lastRenderErr = err
 		c.lastRenderErrMu.Unlock()
@@ -874,10 +902,15 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			slideCount := ui_ipc.GetAdSlideCount()
+			if slideCount <= 1 {
+				continue
+			}
+
 			c.currentModeMu.Lock()
 			isIdle := (c.currentMode == ui_ipc.ModeIdle)
-			fromIdx := c.adSlideIndex
-			toIdx := (c.adSlideIndex + 1) % 3
+			fromIdx := c.adSlideIndex % slideCount
+			toIdx := (c.adSlideIndex + 1) % slideCount
 			c.adSlideIndex = toIdx
 			c.currentModeMu.Unlock()
 
@@ -885,17 +918,26 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 				continue
 			}
 
-			// Wall-clock synchronized 500ms transition at locked 30 FPS (~33.3ms per frame)
+			// Wall-clock synchronized 500ms transition at locked 60 FPS (~16.6ms per frame)
 			const (
 				animDuration  = 500 * time.Millisecond
-				targetFPS     = 30
+				targetFPS     = 60
 				frameDuration = 1000 * time.Millisecond / targetFPS
 			)
 
 			startTime := time.Now()
+			frameTimer := time.NewTimer(frameDuration)
+			if !frameTimer.Stop() {
+				select {
+				case <-frameTimer.C:
+				default:
+				}
+			}
+
 			for {
 				select {
 				case <-ctx.Done():
+					frameTimer.Stop()
 					return
 				default:
 				}
@@ -936,13 +978,77 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 				nextFrameTime := startTime.Add(time.Duration((elapsed/frameDuration)+1) * frameDuration)
 				sleepDuration := time.Until(nextFrameTime)
 				if sleepDuration > 0 {
+					frameTimer.Reset(sleepDuration)
 					select {
 					case <-ctx.Done():
+						frameTimer.Stop()
 						return
-					case <-time.After(sleepDuration):
+					case <-frameTimer.C:
 					}
 				}
 			}
+			frameTimer.Stop()
 		}
 	}
 }
+
+func (c *Client) handleSyncAds(ads []contracts.AdItem) {
+	log.Printf("[SPOOLER] Received sync_ads push with %d items", len(ads))
+	ui_ipc.ConfigureAds(ads)
+	go saveAdsCache(c.cfg.AdsCachePath, ads)
+}
+
+func (c *Client) fetchInitialAds() {
+	if c.cfg.CloudURL == "" {
+		return
+	}
+	httpURL := strings.Replace(c.cfg.CloudURL, "wss://", "https://", 1)
+	httpURL = strings.Replace(httpURL, "ws://", "http://", 1)
+	httpURL = strings.TrimSuffix(httpURL, "/ws") + "/api/ads"
+
+	u, err := url.Parse(httpURL)
+	if err != nil {
+		return
+	}
+	u.RawQuery = ""
+
+	resp, err := c.cfg.HTTPClient.Get(u.String())
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return
+	}
+	defer resp.Body.Close()
+
+	var ads []contracts.AdItem
+	if err := json.NewDecoder(resp.Body).Decode(&ads); err == nil && len(ads) > 0 {
+		c.handleSyncAds(ads)
+	}
+}
+
+func saveAdsCache(path string, ads []contracts.AdItem) {
+	if path == "" {
+		return
+	}
+	dir := filepath.Dir(path)
+	_ = os.MkdirAll(dir, 0755)
+	data, err := json.MarshalIndent(ads, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0644)
+}
+
+func loadAdsCache(path string) ([]contracts.AdItem, error) {
+	if path == "" {
+		return nil, os.ErrNotExist
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var ads []contracts.AdItem
+	if err := json.Unmarshal(data, &ads); err != nil {
+		return nil, err
+	}
+	return ads, nil
+}
+

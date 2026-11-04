@@ -241,6 +241,7 @@ func main() {
 	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
+	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
 	flag.Parse()
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
@@ -263,7 +264,7 @@ func main() {
 			}
 			*idleQRContent = fmt.Sprintf("%s://%s/k/%s", scheme, u.Host, url.PathEscape(*kioskID))
 		} else {
-			*idleQRContent = fmt.Sprintf("http://127.0.0.1:8080/k/%s", url.PathEscape(*kioskID))
+			*idleQRContent = "https://xeroxgo.vercel.app"
 		}
 	}
 
@@ -282,6 +283,16 @@ func main() {
 
 	var screenSink ui_ipc.Sink
 	if *previewPNG != "" {
+		if *screenRes != "" {
+			parts := strings.Split(*screenRes, "x")
+			if len(parts) == 2 {
+				if w, err := strconv.Atoi(parts[0]); err == nil && w > 0 {
+					if h, err := strconv.Atoi(parts[1]); err == nil && h > 0 {
+						ui_ipc.ConfigureTarget(ui_ipc.FramebufferGeometry{Width: w, Height: h, BitsPerPixel: 32, Stride: w * 4})
+					}
+				}
+			}
+		}
 		if err := os.MkdirAll(filepath.Dir(*previewPNG), 0755); err != nil {
 			log.Fatalf("Fatal: failed to create preview png directory: %v", err)
 		}
@@ -315,6 +326,7 @@ func main() {
 		log.Printf("XeroxGo display: output=%s, resolution=%dx%d, bpp=%d, stride=%d",
 			*framebuffer, geom.Width, geom.Height, geom.BitsPerPixel, geom.Stride)
 		suppressConsoleCursor()
+		ui_ipc.ConfigureTarget(geom)
 		screenSink = ui_ipc.FramebufferSinkWithGeometry(*framebuffer, geom)
 	}
 
@@ -364,6 +376,7 @@ func main() {
 		PrinterModel:             effectivePrinterModel,
 		DownloadDir:              *downloadDir,
 		IdleQRContent:            *idleQRContent,
+		AdsCachePath:             *adsCachePath,
 		CompletedDisplayDuration: *completedTimeout,
 		ScreenSink:               screenSink,
 		HTTPClient:               nil,

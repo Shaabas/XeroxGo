@@ -265,6 +265,76 @@ func fillRoundedRect(dst *image.RGBA, r image.Rectangle, radius int, col color.R
 	drawCorner(r.Max.X-radius, r.Max.Y-radius, r.Max.X, r.Max.Y, cx1, cy1)
 }
 
+var bayer8 = [8][8]float64{
+	{0.0 / 64.0, 32.0 / 64.0, 8.0 / 64.0, 40.0 / 64.0, 2.0 / 64.0, 34.0 / 64.0, 10.0 / 64.0, 42.0 / 64.0},
+	{48.0 / 64.0, 16.0 / 64.0, 56.0 / 64.0, 24.0 / 64.0, 50.0 / 64.0, 18.0 / 64.0, 58.0 / 64.0, 26.0 / 64.0},
+	{12.0 / 64.0, 44.0 / 64.0, 4.0 / 64.0, 36.0 / 64.0, 14.0 / 64.0, 46.0 / 64.0, 6.0 / 64.0, 38.0 / 64.0},
+	{60.0 / 64.0, 28.0 / 64.0, 52.0 / 64.0, 20.0 / 64.0, 62.0 / 64.0, 30.0 / 64.0, 54.0 / 64.0, 22.0 / 64.0},
+	{3.0 / 64.0, 35.0 / 64.0, 11.0 / 64.0, 43.0 / 64.0, 1.0 / 64.0, 33.0 / 64.0, 9.0 / 64.0, 41.0 / 64.0},
+	{51.0 / 64.0, 19.0 / 64.0, 59.0 / 64.0, 27.0 / 64.0, 49.0 / 64.0, 17.0 / 64.0, 57.0 / 64.0, 25.0 / 64.0},
+	{15.0 / 64.0, 47.0 / 64.0, 7.0 / 64.0, 39.0 / 64.0, 13.0 / 64.0, 45.0 / 64.0, 5.0 / 64.0, 37.0 / 64.0},
+	{63.0 / 64.0, 31.0 / 64.0, 55.0 / 64.0, 23.0 / 64.0, 61.0 / 64.0, 29.0 / 64.0, 53.0 / 64.0, 21.0 / 64.0},
+}
+
+func clampByte(v float64) uint8 {
+	if v <= 0.0 {
+		return 0
+	}
+	if v >= 254.5 {
+		return 255
+	}
+	return uint8(v + 0.5)
+}
+
+// interpolateGradient3Stop evaluates a continuous C1 Hermite spline across 3 color stops
+// with spatial 8x8 Bayer dithering, eliminating both Mach band creasing at stop 1 and
+// color quantization banding on 8-bit / low-color displays.
+func interpolateGradient3Stop(t float64, c0, c1, c2 color.RGBA, x, y int) (uint8, uint8, uint8) {
+	if t < 0.0 {
+		t = 0.0
+	} else if t > 1.0 {
+		t = 1.0
+	}
+
+	r0, g0, b0 := float64(c0.R), float64(c0.G), float64(c0.B)
+	r1, g1, b1 := float64(c1.R), float64(c1.G), float64(c1.B)
+	r2, g2, b2 := float64(c2.R), float64(c2.G), float64(c2.B)
+
+	mr := (r2 - r0) * 0.5
+	mg := (g2 - g0) * 0.5
+	mb := (b2 - b0) * 0.5
+
+	var cr, cg, cb float64
+	if t <= 0.5 {
+		u := t * 2.0
+		u2 := u * u
+		u3 := u2 * u
+		h00 := 2.0*u3 - 3.0*u2 + 1.0
+		h10 := u3 - 2.0*u2 + u
+		h01 := -2.0*u3 + 3.0*u2
+		h11 := u3 - u2
+
+		cr = h00*r0 + h10*(r1-r0) + h01*r1 + h11*mr
+		cg = h00*g0 + h10*(g1-g0) + h01*g1 + h11*mg
+		cb = h00*b0 + h10*(b1-b0) + h01*b1 + h11*mb
+	} else {
+		u := (t - 0.5) * 2.0
+		u2 := u * u
+		u3 := u2 * u
+		h00 := 2.0*u3 - 3.0*u2 + 1.0
+		h10 := u3 - 2.0*u2 + u
+		h01 := -2.0*u3 + 3.0*u2
+		h11 := u3 - u2
+
+		cr = h00*r1 + h10*mr + h01*r2 + h11*(r2-r1)
+		cg = h00*g1 + h10*mg + h01*g2 + h11*(g2-g1)
+		cb = h00*b1 + h10*mb + h01*b2 + h11*(b2-b1)
+	}
+
+	d := (bayer8[y&7][x&7] - 0.5) * 0.75
+	return clampByte(cr + d), clampByte(cg + d), clampByte(cb + d)
+}
+
 // fillLinearGradient135 fills a rectangle with a true 135-degree 3-stop linear gradient:
 // c0 at 0% (top-left), c1 at 50% (center diagonal), c2 at 100% (bottom-right).
 func fillLinearGradient135(dst *image.RGBA, r image.Rectangle, c0, c1, c2 color.RGBA) {
@@ -276,32 +346,15 @@ func fillLinearGradient135(dst *image.RGBA, r image.Rectangle, c0, c1, c2 color.
 	h := r.Dy()
 	totalDist := float64(w + h)
 
-	r0, g0, b0 := float64(c0.R), float64(c0.G), float64(c0.B)
-	r1, g1, b1 := float64(c1.R), float64(c1.G), float64(c1.B)
-	r2, g2, b2 := float64(c2.R), float64(c2.G), float64(c2.B)
-
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		yDist := float64(y - r.Min.Y)
 		rowStart := y*dst.Stride + r.Min.X*4
 		for x, p := r.Min.X, rowStart; x < r.Max.X; x, p = x+1, p+4 {
 			t := (float64(x-r.Min.X) + yDist) / totalDist
-
-			var cr, cg, cb float64
-			if t <= 0.5 {
-				f := t * 2.0
-				cr = r0 + f*(r1-r0)
-				cg = g0 + f*(g1-g0)
-				cb = b0 + f*(b1-b0)
-			} else {
-				f := (t - 0.5) * 2.0
-				cr = r1 + f*(r2-r1)
-				cg = g1 + f*(g2-g1)
-				cb = b1 + f*(b2-b1)
-			}
-
-			dst.Pix[p+0] = uint8(cr + 0.5)
-			dst.Pix[p+1] = uint8(cg + 0.5)
-			dst.Pix[p+2] = uint8(cb + 0.5)
+			cr, cg, cb := interpolateGradient3Stop(t, c0, c1, c2, x, y)
+			dst.Pix[p+0] = cr
+			dst.Pix[p+1] = cg
+			dst.Pix[p+2] = cb
 			dst.Pix[p+3] = 255
 		}
 	}
@@ -336,10 +389,6 @@ func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1,
 	// Normalized position t along diagonal from top-left (x0, y0) to bottom-right (x1, y1):
 	// t = ((x - x0) + (y - y0)) / (w + h)
 	totalDist := float64(w + h)
-
-	r0, g0, b0 := float64(c0.R), float64(c0.G), float64(c0.B)
-	r1, g1, b1 := float64(c1.R), float64(c1.G), float64(c1.B)
-	r2, g2, b2 := float64(c2.R), float64(c2.G), float64(c2.B)
 
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		yDist := float64(y - r.Min.Y)
@@ -394,32 +443,20 @@ func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1,
 				}
 			}
 
-			// True 135-degree linear interpolation
+			// True 135-degree continuous Hermite interpolation with 8x8 Bayer dithering
 			t := (float64(x-r.Min.X) + yDist) / totalDist
-
-			var cr, cg, cb float64
-			if t <= 0.5 {
-				f := t * 2.0
-				cr = r0 + f*(r1-r0)
-				cg = g0 + f*(g1-g0)
-				cb = b0 + f*(b1-b0)
-			} else {
-				f := (t - 0.5) * 2.0
-				cr = r1 + f*(r2-r1)
-				cg = g1 + f*(g2-g1)
-				cb = b1 + f*(b2-b1)
-			}
+			cr, cg, cb := interpolateGradient3Stop(t, c0, c1, c2, x, y)
 
 			if alpha >= 1.0 {
-				dst.Pix[p+0] = uint8(cr)
-				dst.Pix[p+1] = uint8(cg)
-				dst.Pix[p+2] = uint8(cb)
+				dst.Pix[p+0] = cr
+				dst.Pix[p+1] = cg
+				dst.Pix[p+2] = cb
 				dst.Pix[p+3] = 255
 			} else if alpha > 0 {
 				invAlpha := 1.0 - alpha
-				dst.Pix[p+0] = uint8(cr*alpha + float64(dst.Pix[p+0])*invAlpha)
-				dst.Pix[p+1] = uint8(cg*alpha + float64(dst.Pix[p+1])*invAlpha)
-				dst.Pix[p+2] = uint8(cb*alpha + float64(dst.Pix[p+2])*invAlpha)
+				dst.Pix[p+0] = uint8(float64(cr)*alpha + float64(dst.Pix[p+0])*invAlpha + 0.5)
+				dst.Pix[p+1] = uint8(float64(cg)*alpha + float64(dst.Pix[p+1])*invAlpha + 0.5)
+				dst.Pix[p+2] = uint8(float64(cb)*alpha + float64(dst.Pix[p+2])*invAlpha + 0.5)
 				dst.Pix[p+3] = 255
 			}
 		}

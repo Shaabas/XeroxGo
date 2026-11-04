@@ -19,6 +19,7 @@ type wireMessage struct {
 	Job      *contracts.PrintJobCommand  `json:"job,omitempty"`
 	Progress *contracts.JobProgressEvent `json:"progress,omitempty"`
 	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
+	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 	Error    string                      `json:"error,omitempty"`
 }
 
@@ -97,6 +98,13 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Proactively sync active ads to newly connected kiosk
+	if h.db != nil {
+		if activeAds, err := h.db.GetActiveAds(ctx); err == nil && len(activeAds) > 0 {
+			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: activeAds})
+		}
+	}
 
 	for {
 		var msg wireMessage
@@ -270,4 +278,28 @@ func isValidJobStatus(s contracts.JobStatus) bool {
 	default:
 		return false
 	}
+}
+
+// BroadcastSyncAds broadcasts updated ads to all currently connected kiosks in real time.
+func (h *Hub) BroadcastSyncAds(ctx context.Context, ads []contracts.AdItem) {
+	h.mu.RLock()
+	sessions := make([]*kioskSession, 0, len(h.sessions))
+	for _, sess := range h.sessions {
+		sessions = append(sessions, sess)
+	}
+	h.mu.RUnlock()
+
+	msg := wireMessage{Type: "sync_ads", Ads: ads}
+	for _, sess := range sessions {
+		sess.sendMu.Lock()
+		_ = wsjson.Write(ctx, sess.conn, msg)
+		sess.sendMu.Unlock()
+	}
+}
+
+// ConnectedKiosksCount returns the number of currently connected kiosks.
+func (h *Hub) ConnectedKiosksCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.sessions)
 }

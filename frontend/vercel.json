@@ -6,6 +6,14 @@
       "destination": "https://xeroxgo-cloud.onrender.com/api/:match*"
     },
     {
+      "source": "/admin",
+      "destination": "/admin.html"
+    },
+    {
+      "source": "/admin/:match*",
+      "destination": "/admin.html"
+    },
+    {
       "source": "/k/:kiosk_id",
       "destination": "/"
     },

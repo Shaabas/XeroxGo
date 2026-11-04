@@ -6,16 +6,24 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	_ "image/jpeg"
 	"image/png"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
+	"unsafe"
 
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/image/font"
 	xdraw "golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
+	"xeroxgo/pkg/contracts"
 )
 
 const (
@@ -74,63 +82,78 @@ var (
 
 var renderMu sync.Mutex
 
-// Render renders a 1920x1080 RGBA dashboard image for the given state.
-func Render(state ScreenState) (*image.RGBA, error) {
-	renderMu.Lock()
-	defer renderMu.Unlock()
-
-	initUIAssets()
-
+// Validate checks that the ScreenState has valid mode and range values.
+func (state ScreenState) Validate() error {
 	switch state.Mode {
 	case ModeIdle:
 		if strings.TrimSpace(state.QRContent) == "" {
-			return nil, fmt.Errorf("idle mode: QRContent cannot be empty or whitespace-only")
+			return fmt.Errorf("idle mode: QRContent cannot be empty or whitespace-only")
 		}
 	case ModeDownloading:
 		if state.ProgressPercent < 0 || state.ProgressPercent > 100 {
-			return nil, fmt.Errorf("downloading mode: ProgressPercent must be between 0 and 100, got %d", state.ProgressPercent)
+			return fmt.Errorf("downloading mode: ProgressPercent must be between 0 and 100, got %d", state.ProgressPercent)
 		}
 	case ModePrinting:
 		if state.TotalPages < 1 {
-			return nil, fmt.Errorf("printing mode: TotalPages must be >= 1, got %d", state.TotalPages)
+			return fmt.Errorf("printing mode: TotalPages must be >= 1, got %d", state.TotalPages)
 		}
 		if state.CurrentPage < 0 || state.CurrentPage > state.TotalPages {
-			return nil, fmt.Errorf("printing mode: CurrentPage must be between 0 and TotalPages (%d), got %d", state.TotalPages, state.CurrentPage)
+			return fmt.Errorf("printing mode: CurrentPage must be between 0 and TotalPages (%d), got %d", state.TotalPages, state.CurrentPage)
 		}
 	case ModeCompleted:
 		// Valid
 	case ModeError:
 		// Valid
 	default:
-		return nil, fmt.Errorf("unsupported screen mode: %q", state.Mode)
+		return fmt.Errorf("unsupported screen mode: %q", state.Mode)
+	}
+	return nil
+}
+
+// RenderTo renders the screen state directly into an existing destination buffer.
+// This zero-alloc path enables 60 FPS transitions without triggering Go GC passes.
+func RenderTo(dst *image.RGBA, state ScreenState) error {
+	if dst == nil {
+		return fmt.Errorf("destination buffer cannot be nil")
+	}
+	if err := state.Validate(); err != nil {
+		return fmt.Errorf("invalid screen state: %w", err)
 	}
 
-	canvas := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	renderMu.Lock()
+	defer renderMu.Unlock()
 
-	// Fast-path: Idle mode uses pre-rendered static base for zero-alloc, sub-millisecond rendering
+	initUIAssets()
+
+	// Fast-path: Idle mode renders directly into dst (native or scaled)
 	if state.Mode == ModeIdle {
-		if err := renderIdle(canvas, state); err != nil {
-			return nil, err
-		}
-		return canvas, nil
+		return renderIdle(dst, state)
+	}
+
+	// For non-idle modes (Downloading, Printing, Completed, Error):
+	var fullCanvas *image.RGBA
+	if dst.Bounds().Dx() == ScreenWidth && dst.Bounds().Dy() == ScreenHeight {
+		fullCanvas = dst
+	} else {
+		fullCanvas = image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
 	}
 
 	// 1. Base clean Slate-50 background matching portal.css
-	fillRect(canvas, canvas.Bounds(), colorBgSlate)
+	fillRect(fullCanvas, fullCanvas.Bounds(), colorBgSlate)
 
 	// 2. Top white header bar (0 to 110)
-	fillRect(canvas, image.Rect(0, 0, ScreenWidth, 110), colorCardBg)
-	fillRect(canvas, image.Rect(0, 108, ScreenWidth, 110), colorBorder)
+	fillRect(fullCanvas, image.Rect(0, 0, ScreenWidth, 110), colorCardBg)
+	fillRect(fullCanvas, image.Rect(0, 108, ScreenWidth, 110), colorBorder)
 
 	// Embedded XeroxGo full logo
-	drawLogo(canvas, 80, 31, 48)
+	drawLogo(fullCanvas, 80, 31, 48)
 
 	// Subtitle beside brand logo
-	drawText(canvas, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
+	drawText(fullCanvas, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
 
 	// 3. Footer bar (1010 to 1080)
-	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
-	fillRect(canvas, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
+	fillRect(fullCanvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
+	fillRect(fullCanvas, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
 
 	// Clean footer: in user-edited designs, footer text is only shown during active printing
 	if state.Mode == ModePrinting {
@@ -138,26 +161,37 @@ func Render(state ScreenState) (*image.RGBA, error) {
 		if state.PrinterModel != "" {
 			modelStr = state.PrinterModel
 		}
-		drawText(canvas, faceReg18, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, colorTextSecondary)
+		drawText(fullCanvas, faceReg18, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, colorTextSecondary)
 	}
 
 	// 4. Mode-specific content
 	switch state.Mode {
-	case ModeIdle:
-		if err := renderIdle(canvas, state); err != nil {
-			return nil, err
-		}
 	case ModeDownloading:
-		renderDownloading(canvas, state)
+		renderDownloading(fullCanvas, state)
 	case ModePrinting:
-		renderPrinting(canvas, state)
+		renderPrinting(fullCanvas, state)
 	case ModeCompleted:
-		renderCompleted(canvas, state)
+		renderCompleted(fullCanvas, state)
 	case ModeError:
-		renderError(canvas, state)
+		renderError(fullCanvas, state)
 	}
 
-	return canvas, nil
+	if fullCanvas != dst {
+		xdraw.BiLinear.Scale(dst, dst.Bounds(), fullCanvas, fullCanvas.Bounds(), xdraw.Over, nil)
+	}
+
+	return nil
+}
+
+// Render renders a dashboard image for the given state.
+// Preserves full backward-compatibility for callers and unit tests.
+func Render(state ScreenState) (*image.RGBA, error) {
+	targetW, targetH := GetTargetResolution()
+	dst := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+	if err := RenderTo(dst, state); err != nil {
+		return nil, err
+	}
+	return dst, nil
 }
 
 func drawHeaderBadge(dst *image.RGBA, mode ScreenMode) {
@@ -202,47 +236,63 @@ func drawHeaderBadge(dst *image.RGBA, mode ScreenMode) {
 
 // AdSlide models a single promotional slide from the mobile frontend carousel.
 type AdSlide struct {
-	Title   string
-	Desc    string
-	Tag     string
-	Subline string
-	C0      color.RGBA
-	C1      color.RGBA
-	C2      color.RGBA
+	Title string
+	Desc  string
+	C0    color.RGBA
+	C1    color.RGBA
+	C2    color.RGBA
 }
 
-var adSlides = [3]AdSlide{
+var defaultAdItems = []contracts.AdItem{
 	{
-		Title:   "Quick & Easy",
-		Desc:    "Direct UPI payment. No coins, no cash needed.",
-		Tag:     "TOUCHLESS MOBILE PRINTING",
-		Subline: "Scan QR with any phone  •  Upload PDF  •  Instant UPI  •  Collect print",
-		C0:      color.RGBA{R: 30, G: 58, B: 138, A: 255}, // #1E3A8A (0%)
-		C1:      color.RGBA{R: 37, G: 99, B: 235, A: 255}, // #2563EB (50%)
-		C2:      color.RGBA{R: 79, G: 70, B: 229, A: 255}, // #4F46E5 (100%)
+		ID:          "default-1",
+		Title:       "Quick & Easy",
+		Description: "Direct UPI payment. No coins, no cash needed.",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#1E3A8A",
+		GradientC1:  "#2563EB",
+		GradientC2:  "#4F46E5",
+		SortOrder:   1,
+		IsActive:    true,
 	},
 	{
-		Title:   "High Quality Prints",
-		Desc:    "Crisp laser documents ready in seconds.",
-		Tag:     "CAMPUS PRINT PORTAL",
-		Subline: "Single & Double-Sided (Duplex)  •  Full Color & Monochrome  •  600 DPI",
-		C0:      color.RGBA{R: 6, G: 95, B: 70, A: 255},    // #065F46 (0%)
-		C1:      color.RGBA{R: 16, G: 185, B: 129, A: 255}, // #10B981 (50%)
-		C2:      color.RGBA{R: 5, G: 150, B: 105, A: 255},  // #059669 (100%)
+		ID:          "default-2",
+		Title:       "High Quality Prints",
+		Description: "Crisp laser documents ready in seconds.",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#065F46",
+		GradientC1:  "#10B981",
+		GradientC2:  "#059669",
+		SortOrder:   2,
+		IsActive:    true,
 	},
 	{
-		Title:   "Skip The Queue",
-		Desc:    "Pick up your print job with your 4-digit code.",
-		Tag:     "EXPRESS CAMPUS PICKUP",
-		Subline: "Upload from anywhere on campus  •  Release with your PIN in seconds",
-		C0:      color.RGBA{R: 88, G: 28, B: 135, A: 255},  // #581C87 (0%)
-		C1:      color.RGBA{R: 124, G: 58, B: 237, A: 255}, // #7C3AED (50%)
-		C2:      color.RGBA{R: 217, G: 119, B: 6, A: 255},  // #D97706 (100%)
+		ID:          "default-3",
+		Title:       "Skip The Queue",
+		Description: "Pick up your print job with your 4-digit code.",
+		Type:        contracts.AdTypeGradient,
+		GradientC0:  "#581C87",
+		GradientC1:  "#7C3AED",
+		GradientC2:  "#D97706",
+		SortOrder:   3,
+		IsActive:    true,
 	},
 }
 
 var (
-	adSlideImgs [3]*image.RGBA
+	targetGeomMu sync.RWMutex
+	targetGeom   = FramebufferGeometry{
+		Width:        ScreenWidth,
+		Height:       ScreenHeight,
+		BitsPerPixel: 32,
+		Stride:       ScreenWidth * 4,
+	}
+
+	adSlidesMu           sync.RWMutex
+	adSlideImgs          []*image.RGBA
+	scaledAdSlideImgs    []*image.RGBA
+	cachedScaledIdleBase *image.RGBA
+	cachedScaledIdleQR   string
 
 	cachedQRContent string
 	cachedQRImg     image.Image
@@ -253,38 +303,206 @@ var (
 	idleBaseMu     sync.Mutex
 )
 
-// initAdSlides pre-renders the 3 promotional slides into memory buffers once at startup.
-// Pre-rendering guarantees 0 ms gradient and font calculation during 30 FPS carousel transitions.
+// GetTargetResolution returns the currently configured display width and height.
+func GetTargetResolution() (int, int) {
+	targetGeomMu.RLock()
+	defer targetGeomMu.RUnlock()
+	return targetGeom.Width, targetGeom.Height
+}
+
+// ConfigureTarget configures the target display resolution and pre-scales static
+// bases and ad slides once at startup, guaranteeing 0 ms downscaling and 0 heap
+// allocations during 60 FPS carousel animation loops on Raspberry Pi hardware.
+func ConfigureTarget(geom FramebufferGeometry) {
+	targetGeomMu.Lock()
+	defer targetGeomMu.Unlock()
+
+	if geom.Width <= 0 {
+		geom.Width = ScreenWidth
+	}
+	if geom.Height <= 0 {
+		geom.Height = ScreenHeight
+	}
+	if geom.BitsPerPixel <= 0 {
+		geom.BitsPerPixel = 32
+	}
+	if geom.Stride <= 0 {
+		geom.Stride = geom.Width * (geom.BitsPerPixel / 8)
+	}
+
+	targetGeom = geom
+
+	idleBaseMu.Lock()
+	cachedScaledIdleBase = nil
+	cachedScaledIdleQR = ""
+	idleBaseMu.Unlock()
+
+	adSlidesMu.Lock()
+	scaledAdSlideImgs = nil
+	adSlidesMu.Unlock()
+
+	if geom.Width != ScreenWidth || geom.Height != ScreenHeight {
+		initScaledAdSlides(geom.Width, geom.Height)
+	}
+}
+
+// initScaledAdSlides pre-scales all promotional slides into memory buffers once for the target resolution.
+func initScaledAdSlides(targetW, targetH int) {
+	sx := float64(targetW) / float64(ScreenWidth)
+	sy := float64(targetH) / float64(ScreenHeight)
+
+	cardW := int(float64(1203)*sx + 0.5)
+	cardH := int(float64(840)*sy + 0.5)
+	if cardW < 1 {
+		cardW = 1
+	}
+	if cardH < 1 {
+		cardH = 1
+	}
+
+	adSlidesMu.Lock()
+	defer adSlidesMu.Unlock()
+
+	scaled := make([]*image.RGBA, len(adSlideImgs))
+	for k := range adSlideImgs {
+		img := image.NewRGBA(image.Rect(0, 0, cardW, cardH))
+		xdraw.BiLinear.Scale(img, img.Bounds(), adSlideImgs[k], adSlideImgs[k].Bounds(), xdraw.Over, nil)
+		scaled[k] = img
+	}
+	scaledAdSlideImgs = scaled
+}
+
+// GetAdSlideCount returns the number of active promotional ad slides.
+func GetAdSlideCount() int {
+	initUIAssets()
+	adSlidesMu.RLock()
+	defer adSlidesMu.RUnlock()
+	if len(adSlideImgs) == 0 {
+		return 3
+	}
+	return len(adSlideImgs)
+}
+
+// GetAdSlideImage returns the pre-rendered promotional ad card image for previewing or inspection.
+func GetAdSlideImage(idx int) *image.RGBA {
+	initUIAssets()
+	adSlidesMu.RLock()
+	defer adSlidesMu.RUnlock()
+	if len(adSlideImgs) == 0 || idx < 0 || idx >= len(adSlideImgs) {
+		return nil
+	}
+	return adSlideImgs[idx]
+}
+
+// ConfigureAds updates the promotional ad slides dynamically in real-time.
+// Pre-renders 1203x840 memory buffers for each active ad slide, ensuring zero
+// CPU or memory allocation overhead during 60 FPS idle animation loops.
+func ConfigureAds(items []contracts.AdItem) {
+	initUIAssets()
+	configureAdsInternal(items)
+}
+
+func configureAdsInternal(items []contracts.AdItem) {
+	var active []contracts.AdItem
+	for _, it := range items {
+		if it.IsActive {
+			active = append(active, it)
+		}
+	}
+	if len(active) == 0 {
+		active = defaultAdItems
+	}
+
+	newImgs := make([]*image.RGBA, len(active))
+	for i, it := range active {
+		newImgs[i] = renderSingleAdSlide(it)
+	}
+
+	targetGeomMu.RLock()
+	geom := targetGeom
+	targetGeomMu.RUnlock()
+
+	var newScaled []*image.RGBA
+	if geom.Width != ScreenWidth || geom.Height != ScreenHeight {
+		sx := float64(geom.Width) / float64(ScreenWidth)
+		sy := float64(geom.Height) / float64(ScreenHeight)
+		cardW := int(float64(1203)*sx + 0.5)
+		cardH := int(float64(840)*sy + 0.5)
+		if cardW < 1 {
+			cardW = 1
+		}
+		if cardH < 1 {
+			cardH = 1
+		}
+		newScaled = make([]*image.RGBA, len(newImgs))
+		for k := range newImgs {
+			scaled := image.NewRGBA(image.Rect(0, 0, cardW, cardH))
+			xdraw.BiLinear.Scale(scaled, scaled.Bounds(), newImgs[k], newImgs[k].Bounds(), xdraw.Over, nil)
+			newScaled[k] = scaled
+		}
+	}
+
+	adSlidesMu.Lock()
+	adSlideImgs = newImgs
+	scaledAdSlideImgs = newScaled
+	adSlidesMu.Unlock()
+}
+
+func renderSingleAdSlide(ad contracts.AdItem) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, 1203, 840))
+
+	if ad.Type == contracts.AdTypeImage && ad.ImageURL != "" {
+		if strings.HasPrefix(ad.ImageURL, "http://") || strings.HasPrefix(ad.ImageURL, "https://") {
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Get(ad.ImageURL)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				decoded, _, err := image.Decode(resp.Body)
+				_ = resp.Body.Close()
+				if err == nil {
+					xdraw.BiLinear.Scale(img, img.Bounds(), decoded, decoded.Bounds(), xdraw.Over, nil)
+					return img
+				}
+			}
+		}
+	}
+
+	// Dynamic 135-degree 3-stop Hermite gradient matching mobile portal
+	c0 := parseHexColorDefault(ad.GradientC0, color.RGBA{R: 30, G: 58, B: 138, A: 255})
+	c1 := parseHexColorDefault(ad.GradientC1, color.RGBA{R: 37, G: 99, B: 235, A: 255})
+	c2 := parseHexColorDefault(ad.GradientC2, color.RGBA{R: 79, G: 70, B: 229, A: 255})
+	fillLinearGradient135(img, img.Bounds(), c0, c1, c2)
+
+	startX := 80
+	if ad.Title != "" {
+		drawText(img, faceBold56, ad.Title, startX, 310, colorTextWhite)
+	}
+	if ad.Description != "" {
+		drawText(img, faceReg28, ad.Description, startX, 396, color.RGBA{R: 226, G: 232, B: 240, A: 255})
+	}
+	return img
+}
+
+func parseHexColorDefault(hexStr string, def color.RGBA) color.RGBA {
+	s := strings.TrimPrefix(hexStr, "#")
+	if len(s) != 6 {
+		return def
+	}
+	rgb, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return def
+	}
+	return color.RGBA{
+		R: uint8(rgb >> 16),
+		G: uint8(rgb >> 8),
+		B: uint8(rgb),
+		A: 255,
+	}
+}
+
+// initAdSlides pre-renders promotional slides into memory buffers once at startup.
 func initAdSlides() {
-	for k := 0; k < 3; k++ {
-		slide := adSlides[k]
-		img := image.NewRGBA(image.Rect(0, 0, 1203, 840))
-
-		// 1. Authentic 135-degree 3-stop CSS linear gradient matching mobile frontend
-		fillLinearGradient135(img, img.Bounds(), slide.C0, slide.C1, slide.C2)
-
-		// 2. Tag Pill (no close button)
-		tagW := measureTextWidth(faceBold18, slide.Tag)
-		tagRect := image.Rect(63, 70, 63+tagW+40, 116)
-		fillRoundedRect(img, tagRect, 10, color.RGBA{R: 255, G: 255, B: 255, A: 45})
-		strokeRoundedRect(img, tagRect, 10, 1, color.RGBA{R: 255, G: 255, B: 255, A: 85})
-		drawText(img, faceBold18, slide.Tag, tagRect.Min.X+20, tagRect.Min.Y+7, colorTextWhite)
-
-		// 3. Main Hero Slide Title & Description with clean spacing matching mobile
-		drawText(img, faceBold56, slide.Title, 63, 200, colorTextWhite)
-		drawText(img, faceReg28, slide.Desc, 63, 290, color.RGBA{R: 241, G: 245, B: 249, A: 245})
-
-		// 4. Elegant frosted feature pill (compact and clean, allowing gradient to shine)
-		sublineW := measureTextWidth(faceReg22, slide.Subline)
-		featureRect := image.Rect(63, 380, 63+sublineW+44, 436)
-		fillRoundedRect(img, featureRect, 14, color.RGBA{R: 255, G: 255, B: 255, A: 35})
-		strokeRoundedRect(img, featureRect, 14, 1, color.RGBA{R: 255, G: 255, B: 255, A: 75})
-		drawText(img, faceReg22, slide.Subline, 85, 397, color.RGBA{R: 255, G: 255, B: 255, A: 245})
-
-		// 5. Prompt subtext
-		drawText(img, faceReg20, "Scan the QR code on the right with your phone camera to begin printing", 63, 560, color.RGBA{R: 226, G: 232, B: 240, A: 225})
-
-		adSlideImgs[k] = img
+	if len(adSlideImgs) == 0 {
+		configureAdsInternal(defaultAdItems)
 	}
 }
 
@@ -332,9 +550,6 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	// Subtitle beside brand logo
 	drawText(base, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
 
-	// Status badge in header
-	drawHeaderBadge(base, ModeIdle)
-
 	// 3. Footer bar (1010 to 1080)
 	fillRect(base, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
 	fillRect(base, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
@@ -358,12 +573,22 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	qrBounds := image.Rect(1380, 210, 1780, 610)
 	draw.Draw(base, qrBounds, qrImg, image.Point{}, draw.Src)
 
-	// Action pill under QR
+	// Action pill under QR with website link
 	pillRect := image.Rect(1350, 597, 1808, 657)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
-	pillText := "Instant Web App • No Install Needed"
-	pillW := measureTextWidth(faceBold20, pillText)
-	drawText(base, faceBold20, pillText, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 617, colorPrimaryBlue)
+	displayLink := "xeroxgo.vercel.app"
+	if strings.TrimSpace(qrContent) != "" {
+		cleaned := strings.TrimSpace(qrContent)
+		if strings.HasPrefix(cleaned, "http://") || strings.HasPrefix(cleaned, "https://") {
+			if u, err := url.Parse(cleaned); err == nil && u.Host != "" {
+				displayLink = u.Host
+			}
+		} else if strings.Contains(cleaned, ".") && !strings.Contains(cleaned, " ") {
+			displayLink = cleaned
+		}
+	}
+	pillW := measureTextWidth(faceBold24, displayLink)
+	drawText(base, faceBold24, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 615, colorPrimaryBlue)
 
 	// 4 Numbered Steps
 	steps := []struct {
@@ -401,16 +626,63 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		return err
 	}
 
-	// 1. Instant memory copy of pre-rendered static base (~0.25 ms)
-	copy(dst.Pix, base.Pix)
+	adSlidesMu.RLock()
+	defer adSlidesMu.RUnlock()
 
-	// 2. Left Card: Ad Card (occupies full [37, 140, 1240, 980] bounds, rx=24)
-	adCard := image.Rect(37, 140, 1240, 980)
-	cardW := adCard.Dx()
-	cardH := adCard.Dy()
+	numSlides := len(adSlideImgs)
+	if numSlides == 0 {
+		return nil
+	}
 
-	toIdx := (state.AdSlideIndex%3 + 3) % 3
-	isTransition := state.TransitionFrom >= 0 &&
+	targetW, targetH := dst.Bounds().Dx(), dst.Bounds().Dy()
+	isNative1080p := (targetW == ScreenWidth && targetH == ScreenHeight)
+
+	var (
+		cardW, cardH int
+		adCard       image.Rectangle
+		srcSlides    []*image.RGBA
+		sx, sy       float64
+	)
+
+	if isNative1080p {
+		copy(dst.Pix, base.Pix)
+		adCard = image.Rect(37, 140, 1240, 980)
+		cardW = adCard.Dx()
+		cardH = adCard.Dy()
+		srcSlides = adSlideImgs
+		sx = 1.0
+		sy = 1.0
+	} else {
+		idleBaseMu.Lock()
+		if cachedScaledIdleBase == nil || cachedScaledIdleQR != state.QRContent || cachedScaledIdleBase.Bounds().Dx() != targetW || cachedScaledIdleBase.Bounds().Dy() != targetH {
+			scaled := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+			xdraw.BiLinear.Scale(scaled, scaled.Bounds(), base, base.Bounds(), xdraw.Over, nil)
+			cachedScaledIdleBase = scaled
+			cachedScaledIdleQR = state.QRContent
+		}
+		copy(dst.Pix, cachedScaledIdleBase.Pix)
+		idleBaseMu.Unlock()
+
+		sx = float64(targetW) / float64(ScreenWidth)
+		sy = float64(targetH) / float64(ScreenHeight)
+
+		cardMinX := int(37.0*sx + 0.5)
+		cardMinY := int(140.0*sy + 0.5)
+		cardMaxX := int(1240.0*sx + 0.5)
+		cardMaxY := int(980.0*sy + 0.5)
+		adCard = image.Rect(cardMinX, cardMinY, cardMaxX, cardMaxY)
+		cardW = adCard.Dx()
+		cardH = adCard.Dy()
+
+		srcSlides = scaledAdSlideImgs
+		if len(srcSlides) != numSlides || srcSlides[0] == nil || srcSlides[0].Bounds().Dx() != cardW || srcSlides[0].Bounds().Dy() != cardH {
+			srcSlides = adSlideImgs
+		}
+	}
+
+	toIdx := (state.AdSlideIndex%numSlides + numSlides) % numSlides
+	isTransition := (numSlides > 1) &&
+		state.TransitionFrom >= 0 &&
 		state.TransitionFrom != state.AdSlideIndex &&
 		state.TransitionProg > 0.0 &&
 		state.TransitionProg < 1.0
@@ -420,7 +692,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	var easeProg float64
 
 	if isTransition {
-		fromIdx = (state.TransitionFrom%3 + 3) % 3
+		fromIdx = (state.TransitionFrom%numSlides + numSlides) % numSlides
 		p := state.TransitionProg
 		if p < 0.0 {
 			p = 0.0
@@ -449,50 +721,70 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		dstY := adCard.Min.Y + y
 		dstRowStart := dstY*dst.Stride + adCard.Min.X*4
 		dstRow := dst.Pix[dstRowStart : dstRowStart+cardW*4]
-		srcYStride := y * adSlideImgs[0].Stride
+		srcYStride := y * srcSlides[0].Stride
 
 		if wFrom > 0 {
-			srcFrom := adSlideImgs[fromIdx].Pix[srcYStride+offset*4 : srcYStride+cardW*4]
+			srcFrom := srcSlides[fromIdx].Pix[srcYStride+offset*4 : srcYStride+cardW*4]
 			copy(dstRow[0:wFrom*4], srcFrom)
 		}
 		if wTo > 0 {
-			srcTo := adSlideImgs[toIdx].Pix[srcYStride : srcYStride+offset*4]
+			srcTo := srcSlides[toIdx].Pix[srcYStride : srcYStride+offset*4]
 			copy(dstRow[wFrom*4:cardW*4], srcTo)
 		}
 	}
 
 	// Anti-aliased corner masking with rx=24 against slate background
-	maskCardCorners(dst, adCard, 24, colorBgSlate)
+	scaledRx := int(24.0*sx + 0.5)
+	if scaledRx < 4 {
+		scaledRx = 4
+	}
+	maskCardCorners(dst, adCard, scaledRx, colorBgSlate)
 
 	// Bottom Carousel Indicators matching mobile frontend (.banner-indicators)
-	// Stationary centered at x=638, morphing widths and cross-fading alphas during transition
-	curX := 592
-	for k := 0; k < 3; k++ {
-		var w int
-		var alpha uint8
-		if isTransition {
-			if k == fromIdx {
-				w = int(44.0 - 34.0*easeProg + 0.5)
-				alpha = uint8(255.0 - 140.0*easeProg + 0.5)
-			} else if k == toIdx {
-				w = int(10.0 + 34.0*easeProg + 0.5)
-				alpha = uint8(115.0 + 140.0*easeProg + 0.5)
-			} else {
-				w = 10
-				alpha = 115
-			}
-		} else {
-			if k == toIdx {
-				w = 44
-				alpha = 255
-			} else {
-				w = 10
-				alpha = 115
-			}
+	if numSlides > 1 {
+		totalWidth := float64((numSlides-1)*10 + 44 + (numSlides-1)*14)
+		startX := 638.0 - totalWidth/2.0
+		curX := int(startX*sx + 0.5)
+		indY := int(885.0*sy + 0.5)
+		indH := int(10.0*sy + 0.5)
+		if indH < 4 {
+			indH = 4
 		}
-		pill := image.Rect(curX, 885, curX+w, 895)
-		fillRoundedRect(dst, pill, 5, color.RGBA{R: 255, G: 255, B: 255, A: alpha})
-		curX += w + 14
+		dotR := indH / 2
+		if dotR < 2 {
+			dotR = 2
+		}
+
+		for k := 0; k < numSlides; k++ {
+			var w int
+			var alpha uint8
+			if isTransition {
+				if k == fromIdx {
+					w = int((44.0-34.0*easeProg)*sx + 0.5)
+					alpha = uint8(255.0 - 140.0*easeProg + 0.5)
+				} else if k == toIdx {
+					w = int((10.0+34.0*easeProg)*sx + 0.5)
+					alpha = uint8(115.0 + 140.0*easeProg + 0.5)
+				} else {
+					w = int(10.0*sx + 0.5)
+					alpha = 115
+				}
+			} else {
+				if k == toIdx {
+					w = int(44.0*sx + 0.5)
+					alpha = 255
+				} else {
+					w = int(10.0*sx + 0.5)
+					alpha = 115
+				}
+			}
+			if w < indH {
+				w = indH
+			}
+			pill := image.Rect(curX, indY, curX+w, indY+indH)
+			fillRoundedRect(dst, pill, dotR, color.RGBA{R: 255, G: 255, B: 255, A: alpha})
+			curX += w + int(14.0*sx+0.5)
+		}
 	}
 
 	return nil
@@ -841,8 +1133,11 @@ func FramebufferSink(fbPath string) Sink {
 // FramebufferSinkWithGeometry writes canvas pixels to /dev/fb0, scaling and encoding as required.
 func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 	var (
-		convMu  sync.Mutex
-		convBuf []byte
+		convMu     sync.Mutex
+		convBuf    []byte
+		cachedFile *os.File
+		cachedMmap []byte
+		scaledImg  *image.RGBA
 	)
 
 	return func(img *image.RGBA) error {
@@ -853,11 +1148,24 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 			return fmt.Errorf("image cannot be nil")
 		}
 
-		f, err := os.OpenFile(fbPath, os.O_RDWR, 0)
-		if err != nil {
-			return fmt.Errorf("failed to open framebuffer %s: %w", fbPath, err)
+		convMu.Lock()
+		defer convMu.Unlock()
+
+		if cachedFile == nil {
+			f, err := os.OpenFile(fbPath, os.O_RDWR, 0)
+			if err != nil {
+				return fmt.Errorf("failed to open framebuffer %s: %w", fbPath, err)
+			}
+			cachedFile = f
+
+			totalBytes := geom.Stride * geom.Height
+			info, sErr := cachedFile.Stat()
+			if sErr == nil && (info.Mode()&os.ModeDevice != 0) && totalBytes > 0 {
+				if m, mErr := syscall.Mmap(int(cachedFile.Fd()), 0, totalBytes, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED); mErr == nil {
+					cachedMmap = m
+				}
+			}
 		}
-		defer f.Close()
 
 		canvasBounds := img.Bounds()
 		canvasW := canvasBounds.Dx()
@@ -867,15 +1175,15 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 		if geom.Width == canvasW && geom.Height == canvasH {
 			targetImg = img
 		} else {
-			targetImg = image.NewRGBA(image.Rect(0, 0, geom.Width, geom.Height))
-			xdraw.BiLinear.Scale(targetImg, targetImg.Bounds(), img, canvasBounds, xdraw.Over, nil)
+			if scaledImg == nil || scaledImg.Bounds().Dx() != geom.Width || scaledImg.Bounds().Dy() != geom.Height {
+				scaledImg = image.NewRGBA(image.Rect(0, 0, geom.Width, geom.Height))
+			}
+			xdraw.BiLinear.Scale(scaledImg, scaledImg.Bounds(), img, canvasBounds, xdraw.Over, nil)
+			targetImg = scaledImg
 		}
 
 		targetW := geom.Width
 		targetH := geom.Height
-
-		convMu.Lock()
-		defer convMu.Unlock()
 
 		totalBytes := geom.Stride * targetH
 		if len(convBuf) < totalBytes {
@@ -885,24 +1193,51 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 
 		switch geom.BitsPerPixel {
 		case 16:
+			// 4x4 Bayer matrix ordered dithering for smooth 16-bit RGB565 conversion
+			bayer4 := [4][4]int{
+				{0, 8, 2, 10},
+				{12, 4, 14, 6},
+				{3, 11, 1, 9},
+				{15, 7, 13, 5},
+			}
 			for y := 0; y < targetH; y++ {
 				rowOffset := y * geom.Stride
 				srcRowOffset := y * targetImg.Stride
+				bRow := bayer4[y&3]
 				for x := 0; x < targetW; x++ {
 					p := srcRowOffset + x*4
-					r := uint16(targetImg.Pix[p+0]) >> 3
-					g := uint16(targetImg.Pix[p+1]) >> 2
-					b := uint16(targetImg.Pix[p+2]) >> 3
-					rgb565 := (r << 11) | (g << 5) | b
+					d := bRow[x&3]
+
+					// Red (5 bits, step = 8, dither range [-3, +4])
+					rVal := int(targetImg.Pix[p+0]) + (d >> 1) - 3
+					if rVal < 0 {
+						rVal = 0
+					} else if rVal > 255 {
+						rVal = 255
+					}
+
+					// Green (6 bits, step = 4, dither range [-1, +2])
+					gVal := int(targetImg.Pix[p+1]) + (d >> 2) - 1
+					if gVal < 0 {
+						gVal = 0
+					} else if gVal > 255 {
+						gVal = 255
+					}
+
+					// Blue (5 bits, step = 8, dither range [-3, +4])
+					bVal := int(targetImg.Pix[p+2]) + (d >> 1) - 3
+					if bVal < 0 {
+						bVal = 0
+					} else if bVal > 255 {
+						bVal = 255
+					}
+
+					rgb565 := (uint16(rVal>>3) << 11) | (uint16(gVal>>2) << 5) | uint16(bVal>>3)
 					destIdx := rowOffset + x*2
 					buf[destIdx+0] = byte(rgb565 & 0xFF)
 					buf[destIdx+1] = byte((rgb565 >> 8) & 0xFF)
 				}
 			}
-			if _, err := f.WriteAt(buf, 0); err != nil {
-				return fmt.Errorf("write 16-bit framebuffer: %w", err)
-			}
-			return nil
 
 		default:
 			// Ultra-fast streaming 1D conversion if strides match width * 4
@@ -928,10 +1263,22 @@ func FramebufferSinkWithGeometry(fbPath string, geom FramebufferGeometry) Sink {
 					}
 				}
 			}
-			if _, err := f.WriteAt(buf, 0); err != nil {
-				return fmt.Errorf("write 32-bit framebuffer: %w", err)
-			}
+		}
+
+		if cachedMmap != nil && len(cachedMmap) >= totalBytes {
+			// Synchronize with hardware VBLANK on Linux framebuffer to eliminate shearing/tearing
+			var crtc uint32 = 0
+			_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, cachedFile.Fd(), 0x40044620, uintptr(unsafe.Pointer(&crtc)))
+			copy(cachedMmap[:totalBytes], buf)
 			return nil
 		}
+
+		if _, err := cachedFile.WriteAt(buf, 0); err != nil {
+			_ = cachedFile.Close()
+			cachedFile = nil
+			cachedMmap = nil
+			return fmt.Errorf("write framebuffer: %w", err)
+		}
+		return nil
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"xeroxgo/pkg/contracts"
 )
 
 // Test A — TestRenderAllModes
@@ -647,3 +649,106 @@ func TestRenderAdSlideTransition(t *testing.T) {
 		t.Fatalf("transition outer corner (37, 140) not masked with colorBgSlate: got %v, want %v", cornerSample, colorBgSlate)
 	}
 }
+
+func TestConfigureTarget720p(t *testing.T) {
+	// Configure 1280x720 target
+	ConfigureTarget(FramebufferGeometry{
+		Width:        1280,
+		Height:       720,
+		BitsPerPixel: 32,
+		Stride:       1280 * 4,
+	})
+	defer ConfigureTarget(FramebufferGeometry{
+		Width:        ScreenWidth,
+		Height:       ScreenHeight,
+		BitsPerPixel: 32,
+		Stride:       ScreenWidth * 4,
+	})
+
+	tw, th := GetTargetResolution()
+	if tw != 1280 || th != 720 {
+		t.Fatalf("unexpected target resolution: got %dx%d, want 1280x720", tw, th)
+	}
+
+	img, err := Render(ScreenState{
+		Mode:           ModeIdle,
+		QRContent:      "https://kiosk.test/720p",
+		AdSlideIndex:   1,
+		TransitionFrom: 0,
+		TransitionProg: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("Render 720p failed: %v", err)
+	}
+
+	expectedBounds := image.Rect(0, 0, 1280, 720)
+	if img.Bounds() != expectedBounds {
+		t.Fatalf("unexpected image bounds for 720p: got %v, want %v", img.Bounds(), expectedBounds)
+	}
+
+	// Verify that the left card contains Slide 0 Blue gradient and right side contains Slide 1 Green gradient
+	// Scaled card: x ~ 25 to 827, y ~ 93 to 653
+	leftSample := img.RGBAAt(200, 150)
+	if leftSample.B < 180 || leftSample.R > 70 {
+		t.Fatalf("expected left side of 720p transition card to be Slide 0 Blue, got %v", leftSample)
+	}
+	rightSample := img.RGBAAt(650, 150)
+	if rightSample.G < 110 || rightSample.B > 110 {
+		t.Fatalf("expected right side of 720p transition card to be Slide 1 Green, got %v", rightSample)
+	}
+}
+
+func TestConfigureAdsDynamic(t *testing.T) {
+	defer ConfigureAds(nil)
+
+	customAds := []contracts.AdItem{
+		{
+			ID:          "custom-1",
+			Title:       "Special Promo",
+			Description: "50% off campus printing this week only.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#7C2D12",
+			GradientC1:  "#EA580C",
+			GradientC2:  "#F59E0B",
+			SortOrder:   1,
+			IsActive:    true,
+		},
+		{
+			ID:          "custom-2",
+			Title:       "Night Owl Hours",
+			Description: "Kiosks open 24/7 in library common area.",
+			Type:        contracts.AdTypeGradient,
+			GradientC0:  "#0F172A",
+			GradientC1:  "#334155",
+			GradientC2:  "#1E293B",
+			SortOrder:   2,
+			IsActive:    true,
+		},
+	}
+
+	ConfigureAds(customAds)
+
+	count := GetAdSlideCount()
+	if count != 2 {
+		t.Fatalf("expected slide count 2, got %d", count)
+	}
+
+	img0 := GetAdSlideImage(0)
+	if img0 == nil {
+		t.Fatal("expected non-nil image for slide 0")
+	}
+
+	img, err := Render(ScreenState{
+		Mode:           ModeIdle,
+		QRContent:      "https://kiosk.test/custom",
+		AdSlideIndex:   0,
+		TransitionFrom: -1,
+	})
+	if err != nil {
+		t.Fatalf("Render failed with custom ads: %v", err)
+	}
+	if img == nil {
+		t.Fatal("expected non-nil render output")
+	}
+}
+

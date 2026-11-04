@@ -219,10 +219,11 @@
 
   // --- Promo Banner Carousel ---
   let currentSlide = 0;
-  const totalSlides = 3;
+  let totalSlides = 3;
   let bannerTimer = null;
 
   function setSlide(index) {
+    if (totalSlides <= 0) return;
     currentSlide = (index + totalSlides) % totalSlides;
     if (bannerTrack) {
       bannerTrack.style.transform = `translateX(-${currentSlide * 100}%)`;
@@ -237,18 +238,22 @@
 
   function startBannerAutoSlide() {
     if (bannerTimer) clearInterval(bannerTimer);
-    bannerTimer = setInterval(() => {
-      setSlide(currentSlide + 1);
-    }, 5000);
+    if (totalSlides > 1) {
+      bannerTimer = setInterval(() => {
+        setSlide(currentSlide + 1);
+      }, 5000);
+    }
   }
 
-  if (bannerDots) {
-    bannerDots.querySelectorAll('.indicator').forEach((dot, idx) => {
-      dot.addEventListener('click', () => {
-        setSlide(idx);
-        startBannerAutoSlide();
+  function bindBannerDots() {
+    if (bannerDots) {
+      bannerDots.querySelectorAll('.indicator').forEach((dot, idx) => {
+        dot.addEventListener('click', () => {
+          setSlide(idx);
+          startBannerAutoSlide();
+        });
       });
-    });
+    }
   }
 
   if (bannerCloseBtn && bannerContainer) {
@@ -258,7 +263,71 @@
     });
   }
 
+  bindBannerDots();
   startBannerAutoSlide();
+
+  // Dynamic Ad Fetching & Synchronization
+  async function loadDynamicAds() {
+    try {
+      const res = await fetch('/api/ads');
+      if (!res.ok) return;
+      const ads = await res.json();
+      if (!Array.isArray(ads) || ads.length === 0) return;
+
+      if (!bannerTrack || !bannerDots) return;
+
+      // Render dynamic slides
+      bannerTrack.innerHTML = '';
+      bannerDots.innerHTML = '';
+
+      ads.forEach((ad, idx) => {
+        const slide = document.createElement('div');
+        slide.className = 'banner-slide';
+        if (ad.type === 'image' && ad.image_url) {
+          slide.style.background = `url('${ad.image_url}') center/cover no-repeat`;
+        } else {
+          const c0 = ad.gradient_c0 || '#1E3A8A';
+          const c1 = ad.gradient_c1 || '#2563EB';
+          const c2 = ad.gradient_c2 || '#4F46E5';
+          slide.style.background = `linear-gradient(135deg, ${c0} 0%, ${c1} 50%, ${c2} 100%)`;
+        }
+
+        if (ad.link_url) {
+          slide.style.cursor = 'pointer';
+          slide.title = `Open ${ad.link_url}`;
+          slide.addEventListener('click', () => {
+            window.open(ad.link_url, '_blank', 'noopener,noreferrer');
+          });
+        }
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'banner-title';
+        titleEl.textContent = ad.title || '';
+
+        const descEl = document.createElement('div');
+        descEl.className = 'banner-desc';
+        descEl.textContent = ad.description || '';
+
+        slide.appendChild(titleEl);
+        slide.appendChild(descEl);
+        bannerTrack.appendChild(slide);
+
+        const dot = document.createElement('div');
+        dot.className = `indicator ${idx === 0 ? 'active' : ''}`;
+        bannerDots.appendChild(dot);
+      });
+
+      totalSlides = ads.length;
+      currentSlide = 0;
+      setSlide(0);
+      bindBannerDots();
+      startBannerAutoSlide();
+    } catch (_) {
+      // Graceful fallback to static HTML slides
+    }
+  }
+
+  loadDynamicAds();
 
   // --- PWA Installation Banner & Guide ---
   window.addEventListener('beforeinstallprompt', (e) => {

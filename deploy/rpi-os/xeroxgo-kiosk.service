@@ -39,7 +39,7 @@ ExecStart=/home/xg1/xeroxgo-kiosk \
   --state-db=/var/kiosk/state.db \
   --download-dir=/var/kiosk/jobs \
   --framebuffer=/dev/fb0 \
-  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT:-https://frontend-chi-nine-50.vercel.app/k/kiosk-demo}
+  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT:-https://xeroxgo.vercel.app}
 
 # Security hardening and device access
 NoNewPrivileges=true

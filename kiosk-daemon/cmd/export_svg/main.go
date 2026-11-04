@@ -28,7 +28,7 @@ func main() {
 	logoB64 := base64.StdEncoding.EncodeToString(logoBytes)
 
 	// Generate QR code SVG or data uri
-	qrPng, _ := qrcode.Encode("https://frontend-chi-nine-50.vercel.app/k/kiosk-demo", qrcode.Medium, 400)
+	qrPng, _ := qrcode.Encode("https://xeroxgo.vercel.app", qrcode.Medium, 400)
 	qrB64 := base64.StdEncoding.EncodeToString(qrPng)
 
 	screens := []struct {
@@ -171,7 +171,7 @@ func buildIdleSVG(logoB64, qrB64 string) string {
 
       <!-- Action Pill -->
       <rect x="1250" y="745" width="500" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-      <text x="1500" y="782" fill="#2563EB" font-size="20" font-weight="700" text-anchor="middle">Instant Web App • No Install Needed</text>
+      <text x="1500" y="782" fill="#2563EB" font-size="20" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
 
       <text x="1500" y="865" fill="#64748B" font-size="16" font-weight="500" text-anchor="middle">End-to-End Encrypted Session • Files Deleted Immediately</text>
     </g>

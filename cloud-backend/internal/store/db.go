@@ -115,6 +115,36 @@ CREATE TABLE IF NOT EXISTS job_progress (
     error_reason TEXT NOT NULL DEFAULT '',
     timestamp_ns BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ads (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    ad_type TEXT NOT NULL DEFAULT 'gradient',
+    image_url TEXT NOT NULL DEFAULT '',
+    gradient_c0 TEXT NOT NULL DEFAULT '#1E3A8A',
+    gradient_c1 TEXT NOT NULL DEFAULT '#2563EB',
+    gradient_c2 TEXT NOT NULL DEFAULT '#4F46E5',
+    link_url TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL REFERENCES admin_users(username) ON DELETE CASCADE,
+    expires_at_ns BIGINT NOT NULL,
+    created_at_ns BIGINT NOT NULL
+);
 `
 		if _, err := db.Exec(schema); err != nil {
 			_ = db.Close()
@@ -221,6 +251,36 @@ CREATE TABLE IF NOT EXISTS job_progress (
     sheets_printed INTEGER NOT NULL CHECK (sheets_printed >= 0),
     error_reason TEXT NOT NULL DEFAULT '',
     timestamp_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ads (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    ad_type TEXT NOT NULL DEFAULT 'gradient',
+    image_url TEXT NOT NULL DEFAULT '',
+    gradient_c0 TEXT NOT NULL DEFAULT '#1E3A8A',
+    gradient_c1 TEXT NOT NULL DEFAULT '#2563EB',
+    gradient_c2 TEXT NOT NULL DEFAULT '#4F46E5',
+    link_url TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL REFERENCES admin_users(username) ON DELETE CASCADE,
+    expires_at_ns BIGINT NOT NULL,
+    created_at_ns BIGINT NOT NULL
 );
 `
 	if _, err := db.Exec(schema); err != nil {
