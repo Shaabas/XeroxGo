@@ -7,7 +7,7 @@
   <meta name="description" content="XeroxGO Admin Dashboard - Real-time management and kiosk synchronization." />
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
   <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png" />
-  <link rel="stylesheet" href="/css/admin.css" />
+  <link rel="stylesheet" href="/css/admin.css?v=2" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -51,10 +51,6 @@
           <img src="/assets/xeroxgo-full-logo-transparent.png" alt="XeroxGO" />
         </div>
         <div class="nav-actions">
-          <div id="kiosk-status-pill" class="kiosk-status-pill">
-            <span class="status-dot"></span>
-            <span id="kiosk-status-text">Connecting...</span>
-          </div>
           <div id="user-info" style="font-size:0.875rem; font-weight:600; color:var(--text-muted); display:flex; align-items:center; gap:0.5rem;">
             <span id="user-name">admin</span>
           </div>
@@ -265,6 +261,6 @@
     </div>
   </template>
 
-  <script src="/js/admin.js"></script>
+  <script src="/js/admin.js?v=2"></script>
 </body>
 </html>

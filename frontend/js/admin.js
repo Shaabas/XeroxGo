@@ -157,8 +157,6 @@
     // DOM Elements
     const logoutBtn = document.getElementById('logout-btn');
     const userNameEl = document.getElementById('user-name');
-    const kioskStatusPill = document.getElementById('kiosk-status-pill');
-    const kioskStatusText = document.getElementById('kiosk-status-text');
 
     const adListEl = document.getElementById('ad-list');
     const createAdBtn = document.getElementById('create-ad-btn');
@@ -233,36 +231,6 @@
       window.location.reload();
     });
 
-    // Kiosk online status pill
-    function updateKioskCount(count) {
-      if (!kioskStatusText) return;
-      if (count > 0) {
-        kioskStatusText.textContent = `${count} Kiosk${count > 1 ? 's' : ''} Online`;
-        kioskStatusPill.style.background = 'var(--success-bg)';
-        kioskStatusPill.style.color = '#065F46';
-        kioskStatusPill.style.borderColor = '#A7F3D0';
-      } else {
-        kioskStatusText.textContent = '0 Kiosks Online';
-        kioskStatusPill.style.background = '#F1F5F9';
-        kioskStatusPill.style.color = '#64748B';
-        kioskStatusPill.style.borderColor = '#CBD5E1';
-      }
-    }
-
-    let pollInterval = null;
-    function startStatusPolling() {
-      if (pollInterval) clearInterval(pollInterval);
-      pollInterval = setInterval(async () => {
-        try {
-          const res = await apiRequest('/api/admin/me');
-          if (res.ok) {
-            const data = await parseResponseJSON(res);
-            updateKioskCount(data.kiosks_online || 0);
-          }
-        } catch (_) {}
-      }, 15000);
-    }
-
     // Load ads
     async function loadAds() {
       try {
@@ -285,8 +253,7 @@
       if (!ads || ads.length === 0) {
         adListEl.innerHTML = `
           <div class="ad-empty-box">
-            <p style="font-size:0.95rem; font-weight:600; color:var(--text-main); margin-bottom:0.25rem;">No ads configured</p>
-            <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.25rem;">Default system cards will be displayed.</p>
+            <p style="font-size:0.95rem; font-weight:600; color:var(--text-main); margin-bottom:1rem;">No ads configured</p>
             <button class="btn-primary" type="button" onclick="document.getElementById('create-ad-btn').click()" style="margin:0 auto;">
               + New Ad
             </button>
@@ -741,9 +708,7 @@
     });
 
     // Initial load
-    updateKioskCount(userData.kiosks_online || 0);
     loadAds();
-    startStatusPolling();
   }
 
   function escapeHTML(str) {
