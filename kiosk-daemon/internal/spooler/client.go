@@ -43,6 +43,7 @@ type ClientConfig struct {
 	PrinterModel             string
 	DownloadDir              string
 	IdleQRContent            string
+	IdleCarouselInterval     time.Duration
 	CompletedDisplayDuration time.Duration
 	ErrorDisplayDuration     time.Duration
 	ScreenSink               ui_ipc.Sink
@@ -78,6 +79,10 @@ type Client struct {
 
 	renderHistoryMu sync.Mutex
 	renderHistory   []ui_ipc.ScreenState
+
+	currentModeMu sync.Mutex
+	currentMode   ui_ipc.ScreenMode
+	adSlideIndex  int
 
 	healthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 }
@@ -205,6 +210,18 @@ func (c *Client) Run(ctx context.Context) error {
 		defer wg.Done()
 		c.jobWorker(ctx)
 	}()
+
+	// 3b. Start idle carousel ticker
+	if c.cfg.IdleCarouselInterval == 0 {
+		c.cfg.IdleCarouselInterval = 5 * time.Second
+	}
+	if c.cfg.IdleCarouselInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.idleCarouselLoop(ctx)
+		}()
+	}
 
 	// 4. Connection & reconnection loop
 	delay := c.minBackoff
@@ -816,6 +833,10 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 	c.renderHistory = append(c.renderHistory, state)
 	c.renderHistoryMu.Unlock()
 
+	c.currentModeMu.Lock()
+	c.currentMode = state.Mode
+	c.currentModeMu.Unlock()
+
 	img, err := ui_ipc.Render(state)
 	if err != nil {
 		c.lastRenderErrMu.Lock()
@@ -830,4 +851,32 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) idleCarouselLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.cfg.IdleCarouselInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.currentModeMu.Lock()
+			isIdle := (c.currentMode == ui_ipc.ModeIdle)
+			if isIdle {
+				c.adSlideIndex = (c.adSlideIndex + 1) % 3
+				slideIdx := c.adSlideIndex
+				c.currentModeMu.Unlock()
+				_ = c.renderScreen(ui_ipc.ScreenState{
+					Mode:         ui_ipc.ModeIdle,
+					QRContent:    c.cfg.IdleQRContent,
+					Message:      "Ready to print",
+					AdSlideIndex: slideIdx,
+				})
+			} else {
+				c.currentModeMu.Unlock()
+			}
+		}
+	}
 }

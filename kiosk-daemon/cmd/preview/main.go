@@ -25,6 +25,25 @@ func main() {
 				Mode:         ui_ipc.ModeIdle,
 				QRContent:    "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
 				PrinterModel: "Brother DCP-T310",
+				AdSlideIndex: 0,
+			},
+		},
+		{
+			name: "01_idle_slide2.png",
+			state: ui_ipc.ScreenState{
+				Mode:         ui_ipc.ModeIdle,
+				QRContent:    "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
+				PrinterModel: "Brother DCP-T310",
+				AdSlideIndex: 1,
+			},
+		},
+		{
+			name: "01_idle_slide3.png",
+			state: ui_ipc.ScreenState{
+				Mode:         ui_ipc.ModeIdle,
+				QRContent:    "https://frontend-chi-nine-50.vercel.app/k/kiosk-demo",
+				PrinterModel: "Brother DCP-T310",
+				AdSlideIndex: 2,
 			},
 		},
 		{

@@ -42,6 +42,7 @@ var (
 	faceBold36 font.Face
 	faceBold44 font.Face
 	faceBold48 font.Face
+	faceBold56 font.Face
 
 	rawLogoImg image.Image
 )
@@ -85,6 +86,7 @@ func initUIAssets() {
 		faceBold36 = makeFace(fBold, 36)
 		faceBold44 = makeFace(fBold, 44)
 		faceBold48 = makeFace(fBold, 48)
+		faceBold56 = makeFace(fBold, 56)
 
 		// 2. Decode Logo
 		if len(logoPNGBytes) > 0 {
@@ -203,6 +205,7 @@ func fillRoundedRect(dst *image.RGBA, r image.Rectangle, radius int, col color.R
 }
 
 // fillRoundedGradient fills a rectangle with rounded corners using a 135-degree 3-stop linear gradient.
+// In CSS, 135deg points down-right (dx = dy in screen pixels).
 func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1, c2 color.RGBA) {
 	r = r.Intersect(dst.Bounds())
 	if r.Empty() {
@@ -226,15 +229,17 @@ func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1,
 	cx1 := float64(r.Max.X - radius)
 	cy1 := float64(r.Max.Y - radius)
 
-	wF := float64(w)
-	hF := float64(h)
+	// True 135deg CSS linear gradient:
+	// Normalized position t along diagonal from top-left (x0, y0) to bottom-right (x1, y1):
+	// t = ((x - x0) + (y - y0)) / (w + h)
+	totalDist := float64(w + h)
 
 	r0, g0, b0 := float64(c0.R), float64(c0.G), float64(c0.B)
 	r1, g1, b1 := float64(c1.R), float64(c1.G), float64(c1.B)
 	r2, g2, b2 := float64(c2.R), float64(c2.G), float64(c2.B)
 
 	for y := r.Min.Y; y < r.Max.Y; y++ {
-		v := float64(y-r.Min.Y) / hF
+		yDist := float64(y - r.Min.Y)
 		fy := float64(y) + 0.5
 		isTop := y < r.Min.Y+radius
 		isBottom := y >= r.Max.Y-radius
@@ -286,8 +291,8 @@ func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1,
 				}
 			}
 
-			u := float64(x-r.Min.X) / wF
-			t := (u + v) * 0.5
+			// True 135-degree linear interpolation
+			t := (float64(x-r.Min.X) + yDist) / totalDist
 
 			var cr, cg, cb float64
 			if t <= 0.5 {
