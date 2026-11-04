@@ -101,9 +101,9 @@ fun refresh_callback () {
 }
 Plymouth.SetRefreshFunction(refresh_callback);
 
-# 7. Clean fade-out upon kiosk handover
+# 7. Clean handover to kiosk daemon (retain frame so there is zero black gap)
 fun quit_callback () {
-    logo_sprite.SetOpacity(0);
+    # Keep logo visible during handover so kiosk overwrites the framebuffer with zero flicker
 }
 Plymouth.SetQuitFunction(quit_callback);
 

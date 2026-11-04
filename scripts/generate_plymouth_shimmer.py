@@ -79,3 +79,4 @@ if __name__ == "__main__":
     dest_dir = os.path.join(repo_root, "kiosk-daemon/plymouth/xeroxgo")
     
     generate_shimmer_frames(src_logo, dest_dir, total_frames=36)
+

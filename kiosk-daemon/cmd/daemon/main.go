@@ -208,9 +208,6 @@ func suppressConsoleCursor() {
 			_ = f.Close()
 		}
 	}
-
-	// 3. Fallback to setterm command if installed
-	_ = exec.Command("setterm", "--cursor", "off", "--blank", "0", "--powerdown", "0").Run()
 }
 
 func restoreConsoleCursor() {
@@ -221,7 +218,6 @@ func restoreConsoleCursor() {
 		}
 	}
 	_ = os.WriteFile("/sys/class/graphics/fbcon/cursor_blink", []byte("1\n"), 0644)
-	_ = exec.Command("setterm", "--cursor", "on").Run()
 }
 
 func main() {

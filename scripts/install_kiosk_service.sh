@@ -46,10 +46,12 @@ for grp in video lp input tty; do
     fi
 done
 
-# 3. Disable console login prompt on tty1 so it doesn't fight for /dev/fb0
-echo "[3/6] Disabling conflicting getty@tty1 console prompt..."
+# 3. Disable console login prompt on tty1 and rogue plymouth quit services so they don't fight for /dev/fb0
+echo "[3/6] Masking conflicting getty@tty1 and plymouth-quit services..."
 systemctl stop getty@tty1.service 2>/dev/null || true
-systemctl disable getty@tty1.service 2>/dev/null || true
+systemctl mask getty@tty1.service 2>/dev/null || true
+systemctl mask plymouth-quit.service 2>/dev/null || true
+systemctl mask plymouth-quit-wait.service 2>/dev/null || true
 
 # 4. Install configuration file in /etc/default/
 echo "[4/6] Installing configuration into /etc/default/xeroxgo-kiosk..."
