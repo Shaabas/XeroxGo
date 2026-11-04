@@ -1,167 +1,716 @@
-/**
- * XeroxGO Admin Dashboard Controller
- * Synchronized promotional ad manager for mobile portal and kiosk screens.
- */
-
+// XeroxGo Admin Dashboard Controller
 (function () {
   'use strict';
 
-  // --- Immutable System Default Cards ---
-  const SYSTEM_DEFAULT_CARDS = [
-    {
-      id: 'ad-quick-easy',
-      title: 'Quick & Easy',
-      description: 'Direct UPI payment. No coins, no cash needed.',
-      type: 'gradient',
-      gradient_c0: '#1E3A8A',
-      gradient_c1: '#2563EB',
-      gradient_c2: '#4F46E5'
-    },
-    {
-      id: 'ad-high-quality',
-      title: 'High Quality Prints',
-      description: 'Crisp laser documents ready in seconds.',
-      type: 'gradient',
-      gradient_c0: '#065F46',
-      gradient_c1: '#10B981',
-      gradient_c2: '#059669'
-    },
-    {
-      id: 'ad-skip-queue',
-      title: 'Skip The Queue',
-      description: 'Pick up your print job with your 4-digit code.',
-      type: 'gradient',
-      gradient_c0: '#581C87',
-      gradient_c1: '#7C3AED',
-      gradient_c2: '#D97706'
-    }
-  ];
-
-  // --- Safe Response Parsing Helper ---
-  async function parseResponseJSON(res) {
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch (_) {
-      return { error: text || `HTTP ${res.status}: ${res.statusText}` };
-    }
-  }
+  // --- Session & Auth State ---
+  let authToken = localStorage.getItem('xeroxgo_admin_token') || '';
 
   // --- API Request Helper ---
   async function apiRequest(endpoint, options = {}) {
-    options.headers = options.headers || {};
-    const token = localStorage.getItem('xeroxgo_admin_token');
-    if (token) {
-      options.headers['Authorization'] = 'Bearer ' + token;
-    }
-    if (options.body && typeof options.body === 'object' && !(options.body instanceof FormData)) {
-      options.headers['Content-Type'] = 'application/json';
-      options.body = JSON.stringify(options.body);
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    };
+
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
     }
 
-    const res = await fetch(endpoint, options);
-    if (res.status === 401) {
-      localStorage.removeItem('xeroxgo_admin_token');
-      window.location.reload();
-      throw new Error('Unauthorized');
+    const config = {
+      ...options,
+      headers
+    };
+
+    if (config.body && typeof config.body === 'object' && !(config.body instanceof FormData)) {
+      config.body = JSON.stringify(config.body);
     }
-    return res;
+
+    return fetch(endpoint, config);
   }
 
-  // --- Auth Flow & Session Check ---
-  async function checkSession() {
-    const authPage = document.getElementById('auth-page');
-    const loginForm = document.getElementById('login-form');
-    const loginError = document.getElementById('login-error');
-    const loginUsername = document.getElementById('login-username');
-    const loginPassword = document.getElementById('login-password');
-    const loginSubmitBtn = document.getElementById('login-submit-btn');
-
-    // 1. Check if existing session or token is valid
+  // Helper to safely parse JSON responses
+  async function parseResponseJSON(response) {
+    const text = await response.text();
+    if (!text || text.trim() === '') {
+      return {};
+    }
     try {
-      const res = await fetch('/api/admin/me', {
-        headers: {
-          'Authorization': 'Bearer ' + (localStorage.getItem('xeroxgo_admin_token') || '')
-        }
-      });
+      return JSON.parse(text);
+    } catch (_) {
+      return { error: text.trim() };
+    }
+  }
+
+  // --- Session Validation ---
+  async function checkSession() {
+    if (!authToken) {
+      showAuthPage();
+      return;
+    }
+
+    try {
+      const res = await apiRequest('/api/admin/me');
       if (res.ok) {
-        const data = await parseResponseJSON(res);
-        mountDashboard(data);
-        return;
+        const userData = await parseResponseJSON(res);
+        mountDashboard(userData);
+      } else {
+        localStorage.removeItem('xeroxgo_admin_token');
+        authToken = '';
+        showAuthPage();
       }
     } catch (_) {
-      // Unauthenticated, continue to show login view
+      showAuthPage();
     }
+  }
 
-    // 2. Setup login form handlers if unauthenticated
-    if (loginForm) {
-      loginForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        loginSubmitBtn.disabled = true;
-        loginSubmitBtn.textContent = 'Verifying...';
-        loginError.classList.add('hidden');
+  function showAuthPage() {
+    const authPage = document.getElementById('auth-page');
+    if (authPage) authPage.classList.remove('hidden');
 
-        try {
-          const res = await fetch('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              username: loginUsername.value.trim(),
-              password: loginPassword.value
-            })
-          });
+    const form = document.getElementById('login-form');
+    const errBox = document.getElementById('login-error');
+    const pwdInput = document.getElementById('login-password');
+    const userInput = document.getElementById('login-username');
+    const submitBtn = document.getElementById('login-submit-btn');
 
-          const data = await parseResponseJSON(res);
-          if (!res.ok) {
-            throw new Error(data.error || 'Authentication failed');
-          }
+    if (!form || form._hasListener) return;
+    form._hasListener = true;
 
-          if (data.token) {
-            localStorage.setItem('xeroxgo_admin_token', data.token);
-          }
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errBox.classList.add('hidden');
+      errBox.textContent = '';
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Signing in...';
 
+      const username = userInput.value.trim();
+      const password = pwdInput.value;
+
+      try {
+        const res = await apiRequest('/api/admin/login', {
+          method: 'POST',
+          body: { username, password }
+        });
+
+        const data = await parseResponseJSON(res);
+        if (res.ok && data.token) {
+          authToken = data.token;
+          localStorage.setItem('xeroxgo_admin_token', authToken);
+          pwdInput.value = '';
+          authPage.classList.add('hidden');
           mountDashboard(data);
-        } catch (err) {
-          loginError.textContent = err.message || 'Login failed';
-          loginError.classList.remove('hidden');
-        } finally {
-          loginSubmitBtn.disabled = false;
-          loginSubmitBtn.textContent = 'Sign In';
+        } else {
+          errBox.textContent = data.error || 'Invalid credentials';
+          errBox.classList.remove('hidden');
+          pwdInput.focus();
         }
-      });
-    }
+      } catch (err) {
+        errBox.textContent = 'Connection error: ' + err.message;
+        errBox.classList.remove('hidden');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign In';
+      }
+    });
   }
 
   // --- Mount Dashboard ---
   function mountDashboard(userData) {
-    // Remove login page entirely from DOM
     const authPage = document.getElementById('auth-page');
-    if (authPage) authPage.remove();
+    if (authPage) authPage.classList.add('hidden');
 
-    // Clone dashboard template into DOM
-    const tpl = document.getElementById('dashboard-template');
-    if (!tpl) return;
-    document.body.appendChild(tpl.content.cloneNode(true));
+    const template = document.getElementById('dashboard-template');
+    if (!template) return;
+
+    const clone = template.content.cloneNode(true);
+    document.body.appendChild(clone);
 
     initDashboard(userData);
   }
 
-  // --- Dashboard Logic & State ---
+  // --- Dashboard Controller ---
   function initDashboard(userData) {
+    // --- Global State ---
+    let activeNavTab = 'overview';
     let ads = [];
     let currentPreviewIdx = 0;
     let previewTimer = null;
-    let activeTab = 'mobile';
+    let activePreviewTab = 'mobile';
     let isEditingInModal = false;
 
-    // DOM Elements
+    let currentBWPricePaise = 200;
+    let currentColorPricePaise = 1000;
+
+    let ordersFilter = {
+      page: 0,
+      limit: 25,
+      total: 0,
+      status: '',
+      search: ''
+    };
+
+    // DOM Elements - Navigation & User
     const logoutBtn = document.getElementById('logout-btn');
     const userNameEl = document.getElementById('user-name');
+    if (userNameEl && userData && userData.username) {
+      userNameEl.textContent = userData.username;
+    }
+
+    const tabNavOverview = document.getElementById('tab-nav-overview');
+    const tabNavOrders = document.getElementById('tab-nav-orders');
+    const tabNavPricing = document.getElementById('tab-nav-pricing');
+    const tabNavAds = document.getElementById('tab-nav-ads');
+
+    const viewOverview = document.getElementById('view-overview');
+    const viewOrders = document.getElementById('view-orders');
+    const viewPricing = document.getElementById('view-pricing');
+    const viewAds = document.getElementById('view-ads');
+
+    // Toast element
+    const toastEl = document.getElementById('toast');
+    const toastMessageEl = document.getElementById('toast-message');
+
+    function showToast(message) {
+      if (!toastEl) return;
+      toastMessageEl.textContent = message;
+      toastEl.classList.remove('hidden');
+      clearTimeout(toastEl._timer);
+      toastEl._timer = setTimeout(() => {
+        toastEl.classList.add('hidden');
+      }, 3000);
+    }
+
+    // Sign out handler
+    logoutBtn.addEventListener('click', async () => {
+      try {
+        await apiRequest('/api/admin/logout', { method: 'POST' });
+      } catch (_) {}
+      localStorage.removeItem('xeroxgo_admin_token');
+      window.location.reload();
+    });
+
+    // --- Tab Navigation ---
+    function switchNavTab(tabName) {
+      activeNavTab = tabName;
+      [tabNavOverview, tabNavOrders, tabNavPricing, tabNavAds].forEach(btn => {
+        if (btn) btn.classList.remove('active');
+      });
+      [viewOverview, viewOrders, viewPricing, viewAds].forEach(view => {
+        if (view) view.classList.add('hidden');
+      });
+
+      if (tabName === 'overview') {
+        if (tabNavOverview) tabNavOverview.classList.add('active');
+        if (viewOverview) viewOverview.classList.remove('hidden');
+        loadAnalytics();
+      } else if (tabName === 'orders') {
+        if (tabNavOrders) tabNavOrders.classList.add('active');
+        if (viewOrders) viewOrders.classList.remove('hidden');
+        loadOrders();
+      } else if (tabName === 'pricing') {
+        if (tabNavPricing) tabNavPricing.classList.add('active');
+        if (viewPricing) viewPricing.classList.remove('hidden');
+        loadPricing();
+      } else if (tabName === 'ads') {
+        if (tabNavAds) tabNavAds.classList.add('active');
+        if (viewAds) viewAds.classList.remove('hidden');
+        loadAds();
+      }
+    }
+
+    if (tabNavOverview) tabNavOverview.addEventListener('click', () => switchNavTab('overview'));
+    if (tabNavOrders) tabNavOrders.addEventListener('click', () => switchNavTab('orders'));
+    if (tabNavPricing) tabNavPricing.addEventListener('click', () => switchNavTab('pricing'));
+    if (tabNavAds) tabNavAds.addEventListener('click', () => switchNavTab('ads'));
+
+    // ==========================================
+    // 1. OVERVIEW & ANALYTICS
+    // ==========================================
+    const kpiRevenue = document.getElementById('kpi-revenue');
+    const kpiRevenueToday = document.getElementById('kpi-revenue-today');
+    const kpiRevenue7d = document.getElementById('kpi-revenue-7d');
+    const kpiSheets = document.getElementById('kpi-sheets');
+    const kpiBwOrders = document.getElementById('kpi-bw-orders');
+    const kpiColorOrders = document.getElementById('kpi-color-orders');
+    const kpiCompleted = document.getElementById('kpi-completed');
+    const kpiTotalOrders = document.getElementById('kpi-total-orders');
+    const kpiSuccessRate = document.getElementById('kpi-success-rate');
+    const kpiAov = document.getElementById('kpi-aov');
+    const analyticsChartContainer = document.getElementById('analytics-chart-container');
+
+    async function loadAnalytics() {
+      try {
+        const res = await apiRequest('/api/admin/analytics?range=7d');
+        if (!res.ok) throw new Error('Failed to load analytics');
+        const data = await parseResponseJSON(res);
+
+        if (kpiRevenue) kpiRevenue.textContent = `₹${(data.total_revenue_paise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+        if (kpiRevenueToday) kpiRevenueToday.textContent = `₹${(data.revenue_today_paise / 100).toFixed(2)} today`;
+        if (kpiRevenue7d) kpiRevenue7d.textContent = `₹${(data.revenue_7d_paise / 100).toFixed(2)} this week`;
+
+        if (kpiSheets) kpiSheets.textContent = `${data.total_sheets_printed.toLocaleString()} sheets`;
+        if (kpiBwOrders) kpiBwOrders.textContent = `${data.bw_orders_count} B&W`;
+        if (kpiColorOrders) kpiColorOrders.textContent = `${data.color_orders_count} Color`;
+
+        if (kpiCompleted) kpiCompleted.textContent = data.completed_orders.toLocaleString();
+        if (kpiTotalOrders) kpiTotalOrders.textContent = `${data.total_orders.toLocaleString()} total attempts`;
+
+        if (kpiSuccessRate) kpiSuccessRate.textContent = `${data.success_rate_percent.toFixed(1)}%`;
+        if (kpiAov) kpiAov.textContent = `Avg ₹${(data.average_order_paise / 100).toFixed(2)} / order`;
+
+        renderDailyChart(data.daily_trends || []);
+      } catch (err) {
+        if (analyticsChartContainer) {
+          analyticsChartContainer.innerHTML = `<div style="text-align:center; padding:2rem; color:var(--text-muted);">Analytics loading error: ${escapeHTML(err.message)}</div>`;
+        }
+      }
+    }
+
+    function renderDailyChart(trends) {
+      if (!analyticsChartContainer) return;
+      if (!trends || trends.length === 0) {
+        analyticsChartContainer.innerHTML = `<div style="text-align:center; padding:3rem; color:var(--text-muted);">No trend activity recorded yet.</div>`;
+        return;
+      }
+
+      const maxRev = Math.max(...trends.map(t => t.revenue_paise / 100), 10);
+      const width = 800;
+      const height = 180;
+      const padLeft = 45;
+      const padRight = 20;
+      const padTop = 20;
+      const padBottom = 30;
+
+      const innerWidth = width - padLeft - padRight;
+      const innerHeight = height - padTop - padBottom;
+
+      const pts = trends.map((t, i) => {
+        const x = padLeft + (i / (trends.length - 1)) * innerWidth;
+        const val = t.revenue_paise / 100;
+        const y = padTop + innerHeight - (val / maxRev) * innerHeight;
+        return { x, y, date: t.date, val, sheets: t.sheets_count, orders: t.order_count };
+      });
+
+      const lineD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+      const areaD = `${lineD} L ${pts[pts.length - 1].x.toFixed(1)} ${(padTop + innerHeight).toFixed(1)} L ${pts[0].x.toFixed(1)} ${(padTop + innerHeight).toFixed(1)} Z`;
+
+      const svgHtml = `
+        <svg viewBox="0 0 ${width} ${height}" style="width:100%; height:auto; overflow:visible;">
+          <defs>
+            <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#2563EB" stop-opacity="0.25" />
+              <stop offset="100%" stop-color="#2563EB" stop-opacity="0.0" />
+            </linearGradient>
+          </defs>
+
+          <!-- Horizontal Gridlines -->
+          <line x1="${padLeft}" y1="${padTop}" x2="${width - padRight}" y2="${padTop}" stroke="#E2E8F0" stroke-dasharray="3,3" />
+          <line x1="${padLeft}" y1="${padTop + innerHeight * 0.5}" x2="${width - padRight}" y2="${padTop + innerHeight * 0.5}" stroke="#E2E8F0" stroke-dasharray="3,3" />
+          <line x1="${padLeft}" y1="${padTop + innerHeight}" x2="${width - padRight}" y2="${padTop + innerHeight}" stroke="#CBD5E1" />
+
+          <!-- Y-Axis Labels -->
+          <text x="${padLeft - 8}" y="${padTop + 4}" fill="#94A3B8" font-size="10" text-anchor="end" font-weight="600">₹${maxRev.toFixed(0)}</text>
+          <text x="${padLeft - 8}" y="${padTop + innerHeight * 0.5 + 4}" fill="#94A3B8" font-size="10" text-anchor="end" font-weight="600">₹${(maxRev * 0.5).toFixed(0)}</text>
+          <text x="${padLeft - 8}" y="${padTop + innerHeight + 4}" fill="#94A3B8" font-size="10" text-anchor="end" font-weight="600">₹0</text>
+
+          <!-- Area & Line -->
+          <path d="${areaD}" fill="url(#chartGradient)" />
+          <path d="${lineD}" fill="none" stroke="#2563EB" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+
+          <!-- Data Points & X-Labels -->
+          ${pts.map(p => `
+            <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" fill="#FFFFFF" stroke="#2563EB" stroke-width="2.5">
+              <title>${p.date}: ₹${p.val.toFixed(2)} (${p.sheets} sheets, ${p.orders} jobs)</title>
+            </circle>
+            <text x="${p.x.toFixed(1)}" y="${height - 6}" fill="#64748B" font-size="10" text-anchor="middle" font-weight="600">
+              ${p.date.slice(5)}
+            </text>
+          `).join('')}
+        </svg>
+      `;
+
+      analyticsChartContainer.innerHTML = svgHtml;
+    }
+
+    // ==========================================
+    // 2. ORDER HISTORY & INSPECTION
+    // ==========================================
+    const ordersSearchInput = document.getElementById('orders-search-input');
+    const ordersStatusFilter = document.getElementById('orders-status-filter');
+    const ordersRefreshBtn = document.getElementById('orders-refresh-btn');
+    const ordersExportBtn = document.getElementById('orders-export-btn');
+    const ordersTableBody = document.getElementById('orders-table-body');
+    const ordersCountText = document.getElementById('orders-count-text');
+    const ordersPrevBtn = document.getElementById('orders-prev-btn');
+    const ordersNextBtn = document.getElementById('orders-next-btn');
+
+    const orderModal = document.getElementById('order-modal');
+    const orderModalCloseBtn = document.getElementById('order-modal-close-btn');
+    const orderModalBody = document.getElementById('order-modal-body');
+
+    let searchDebounceTimer = null;
+    if (ordersSearchInput) {
+      ordersSearchInput.addEventListener('input', () => {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => {
+          ordersFilter.search = ordersSearchInput.value.trim();
+          ordersFilter.page = 0;
+          loadOrders();
+        }, 300);
+      });
+    }
+
+    if (ordersStatusFilter) {
+      ordersStatusFilter.addEventListener('change', () => {
+        ordersFilter.status = ordersStatusFilter.value;
+        ordersFilter.page = 0;
+        loadOrders();
+      });
+    }
+
+    if (ordersRefreshBtn) {
+      ordersRefreshBtn.addEventListener('click', () => loadOrders());
+    }
+
+    if (ordersPrevBtn) {
+      ordersPrevBtn.addEventListener('click', () => {
+        if (ordersFilter.page > 0) {
+          ordersFilter.page--;
+          loadOrders();
+        }
+      });
+    }
+
+    if (ordersNextBtn) {
+      ordersNextBtn.addEventListener('click', () => {
+        if ((ordersFilter.page + 1) * ordersFilter.limit < ordersFilter.total) {
+          ordersFilter.page++;
+          loadOrders();
+        }
+      });
+    }
+
+    if (ordersExportBtn) {
+      ordersExportBtn.addEventListener('click', async () => {
+        try {
+          showToast('Preparing CSV export...');
+          const res = await apiRequest('/api/admin/orders/export');
+          if (!res.ok) throw new Error('Export failed');
+          const blob = await res.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `xeroxgo-orders-${new Date().toISOString().slice(0, 10)}.csv`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+          showToast('CSV downloaded');
+        } catch (err) {
+          alert('Export error: ' + err.message);
+        }
+      });
+    }
+
+    if (orderModalCloseBtn && orderModal) {
+      orderModalCloseBtn.addEventListener('click', () => orderModal.classList.add('hidden'));
+      orderModal.addEventListener('click', (e) => {
+        if (e.target === orderModal) orderModal.classList.add('hidden');
+      });
+    }
+
+    let loadedOrdersMap = {};
+
+    async function loadOrders() {
+      if (!ordersTableBody) return;
+      ordersTableBody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:2rem; color:var(--text-muted);"><div class="spinner" style="margin:0 auto 0.75rem;"></div>Loading orders...</td></tr>`;
+
+      try {
+        const offset = ordersFilter.page * ordersFilter.limit;
+        const query = new URLSearchParams({
+          limit: ordersFilter.limit.toString(),
+          offset: offset.toString(),
+          status: ordersFilter.status,
+          search: ordersFilter.search
+        });
+
+        const res = await apiRequest(`/api/admin/orders?${query.toString()}`);
+        if (!res.ok) throw new Error('Failed to load orders');
+        const data = await parseResponseJSON(res);
+
+        const orders = data.orders || [];
+        ordersFilter.total = data.total || 0;
+        loadedOrdersMap = {};
+
+        if (ordersCountText) {
+          const from = ordersFilter.total === 0 ? 0 : offset + 1;
+          const to = Math.min(offset + orders.length, ordersFilter.total);
+          ordersCountText.textContent = `Showing ${from}–${to} of ${ordersFilter.total} orders`;
+        }
+
+        if (ordersPrevBtn) ordersPrevBtn.disabled = ordersFilter.page === 0;
+        if (ordersNextBtn) ordersNextBtn.disabled = (ordersFilter.page + 1) * ordersFilter.limit >= ordersFilter.total;
+
+        if (orders.length === 0) {
+          ordersTableBody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:3rem 1rem; color:var(--text-muted);">No matching orders found.</td></tr>`;
+          return;
+        }
+
+        ordersTableBody.innerHTML = orders.map(ord => {
+          loadedOrdersMap[ord.order_id] = ord;
+          const isColor = ord.color_mode === 'COLOR';
+          const isCompleted = ord.status === 'COMPLETED';
+          const isFailed = ord.status === 'FAILED_REFUNDABLE' || ord.status === 'PAUSED_ERROR';
+          const isPrinting = ord.status === 'PRINTING' || ord.status === 'SPOOLING';
+
+          let statusClass = 'badge-status-pending';
+          if (isCompleted) statusClass = 'badge-status-completed';
+          else if (isFailed) statusClass = 'badge-status-failed';
+          else if (isPrinting) statusClass = 'badge-status-printing';
+
+          const dateStr = new Date(ord.created_at).toLocaleString('en-IN', {
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+          });
+
+          return `
+            <tr>
+              <td style="font-family:monospace; font-weight:600; font-size:0.8125rem;">${escapeHTML(ord.order_id)}</td>
+              <td><span style="font-weight:700; color:var(--primary); font-family:monospace;">${escapeHTML(ord.display_code)}</span></td>
+              <td style="color:var(--text-muted);">${dateStr}</td>
+              <td>
+                <span class="badge-tag" style="background:${isColor ? '#FEF3C7; color:#B45309;' : '#F1F5F9; color:#475569;'} font-size:0.75rem;">
+                  ${isColor ? 'Color' : 'B&W'}
+                </span>
+              </td>
+              <td>${ord.total_pages} pages (${ord.total_sheets} sheets)</td>
+              <td style="font-weight:700;">₹${(ord.price_paise / 100).toFixed(2)}</td>
+              <td><span class="badge-status ${statusClass}">${escapeHTML(ord.status)}</span></td>
+              <td style="text-align:right;">
+                <button class="btn-secondary btn-inspect-order" data-id="${ord.order_id}" type="button" style="padding:0.3rem 0.65rem; font-size:0.78rem;">
+                  Inspect
+                </button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+
+        ordersTableBody.querySelectorAll('.btn-inspect-order').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const id = btn.dataset.id;
+            const ord = loadedOrdersMap[id];
+            if (ord) openOrderDetails(ord);
+          });
+        });
+
+      } catch (err) {
+        ordersTableBody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:2rem; color:var(--danger);">Error: ${escapeHTML(err.message)}</td></tr>`;
+      }
+    }
+
+    function openOrderDetails(ord) {
+      if (!orderModal || !orderModalBody) return;
+      const amount = (ord.price_paise / 100).toFixed(2);
+      const isColor = ord.color_mode === 'COLOR';
+
+      orderModalBody.innerHTML = `
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; padding-bottom:0.75rem; border-bottom:1px solid var(--border);">
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Order ID</span>
+            <span style="font-family:monospace; font-weight:600;">${escapeHTML(ord.order_id)}</span>
+          </div>
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Display Code</span>
+            <span style="font-family:monospace; font-weight:800; font-size:1.1rem; color:var(--primary);">${escapeHTML(ord.display_code)}</span>
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; padding-bottom:0.75rem; border-bottom:1px solid var(--border);">
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Job ID</span>
+            <span style="font-family:monospace;">${escapeHTML(ord.job_id)}</span>
+          </div>
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Kiosk</span>
+            <span style="font-weight:600;">${escapeHTML(ord.kiosk_id)}</span>
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:0.75rem; padding-bottom:0.75rem; border-bottom:1px solid var(--border);">
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Print Mode</span>
+            <span style="font-weight:600;">${isColor ? 'Color' : 'Monochrome'}</span>
+          </div>
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Pages / Sheets</span>
+            <span style="font-weight:600;">${ord.total_pages} / ${ord.total_sheets}</span>
+          </div>
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Duplex</span>
+            <span style="font-weight:600;">${escapeHTML(ord.duplex)}</span>
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; padding-bottom:0.75rem; border-bottom:1px solid var(--border);">
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Amount Charged</span>
+            <span style="font-weight:800; font-size:1.2rem; color:var(--text-main);">₹${amount}</span>
+          </div>
+          <div>
+            <span style="font-size:0.75rem; color:var(--text-muted); display:block;">Status</span>
+            <span style="font-weight:700;">${escapeHTML(ord.status)}</span>
+          </div>
+        </div>
+
+        ${ord.error_reason ? `
+          <div style="padding:0.75rem; background:var(--danger-bg); border-radius:var(--radius-sm); border:1px solid #FECACA; color:var(--danger);">
+            <strong>Error Message:</strong> ${escapeHTML(ord.error_reason)}
+          </div>
+        ` : ''}
+
+        <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.5rem;">
+          Created: ${new Date(ord.created_at).toUTCString()}
+        </div>
+      `;
+
+      orderModal.classList.remove('hidden');
+    }
+
+    // ==========================================
+    // 3. PRICING CONTROLLER & COST ESTIMATOR
+    // ==========================================
+    const pricingForm = document.getElementById('pricing-form');
+    const priceBwInput = document.getElementById('price-bw-input');
+    const priceColorInput = document.getElementById('price-color-input');
+    const pricingSaveBtn = document.getElementById('pricing-save-btn');
+
+    const calcPagesInput = document.getElementById('calc-pages-input');
+    const calcResultSheets = document.getElementById('calc-result-sheets');
+    const calcResultBw = document.getElementById('calc-result-bw');
+    const calcResultColor = document.getElementById('calc-result-color');
+
+    async function loadPricing() {
+      try {
+        const res = await apiRequest('/api/admin/pricing');
+        if (!res.ok) throw new Error('Failed to load pricing');
+        const data = await parseResponseJSON(res);
+
+        currentBWPricePaise = data.bw_price_per_sheet_paise || 200;
+        currentColorPricePaise = data.color_price_per_sheet_paise || 1000;
+
+        if (priceBwInput) priceBwInput.value = (currentBWPricePaise / 100).toFixed(2);
+        if (priceColorInput) priceColorInput.value = (currentColorPricePaise / 100).toFixed(2);
+
+        updateCostEstimator();
+      } catch (err) {
+        showToast('Pricing load error: ' + err.message);
+      }
+    }
+
+    function updateCostEstimator() {
+      if (!calcPagesInput) return;
+      const pages = Math.max(1, parseInt(calcPagesInput.value, 10) || 1);
+      const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
+
+      const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
+
+      const bwRate = priceBwInput && priceBwInput.value ? parseFloat(priceBwInput.value) : (currentBWPricePaise / 100);
+      const colorRate = priceColorInput && priceColorInput.value ? parseFloat(priceColorInput.value) : (currentColorPricePaise / 100);
+
+      const bwCost = sheets * bwRate;
+      const colorCost = sheets * colorRate;
+
+      if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
+      if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
+      if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
+    }
+
+    if (calcPagesInput) calcPagesInput.addEventListener('input', updateCostEstimator);
+    document.querySelectorAll('input[name="calc-duplex"]').forEach(r => {
+      r.addEventListener('change', updateCostEstimator);
+    });
+    if (priceBwInput) priceBwInput.addEventListener('input', updateCostEstimator);
+    if (priceColorInput) priceColorInput.addEventListener('input', updateCostEstimator);
+
+    if (pricingForm) {
+      pricingForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const bw = parseFloat(priceBwInput.value);
+        const color = parseFloat(priceColorInput.value);
+
+        if (isNaN(bw) || bw <= 0 || isNaN(color) || color <= 0) {
+          alert('Prices must be valid positive numbers.');
+          return;
+        }
+
+        pricingSaveBtn.disabled = true;
+        pricingSaveBtn.textContent = 'Saving...';
+
+        try {
+          const res = await apiRequest('/api/admin/pricing', {
+            method: 'PUT',
+            body: {
+              bw_price_per_sheet_paise: Math.round(bw * 100),
+              color_price_per_sheet_paise: Math.round(color * 100)
+            }
+          });
+
+          if (!res.ok) {
+            const data = await parseResponseJSON(res);
+            throw new Error(data.error || 'Failed to save');
+          }
+
+          currentBWPricePaise = Math.round(bw * 100);
+          currentColorPricePaise = Math.round(color * 100);
+          updateCostEstimator();
+          showToast('Print rates saved');
+        } catch (err) {
+          alert('Save error: ' + err.message);
+        } finally {
+          pricingSaveBtn.disabled = false;
+          pricingSaveBtn.textContent = 'Save Rates';
+        }
+      });
+    }
+
+    // ==========================================
+    // 4. PROMOTIONAL ADS & SIMULATOR
+    // ==========================================
+    const SYSTEM_DEFAULT_CARDS = [
+      {
+        id: 'ad-quick-easy',
+        title: 'Quick & Easy',
+        description: 'Direct UPI payment. No coins, no cash needed.',
+        type: 'gradient',
+        gradient_c0: '#1E3A8A',
+        gradient_c1: '#2563EB',
+        gradient_c2: '#4F46E5'
+      },
+      {
+        id: 'ad-high-quality',
+        title: 'High Quality Prints',
+        description: 'Crisp laser documents ready in seconds.',
+        type: 'gradient',
+        gradient_c0: '#065F46',
+        gradient_c1: '#10B981',
+        gradient_c2: '#059669'
+      },
+      {
+        id: 'ad-skip-queue',
+        title: 'Skip the Xerox Line',
+        description: 'Upload right from your phone and collect instantly.',
+        type: 'gradient',
+        gradient_c0: '#581C87',
+        gradient_c1: '#7C3AED',
+        gradient_c2: '#D97706'
+      }
+    ];
 
     const adListEl = document.getElementById('ad-list');
     const createAdBtn = document.getElementById('create-ad-btn');
 
-    // Preview elements
     const tabMobileBtn = document.getElementById('tab-mobile');
     const tabKioskBtn = document.getElementById('tab-kiosk');
     const mobilePreviewContainer = document.getElementById('mobile-preview-container');
@@ -176,7 +725,6 @@
     const kioskPreviewTitle = document.getElementById('kiosk-preview-title');
     const kioskPreviewDesc = document.getElementById('kiosk-preview-desc');
 
-    // Modal elements
     const adModal = document.getElementById('ad-modal');
     const modalHeading = document.getElementById('modal-heading');
     const modalCloseBtn = document.getElementById('modal-close-btn');
@@ -203,36 +751,8 @@
     const imagePreviewThumb = document.getElementById('image-preview-thumb');
     const adImageUrlInput = document.getElementById('ad-image-url');
 
-    const toastEl = document.getElementById('toast');
-    const toastMessageEl = document.getElementById('toast-message');
-
-    // User display
-    if (userNameEl && userData && userData.username) {
-      userNameEl.textContent = userData.username;
-    }
-
-    // Toast helper
-    function showToast(message) {
-      if (!toastEl) return;
-      toastMessageEl.textContent = message;
-      toastEl.classList.remove('hidden');
-      clearTimeout(toastEl._timer);
-      toastEl._timer = setTimeout(() => {
-        toastEl.classList.add('hidden');
-      }, 3500);
-    }
-
-    // Sign out
-    logoutBtn.addEventListener('click', async () => {
-      try {
-        await apiRequest('/api/admin/logout', { method: 'POST' });
-      } catch (_) {}
-      localStorage.removeItem('xeroxgo_admin_token');
-      window.location.reload();
-    });
-
-    // Load ads
     async function loadAds() {
+      if (!adListEl) return;
       try {
         const res = await apiRequest('/api/admin/ads');
         if (!res.ok) throw new Error('Failed to load ads');
@@ -250,6 +770,7 @@
     }
 
     function renderAdList() {
+      if (!adListEl) return;
       if (!ads || ads.length === 0) {
         adListEl.innerHTML = `
           <div class="ad-empty-box">
@@ -306,7 +827,7 @@
         `;
       }).join('');
 
-      // Active toggles
+      // Wire active toggle listeners
       adListEl.querySelectorAll('.toggle-active').forEach(chk => {
         chk.addEventListener('change', async (e) => {
           const id = e.target.dataset.id;
@@ -315,7 +836,7 @@
         });
       });
 
-      // Edit buttons
+      // Wire edit buttons
       adListEl.querySelectorAll('.btn-edit').forEach(btn => {
         btn.addEventListener('click', () => {
           const id = btn.dataset.id;
@@ -324,18 +845,18 @@
         });
       });
 
-      // Delete buttons
+      // Wire delete buttons
       adListEl.querySelectorAll('.btn-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
           const id = btn.dataset.id;
           const ad = ads.find(a => a.id === id);
-          if (ad && confirm(`Are you sure you want to delete "${ad.title}"?`)) {
+          if (ad && confirm(`Delete ad "${ad.title}"?`)) {
             await deleteAd(id);
           }
         });
       });
 
-      // Move Up
+      // Wire move up
       adListEl.querySelectorAll('.btn-move-up').forEach(btn => {
         btn.addEventListener('click', async () => {
           const idx = parseInt(btn.dataset.index, 10);
@@ -348,7 +869,7 @@
         });
       });
 
-      // Move Down
+      // Wire move down
       adListEl.querySelectorAll('.btn-move-down').forEach(btn => {
         btn.addEventListener('click', async () => {
           const idx = parseInt(btn.dataset.index, 10);
@@ -414,21 +935,23 @@
     }
 
     // --- Preview Simulator ---
-    tabMobileBtn.addEventListener('click', () => {
-      activeTab = 'mobile';
-      tabMobileBtn.classList.add('active');
-      tabKioskBtn.classList.remove('active');
-      mobilePreviewContainer.classList.remove('hidden');
-      kioskPreviewContainer.classList.add('hidden');
-    });
+    if (tabMobileBtn && tabKioskBtn) {
+      tabMobileBtn.addEventListener('click', () => {
+        activePreviewTab = 'mobile';
+        tabMobileBtn.classList.add('active');
+        tabKioskBtn.classList.remove('active');
+        mobilePreviewContainer.classList.remove('hidden');
+        kioskPreviewContainer.classList.add('hidden');
+      });
 
-    tabKioskBtn.addEventListener('click', () => {
-      activeTab = 'kiosk';
-      tabKioskBtn.classList.add('active');
-      tabMobileBtn.classList.remove('active');
-      kioskPreviewContainer.classList.remove('hidden');
-      mobilePreviewContainer.classList.add('hidden');
-    });
+      tabKioskBtn.addEventListener('click', () => {
+        activePreviewTab = 'kiosk';
+        tabKioskBtn.classList.add('active');
+        tabMobileBtn.classList.remove('active');
+        kioskPreviewContainer.classList.remove('hidden');
+        mobilePreviewContainer.classList.add('hidden');
+      });
+    }
 
     function initPreviewCarousel() {
       if (previewTimer) clearInterval(previewTimer);
@@ -437,278 +960,279 @@
 
       currentPreviewIdx = 0;
       renderPreviewSlide(displayAds[currentPreviewIdx]);
-      renderDots(displayAds.length, currentPreviewIdx, displayAds);
 
       if (displayAds.length > 1) {
         previewTimer = setInterval(() => {
-          if (isEditingInModal) return; // Freeze while editing
-          currentPreviewIdx = (currentPreviewIdx + 1) % displayAds.length;
-          renderPreviewSlide(displayAds[currentPreviewIdx]);
-          renderDots(displayAds.length, currentPreviewIdx, displayAds);
-        }, 4000);
-      }
-    }
-
-    function renderDots(count, activeIdx, displayAdsList) {
-      mobilePreviewDots.innerHTML = Array.from({ length: count }, (_, i) => `
-        <span class="preview-dot ${i === activeIdx ? 'active' : ''}" data-idx="${i}"></span>
-      `).join('');
-
-      mobilePreviewDots.querySelectorAll('.preview-dot').forEach(dot => {
-        dot.addEventListener('click', () => {
-          const idx = parseInt(dot.dataset.idx, 10);
-          const list = displayAdsList || (ads.filter(a => a.is_active).length > 0 ? ads.filter(a => a.is_active) : SYSTEM_DEFAULT_CARDS);
-          if (list[idx]) {
-            currentPreviewIdx = idx;
-            renderPreviewSlide(list[idx]);
-            renderDots(list.length, idx, list);
+          if (!isEditingInModal) {
+            currentPreviewIdx = (currentPreviewIdx + 1) % displayAds.length;
+            renderPreviewSlide(displayAds[currentPreviewIdx]);
           }
-        });
-      });
+        }, 5000);
+      }
     }
 
     function renderPreviewSlide(ad) {
       if (!ad) return;
       const isGradient = ad.type === 'gradient' || !ad.type;
-      const bgStyle = isGradient
-        ? `linear-gradient(135deg, ${ad.gradient_c0 || '#1E3A8A'}, ${ad.gradient_c1 || '#2563EB'}, ${ad.gradient_c2 || '#4F46E5'})`
+      const bg = isGradient
+        ? `linear-gradient(135deg, ${ad.gradient_c0 || '#1E3A8A'} 0%, ${ad.gradient_c1 || '#2563EB'} 50%, ${ad.gradient_c2 || '#4F46E5'} 100%)`
         : `url('${ad.image_url}') center/cover no-repeat`;
 
-      mobileSlidePreview.style.background = bgStyle;
-      mobilePreviewTitle.textContent = ad.title || '';
-      mobilePreviewDesc.textContent = ad.description || '';
+      if (mobileSlidePreview) {
+        mobileSlidePreview.style.background = bg;
+        if (mobilePreviewTitle) mobilePreviewTitle.textContent = ad.title || 'Headline';
+        if (mobilePreviewDesc) mobilePreviewDesc.textContent = ad.description || 'Subtitle';
+      }
 
-      kioskSlidePreview.style.background = bgStyle;
-      kioskPreviewTitle.textContent = ad.title || '';
-      kioskPreviewDesc.textContent = ad.description || '';
+      if (kioskSlidePreview) {
+        kioskSlidePreview.style.background = bg;
+        if (kioskPreviewTitle) kioskPreviewTitle.textContent = ad.title || 'Headline';
+        if (kioskPreviewDesc) kioskPreviewDesc.textContent = ad.description || 'Subtitle';
+      }
+
+      const activeCustomAds = ads.filter(a => a.is_active);
+      const displayAds = activeCustomAds.length > 0 ? activeCustomAds : SYSTEM_DEFAULT_CARDS;
+      if (mobilePreviewDots) {
+        mobilePreviewDots.innerHTML = displayAds.map((_, i) =>
+          `<span class="preview-dot ${i === currentPreviewIdx ? 'active' : ''}"></span>`
+        ).join('');
+      }
     }
 
-    // --- Modal Form & Live Binding ---
+    // Modal Form handlers
     function openCreateModal() {
       isEditingInModal = true;
-      modalHeading.textContent = 'New Ad';
-      adIdInput.value = '';
-      adTitleInput.value = '';
-      adDescInput.value = '';
-      adLinkInput.value = '';
-      adIsActiveInput.checked = true;
+      if (modalHeading) modalHeading.textContent = 'New Ad';
+      if (adIdInput) adIdInput.value = '';
+      if (adTitleInput) adTitleInput.value = '';
+      if (adDescInput) adDescInput.value = '';
+      if (adLinkInput) adLinkInput.value = '';
+      if (adIsActiveInput) adIsActiveInput.checked = true;
 
-      setGradientColors('#1E3A8A', '#2563EB', '#4F46E5');
-      setCardType('gradient');
-      imagePreviewThumb.style.backgroundImage = '';
-      imagePreviewThumb.textContent = 'No file';
-      adImageUrlInput.value = '';
+      setFormType('gradient');
+      setC0('#1E3A8A');
+      setC1('#2563EB');
+      setC2('#4F46E5');
 
-      syncFormToLivePreview();
-      adModal.classList.remove('hidden');
-      adTitleInput.focus();
-    }
-
-    function openEditModal(ad) {
-      isEditingInModal = true;
-      modalHeading.textContent = 'Edit Ad';
-      adIdInput.value = ad.id;
-      adTitleInput.value = ad.title;
-      adDescInput.value = ad.description;
-      adLinkInput.value = ad.link_url || '';
-      adIsActiveInput.checked = ad.is_active;
-
-      setGradientColors(ad.gradient_c0 || '#1E3A8A', ad.gradient_c1 || '#2563EB', ad.gradient_c2 || '#4F46E5');
-      setCardType(ad.type || 'gradient');
-
-      if (ad.image_url) {
-        adImageUrlInput.value = ad.image_url;
-        imagePreviewThumb.style.backgroundImage = `url('${ad.image_url}')`;
-        imagePreviewThumb.textContent = '';
-      } else {
-        adImageUrlInput.value = '';
+      if (adImageUrlInput) adImageUrlInput.value = '';
+      if (imagePreviewThumb) {
         imagePreviewThumb.style.backgroundImage = '';
         imagePreviewThumb.textContent = 'No file';
       }
 
+      if (adModal) adModal.classList.remove('hidden');
       syncFormToLivePreview();
-      adModal.classList.remove('hidden');
-      adTitleInput.focus();
+      if (adTitleInput) adTitleInput.focus();
+    }
+
+    function openEditModal(ad) {
+      isEditingInModal = true;
+      if (modalHeading) modalHeading.textContent = 'Edit Ad';
+      if (adIdInput) adIdInput.value = ad.id;
+      if (adTitleInput) adTitleInput.value = ad.title;
+      if (adDescInput) adDescInput.value = ad.description;
+      if (adLinkInput) adLinkInput.value = ad.link_url || '';
+      if (adIsActiveInput) adIsActiveInput.checked = ad.is_active;
+
+      setFormType(ad.type || 'gradient');
+      setC0(ad.gradient_c0 || '#1E3A8A');
+      setC1(ad.gradient_c1 || '#2563EB');
+      setC2(ad.gradient_c2 || '#4F46E5');
+
+      if (adImageUrlInput) adImageUrlInput.value = ad.image_url || '';
+      if (imagePreviewThumb) {
+        if (ad.image_url) {
+          imagePreviewThumb.style.backgroundImage = `url('${ad.image_url}')`;
+          imagePreviewThumb.textContent = '';
+        } else {
+          imagePreviewThumb.style.backgroundImage = '';
+          imagePreviewThumb.textContent = 'No file';
+        }
+      }
+
+      if (adModal) adModal.classList.remove('hidden');
+      syncFormToLivePreview();
     }
 
     function closeModal() {
       isEditingInModal = false;
-      adModal.classList.add('hidden');
+      if (adModal) adModal.classList.add('hidden');
       initPreviewCarousel();
     }
 
-    createAdBtn.addEventListener('click', openCreateModal);
-    modalCloseBtn.addEventListener('click', closeModal);
-    modalCancelBtn.addEventListener('click', closeModal);
-
-    function setCardType(type) {
-      const radios = document.getElementsByName('ad-type');
-      for (const r of radios) {
-        r.checked = r.value === type;
-      }
-      if (type === 'image') {
-        gradientControlsGroup.classList.add('hidden');
-        imageControlsGroup.classList.remove('hidden');
-      } else {
-        gradientControlsGroup.classList.remove('hidden');
-        imageControlsGroup.classList.add('hidden');
-      }
-      syncFormToLivePreview();
+    if (createAdBtn) createAdBtn.addEventListener('click', openCreateModal);
+    if (modalCloseBtn) modalCloseBtn.addEventListener('click', closeModal);
+    if (modalCancelBtn) modalCancelBtn.addEventListener('click', closeModal);
+    if (adModal) {
+      adModal.addEventListener('click', (e) => {
+        if (e.target === adModal) closeModal();
+      });
     }
 
-    document.getElementsByName('ad-type').forEach(radio => {
-      radio.addEventListener('change', (e) => {
-        setCardType(e.target.value);
+    function setFormType(type) {
+      const radio = document.querySelector(`input[name="ad-type"][value="${type}"]`);
+      if (radio) radio.checked = true;
+
+      if (type === 'image') {
+        if (gradientControlsGroup) gradientControlsGroup.classList.add('hidden');
+        if (imageControlsGroup) imageControlsGroup.classList.remove('hidden');
+      } else {
+        if (gradientControlsGroup) gradientControlsGroup.classList.remove('hidden');
+        if (imageControlsGroup) imageControlsGroup.classList.add('hidden');
+      }
+    }
+
+    document.querySelectorAll('input[name="ad-type"]').forEach(r => {
+      r.addEventListener('change', () => {
+        setFormType(r.value);
+        syncFormToLivePreview();
       });
     });
 
-    function setGradientColors(c0, c1, c2) {
-      adC0.value = c0;
-      adC0Hex.value = c0.toUpperCase();
-      adC1.value = c1;
-      adC1Hex.value = c1.toUpperCase();
-      adC2.value = c2;
-      adC2Hex.value = c2.toUpperCase();
-      syncFormToLivePreview();
-    }
+    function setC0(c) { if (adC0) adC0.value = c; if (adC0Hex) adC0Hex.value = c; }
+    function setC1(c) { if (adC1) adC1.value = c; if (adC1Hex) adC1Hex.value = c; }
+    function setC2(c) { if (adC2) adC2.value = c; if (adC2Hex) adC2Hex.value = c; }
 
-    function bindColorPair(picker, textInput) {
-      picker.addEventListener('input', () => {
-        textInput.value = picker.value.toUpperCase();
-        syncFormToLivePreview();
-      });
-      textInput.addEventListener('input', () => {
-        if (/^#[0-9A-Fa-f]{6}$/.test(textInput.value)) {
-          picker.value = textInput.value;
-          syncFormToLivePreview();
-        }
-      });
-    }
+    if (adC0) adC0.addEventListener('input', () => { if (adC0Hex) adC0Hex.value = adC0.value; syncFormToLivePreview(); });
+    if (adC1) adC1.addEventListener('input', () => { if (adC1Hex) adC1Hex.value = adC1.value; syncFormToLivePreview(); });
+    if (adC2) adC2.addEventListener('input', () => { if (adC2Hex) adC2Hex.value = adC2.value; syncFormToLivePreview(); });
 
-    bindColorPair(adC0, adC0Hex);
-    bindColorPair(adC1, adC1Hex);
-    bindColorPair(adC2, adC2Hex);
+    if (adC0Hex) adC0Hex.addEventListener('input', () => { if (/^#[0-9A-Fa-f]{6}$/.test(adC0Hex.value)) { adC0.value = adC0Hex.value; syncFormToLivePreview(); } });
+    if (adC1Hex) adC1Hex.addEventListener('input', () => { if (/^#[0-9A-Fa-f]{6}$/.test(adC1Hex.value)) { adC1.value = adC1Hex.value; syncFormToLivePreview(); } });
+    if (adC2Hex) adC2Hex.addEventListener('input', () => { if (/^#[0-9A-Fa-f]{6}$/.test(adC2Hex.value)) { adC2.value = adC2Hex.value; syncFormToLivePreview(); } });
 
     document.querySelectorAll('.palette-btn').forEach(btn => {
       btn.addEventListener('click', () => {
-        setGradientColors(btn.dataset.c0, btn.dataset.c1, btn.dataset.c2);
+        setC0(btn.dataset.c0);
+        setC1(btn.dataset.c1);
+        setC2(btn.dataset.c2);
+        syncFormToLivePreview();
       });
     });
 
-    adTitleInput.addEventListener('input', syncFormToLivePreview);
-    adDescInput.addEventListener('input', syncFormToLivePreview);
+    if (adTitleInput) adTitleInput.addEventListener('input', syncFormToLivePreview);
+    if (adDescInput) adDescInput.addEventListener('input', syncFormToLivePreview);
 
     function syncFormToLivePreview() {
       const type = document.querySelector('input[name="ad-type"]:checked')?.value || 'gradient';
-      const formAd = {
-        title: adTitleInput.value || 'Card Headline',
-        description: adDescInput.value || 'Card description text...',
+      const liveAd = {
+        title: (adTitleInput && adTitleInput.value.trim()) || 'Preview Title',
+        description: (adDescInput && adDescInput.value.trim()) || 'Preview description line',
         type: type,
-        gradient_c0: adC0.value,
-        gradient_c1: adC1.value,
-        gradient_c2: adC2.value,
-        image_url: adImageUrlInput.value
+        gradient_c0: (adC0 && adC0.value) || '#1E3A8A',
+        gradient_c1: (adC1 && adC1.value) || '#2563EB',
+        gradient_c2: (adC2 && adC2.value) || '#4F46E5',
+        image_url: (adImageUrlInput && adImageUrlInput.value) || ''
       };
-      renderPreviewSlide(formAd);
+      renderPreviewSlide(liveAd);
     }
 
-    // Banner Image Upload
-    uploadImageBtn.addEventListener('click', () => {
-      adImageFile.click();
-    });
+    if (uploadImageBtn && adImageFile) {
+      uploadImageBtn.addEventListener('click', () => adImageFile.click());
+      adImageFile.addEventListener('change', async () => {
+        const file = adImageFile.files[0];
+        if (!file) return;
 
-    adImageFile.addEventListener('change', async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
+        if (file.size > 5 * 1024 * 1024) {
+          alert('File size exceeds 5MB limit.');
+          return;
+        }
 
-      if (file.size > 5 * 1024 * 1024) {
-        alert('Image file must be under 5MB');
-        return;
-      }
-
-      uploadImageBtn.disabled = true;
-      uploadImageBtn.textContent = 'Uploading...';
-
-      try {
         const formData = new FormData();
-        formData.append('image', file);
+        formData.append('file', file);
 
-        const res = await apiRequest('/api/admin/upload-image', {
-          method: 'POST',
-          body: formData
-        });
+        uploadImageBtn.disabled = true;
+        uploadImageBtn.textContent = 'Uploading...';
 
-        const data = await parseResponseJSON(res);
-        if (!res.ok) throw new Error(data.error || 'Upload failed');
-
-        adImageUrlInput.value = data.image_url;
-        imagePreviewThumb.style.backgroundImage = `url('${data.image_url}')`;
-        imagePreviewThumb.textContent = '';
-        syncFormToLivePreview();
-        showToast('Image uploaded');
-      } catch (err) {
-        alert('Upload error: ' + err.message);
-      } finally {
-        uploadImageBtn.disabled = false;
-        uploadImageBtn.textContent = 'Choose Graphic...';
-      }
-    });
-
-    // Form submit
-    adForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const saveBtn = document.getElementById('modal-save-btn');
-      saveBtn.disabled = true;
-      saveBtn.textContent = 'Saving...';
-
-      const id = adIdInput.value;
-      const type = document.querySelector('input[name="ad-type"]:checked')?.value || 'gradient';
-
-      const payload = {
-        title: adTitleInput.value.trim(),
-        description: adDescInput.value.trim(),
-        type: type,
-        image_url: type === 'image' ? adImageUrlInput.value : '',
-        gradient_c0: adC0.value,
-        gradient_c1: adC1.value,
-        gradient_c2: adC2.value,
-        link_url: adLinkInput.value.trim(),
-        is_active: adIsActiveInput.checked
-      };
-
-      try {
-        let res;
-        if (id) {
-          payload.id = id;
-          res = await apiRequest(`/api/admin/ads/${encodeURIComponent(id)}`, {
-            method: 'PUT',
-            body: payload
-          });
-        } else {
-          res = await apiRequest('/api/admin/ads', {
+        try {
+          const res = await apiRequest('/api/admin/upload-image', {
             method: 'POST',
-            body: payload
+            body: formData
           });
+
+          const data = await parseResponseJSON(res);
+          if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+          adImageUrlInput.value = data.image_url;
+          imagePreviewThumb.style.backgroundImage = `url('${data.image_url}')`;
+          imagePreviewThumb.textContent = '';
+          syncFormToLivePreview();
+          showToast('Image uploaded');
+        } catch (err) {
+          alert('Upload error: ' + err.message);
+        } finally {
+          uploadImageBtn.disabled = false;
+          uploadImageBtn.textContent = 'Choose Graphic...';
+        }
+      });
+    }
+
+    if (adForm) {
+      adForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const saveBtn = document.getElementById('modal-save-btn');
+        if (saveBtn) {
+          saveBtn.disabled = true;
+          saveBtn.textContent = 'Saving...';
         }
 
-        const data = await parseResponseJSON(res);
-        if (!res.ok) {
-          throw new Error(data.error || 'Failed to save ad');
+        const id = adIdInput.value;
+        const type = document.querySelector('input[name="ad-type"]:checked')?.value || 'gradient';
+        const payload = {
+          title: adTitleInput.value.trim(),
+          description: adDescInput.value.trim(),
+          type: type,
+          gradient_c0: adC0.value,
+          gradient_c1: adC1.value,
+          gradient_c2: adC2.value,
+          image_url: adImageUrlInput.value,
+          link_url: adLinkInput.value.trim(),
+          is_active: adIsActiveInput.checked
+        };
+
+        if (type === 'image' && !payload.image_url) {
+          alert('Please upload a graphic for image-style ads.');
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save';
+          }
+          return;
         }
 
-        closeModal();
-        showToast('Ad saved');
-        await loadAds();
-      } catch (err) {
-        alert('Error saving ad: ' + err.message);
-      } finally {
-        saveBtn.disabled = false;
-        saveBtn.textContent = 'Save';
-      }
-    });
+        try {
+          let res;
+          if (id) {
+            payload.id = id;
+            res = await apiRequest(`/api/admin/ads/${encodeURIComponent(id)}`, {
+              method: 'PUT',
+              body: payload
+            });
+          } else {
+            res = await apiRequest('/api/admin/ads', {
+              method: 'POST',
+              body: payload
+            });
+          }
 
-    // Initial load
-    loadAds();
+          const data = await parseResponseJSON(res);
+          if (!res.ok) throw new Error(data.error || 'Failed to save ad');
+
+          closeModal();
+          showToast('Ad saved');
+          await loadAds();
+        } catch (err) {
+          alert('Error saving ad: ' + err.message);
+        } finally {
+          if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save';
+          }
+        }
+      });
+    }
+
+    // --- Initial View Load ---
+    switchNavTab('overview');
   }
 
   function escapeHTML(str) {

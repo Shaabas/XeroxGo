@@ -7,7 +7,7 @@
   <meta name="description" content="XeroxGO Admin Dashboard - Real-time management and kiosk synchronization." />
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
   <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png" />
-  <link rel="stylesheet" href="/css/admin.css?v=2" />
+  <link rel="stylesheet" href="/css/admin.css?v=3" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -57,79 +57,288 @@
           <button id="logout-btn" class="btn-logout" type="button">Sign Out</button>
         </div>
       </div>
+      <!-- Tab Navigation -->
+      <div class="nav-tabs-bar">
+        <button id="tab-nav-overview" class="nav-tab-item active" type="button">Overview</button>
+        <button id="tab-nav-orders" class="nav-tab-item" type="button">Orders</button>
+        <button id="tab-nav-pricing" class="nav-tab-item" type="button">Pricing</button>
+        <button id="tab-nav-ads" class="nav-tab-item" type="button">Ads</button>
+      </div>
     </nav>
 
     <!-- Main Container -->
     <main class="admin-container">
-      <div class="admin-grid">
 
-        <!-- Left Panel: Ad Management -->
-        <section class="panel-card">
-          <div class="panel-header">
+      <!-- 1. OVERVIEW VIEW -->
+      <section id="view-overview" class="admin-view">
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-title">Gross Revenue</div>
+            <div id="kpi-revenue" class="kpi-value">₹0.00</div>
+            <div class="kpi-subtext"><span id="kpi-revenue-today">₹0.00 today</span> · <span id="kpi-revenue-7d">₹0.00 this week</span></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">Print Volume</div>
+            <div id="kpi-sheets" class="kpi-value">0 sheets</div>
+            <div class="kpi-subtext"><span id="kpi-bw-orders">0 B&amp;W</span> · <span id="kpi-color-orders">0 Color</span></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">Completed Jobs</div>
+            <div id="kpi-completed" class="kpi-value">0</div>
+            <div class="kpi-subtext"><span id="kpi-total-orders">0 total attempts</span></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-title">Success Rate</div>
+            <div id="kpi-success-rate" class="kpi-value">100%</div>
+            <div class="kpi-subtext"><span id="kpi-aov">Avg ₹0.00 / order</span></div>
+          </div>
+        </div>
+
+        <!-- Trend Chart Card -->
+        <div class="chart-card">
+          <div class="chart-header">
             <div>
-              <h1 class="panel-title">Promotional Ads</h1>
+              <h2 class="panel-title">Daily Volume &amp; Revenue</h2>
             </div>
-            <button id="create-ad-btn" class="btn-primary" type="button">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-              New Ad
-            </button>
+            <div style="font-size:0.8125rem; color:var(--text-muted); font-weight:600;">Past 7 Days</div>
           </div>
+          <div id="analytics-chart-container" class="chart-container-box">
+            <!-- Rendered via SVG -->
+          </div>
+        </div>
+      </section>
 
-          <!-- Ad List -->
-          <div id="ad-list" class="ad-list">
-            <div style="text-align:center; padding:3rem 1rem; color:var(--text-muted);">
-              <div class="spinner" style="margin:0 auto 1rem;"></div>
-              Loading ads...
+      <!-- 2. ORDERS VIEW -->
+      <section id="view-orders" class="admin-view hidden">
+        <div class="panel-card">
+          <div class="table-toolbar">
+            <div style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:center;">
+              <input id="orders-search-input" class="table-search-input" type="text" placeholder="Filter by ID, Code..." />
+              <select id="orders-status-filter" class="form-input" style="width:auto; padding:0.55rem 0.85rem;">
+                <option value="">All Statuses</option>
+                <option value="COMPLETED">Completed</option>
+                <option value="PRINTING">Printing</option>
+                <option value="FAILED_REFUNDABLE">Failed / Refundable</option>
+                <option value="PAUSED_ERROR">Paused Error</option>
+                <option value="PENDING_PAYMENT">Pending Payment</option>
+              </select>
             </div>
-          </div>
-        </section>
-
-        <!-- Right Panel: Preview -->
-        <section class="panel-card">
-          <div class="panel-header">
-            <div>
-              <h2 class="panel-title">Preview</h2>
-            </div>
-          </div>
-
-          <!-- Preview Tabs -->
-          <div class="preview-tabs">
-            <button id="tab-mobile" class="preview-tab-btn active" type="button">Mobile Web</button>
-            <button id="tab-kiosk" class="preview-tab-btn" type="button">Kiosk Screen (16:9)</button>
-          </div>
-
-          <!-- Mobile Simulator -->
-          <div id="mobile-preview-container" class="mobile-preview-box">
-            <div class="mobile-notch"></div>
-            <div id="mobile-slide-preview" class="mobile-slide-card" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
-              <div id="mobile-preview-title" class="mobile-slide-title">Quick &amp; Easy</div>
-              <div id="mobile-preview-desc" class="mobile-slide-desc">Direct UPI payment. No coins, no cash needed.</div>
-            </div>
-            <div id="mobile-preview-dots" class="mobile-dots">
-              <span class="preview-dot active"></span>
-              <span class="preview-dot"></span>
-              <span class="preview-dot"></span>
+            <div style="display:flex; gap:0.5rem;">
+              <button id="orders-refresh-btn" class="btn-secondary" type="button" style="padding:0.55rem 0.85rem; font-size:0.875rem;">
+                Refresh
+              </button>
+              <button id="orders-export-btn" class="btn-primary" type="button" style="padding:0.55rem 0.85rem; font-size:0.875rem;">
+                Export CSV
+              </button>
             </div>
           </div>
 
-          <!-- Kiosk Simulator -->
-          <div id="kiosk-preview-container" class="kiosk-preview-box hidden">
-            <div class="kiosk-preview-aspect">
-              <div id="kiosk-slide-preview" class="kiosk-preview-slide" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
-                <div id="kiosk-preview-title" class="kiosk-slide-title">Quick &amp; Easy</div>
-                <div id="kiosk-preview-desc" class="kiosk-slide-desc">Direct UPI payment. No coins, no cash needed.</div>
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Code</th>
+                  <th>Date</th>
+                  <th>Mode</th>
+                  <th>Pages / Sheets</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th style="text-align:right;">Action</th>
+                </tr>
+              </thead>
+              <tbody id="orders-table-body">
+                <tr><td colspan="8" style="text-align:center; padding:2rem; color:var(--text-muted);">Loading orders...</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Pagination -->
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:1rem; padding:0 0.5rem;">
+            <div id="orders-count-text" style="font-size:0.8125rem; color:var(--text-muted);">Showing 0 orders</div>
+            <div style="display:flex; gap:0.5rem;">
+              <button id="orders-prev-btn" class="btn-secondary" type="button" style="padding:0.4rem 0.75rem; font-size:0.8rem;" disabled>Previous</button>
+              <button id="orders-next-btn" class="btn-secondary" type="button" style="padding:0.4rem 0.75rem; font-size:0.8rem;" disabled>Next</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. PRICING VIEW -->
+      <section id="view-pricing" class="admin-view hidden">
+        <div class="pricing-grid">
+          
+          <!-- Pricing Editor Card -->
+          <div class="panel-card">
+            <div class="panel-header" style="margin-bottom:1.5rem;">
+              <div>
+                <h2 class="panel-title">Print Rates</h2>
               </div>
-              <div class="kiosk-preview-qr-card">
-                <div class="qr-placeholder-box"></div>
-                <div style="font-size:0.65rem; font-weight:800; color:#0F172A; line-height:1.2;">SCAN TO PRINT</div>
-                <div style="font-size:0.55rem; color:#64748B;">xeroxgo.vercel.app</div>
+            </div>
+
+            <form id="pricing-form">
+              <div class="form-group">
+                <label class="form-label" for="price-bw-input">Monochrome (B&amp;W) Price</label>
+                <div style="position:relative; display:flex; align-items:center;">
+                  <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                  <input id="price-bw-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
+                </div>
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate charged per physical A4 sheet.</div>
+              </div>
+
+              <div class="form-group" style="margin-top:1.25rem;">
+                <label class="form-label" for="price-color-input">Color Print Price</label>
+                <div style="position:relative; display:flex; align-items:center;">
+                  <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                  <input id="price-color-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
+                </div>
+                <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate charged per physical A4 sheet.</div>
+              </div>
+
+              <div style="margin-top:2rem;">
+                <button id="pricing-save-btn" class="btn-primary" type="submit" style="width:100%;">
+                  Save Rates
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Live Cost Estimator -->
+          <div class="panel-card">
+            <div class="panel-header" style="margin-bottom:1.5rem;">
+              <div>
+                <h2 class="panel-title">Cost Estimator</h2>
+              </div>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:1rem;">
+              <div class="form-group">
+                <label class="form-label" for="calc-pages-input">Document Pages</label>
+                <input id="calc-pages-input" class="form-input" type="number" min="1" max="500" value="10" />
+              </div>
+
+              <div class="form-group">
+                <label class="form-label">Sides</label>
+                <div style="display:flex; gap:0.75rem;">
+                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
+                    <input type="radio" name="calc-duplex" value="simplex" checked />
+                    <span style="font-weight:600; font-size:0.875rem;">Single Side</span>
+                  </label>
+                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
+                    <input type="radio" name="calc-duplex" value="duplex" />
+                    <span style="font-weight:600; font-size:0.875rem;">Double Side</span>
+                  </label>
+                </div>
+              </div>
+
+              <div style="margin-top:1rem; padding:1.25rem; background:#F8FAFC; border:1px solid var(--border); border-radius:var(--radius-sm);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Physical Sheets:</span>
+                  <span id="calc-result-sheets" style="font-weight:700;">10 sheets</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Monochrome:</span>
+                  <span id="calc-result-bw" style="font-weight:800; font-size:1.15rem; color:var(--text-main);">₹20.00</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Color:</span>
+                  <span id="calc-result-color" style="font-weight:800; font-size:1.15rem; color:var(--primary);">₹100.00</span>
+                </div>
               </div>
             </div>
           </div>
-        </section>
 
-      </div>
+        </div>
+      </section>
+
+      <!-- 4. ADS VIEW -->
+      <section id="view-ads" class="admin-view hidden">
+        <div class="admin-grid">
+
+          <!-- Left Panel: Ad Management -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h1 class="panel-title">Promotional Ads</h1>
+              </div>
+              <button id="create-ad-btn" class="btn-primary" type="button">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                New Ad
+              </button>
+            </div>
+
+            <!-- Ad List -->
+            <div id="ad-list" class="ad-list">
+              <div style="text-align:center; padding:3rem 1rem; color:var(--text-muted);">
+                <div class="spinner" style="margin:0 auto 1rem;"></div>
+                Loading ads...
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Panel: Preview -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Preview</h2>
+              </div>
+            </div>
+
+            <!-- Preview Tabs -->
+            <div class="preview-tabs">
+              <button id="tab-mobile" class="preview-tab-btn active" type="button">Mobile Web</button>
+              <button id="tab-kiosk" class="preview-tab-btn" type="button">Kiosk Screen (16:9)</button>
+            </div>
+
+            <!-- Mobile Simulator -->
+            <div id="mobile-preview-container" class="mobile-preview-box">
+              <div class="mobile-notch"></div>
+              <div id="mobile-slide-preview" class="mobile-slide-card" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
+                <div id="mobile-preview-title" class="mobile-slide-title">Quick &amp; Easy</div>
+                <div id="mobile-preview-desc" class="mobile-slide-desc">Direct UPI payment. No coins, no cash needed.</div>
+              </div>
+              <div id="mobile-preview-dots" class="mobile-dots">
+                <span class="preview-dot active"></span>
+                <span class="preview-dot"></span>
+                <span class="preview-dot"></span>
+              </div>
+            </div>
+
+            <!-- Kiosk Simulator -->
+            <div id="kiosk-preview-container" class="kiosk-preview-box hidden">
+              <div class="kiosk-preview-aspect">
+                <div id="kiosk-slide-preview" class="kiosk-preview-slide" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
+                  <div id="kiosk-preview-title" class="kiosk-slide-title">Quick &amp; Easy</div>
+                  <div id="kiosk-preview-desc" class="kiosk-slide-desc">Direct UPI payment. No coins, no cash needed.</div>
+                </div>
+                <div class="kiosk-preview-qr-card">
+                  <div class="qr-placeholder-box"></div>
+                  <div style="font-size:0.65rem; font-weight:800; color:#0F172A; line-height:1.2;">SCAN TO PRINT</div>
+                  <div style="font-size:0.55rem; color:#64748B;">xeroxgo.vercel.app</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
     </main>
+
+    <!-- Order Details Modal -->
+    <div id="order-modal" class="modal-overlay hidden">
+      <div class="modal-card" style="max-width:540px;">
+        <div class="panel-header" style="margin-bottom:1.25rem;">
+          <h2 class="panel-title">Order Details</h2>
+          <button id="order-modal-close-btn" class="btn-icon" type="button" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div id="order-modal-body" style="display:flex; flex-direction:column; gap:0.85rem; font-size:0.875rem;">
+          <!-- Dynamically populated -->
+        </div>
+      </div>
+    </div>
 
     <!-- Ad Editor Modal -->
     <div id="ad-modal" class="modal-overlay hidden">
@@ -261,6 +470,6 @@
     </div>
   </template>
 
-  <script src="/js/admin.js?v=2"></script>
+  <script src="/js/admin.js?v=3"></script>
 </body>
 </html>

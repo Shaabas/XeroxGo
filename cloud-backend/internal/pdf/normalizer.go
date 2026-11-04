@@ -29,6 +29,18 @@ func NormalizeAndCount(
 	copies int,
 	duplex contracts.DuplexMode,
 ) (*NormalizedResult, error) {
+	return NormalizeAndCountMode(ctx, inputPath, outputPath, copies, duplex, "BW")
+}
+
+// NormalizeAndCountMode normalizes an input PDF and counts its pages and physical sheets,
+// supporting both monochrome ("BW") and full-color ("COLOR") color spaces.
+func NormalizeAndCountMode(
+	ctx context.Context,
+	inputPath, outputPath string,
+	copies int,
+	duplex contracts.DuplexMode,
+	colorMode string,
+) (*NormalizedResult, error) {
 	// Step 1: Validate arguments and filesystem paths
 	if ctx == nil {
 		return nil, errors.New("context must not be nil")
@@ -117,12 +129,19 @@ func NormalizeAndCount(
 	}
 
 	// Step 3: Normalize the PDF with Ghostscript
+	colorStrategy := "-sColorConversionStrategy=Gray"
+	processModel := "-dProcessColorModel=/DeviceGray"
+	if strings.ToUpper(strings.TrimSpace(colorMode)) == "COLOR" {
+		colorStrategy = "-sColorConversionStrategy=LeaveColorUnchanged"
+		processModel = "-dProcessColorModel=/DeviceRGB"
+	}
+
 	cmdGS := exec.CommandContext(ctx, "gs",
 		"-sDEVICE=pdfwrite",
 		"-dCompatibilityLevel=1.7",
 		"-dPDFSETTINGS=/prepress",
-		"-sColorConversionStrategy=Gray",
-		"-dProcessColorModel=/DeviceGray",
+		colorStrategy,
+		processModel,
 		"-sPAPERSIZE=a4",
 		"-dFIXEDMEDIA",
 		"-dPDFFitPage",

@@ -250,16 +250,16 @@ const portalHTML = `<!DOCTYPE html>
               <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #64748B, #334155);"></div>
               <div style="text-align:left;">
                 <div style="color:var(--text-primary); font-weight:600;">B&amp;W</div>
-                <div style="font-size:0.875rem; color:var(--text-secondary);">₹5.00/sheet</div>
+                <div id="price-bw-label" style="font-size:0.875rem; color:var(--text-secondary);">₹2.00/sheet</div>
               </div>
             </div>
           </button>
-          <button id="btn-mode-color" type="button" class="option-btn" disabled style="flex-direction:row; justify-content:center; padding:1rem; opacity:0.55; cursor:not-allowed;" title="Monochrome kiosk — Color not supported">
+          <button id="btn-mode-color" type="button" class="option-btn" style="flex-direction:row; justify-content:center; padding:1rem;">
             <div style="display:flex; align-items:center; gap:0.75rem;">
               <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #F59E0B, #3B82F6);"></div>
               <div style="text-align:left;">
                 <div style="color:var(--text-primary); font-weight:600;">Color</div>
-                <div style="font-size:0.75rem; color:var(--text-secondary);">B&amp;W Only Kiosk</div>
+                <div id="price-color-label" style="font-size:0.875rem; color:var(--text-secondary);">₹10.00/sheet</div>
               </div>
             </div>
           </button>
@@ -708,15 +708,28 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	h := sha256.Sum256([]byte(orderID))
 	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
-	normRes, err := pdf.NormalizeAndCount(r.Context(), tmpInputName, outputPath, copies, duplexMode)
+	colorMode := strings.ToUpper(strings.TrimSpace(r.FormValue("color_mode")))
+	if colorMode != "COLOR" {
+		colorMode = "BW"
+	}
+
+	normRes, err := pdf.NormalizeAndCountMode(r.Context(), tmpInputName, outputPath, copies, duplexMode, colorMode)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	pricePerSheet, err := s.db.GetPricePerSheetPaise(r.Context())
-	if err != nil || pricePerSheet <= 0 {
+	pricing, err := s.db.GetPricing(r.Context())
+	var pricePerSheet int64
+	if err == nil {
+		if colorMode == "COLOR" {
+			pricePerSheet = pricing.ColorPricePerSheetPaise
+		} else {
+			pricePerSheet = pricing.BWPricePerSheetPaise
+		}
+	}
+	if pricePerSheet <= 0 {
 		pricePerSheet = s.cfg.pricePerSheetPaise
 	}
 	totalPricePaise, err := payments.CalculatePricePaise(normRes.TotalSheets, pricePerSheet)
@@ -755,6 +768,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		Command:    cmd,
 		Status:     contracts.JobStatusPendingPayment,
 		PricePaise: totalPricePaise,
+		ColorMode:  colorMode,
 	}
 
 	if err := s.db.CreateOrder(r.Context(), order); err != nil {
@@ -768,6 +782,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"order_id":              orderID,
 		"job_id":                jobID,
 		"display_code":          displayCode,
+		"color_mode":            colorMode,
 		"total_pages":           normRes.TotalPages,
 		"total_sheets":          normRes.TotalSheets,
 		"copies":                copies,
@@ -1277,6 +1292,9 @@ func main() {
 		app.handlePublicAds(w, r)
 	})
 
+	// Public Pricing API
+	mux.HandleFunc("/api/pricing", app.handlePublicPricing)
+
 	// Protected Admin Dashboard API
 	mux.HandleFunc("/api/admin/login", app.handleAdminLogin)
 	mux.HandleFunc("/api/admin/logout", app.handleAdminLogout)
@@ -1285,6 +1303,10 @@ func main() {
 	mux.HandleFunc("/api/admin/upload-image", app.handleAdminUploadImage)
 	mux.HandleFunc("/api/admin/ads", app.handleAdminAds)
 	mux.HandleFunc("/api/admin/ads/", app.handleAdminAds)
+	mux.HandleFunc("/api/admin/pricing", app.handleAdminPricing)
+	mux.HandleFunc("/api/admin/analytics", app.handleAdminAnalytics)
+	mux.HandleFunc("/api/admin/orders", app.handleAdminOrders)
+	mux.HandleFunc("/api/admin/orders/export", app.handleAdminOrdersExport)
 
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")

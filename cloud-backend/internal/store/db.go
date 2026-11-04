@@ -41,6 +41,7 @@ type Order struct {
 	Command    contracts.PrintJobCommand
 	Status     contracts.JobStatus
 	PricePaise int64
+	ColorMode  string // "BW" or "COLOR"
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
@@ -95,13 +96,18 @@ CREATE TABLE IF NOT EXISTS print_configs (
     total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
     copies INTEGER NOT NULL CHECK (copies > 0),
     duplex TEXT NOT NULL,
-    start_from_page INTEGER NOT NULL CHECK (start_from_page >= 1)
+    start_from_page INTEGER NOT NULL CHECK (start_from_page >= 1),
+    color_mode TEXT NOT NULL DEFAULT 'BW'
 );
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     price_per_sheet_paise BIGINT NOT NULL
         CHECK (price_per_sheet_paise > 0),
+    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
+        CHECK (bw_price_per_sheet_paise > 0),
+    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
+        CHECK (color_price_per_sheet_paise > 0),
     updated_at_ns BIGINT NOT NULL
 );
 
@@ -154,6 +160,18 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
 		if _, err := db.Exec(schema); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("open store: postgres schema init: %w", err)
+		}
+
+		pgMigrations := []string{
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
+			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
+		}
+		for _, mig := range pgMigrations {
+			if _, err := db.Exec(mig); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("open store: postgres migration: %w", err)
+			}
 		}
 
 		return &Store{db: db, dialect: "postgres"}, nil
@@ -232,13 +250,18 @@ CREATE TABLE IF NOT EXISTS print_configs (
     total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
     copies INTEGER NOT NULL CHECK (copies > 0),
     duplex TEXT NOT NULL,
-    start_from_page INTEGER NOT NULL CHECK (start_from_page >= 1)
+    start_from_page INTEGER NOT NULL CHECK (start_from_page >= 1),
+    color_mode TEXT NOT NULL DEFAULT 'BW'
 );
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     price_per_sheet_paise BIGINT NOT NULL
         CHECK (price_per_sheet_paise > 0),
+    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
+        CHECK (bw_price_per_sheet_paise > 0),
+    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
+        CHECK (color_price_per_sheet_paise > 0),
     updated_at_ns BIGINT NOT NULL
 );
 
@@ -293,7 +316,54 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
 		return nil, fmt.Errorf("open store: create schema: %w", err)
 	}
 
+	if err := migrateSQLiteSchema(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: sqlite migration: %w", err)
+	}
+
 	return &Store{db: db, dialect: "sqlite"}, nil
+}
+
+func migrateSQLiteSchema(db *sql.DB) error {
+	colsPricing := make(map[string]bool)
+	rows, err := db.Query("PRAGMA table_info(pricing);")
+	if err == nil {
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt *string
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+				colsPricing[name] = true
+			}
+		}
+		_ = rows.Close()
+	}
+	if !colsPricing["bw_price_per_sheet_paise"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 200;")
+	}
+	if !colsPricing["color_price_per_sheet_paise"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
+	}
+
+	colsConfigs := make(map[string]bool)
+	rowsCfg, err := db.Query("PRAGMA table_info(print_configs);")
+	if err == nil {
+		for rowsCfg.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt *string
+			if err := rowsCfg.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+				colsConfigs[name] = true
+			}
+		}
+		_ = rowsCfg.Close()
+	}
+	if !colsConfigs["color_mode"] {
+		_, _ = db.Exec("ALTER TABLE print_configs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
+	}
+	return nil
 }
 
 // Close closes the underlying SQLite database connection.
@@ -395,9 +465,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 		return fmt.Errorf("create order: insert into orders: %w", err)
 	}
 
+	colorMode := strings.ToUpper(strings.TrimSpace(order.ColorMode))
+	if colorMode == "" {
+		colorMode = "BW"
+	}
+
 	_, err = tx.ExecContext(ctx, s.rebind(`
-INSERT INTO print_configs (order_id, download_url, sha256_checksum, total_pages, total_sheets, copies, duplex, start_from_page)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO print_configs (order_id, download_url, sha256_checksum, total_pages, total_sheets, copies, duplex, start_from_page, color_mode)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 `),
 		order.OrderID,
 		order.Command.DownloadURL,
@@ -407,6 +482,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 		order.Command.Copies,
 		string(order.Command.Duplex),
 		order.Command.StartFromPage,
+		colorMode,
 	)
 	if err != nil {
 		return fmt.Errorf("create order: insert into print_configs: %w", err)
@@ -437,7 +513,8 @@ func (s *Store) GetOrder(ctx context.Context, orderID string) (*Order, error) {
 	query := `
 SELECT
     o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise, o.created_at_ns, o.updated_at_ns,
-    p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page
+    p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page,
+    COALESCE(p.color_mode, 'BW')
 FROM orders o
 JOIN print_configs p ON o.order_id = p.order_id
 WHERE o.order_id = ?;
@@ -461,6 +538,7 @@ WHERE o.order_id = ?;
 		copies        int
 		duplexStr     string
 		startFromPage int
+		colorMode     string
 	)
 
 	err := row.Scan(
@@ -479,6 +557,7 @@ WHERE o.order_id = ?;
 		&copies,
 		&duplexStr,
 		&startFromPage,
+		&colorMode,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -503,6 +582,7 @@ WHERE o.order_id = ?;
 		},
 		Status:     contracts.JobStatus(statusStr),
 		PricePaise: pricePaise,
+		ColorMode:  colorMode,
 		CreatedAt:  time.Unix(0, createdNS).UTC(),
 		UpdatedAt:  time.Unix(0, updatedNS).UTC(),
 	}
@@ -552,58 +632,21 @@ WHERE order_id = ?;
 
 // SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.
 func (s *Store) SetPricePerSheetPaise(ctx context.Context, pricePaise int64) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("set price: store is closed or nil")
+	cfg, _ := s.GetPricing(ctx)
+	colorPrice := cfg.ColorPricePerSheetPaise
+	if colorPrice <= 0 {
+		colorPrice = 1000
 	}
-	if ctx == nil {
-		return fmt.Errorf("set price: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("set price: %w", err)
-	}
-	if pricePaise <= 0 {
-		return fmt.Errorf("set price: pricePaise must be > 0, got %d", pricePaise)
-	}
-
-	updatedNS := time.Now().UTC().UnixNano()
-
-	query := `
-INSERT INTO pricing (id, price_per_sheet_paise, updated_at_ns)
-VALUES (1, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    price_per_sheet_paise = excluded.price_per_sheet_paise,
-    updated_at_ns = excluded.updated_at_ns;
-`
-	_, err := s.db.ExecContext(ctx, s.rebind(query), pricePaise, updatedNS)
-	if err != nil {
-		return fmt.Errorf("set price: %w", err)
-	}
-
-	return nil
+	return s.SetPricing(ctx, pricePaise, colorPrice)
 }
 
 // GetPricePerSheetPaise retrieves the configured per-sheet pricing.
 func (s *Store) GetPricePerSheetPaise(ctx context.Context) (int64, error) {
-	if s == nil || s.db == nil {
-		return 0, fmt.Errorf("get price: store is closed or nil")
-	}
-	if ctx == nil {
-		return 0, fmt.Errorf("get price: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("get price: %w", err)
-	}
-
-	var price int64
-	err := s.db.QueryRowContext(ctx, "SELECT price_per_sheet_paise FROM pricing WHERE id = 1;").Scan(&price)
-	if err == sql.ErrNoRows {
-		return 0, fmt.Errorf("get price: pricing has not been configured")
-	}
+	cfg, err := s.GetPricing(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("get price: %w", err)
+		return 0, err
 	}
-
-	return price, nil
+	return cfg.BWPricePerSheetPaise, nil
 }
 
 // RecordWebhook atomically attempts to record a webhook ID.

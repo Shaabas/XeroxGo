@@ -20,7 +20,8 @@
     kioskID = 'kiosk-demo';
   }
   const devMode = container.dataset.devMode === 'true';
-  let pricePerSheetPaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 500;
+  let bwPricePerSheetPaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
+  let colorPricePerSheetPaise = 1000;
 
   // --- State Variables ---
   let file = null;
@@ -189,12 +190,13 @@
     const isDouble = sides === 'Double-sided';
     const sheetsPerCopy = isDouble ? Math.ceil(selectedCount / 2) : selectedCount;
     const totalSheets = sheetsPerCopy * copies;
-    const totalPricePaise = totalSheets * pricePerSheetPaise;
+    const activePrice = mode === 'Color' ? colorPricePerSheetPaise : bwPricePerSheetPaise;
+    const totalPricePaise = totalSheets * activePrice;
 
     if (summaryFileName) summaryFileName.textContent = file ? file.name : '-';
     if (summaryPages) summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'}`;
     if (summaryOptions) {
-      summaryOptions.textContent = `B&W · ${isDouble ? 'Double Side' : 'Single Side'} · 1 page/sheet`;
+      summaryOptions.textContent = `${mode} · ${isDouble ? 'Double Side' : 'Single Side'} · 1 page/sheet`;
     }
     if (summaryCopies) summaryCopies.textContent = `${copies} ${copies === 1 ? 'copy' : 'copies'}`;
     if (summaryPrice) summaryPrice.textContent = formatRupees(totalPricePaise);
@@ -563,6 +565,45 @@
     });
   }
 
+  if (btnModeBW) {
+    btnModeBW.addEventListener('click', () => {
+      mode = 'B&W';
+      btnModeBW.classList.add('active');
+      if (btnModeColor) btnModeColor.classList.remove('active');
+      updatePriceAndReviewSummary();
+    });
+  }
+
+  if (btnModeColor) {
+    btnModeColor.addEventListener('click', () => {
+      mode = 'Color';
+      btnModeColor.classList.add('active');
+      if (btnModeBW) btnModeBW.classList.remove('active');
+      updatePriceAndReviewSummary();
+    });
+  }
+
+  async function fetchPricing() {
+    try {
+      const res = await fetch('/api/pricing');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.bw_price_per_sheet_paise) {
+          bwPricePerSheetPaise = data.bw_price_per_sheet_paise;
+        }
+        if (data.color_price_per_sheet_paise) {
+          colorPricePerSheetPaise = data.color_price_per_sheet_paise;
+        }
+        const bwLabel = document.getElementById('price-bw-label');
+        if (bwLabel) bwLabel.textContent = `₹${(bwPricePerSheetPaise / 100).toFixed(2)}/sheet`;
+        const colorLabel = document.getElementById('price-color-label');
+        if (colorLabel) colorLabel.textContent = `₹${(colorPricePerSheetPaise / 100).toFixed(2)}/sheet`;
+        updatePriceAndReviewSummary();
+      }
+    } catch (_) {}
+  }
+  fetchPricing();
+
   if (btnSideSingle) {
     btnSideSingle.addEventListener('click', () => {
       sides = 'Single-sided';
@@ -901,6 +942,7 @@
       formData.append('file', uploadDoc);
       formData.append('copies', copies.toString());
       formData.append('duplex', sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
+      formData.append('color_mode', mode === 'Color' ? 'COLOR' : 'BW');
 
       // 3. Submit to server
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;

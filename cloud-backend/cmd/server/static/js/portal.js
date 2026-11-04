@@ -10,9 +10,18 @@
   const container = document.querySelector('.app-container');
   if (!container) return;
 
-  const kioskID = container.dataset.kioskId || 'kiosk-demo';
+  let kioskID = container.dataset.kioskId;
+  const pathMatch = window.location.pathname.match(/\/k\/([^/]+)/);
+  const searchParams = new URLSearchParams(window.location.search);
+  const urlKiosk = (pathMatch && pathMatch[1]) || searchParams.get('kiosk_id');
+  if (urlKiosk) {
+    kioskID = urlKiosk;
+  } else if (!kioskID) {
+    kioskID = 'kiosk-demo';
+  }
   const devMode = container.dataset.devMode === 'true';
-  let pricePerSheetPaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 500;
+  let bwPricePerSheetPaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
+  let colorPricePerSheetPaise = 1000;
 
   // --- State Variables ---
   let file = null;
@@ -181,12 +190,13 @@
     const isDouble = sides === 'Double-sided';
     const sheetsPerCopy = isDouble ? Math.ceil(selectedCount / 2) : selectedCount;
     const totalSheets = sheetsPerCopy * copies;
-    const totalPricePaise = totalSheets * pricePerSheetPaise;
+    const activePrice = mode === 'Color' ? colorPricePerSheetPaise : bwPricePerSheetPaise;
+    const totalPricePaise = totalSheets * activePrice;
 
     if (summaryFileName) summaryFileName.textContent = file ? file.name : '-';
     if (summaryPages) summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'}`;
     if (summaryOptions) {
-      summaryOptions.textContent = `B&W · ${isDouble ? 'Double Side' : 'Single Side'} · 1 page/sheet`;
+      summaryOptions.textContent = `${mode} · ${isDouble ? 'Double Side' : 'Single Side'} · 1 page/sheet`;
     }
     if (summaryCopies) summaryCopies.textContent = `${copies} ${copies === 1 ? 'copy' : 'copies'}`;
     if (summaryPrice) summaryPrice.textContent = formatRupees(totalPricePaise);
@@ -211,10 +221,11 @@
 
   // --- Promo Banner Carousel ---
   let currentSlide = 0;
-  const totalSlides = 3;
+  let totalSlides = 3;
   let bannerTimer = null;
 
   function setSlide(index) {
+    if (totalSlides <= 0) return;
     currentSlide = (index + totalSlides) % totalSlides;
     if (bannerTrack) {
       bannerTrack.style.transform = `translateX(-${currentSlide * 100}%)`;
@@ -229,18 +240,22 @@
 
   function startBannerAutoSlide() {
     if (bannerTimer) clearInterval(bannerTimer);
-    bannerTimer = setInterval(() => {
-      setSlide(currentSlide + 1);
-    }, 5000);
+    if (totalSlides > 1) {
+      bannerTimer = setInterval(() => {
+        setSlide(currentSlide + 1);
+      }, 5000);
+    }
   }
 
-  if (bannerDots) {
-    bannerDots.querySelectorAll('.indicator').forEach((dot, idx) => {
-      dot.addEventListener('click', () => {
-        setSlide(idx);
-        startBannerAutoSlide();
+  function bindBannerDots() {
+    if (bannerDots) {
+      bannerDots.querySelectorAll('.indicator').forEach((dot, idx) => {
+        dot.addEventListener('click', () => {
+          setSlide(idx);
+          startBannerAutoSlide();
+        });
       });
-    });
+    }
   }
 
   if (bannerCloseBtn && bannerContainer) {
@@ -250,7 +265,72 @@
     });
   }
 
+  bindBannerDots();
   startBannerAutoSlide();
+
+  // Dynamic Ad Fetching & Synchronization
+  async function loadDynamicAds() {
+    try {
+      const res = await fetch('/api/ads');
+      if (!res.ok) return;
+      const data = await res.json();
+      const ads = Array.isArray(data) ? data : (data.ads || []);
+      if (!Array.isArray(ads) || ads.length === 0) return;
+
+      if (!bannerTrack || !bannerDots) return;
+
+      // Render dynamic slides
+      bannerTrack.innerHTML = '';
+      bannerDots.innerHTML = '';
+
+      ads.forEach((ad, idx) => {
+        const slide = document.createElement('div');
+        slide.className = 'banner-slide';
+        if (ad.type === 'image' && ad.image_url) {
+          slide.style.background = `url('${ad.image_url}') center/cover no-repeat`;
+        } else {
+          const c0 = ad.gradient_c0 || '#1E3A8A';
+          const c1 = ad.gradient_c1 || '#2563EB';
+          const c2 = ad.gradient_c2 || '#4F46E5';
+          slide.style.background = `linear-gradient(135deg, ${c0} 0%, ${c1} 50%, ${c2} 100%)`;
+        }
+
+        if (ad.link_url) {
+          slide.style.cursor = 'pointer';
+          slide.title = `Open ${ad.link_url}`;
+          slide.addEventListener('click', () => {
+            window.open(ad.link_url, '_blank', 'noopener,noreferrer');
+          });
+        }
+
+        const titleEl = document.createElement('div');
+        titleEl.className = 'banner-title';
+        titleEl.textContent = ad.title || '';
+
+        const descEl = document.createElement('div');
+        descEl.className = 'banner-desc';
+        descEl.textContent = ad.description || '';
+
+        slide.appendChild(titleEl);
+        slide.appendChild(descEl);
+        bannerTrack.appendChild(slide);
+
+        const dot = document.createElement('div');
+        dot.className = `indicator ${idx === 0 ? 'active' : ''}`;
+        bannerDots.appendChild(dot);
+      });
+
+      totalSlides = ads.length;
+      currentSlide = 0;
+      setSlide(0);
+      bindBannerDots();
+      startBannerAutoSlide();
+    } catch (_) {
+      // Graceful fallback to static HTML slides
+    }
+  }
+
+  loadDynamicAds();
 
   // --- PWA Installation Banner & Guide ---
   window.addEventListener('beforeinstallprompt', (e) => {
@@ -484,6 +564,45 @@
       }
     });
   }
+
+  if (btnModeBW) {
+    btnModeBW.addEventListener('click', () => {
+      mode = 'B&W';
+      btnModeBW.classList.add('active');
+      if (btnModeColor) btnModeColor.classList.remove('active');
+      updatePriceAndReviewSummary();
+    });
+  }
+
+  if (btnModeColor) {
+    btnModeColor.addEventListener('click', () => {
+      mode = 'Color';
+      btnModeColor.classList.add('active');
+      if (btnModeBW) btnModeBW.classList.remove('active');
+      updatePriceAndReviewSummary();
+    });
+  }
+
+  async function fetchPricing() {
+    try {
+      const res = await fetch('/api/pricing');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.bw_price_per_sheet_paise) {
+          bwPricePerSheetPaise = data.bw_price_per_sheet_paise;
+        }
+        if (data.color_price_per_sheet_paise) {
+          colorPricePerSheetPaise = data.color_price_per_sheet_paise;
+        }
+        const bwLabel = document.getElementById('price-bw-label');
+        if (bwLabel) bwLabel.textContent = `₹${(bwPricePerSheetPaise / 100).toFixed(2)}/sheet`;
+        const colorLabel = document.getElementById('price-color-label');
+        if (colorLabel) colorLabel.textContent = `₹${(colorPricePerSheetPaise / 100).toFixed(2)}/sheet`;
+        updatePriceAndReviewSummary();
+      }
+    } catch (_) {}
+  }
+  fetchPricing();
 
   if (btnSideSingle) {
     btnSideSingle.addEventListener('click', () => {
@@ -823,6 +942,7 @@
       formData.append('file', uploadDoc);
       formData.append('copies', copies.toString());
       formData.append('duplex', sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
+      formData.append('color_mode', mode === 'Color' ? 'COLOR' : 'BW');
 
       // 3. Submit to server
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;
