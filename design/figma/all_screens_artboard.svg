@@ -30,13 +30,6 @@
     </g>
   </g>
 
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
-  </g>
-
   <!-- MAIN CONTENT: DUAL CARDS -->
   <g id="IdleCards">
     <!-- LEFT CARD: PROMOTIONAL AD BANNER CAROUSEL -->
@@ -132,13 +125,6 @@
       <rect width="300" height="50" rx="25" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
       <text x="150" y="31" fill="#047857" font-size="18" font-weight="700" text-anchor="middle">● READY TO PRINT</text>
     </g>
-  </g>
-
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
   </g>
 
   <!-- MAIN CONTENT: DUAL CARDS -->
@@ -238,13 +224,6 @@
     </g>
   </g>
 
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
-  </g>
-
   <!-- MAIN CONTENT: DUAL CARDS -->
   <g id="IdleCards">
     <!-- LEFT CARD: PROMOTIONAL AD BANNER CAROUSEL -->
@@ -342,13 +321,6 @@
     </g>
   </g>
 
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
-  </g>
-
   <!-- MAIN CARD -->
   <g id="DownloadingCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
@@ -395,13 +367,6 @@
       <rect width="300" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
       <text x="150" y="31" fill="#1D4ED8" font-size="18" font-weight="700" text-anchor="middle">● PRINTING</text>
     </g>
-  </g>
-
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
   </g>
 
   <!-- MAIN CARD -->
@@ -457,13 +422,6 @@
     </g>
   </g>
 
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
-  </g>
-
   <!-- MAIN CARD -->
   <g id="CompletedCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
@@ -509,13 +467,6 @@
       <rect width="300" height="50" rx="25" fill="#FEF2F2" stroke="#FECACA" stroke-width="2"/>
       <text x="150" y="31" fill="#B91C1C" font-size="18" font-weight="700" text-anchor="middle">● ATTENTION</text>
     </g>
-  </g>
-
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
   </g>
 
   <!-- MAIN CARD -->

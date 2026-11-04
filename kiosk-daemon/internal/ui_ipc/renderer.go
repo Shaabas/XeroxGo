@@ -151,19 +151,6 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 	// Subtitle beside brand logo
 	drawText(fullCanvas, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
 
-	// 3. Footer bar (1010 to 1080)
-	fillRect(fullCanvas, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
-	fillRect(fullCanvas, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
-
-	// Clean footer: in user-edited designs, footer text is only shown during active printing
-	if state.Mode == ModePrinting {
-		modelStr := "Brother HL-L5210DN"
-		if state.PrinterModel != "" {
-			modelStr = state.PrinterModel
-		}
-		drawText(fullCanvas, faceReg18, "XeroxGo Kiosk Daemon • Touchless Mobile Printing • "+modelStr, 80, 1035, colorTextSecondary)
-	}
-
 	// 4. Mode-specific content
 	switch state.Mode {
 	case ModeDownloading:
@@ -549,10 +536,6 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 
 	// Subtitle beside brand logo
 	drawText(base, faceReg18, "Campus Print Kiosk • Touchless Mobile Printing", 480, 46, colorTextSecondary)
-
-	// 3. Footer bar (1010 to 1080)
-	fillRect(base, image.Rect(0, 1010, ScreenWidth, ScreenHeight), colorCardBg)
-	fillRect(base, image.Rect(0, 1010, ScreenWidth, 1012), colorBorder)
 
 	// 4. Right Card: QR Code + Onboarding Steps
 	rightCard := image.Rect(1268, 140, 1891, 980)

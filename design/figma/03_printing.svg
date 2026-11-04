@@ -24,13 +24,6 @@
     </g>
   </g>
 
-  <!-- FOOTER -->
-  <g id="Footer">
-    <rect y="1010" width="1920" height="70" fill="#FFFFFF"/>
-    <line x1="0" y1="1010" x2="1920" y2="1010" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="80" y="1052" fill="#64748B" font-size="18" font-weight="500">XeroxGo Kiosk Daemon • Touchless Mobile Printing • Brother DCP-T310</text>
-  </g>
-
   <!-- MAIN CARD -->
   <g id="PrintingCard">
     <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
