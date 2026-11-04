@@ -885,14 +885,15 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 				continue
 			}
 
-			// Smooth horizontal slide transition over 500ms in 15 frames (~33ms per frame, 30 FPS)
+			// Wall-clock synchronized 500ms transition at locked 30 FPS (~33.3ms per frame)
 			const (
-				totalSteps   = 15
-				stepDuration = 33 * time.Millisecond
+				animDuration  = 500 * time.Millisecond
+				targetFPS     = 30
+				frameDuration = 1000 * time.Millisecond / targetFPS
 			)
 
-			for step := 1; step <= totalSteps; step++ {
-				// Abort immediately if context is canceled or a job arrives
+			startTime := time.Now()
+			for {
 				select {
 				case <-ctx.Done():
 					return
@@ -907,27 +908,38 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 					break
 				}
 
-				prog := float64(step) / float64(totalSteps)
-				transFrom := fromIdx
-				if step == totalSteps {
-					transFrom = -1
-					prog = 1.0
+				elapsed := time.Since(startTime)
+				if elapsed >= animDuration {
+					// Final static frame
+					_ = c.renderScreen(ui_ipc.ScreenState{
+						Mode:           ui_ipc.ModeIdle,
+						QRContent:      c.cfg.IdleQRContent,
+						Message:        "Ready to print",
+						AdSlideIndex:   toIdx,
+						TransitionFrom: -1,
+						TransitionProg: 1.0,
+					})
+					break
 				}
 
+				prog := float64(elapsed) / float64(animDuration)
 				_ = c.renderScreen(ui_ipc.ScreenState{
 					Mode:           ui_ipc.ModeIdle,
 					QRContent:      c.cfg.IdleQRContent,
 					Message:        "Ready to print",
 					AdSlideIndex:   toIdx,
-					TransitionFrom: transFrom,
+					TransitionFrom: fromIdx,
 					TransitionProg: prog,
 				})
 
-				if step < totalSteps {
+				// Sleep precisely until next frame boundary based on wall-clock time
+				nextFrameTime := startTime.Add(time.Duration((elapsed/frameDuration)+1) * frameDuration)
+				sleepDuration := time.Until(nextFrameTime)
+				if sleepDuration > 0 {
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(stepDuration):
+					case <-time.After(sleepDuration):
 					}
 				}
 			}

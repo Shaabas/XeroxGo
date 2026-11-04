@@ -584,14 +584,14 @@ func TestFramebufferSinkRGB565Scaled(t *testing.T) {
 	}
 }
 
-func TestRenderAdSlidesSolidColors(t *testing.T) {
-	expectedColors := [3]color.RGBA{
-		{R: 37, G: 99, B: 235, A: 255},  // Slide 0: Prominent Primary Blue #2563EB
-		{R: 16, G: 185, B: 129, A: 255}, // Slide 1: Prominent Emerald Green #10B981
-		{R: 124, G: 58, B: 237, A: 255}, // Slide 2: Prominent Violet #7C3AED
+func TestRenderAdSlidesGradients(t *testing.T) {
+	expectedCenterColors := [3]color.RGBA{
+		{R: 37, G: 99, B: 235, A: 255},  // Slide 0: Center 50% Primary Blue #2563EB
+		{R: 16, G: 185, B: 129, A: 255}, // Slide 1: Center 50% Emerald Green #10B981
+		{R: 124, G: 58, B: 237, A: 255}, // Slide 2: Center 50% Violet #7C3AED
 	}
 
-	for i, expected := range expectedColors {
+	for i, expected := range expectedCenterColors {
 		img, err := Render(ScreenState{
 			Mode:         ModeIdle,
 			QRContent:    "https://kiosk.test/idle",
@@ -601,10 +601,11 @@ func TestRenderAdSlidesSolidColors(t *testing.T) {
 			t.Fatalf("Render slide %d failed: %v", i, err)
 		}
 
-		// Sample clean interior coordinate in upper right quadrant of ad card (800, 200)
-		sampled := img.RGBAAt(800, 200)
-		if sampled != expected {
-			t.Fatalf("slide %d solid color mismatch at (800, 200): got %v, want %v", i, sampled, expected)
+		// Sample along center diagonal (t = 0.5) where dx + dy = (1203 + 840) / 2 = 1021
+		// e.g. dx = 700 (x = 737), dy = 321 (y = 461)
+		sampledCenter := img.RGBAAt(737, 461)
+		if sampledCenter != expected {
+			t.Fatalf("slide %d center gradient color mismatch at (737, 461): got %v, want %v", i, sampledCenter, expected)
 		}
 
 		// Verify rounded corner masking at outer corner (37, 140) against Slate background
@@ -616,7 +617,7 @@ func TestRenderAdSlidesSolidColors(t *testing.T) {
 }
 
 func TestRenderAdSlideTransition(t *testing.T) {
-	// Transitioning from Slide 0 (Blue) to Slide 1 (Green) at 50%
+	// Transitioning from Slide 0 (Blue gradient) to Slide 1 (Green gradient) at 50%
 	img, err := Render(ScreenState{
 		Mode:           ModeIdle,
 		QRContent:      "https://kiosk.test/idle",
@@ -628,19 +629,16 @@ func TestRenderAdSlideTransition(t *testing.T) {
 		t.Fatalf("Render transition failed: %v", err)
 	}
 
-	blue := color.RGBA{R: 37, G: 99, B: 235, A: 255}
-	green := color.RGBA{R: 16, G: 185, B: 129, A: 255}
-
 	// At 50% transition, card width is 1203.
 	// Outgoing Slide 0 occupies the left half, incoming Slide 1 occupies the right half.
 	leftSample := img.RGBAAt(300, 200)
-	if leftSample != blue {
-		t.Fatalf("expected left side of transition card to be Slide 0 Blue, got %v", leftSample)
+	if leftSample.B < 200 || leftSample.R > 60 {
+		t.Fatalf("expected left side of transition card to be Slide 0 Blue gradient, got %v", leftSample)
 	}
 
 	rightSample := img.RGBAAt(1000, 200)
-	if rightSample != green {
-		t.Fatalf("expected right side of transition card to be Slide 1 Green, got %v", rightSample)
+	if rightSample.G < 120 || rightSample.B > 100 {
+		t.Fatalf("expected right side of transition card to be Slide 1 Green gradient, got %v", rightSample)
 	}
 
 	// Verify corner masking still intact during active transition

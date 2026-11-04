@@ -265,6 +265,48 @@ func fillRoundedRect(dst *image.RGBA, r image.Rectangle, radius int, col color.R
 	drawCorner(r.Max.X-radius, r.Max.Y-radius, r.Max.X, r.Max.Y, cx1, cy1)
 }
 
+// fillLinearGradient135 fills a rectangle with a true 135-degree 3-stop linear gradient:
+// c0 at 0% (top-left), c1 at 50% (center diagonal), c2 at 100% (bottom-right).
+func fillLinearGradient135(dst *image.RGBA, r image.Rectangle, c0, c1, c2 color.RGBA) {
+	r = r.Intersect(dst.Bounds())
+	if r.Empty() {
+		return
+	}
+	w := r.Dx()
+	h := r.Dy()
+	totalDist := float64(w + h)
+
+	r0, g0, b0 := float64(c0.R), float64(c0.G), float64(c0.B)
+	r1, g1, b1 := float64(c1.R), float64(c1.G), float64(c1.B)
+	r2, g2, b2 := float64(c2.R), float64(c2.G), float64(c2.B)
+
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		yDist := float64(y - r.Min.Y)
+		rowStart := y*dst.Stride + r.Min.X*4
+		for x, p := r.Min.X, rowStart; x < r.Max.X; x, p = x+1, p+4 {
+			t := (float64(x-r.Min.X) + yDist) / totalDist
+
+			var cr, cg, cb float64
+			if t <= 0.5 {
+				f := t * 2.0
+				cr = r0 + f*(r1-r0)
+				cg = g0 + f*(g1-g0)
+				cb = b0 + f*(b1-b0)
+			} else {
+				f := (t - 0.5) * 2.0
+				cr = r1 + f*(r2-r1)
+				cg = g1 + f*(g2-g1)
+				cb = b1 + f*(b2-b1)
+			}
+
+			dst.Pix[p+0] = uint8(cr + 0.5)
+			dst.Pix[p+1] = uint8(cg + 0.5)
+			dst.Pix[p+2] = uint8(cb + 0.5)
+			dst.Pix[p+3] = 255
+		}
+	}
+}
+
 // fillRoundedGradient fills a rectangle with rounded corners using a 135-degree 3-stop linear gradient.
 // In CSS, 135deg points down-right (dx = dy in screen pixels).
 func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1, c2 color.RGBA) {
