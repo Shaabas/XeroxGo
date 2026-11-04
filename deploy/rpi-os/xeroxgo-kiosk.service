@@ -34,13 +34,13 @@ ExecStartPre=-/usr/bin/plymouth --quit
 EnvironmentFile=-/etc/default/xeroxgo-kiosk
 
 ExecStart=/home/xg1/xeroxgo-kiosk \
-  --cloud-url=${XEROXGO_CLOUD_WS_URL:-wss://xeroxgo-cloud.onrender.com/ws} \
-  --kiosk-id=${XEROXGO_KIOSK_ID:-kiosk-demo} \
-  --cups-printer=${XEROXGO_CUPS_PRINTER:-DCPT310} \
+  --cloud-url=${XEROXGO_CLOUD_WS_URL} \
+  --kiosk-id=${XEROXGO_KIOSK_ID} \
+  --cups-printer=${XEROXGO_CUPS_PRINTER} \
   --state-db=/var/kiosk/state.db \
   --download-dir=/var/kiosk/jobs \
   --framebuffer=/dev/fb0 \
-  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT:-https://xeroxgo.vercel.app}
+  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT}
 
 # Security hardening and device access
 NoNewPrivileges=true
