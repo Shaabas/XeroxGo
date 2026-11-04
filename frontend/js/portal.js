@@ -31,6 +31,7 @@
   // --- State Variables ---
   let file = null;
   let fileBuffer = null;
+  let convertedPdfBytes = null;
   let pdfLibDoc = null;
   let pdfJsDoc = null;
   let totalDocPages = 0;
@@ -383,6 +384,10 @@
   }
 
   // --- File Selection & Inspection ---
+  const defaultUploadAreaHTML = uploadArea ? uploadArea.innerHTML : '';
+  const officeExtensions = ['.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.odt', '.ods', '.odp', '.rtf', '.txt'];
+  const imageExtensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'];
+
   function showError(msg) {
     if (uploadAlert) {
       uploadAlert.textContent = msg;
@@ -397,12 +402,88 @@
     }
   }
 
+  async function convertImageToPdf(selectedFile) {
+    if (!window.PDFLib) {
+      throw new Error('PDF processing library not loaded.');
+    }
+    const pdfDoc = await window.PDFLib.PDFDocument.create();
+    const page = pdfDoc.addPage([595.28, 841.89]); // A4 in points (72 DPI)
+
+    const nameLower = selectedFile.name.toLowerCase();
+    const isJpg = nameLower.endsWith('.jpg') || nameLower.endsWith('.jpeg') || selectedFile.type === 'image/jpeg';
+    const isPng = nameLower.endsWith('.png') || selectedFile.type === 'image/png';
+
+    let embeddedImage;
+    if (isJpg) {
+      const bytes = await selectedFile.arrayBuffer();
+      embeddedImage = await pdfDoc.embedJpg(bytes);
+    } else if (isPng) {
+      const bytes = await selectedFile.arrayBuffer();
+      embeddedImage = await pdfDoc.embedPng(bytes);
+    } else {
+      // For BMP, WEBP, etc: render to canvas and export as PNG
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(selectedFile);
+      });
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const pngDataUrl = canvas.toDataURL('image/png');
+      const pngBytes = Uint8Array.from(atob(pngDataUrl.split(',')[1]), c => c.charCodeAt(0));
+      embeddedImage = await pdfDoc.embedPng(pngBytes);
+    }
+
+    const margin = 36; // 0.5 inch margins
+    const maxWidth = 595.28 - (margin * 2);
+    const maxHeight = 841.89 - (margin * 2);
+    const { width, height } = embeddedImage.scaleToFit(maxWidth, maxHeight);
+
+    page.drawImage(embeddedImage, {
+      x: (595.28 - width) / 2,
+      y: (841.89 - height) / 2,
+      width,
+      height,
+    });
+
+    return await pdfDoc.save();
+  }
+
+  async function convertDocumentOnServer(selectedFile) {
+    const formData = new FormData();
+    formData.append('file', selectedFile);
+    const resp = await fetch('/api/convert', {
+      method: 'POST',
+      body: formData,
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(errText || 'Document conversion failed on server');
+    }
+    return await resp.arrayBuffer();
+  }
+
   async function handleFile(selectedFile) {
     clearError();
     if (!selectedFile) return;
 
-    if (!selectedFile.name.toLowerCase().endsWith('.pdf') && selectedFile.type !== 'application/pdf') {
-      showError('Unsupported file format. Please upload a PDF document.');
+    const nameLower = selectedFile.name.toLowerCase();
+    const isPDF = nameLower.endsWith('.pdf') || selectedFile.type === 'application/pdf';
+    const isOffice = officeExtensions.some(ext => nameLower.endsWith(ext));
+    const isImage = imageExtensions.some(ext => nameLower.endsWith(ext)) || selectedFile.type.startsWith('image/');
+
+    if (!isPDF && !isOffice && !isImage) {
+      showError('Unsupported file format. Please upload PDF, Word (DOCX/DOC), PowerPoint (PPTX), Excel (XLSX), or Images (JPG, PNG).');
       return;
     }
 
@@ -414,7 +495,37 @@
 
     try {
       file = selectedFile;
-      const buffer = await selectedFile.arrayBuffer();
+      let buffer = null;
+
+      if (isPDF) {
+        buffer = await selectedFile.arrayBuffer();
+        convertedPdfBytes = null;
+      } else if (isImage) {
+        if (uploadArea) {
+          uploadArea.innerHTML = `
+            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 0;">
+              <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
+              <div style="font-weight:600; color:var(--text-primary); font-size:1rem;">Formatting image into print page...</div>
+            </div>
+          `;
+        }
+        const pdfBytes = await convertImageToPdf(selectedFile);
+        buffer = pdfBytes.buffer;
+        convertedPdfBytes = pdfBytes;
+      } else if (isOffice) {
+        if (uploadArea) {
+          uploadArea.innerHTML = `
+            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 0;">
+              <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
+              <div style="font-weight:600; color:var(--text-primary); font-size:1rem;">Converting document to PDF...</div>
+              <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.25rem;">This only takes a couple of seconds</div>
+            </div>
+          `;
+        }
+        const pdfArrayBuffer = await convertDocumentOnServer(selectedFile);
+        buffer = pdfArrayBuffer;
+        convertedPdfBytes = new Uint8Array(pdfArrayBuffer);
+      }
 
       // Parse with PDFLib
       if (!window.PDFLib) {
@@ -442,7 +553,10 @@
       }
 
       // Update UI
-      if (uploadArea) uploadArea.classList.add('hidden');
+      if (uploadArea) {
+        uploadArea.innerHTML = defaultUploadAreaHTML;
+        uploadArea.classList.add('hidden');
+      }
       if (filePreviewCard) filePreviewCard.classList.remove('hidden');
       if (fileNameDisplay) fileNameDisplay.textContent = file.name;
       if (fileMetaDisplay) {
@@ -452,7 +566,7 @@
       updatePriceAndReviewSummary();
     } catch (err) {
       console.error('File load failed:', err);
-      showError('Failed to parse PDF document. Please verify the file is valid.');
+      showError(err.message || 'Failed to process document. Please verify the file is valid.');
       resetFile();
     }
   }
@@ -460,6 +574,7 @@
   function resetFile() {
     file = null;
     fileBuffer = null;
+    convertedPdfBytes = null;
     pdfLibDoc = null;
     pdfJsDoc = null;
     totalDocPages = 0;
@@ -468,7 +583,10 @@
     activePageIndex = 0;
     if (fileInput) fileInput.value = '';
     if (uploadSection) uploadSection.classList.remove('hidden');
-    if (uploadArea) uploadArea.classList.remove('hidden');
+    if (uploadArea) {
+      uploadArea.innerHTML = defaultUploadAreaHTML;
+      uploadArea.classList.remove('hidden');
+    }
     if (filePreviewCard) filePreviewCard.classList.add('hidden');
     updatePriceAndReviewSummary();
   }
@@ -915,14 +1033,19 @@
       selectedPages.some((p, idx) => p.originalIndex !== idx)
     );
 
+    const pdfName = file.name.replace(/\.[^/.]+$/, "") + ".pdf";
+
     if (!hasEdits) {
+      if (convertedPdfBytes) {
+        return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
+      }
       return file;
     }
 
     // Extract selected pages and rotations using PDFLib
     try {
-      const freshBuffer = await file.arrayBuffer();
-      const srcDoc = await window.PDFLib.PDFDocument.load(freshBuffer);
+      const sourceBuffer = convertedPdfBytes ? convertedPdfBytes : await file.arrayBuffer();
+      const srcDoc = await window.PDFLib.PDFDocument.load(sourceBuffer);
       const outDoc = await window.PDFLib.PDFDocument.create();
 
       for (const p of selectedPages) {
@@ -935,7 +1058,7 @@
       }
 
       const outBytes = await outDoc.save();
-      return new File([outBytes], file.name, { type: 'application/pdf' });
+      return new File([outBytes], pdfName, { type: 'application/pdf' });
     } catch (extractErr) {
       console.error('PDF page extraction failed:', extractErr);
       throw new Error('Failed to extract selected PDF pages: ' + (extractErr.message || extractErr));

@@ -159,12 +159,12 @@ const portalHTML = `<!DOCTYPE html>
       <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">1. Upload Document</h2>
       <div class="card" style="margin-top:0;">
         <div id="upload-area" class="upload-area">
-          <input type="file" id="file-input" accept=".pdf" style="display:none;" />
+          <input type="file" id="file-input" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.ods,.odp,.rtf,.txt,.jpg,.jpeg,.png,.webp,.bmp" style="display:none;" />
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="upload-icon" style="margin:0 auto 0.5rem; display:block;">
             <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
           </svg>
           <div class="upload-text">Click to upload or drag and drop</div>
-          <div class="upload-subtext">Supported format: PDF</div>
+          <div class="upload-subtext">Supported formats: PDF, Word, PowerPoint, Excel, Images</div>
           <div class="upload-subtext">Max size: 25 MB</div>
         </div>
 
@@ -636,12 +636,18 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	file, fileHeader, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "missing file field", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
+
+	originalFilename := fileHeader.Filename
+	if !pdf.IsSupportedFormat(originalFilename) {
+		http.Error(w, fmt.Sprintf("unsupported file format %q: only PDF, Office documents (DOCX, PPTX, XLSX), and Images (JPG, PNG) are supported", filepath.Ext(originalFilename)), http.StatusBadRequest)
+		return
+	}
 
 	copiesStr := r.FormValue("copies")
 	copies := 1
@@ -668,7 +674,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "upload_in_*.pdf")
+	ext := strings.ToLower(filepath.Ext(originalFilename))
+	if ext == "" {
+		ext = ".pdf"
+	}
+	tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "upload_in_*"+ext)
 	if err != nil {
 		http.Error(w, "failed to create temp file", http.StatusInternalServerError)
 		return
@@ -684,6 +694,28 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = tmpInput.Close()
+
+	// Convert to PDF if non-PDF document or image
+	normalizedInputPath := tmpInputName
+	if ext != ".pdf" {
+		tmpConverted, err := os.CreateTemp(s.cfg.jobsDir, "upload_conv_*.pdf")
+		if err != nil {
+			http.Error(w, "failed to create temp file for conversion", http.StatusInternalServerError)
+			return
+		}
+		tmpConvertedName := tmpConverted.Name()
+		defer func() {
+			_ = tmpConverted.Close()
+			_ = os.Remove(tmpConvertedName)
+		}()
+		_ = tmpConverted.Close()
+
+		if err := pdf.ConvertToPDF(r.Context(), tmpInputName, originalFilename, tmpConvertedName); err != nil {
+			http.Error(w, fmt.Sprintf("document conversion failed: %v", err), http.StatusBadRequest)
+			return
+		}
+		normalizedInputPath = tmpConvertedName
+	}
 
 	orderHex, err := randomHex(12)
 	if err != nil {
@@ -719,7 +751,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		colorMode = "BW"
 	}
 
-	normRes, err := pdf.NormalizeAndCountMode(r.Context(), tmpInputName, outputPath, copies, duplexMode, colorMode)
+	normRes, err := pdf.NormalizeAndCountMode(r.Context(), normalizedInputPath, outputPath, copies, duplexMode, colorMode)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
@@ -880,6 +912,77 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.Copy(w, f)
+}
+
+func (s *appServer) handleConvert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	const maxUploadSize = 25 * 1024 * 1024 // 25 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+		http.Error(w, "file exceeds 25 MiB limit or malformed", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file field", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	filename := header.Filename
+	if !pdf.IsSupportedFormat(filename) {
+		http.Error(w, fmt.Sprintf("unsupported file format %q: only PDF, Office documents (DOCX, PPTX, XLSX), and Images (JPG, PNG) are supported", filepath.Ext(filename)), http.StatusBadRequest)
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == "" {
+		ext = ".tmp"
+	}
+	tmpInput, err := os.CreateTemp("", "conv_in_*"+ext)
+	if err != nil {
+		http.Error(w, "failed to create temp file", http.StatusInternalServerError)
+		return
+	}
+	tmpInputName := tmpInput.Name()
+	defer os.Remove(tmpInputName)
+	defer tmpInput.Close()
+
+	if _, err := io.Copy(tmpInput, file); err != nil {
+		http.Error(w, "failed to read uploaded file", http.StatusInternalServerError)
+		return
+	}
+	_ = tmpInput.Close()
+
+	tmpOutput, err := os.CreateTemp("", "conv_out_*.pdf")
+	if err != nil {
+		http.Error(w, "failed to create output file", http.StatusInternalServerError)
+		return
+	}
+	tmpOutputName := tmpOutput.Name()
+	defer os.Remove(tmpOutputName)
+	defer tmpOutput.Close()
+
+	if err := pdf.ConvertToPDF(r.Context(), tmpInputName, filename, tmpOutputName); err != nil {
+		http.Error(w, fmt.Sprintf("conversion failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	pdfBytes, err := os.ReadFile(tmpOutputName)
+	if err != nil {
+		http.Error(w, "failed to read converted pdf", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Length", strconv.Itoa(len(pdfBytes)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pdfBytes)
 }
 
 func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request) {
@@ -1282,6 +1385,7 @@ func main() {
 		staticFileServer.ServeHTTP(w, r)
 	})
 
+	mux.HandleFunc("/api/convert", app.handleConvert)
 	mux.HandleFunc("/api/k/", app.handleUpload)
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
