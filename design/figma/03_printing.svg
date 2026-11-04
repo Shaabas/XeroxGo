@@ -20,29 +20,29 @@
 
   <!-- MAIN CARD -->
   <g id="PrintingCard">
-    <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
+    <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="140" y="240" fill="#2563EB" font-size="44" font-weight="800">PRINTING DOCUMENT</text>
-    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="500">Please wait while your document prints...</text>
+    <text x="90" y="240" fill="#2563EB" font-size="44" font-weight="800">PRINTING DOCUMENT</text>
+    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="500">Please wait while your document prints...</text>
 
     <!-- Page Counter Pill -->
-    <rect x="140" y="345" width="240" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-    <text x="260" y="377" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">PAGE 2 OF 5</text>
+    <rect x="90" y="345" width="240" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+    <text x="210" y="377" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">PAGE 2 OF 5</text>
 
     <!-- Detail Pill -->
-    <rect x="400" y="345" width="580" height="50" rx="25" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.5"/>
-    <text x="425" y="377" fill="#64748B" font-size="18" font-weight="500">Job ID: xg-order-883921 • Duplex Simplex • 1 Copy</text>
+    <rect x="350" y="345" width="580" height="50" rx="25" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.5"/>
+    <text x="375" y="377" fill="#64748B" font-size="18" font-weight="500">Job ID: xg-order-883921 • Duplex Simplex • 1 Copy</text>
 
     <!-- Progress Bar -->
-    <g id="ProgressBar" transform="translate(140, 500)">
-      <rect width="1640" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
-      <rect x="2" y="2" width="654" height="46" rx="8" fill="#2563EB"/>
+    <g id="ProgressBar" transform="translate(90, 500)">
+      <rect width="1740" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
+      <rect x="2" y="2" width="694" height="46" rx="8" fill="#2563EB"/>
     </g>
 
-    <text x="140" y="585" fill="#1E293B" font-size="24" font-weight="700">Progress: 2 of 5 pages streamed to printer hardware</text>
+    <text x="90" y="585" fill="#1E293B" font-size="24" font-weight="700">Progress: 2 of 5 pages streamed to printer hardware</text>
 
     <!-- Hardware Notice Pill -->
-    <rect x="140" y="640" width="960" height="65" rx="32" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="170" y="681" fill="#64748B" font-size="20" font-weight="400">Job is active on Brother DCP-T310. Pages will exit into output tray.</text>
+    <rect x="90" y="640" width="960" height="65" rx="32" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+    <text x="120" y="681" fill="#64748B" font-size="20" font-weight="400">Job is active on Brother DCP-T310. Pages will exit into output tray.</text>
   </g>
 </svg>

@@ -20,18 +20,18 @@
 
   <!-- MAIN CARD -->
   <g id="ErrorCard">
-    <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
+    <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="140" y="240" fill="#EF4444" font-size="44" font-weight="800">PRINTER ATTENTION REQUIRED</text>
-    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="700">Printer paper tray 1 is empty or disconnected.</text>
+    <text x="90" y="240" fill="#EF4444" font-size="44" font-weight="800">PRINTER ATTENTION REQUIRED</text>
+    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="700">Printer paper tray 1 is empty or disconnected.</text>
 
     <!-- Detail Pill -->
-    <rect x="140" y="345" width="580" height="50" rx="25" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
-    <text x="165" y="377" fill="#DC2626" font-size="18" font-weight="500">Error Code: CUPS_MEDIA_EMPTY • Job ID: xg-order-883921</text>
+    <rect x="90" y="345" width="580" height="50" rx="25" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
+    <text x="115" y="377" fill="#DC2626" font-size="18" font-weight="500">Error Code: CUPS_MEDIA_EMPTY • Job ID: xg-order-883921</text>
 
     <!-- Recovery Box -->
-    <g id="RecoveryInstructions" transform="translate(140, 430)">
-      <rect width="1640" height="460" rx="20" fill="#FFFBEB" stroke="#FDE68A" stroke-width="2"/>
+    <g id="RecoveryInstructions" transform="translate(90, 430)">
+      <rect width="1740" height="530" rx="20" fill="#FFFBEB" stroke="#FDE68A" stroke-width="2"/>
       <text x="40" y="48" fill="#B45309" font-size="22" font-weight="700">ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:</text>
 
       <g transform="translate(40, 110)">

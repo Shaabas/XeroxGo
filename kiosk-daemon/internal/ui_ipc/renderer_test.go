@@ -603,17 +603,17 @@ func TestRenderAdSlidesGradients(t *testing.T) {
 			t.Fatalf("Render slide %d failed: %v", i, err)
 		}
 
-		// Sample along center diagonal (t = 0.5) where dx + dy = (1203 + 840) / 2 = 1021
-		// e.g. dx = 700 (x = 737), dy = 321 (y = 461)
-		sampledCenter := img.RGBAAt(737, 461)
+		// Sample along center diagonal (t = 0.5) where dx + dy = (1220 + 910) / 2 = 1065
+		// e.g. dx = 700 (x = 730), dy = 365 (y = 505)
+		sampledCenter := img.RGBAAt(730, 505)
 		if sampledCenter != expected {
-			t.Fatalf("slide %d center gradient color mismatch at (737, 461): got %v, want %v", i, sampledCenter, expected)
+			t.Fatalf("slide %d center gradient color mismatch at (730, 505): got %v, want %v", i, sampledCenter, expected)
 		}
 
-		// Verify rounded corner masking at outer corner (37, 140) against Slate background
-		cornerSample := img.RGBAAt(37, 140)
+		// Verify rounded corner masking at outer corner (30, 140) against Slate background
+		cornerSample := img.RGBAAt(30, 140)
 		if cornerSample != colorBgSlate {
-			t.Fatalf("slide %d outer corner (37, 140) not masked with colorBgSlate: got %v, want %v", i, cornerSample, colorBgSlate)
+			t.Fatalf("slide %d outer corner (30, 140) not masked with colorBgSlate: got %v, want %v", i, cornerSample, colorBgSlate)
 		}
 	}
 }
@@ -644,9 +644,9 @@ func TestRenderAdSlideTransition(t *testing.T) {
 	}
 
 	// Verify corner masking still intact during active transition
-	cornerSample := img.RGBAAt(37, 140)
+	cornerSample := img.RGBAAt(30, 140)
 	if cornerSample != colorBgSlate {
-		t.Fatalf("transition outer corner (37, 140) not masked with colorBgSlate: got %v, want %v", cornerSample, colorBgSlate)
+		t.Fatalf("transition outer corner (30, 140) not masked with colorBgSlate: got %v, want %v", cornerSample, colorBgSlate)
 	}
 }
 

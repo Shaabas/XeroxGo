@@ -373,8 +373,8 @@ func configureAdsInternal(items []contracts.AdItem) {
 	if geom.Width != ScreenWidth || geom.Height != ScreenHeight {
 		sx := float64(geom.Width) / float64(ScreenWidth)
 		sy := float64(geom.Height) / float64(ScreenHeight)
-		cardW := int(float64(1203)*sx + 0.5)
-		cardH := int(float64(840)*sy + 0.5)
+		cardW := int(float64(1220)*sx + 0.5)
+		cardH := int(float64(910)*sy + 0.5)
 		if cardW < 1 {
 			cardW = 1
 		}
@@ -396,7 +396,7 @@ func configureAdsInternal(items []contracts.AdItem) {
 }
 
 func renderSingleAdSlide(ad contracts.AdItem) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, 1203, 840))
+	img := image.NewRGBA(image.Rect(0, 0, 1220, 910))
 
 	if ad.Type == contracts.AdTypeImage && ad.ImageURL != "" {
 		if strings.HasPrefix(ad.ImageURL, "http://") || strings.HasPrefix(ad.ImageURL, "https://") {
@@ -498,14 +498,14 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	drawText(base, faceReg18, "Upload, Print, Collect - It's that simple!", 480, 46, colorTextSecondary)
 
 	// 4. Right Card: QR Code + Onboarding Steps
-	rightCard := image.Rect(1268, 140, 1891, 980)
+	rightCard := image.Rect(1280, 140, 1890, 1050)
 	fillRoundedRect(base, rightCard, 24, colorCardBg)
 	strokeRoundedRect(base, rightCard, 24, 2, colorBorder)
 
 	// Headline above QR code
 	qrTitle := "Scan with any phone to open your personal print portal"
 	qrTitleW := measureTextWidth(faceReg18, qrTitle)
-	drawText(base, faceReg18, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 172, colorTextPrimary)
+	drawText(base, faceReg18, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 175, colorTextPrimary)
 
 	// QR Code Generation (Cached for zero-lag performance)
 	qrImg, err := getQRCodeImage(qrContent)
@@ -513,11 +513,11 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		return nil, err
 	}
 
-	qrBounds := image.Rect(1380, 210, 1780, 610)
+	qrBounds := image.Rect(1385, 215, 1785, 615)
 	draw.Draw(base, qrBounds, qrImg, image.Point{}, draw.Src)
 
 	// Action pill under QR with website link
-	pillRect := image.Rect(1350, 597, 1808, 657)
+	pillRect := image.Rect(1355, 635, 1815, 695)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
 	displayLink := "xeroxgo.vercel.app"
 	if strings.TrimSpace(qrContent) != "" {
@@ -531,7 +531,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		}
 	}
 	pillW := measureTextWidth(faceBold24, displayLink)
-	drawText(base, faceBold24, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 615, colorPrimaryBlue)
+	drawText(base, faceBold24, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 655, colorPrimaryBlue)
 
 	// 4 Numbered Steps
 	steps := []struct {
@@ -544,19 +544,24 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		{"3", "Pay securely with instant UPI", false},
 		{"4", "Collect prints from the output tray", true},
 	}
-	ySteps := []int{692, 750, 808, 867}
+	ySteps := []int{725, 785, 845, 905}
 	for i, s := range steps {
 		y := ySteps[i]
 		circleCol := colorPrimaryBlue
 		if s.isLast {
 			circleCol = colorSuccessGreen
 		}
-		drawCircle(base, 1404, y+14, 15, circleCol)
+		drawCircle(base, 1390, y+14, 15, circleCol)
 		numW := measureTextWidth(faceBold18, s.num)
-		drawText(base, faceBold18, s.num, 1404-numW/2, y+4, colorTextWhite)
+		drawText(base, faceBold18, s.num, 1390-numW/2, y+4, colorTextWhite)
 
-		drawText(base, faceBold20, s.title, 1440, y+4, colorTextPrimary)
+		drawText(base, faceBold20, s.title, 1425, y+4, colorTextPrimary)
 	}
+
+	// Security badge / footer text inside right card
+	secText := "End-to-End Encrypted Session • Files Deleted Immediately"
+	secW := measureTextWidth(faceReg16, secText)
+	drawText(base, faceReg16, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 990, colorTextSecondary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
@@ -589,7 +594,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 
 	if isNative1080p {
 		copy(dst.Pix, base.Pix)
-		adCard = image.Rect(37, 140, 1240, 980)
+		adCard = image.Rect(30, 140, 1250, 1050)
 		cardW = adCard.Dx()
 		cardH = adCard.Dy()
 		srcSlides = adSlideImgs
@@ -609,10 +614,10 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		sx = float64(targetW) / float64(ScreenWidth)
 		sy = float64(targetH) / float64(ScreenHeight)
 
-		cardMinX := int(37.0*sx + 0.5)
+		cardMinX := int(30.0*sx + 0.5)
 		cardMinY := int(140.0*sy + 0.5)
-		cardMaxX := int(1240.0*sx + 0.5)
-		cardMaxY := int(980.0*sy + 0.5)
+		cardMaxX := int(1250.0*sx + 0.5)
+		cardMaxY := int(1050.0*sy + 0.5)
 		adCard = image.Rect(cardMinX, cardMinY, cardMaxX, cardMaxY)
 		cardW = adCard.Dx()
 		cardH = adCard.Dy()
@@ -686,9 +691,9 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	// Bottom Carousel Indicators matching mobile frontend (.banner-indicators)
 	if numSlides > 1 {
 		totalWidth := float64((numSlides-1)*10 + 44 + (numSlides-1)*14)
-		startX := 638.0 - totalWidth/2.0
+		startX := 640.0 - totalWidth/2.0
 		curX := int(startX*sx + 0.5)
-		indY := int(885.0*sy + 0.5)
+		indY := int(955.0*sy + 0.5)
 		indH := int(10.0*sy + 0.5)
 		if indH < 4 {
 			indH = 4
@@ -734,136 +739,136 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 }
 
 func renderDownloading(dst *image.RGBA, state ScreenState) {
-	card := image.Rect(80, 140, 1840, 980)
+	card := image.Rect(30, 140, 1890, 1050)
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold44, "DOWNLOADING DOCUMENT", 140, 240, colorPrimaryBlue)
+	drawText(dst, faceBold44, "DOWNLOADING DOCUMENT", 90, 240, colorPrimaryBlue)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Receiving print job securely from XeroxGo cloud..."
 	}
-	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 90, 305, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailPill := image.Rect(140, 345, 760, 395)
+		detailPill := image.Rect(90, 345, 750, 395)
 		drawPill(dst, detailPill, colorPillBlueBg, colorPillBlueBorder)
-		drawText(dst, faceReg18, state.Detail, 165, 362, colorPrimaryBlue)
+		drawText(dst, faceReg18, state.Detail, 115, 362, colorPrimaryBlue)
 	}
 
-	// Progress Bar (140, 500, 1780, 550) - width 1640
-	drawProgressBar(dst, 140, 500, 1640, 50, state.ProgressPercent, 100, colorPrimaryBlue)
+	// Progress Bar (90, 500, 1830, 550) - width 1740
+	drawProgressBar(dst, 90, 500, 1740, 50, state.ProgressPercent, 100, colorPrimaryBlue)
 
 	pctText := fmt.Sprintf("Download Progress: %d%%", state.ProgressPercent)
-	drawText(dst, faceBold24, pctText, 140, 585, colorTextPrimary)
+	drawText(dst, faceBold24, pctText, 90, 585, colorTextPrimary)
 
-	drawText(dst, faceReg20, "Secure encrypted download in progress. Printing will begin automatically.", 140, 630, colorTextSecondary)
+	drawText(dst, faceReg20, "Secure encrypted download in progress. Printing will begin automatically.", 90, 630, colorTextSecondary)
 }
 
 func renderPrinting(dst *image.RGBA, state ScreenState) {
-	card := image.Rect(80, 140, 1840, 980)
+	card := image.Rect(30, 140, 1890, 1050)
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold44, "PRINTING DOCUMENT", 140, 240, colorPrimaryBlue)
+	drawText(dst, faceBold44, "PRINTING DOCUMENT", 90, 240, colorPrimaryBlue)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Please wait while your document prints..."
 	}
-	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 90, 305, colorTextPrimary)
 
 	// Counter Pill aligned in metadata row
 	counterText := fmt.Sprintf("PAGE %d OF %d", state.CurrentPage, state.TotalPages)
-	counterPill := image.Rect(140, 345, 380, 395)
+	counterPill := image.Rect(90, 345, 330, 395)
 	drawPill(dst, counterPill, colorPillBlueBg, colorPillBlueBorder)
 	cW := measureTextWidth(faceBold22, counterText)
 	drawText(dst, faceBold22, counterText, counterPill.Min.X+(counterPill.Dx()-cW)/2, 360, colorPrimaryBlue)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailPill := image.Rect(400, 345, 1020, 395)
+		detailPill := image.Rect(350, 345, 970, 395)
 		drawPill(dst, detailPill, colorBgSlate, colorBorder)
-		drawText(dst, faceReg18, state.Detail, 420, 362, colorTextSecondary)
+		drawText(dst, faceReg18, state.Detail, 375, 362, colorTextSecondary)
 	}
 
-	// Progress Bar matching Downloading layout: (140, 500, 1780, 550)
-	drawProgressBar(dst, 140, 500, 1640, 50, state.CurrentPage, state.TotalPages, colorPrimaryBlue)
+	// Progress Bar matching Downloading layout: (90, 500, 1830, 550)
+	drawProgressBar(dst, 90, 500, 1740, 50, state.CurrentPage, state.TotalPages, colorPrimaryBlue)
 
 	subProgress := fmt.Sprintf("Progress: %d of %d pages streamed to printer hardware", state.CurrentPage, state.TotalPages)
-	drawText(dst, faceBold24, subProgress, 140, 585, colorTextPrimary)
+	drawText(dst, faceBold24, subProgress, 90, 585, colorTextPrimary)
 
 	modelStr := "Brother HL-L5210DN"
 	if state.PrinterModel != "" {
 		modelStr = state.PrinterModel
 	}
-	activePill := image.Rect(140, 640, 1100, 705)
+	activePill := image.Rect(90, 640, 1050, 705)
 	drawPill(dst, activePill, colorBgSlate, colorBorder)
 	activeText := fmt.Sprintf("Job is active on %s. Pages will exit into output tray.", modelStr)
-	drawText(dst, faceReg20, activeText, 170, 662, colorTextSecondary)
+	drawText(dst, faceReg20, activeText, 120, 662, colorTextSecondary)
 }
 
 func renderCompleted(dst *image.RGBA, state ScreenState) {
-	card := image.Rect(80, 140, 1840, 980)
+	card := image.Rect(30, 140, 1890, 1050)
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold44, "PRINT COMPLETE", 140, 240, colorSuccessGreen)
+	drawText(dst, faceBold44, "PRINT COMPLETE", 90, 240, colorSuccessGreen)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Your print job has finished successfully."
 	}
-	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 90, 305, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailPill := image.Rect(140, 345, 760, 395)
+		detailPill := image.Rect(90, 345, 710, 395)
 		drawPill(dst, detailPill, colorPillGreenBg, colorPillGreenBorder)
-		drawText(dst, faceReg18, state.Detail, 165, 362, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+		drawText(dst, faceReg18, state.Detail, 115, 362, color.RGBA{R: 4, G: 120, B: 87, A: 255})
 	}
 
 	// Collection Hero Callout Banner
-	calloutBox := image.Rect(140, 430, 1780, 510)
+	calloutBox := image.Rect(90, 430, 1830, 510)
 	drawPill(dst, calloutBox, colorPillGreenBg, colorPillGreenBorder)
 	calloutText := "PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY"
 	cW := measureTextWidth(faceBold24, calloutText)
 	drawText(dst, faceBold24, calloutText, calloutBox.Min.X+(calloutBox.Dx()-cW)/2, 457, color.RGBA{R: 4, G: 120, B: 87, A: 255})
 
 	// Instructions box
-	instBox := image.Rect(140, 540, 1780, 740)
+	instBox := image.Rect(90, 540, 1830, 780)
 	fillRoundedRect(dst, instBox, 16, colorBgSlate)
 	strokeRoundedRect(dst, instBox, 16, 2, colorBorder)
 
-	drawText(dst, faceReg22, "1. Inspect all printed pages before leaving the kiosk area.", 180, 580, colorTextPrimary)
-	drawText(dst, faceReg22, "2. Kiosk will reset to the idle screen for the next user.", 180, 630, colorTextPrimary)
-	drawText(dst, faceReg20, "Thank you for printing with XeroxGo!", 180, 680, colorTextSecondary)
+	drawText(dst, faceReg22, "1. Inspect all printed pages before leaving the kiosk area.", 130, 590, colorTextPrimary)
+	drawText(dst, faceReg22, "2. Kiosk will reset to the idle screen for the next user.", 130, 645, colorTextPrimary)
+	drawText(dst, faceReg20, "Thank you for printing with XeroxGo!", 130, 710, colorTextSecondary)
 }
 
 func renderError(dst *image.RGBA, state ScreenState) {
-	card := image.Rect(80, 140, 1840, 980)
+	card := image.Rect(30, 140, 1890, 1050)
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	drawText(dst, faceBold44, "PRINTER ATTENTION REQUIRED", 140, 240, colorErrorRed)
+	drawText(dst, faceBold44, "PRINTER ATTENTION REQUIRED", 90, 240, colorErrorRed)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
 		msg = "Printer paper tray 1 is empty or disconnected."
 	}
-	drawText(dst, faceReg24, msg, 140, 305, colorTextPrimary)
+	drawText(dst, faceReg24, msg, 90, 305, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailPill := image.Rect(140, 345, 760, 395)
+		detailPill := image.Rect(90, 345, 710, 395)
 		drawPill(dst, detailPill, colorPillRedBg, colorPillRedBorder)
-		drawText(dst, faceReg18, state.Detail, 165, 362, colorErrorRed)
+		drawText(dst, faceReg18, state.Detail, 115, 362, colorErrorRed)
 	}
 
 	// Actionable recovery box
-	boxRect := image.Rect(140, 430, 1780, 890)
+	boxRect := image.Rect(90, 430, 1830, 960)
 	fillRoundedRect(dst, boxRect, 20, color.RGBA{R: 255, G: 251, B: 235, A: 255})
 	strokeRoundedRect(dst, boxRect, 20, 2, color.RGBA{R: 253, G: 230, B: 138, A: 255})
 
-	drawText(dst, faceBold22, "ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:", 180, 475, color.RGBA{R: 180, G: 83, B: 9, A: 255})
+	drawText(dst, faceBold22, "ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:", 130, 480, color.RGBA{R: 180, G: 83, B: 9, A: 255})
 
 	recoverySteps := []string{
 		"1. Check paper tray 1 and refill standard A4 paper if depleted.",
@@ -871,10 +876,10 @@ func renderError(dst *image.RGBA, state ScreenState) {
 		"3. Verify that the output area and paper exit tray are completely clear.",
 		"4. If error persists, please notify the campus attendant or support.",
 	}
-	yR := 535
+	yR := 545
 	for _, step := range recoverySteps {
-		drawText(dst, faceReg20, step, 180, yR, colorTextPrimary)
-		yR += 60
+		drawText(dst, faceReg20, step, 130, yR, colorTextPrimary)
+		yR += 65
 	}
 }
 

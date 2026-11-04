@@ -20,22 +20,22 @@
 
   <!-- MAIN CARD -->
   <g id="CompletedCard">
-    <rect x="80" y="140" width="1760" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
+    <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="140" y="240" fill="#10B981" font-size="44" font-weight="800">PRINT COMPLETE</text>
-    <text x="140" y="305" fill="#1E293B" font-size="24" font-weight="500">Your print job has finished successfully.</text>
+    <text x="90" y="240" fill="#10B981" font-size="44" font-weight="800">PRINT COMPLETE</text>
+    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="500">Your print job has finished successfully.</text>
 
     <!-- Detail Pill -->
-    <rect x="140" y="345" width="460" height="50" rx="25" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1.5"/>
-    <text x="165" y="377" fill="#047857" font-size="18" font-weight="500">Job ID: xg-order-883921 • Total Sheets: 5</text>
+    <rect x="90" y="345" width="460" height="50" rx="25" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1.5"/>
+    <text x="115" y="377" fill="#047857" font-size="18" font-weight="500">Job ID: xg-order-883921 • Total Sheets: 5</text>
 
     <!-- Collection Callout Banner -->
-    <rect x="140" y="430" width="1640" height="80" rx="20" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
+    <rect x="90" y="430" width="1740" height="80" rx="20" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
     <text x="960" y="480" fill="#047857" font-size="24" font-weight="700" text-anchor="middle">PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY</text>
 
     <!-- Instructions Box -->
-    <rect x="140" y="540" width="1640" height="200" rx="20" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
-    <g id="Instructions" transform="translate(180, 595)">
+    <rect x="90" y="540" width="1740" height="220" rx="20" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+    <g id="Instructions" transform="translate(130, 600)">
       <text x="0" y="0" fill="#1E293B" font-size="22" font-weight="500">1. Inspect all printed pages before leaving the kiosk area.</text>
       <text x="0" y="45" fill="#1E293B" font-size="22" font-weight="500">2. Kiosk will reset to the idle screen for the next user.</text>
       <text x="0" y="105" fill="#64748B" font-size="20" font-weight="400">Thank you for printing with XeroxGo!</text>

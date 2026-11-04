@@ -27,16 +27,16 @@
   <g id="IdleCards">
     <!-- LEFT CARD: PROMOTIONAL AD BANNER CAROUSEL -->
     <g id="LeftCard_AdSlide">
-      <rect x="37" y="140" width="1203" height="840" rx="24" fill="url(#adGrad1)"/>
+      <rect x="30" y="140" width="1220" height="910" rx="24" fill="url(#adGrad1)"/>
       
       <!-- Slide Content -->
-      <g id="SlideText" transform="translate(117, 450)">
+      <g id="SlideText" transform="translate(110, 480)">
         <text x="0" y="0" fill="#FFFFFF" font-size="56" font-weight="800" letter-spacing="-0.02em">Quick &amp; Easy</text>
         <text x="0" y="70" fill="#E2E8F0" font-size="28" font-weight="400">Direct UPI payment. No coins, no cash needed.</text>
       </g>
 
       <!-- Carousel Indicator Dots -->
-      <g id="CarouselIndicators" transform="translate(590, 885)">
+      <g id="CarouselIndicators" transform="translate(595, 955)">
         <rect x="0" y="0" width="44" height="10" rx="5" fill="#FFFFFF" opacity="1.0"/>
         <rect x="58" y="0" width="10" height="10" rx="5" fill="#FFFFFF" opacity="0.45"/>
         <rect x="82" y="0" width="10" height="10" rx="5" fill="#FFFFFF" opacity="0.45"/>
@@ -45,24 +45,24 @@
 
     <!-- RIGHT CARD: QR CODE & MOBILE ONBOARDING -->
     <g id="RightCard_QROnboarding">
-      <rect x="1268" y="140" width="612" height="840" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
+      <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
       <!-- QR Title -->
-      <text x="1574" y="185" fill="#1E293B" font-size="18" font-weight="600" text-anchor="middle">Scan with any phone to open your personal print portal</text>
+      <text x="1585" y="180" fill="#1E293B" font-size="18" font-weight="600" text-anchor="middle">Scan with any phone to open your personal print portal</text>
 
       <!-- QR Code Image -->
-      <g id="QRCode" transform="translate(1374, 210)">
+      <g id="QRCode" transform="translate(1385, 215)">
         <image width="400" height="400" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
       </g>
 
       <!-- Action Pill with Website Link -->
-      <g id="ActionPill" transform="translate(1344, 615)">
+      <g id="ActionPill" transform="translate(1355, 635)">
         <rect width="460" height="56" rx="28" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
         <text x="230" y="36" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
       </g>
 
       <!-- Numbered Steps -->
-      <g id="Steps" transform="translate(1344, 700)">
+      <g id="Steps" transform="translate(1365, 715)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
           <circle cx="16" cy="16" r="16" fill="#2563EB"/>
@@ -92,7 +92,7 @@
         </g>
       </g>
 
-      <text x="1574" y="945" fill="#94A3B8" font-size="14" font-weight="500" text-anchor="middle">End-to-End Encrypted Session • Files Deleted Immediately</text>
+      <text x="1585" y="990" fill="#94A3B8" font-size="14" font-weight="500" text-anchor="middle">End-to-End Encrypted Session • Files Deleted Immediately</text>
     </g>
   </g>
 </svg>
