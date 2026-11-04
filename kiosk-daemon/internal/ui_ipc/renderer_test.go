@@ -583,3 +583,69 @@ func TestFramebufferSinkRGB565Scaled(t *testing.T) {
 		t.Fatalf("pixel 0 mismatch: got [%x %x], want [00 f8]", data[0], data[1])
 	}
 }
+
+func TestRenderAdSlidesSolidColors(t *testing.T) {
+	expectedColors := [3]color.RGBA{
+		{R: 37, G: 99, B: 235, A: 255},  // Slide 0: Prominent Primary Blue #2563EB
+		{R: 16, G: 185, B: 129, A: 255}, // Slide 1: Prominent Emerald Green #10B981
+		{R: 124, G: 58, B: 237, A: 255}, // Slide 2: Prominent Violet #7C3AED
+	}
+
+	for i, expected := range expectedColors {
+		img, err := Render(ScreenState{
+			Mode:         ModeIdle,
+			QRContent:    "https://kiosk.test/idle",
+			AdSlideIndex: i,
+		})
+		if err != nil {
+			t.Fatalf("Render slide %d failed: %v", i, err)
+		}
+
+		// Sample clean interior coordinate in upper right quadrant of ad card (800, 200)
+		sampled := img.RGBAAt(800, 200)
+		if sampled != expected {
+			t.Fatalf("slide %d solid color mismatch at (800, 200): got %v, want %v", i, sampled, expected)
+		}
+
+		// Verify rounded corner masking at outer corner (37, 140) against Slate background
+		cornerSample := img.RGBAAt(37, 140)
+		if cornerSample != colorBgSlate {
+			t.Fatalf("slide %d outer corner (37, 140) not masked with colorBgSlate: got %v, want %v", i, cornerSample, colorBgSlate)
+		}
+	}
+}
+
+func TestRenderAdSlideTransition(t *testing.T) {
+	// Transitioning from Slide 0 (Blue) to Slide 1 (Green) at 50%
+	img, err := Render(ScreenState{
+		Mode:           ModeIdle,
+		QRContent:      "https://kiosk.test/idle",
+		AdSlideIndex:   1,
+		TransitionFrom: 0,
+		TransitionProg: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("Render transition failed: %v", err)
+	}
+
+	blue := color.RGBA{R: 37, G: 99, B: 235, A: 255}
+	green := color.RGBA{R: 16, G: 185, B: 129, A: 255}
+
+	// At 50% transition, card width is 1203.
+	// Outgoing Slide 0 occupies the left half, incoming Slide 1 occupies the right half.
+	leftSample := img.RGBAAt(300, 200)
+	if leftSample != blue {
+		t.Fatalf("expected left side of transition card to be Slide 0 Blue, got %v", leftSample)
+	}
+
+	rightSample := img.RGBAAt(1000, 200)
+	if rightSample != green {
+		t.Fatalf("expected right side of transition card to be Slide 1 Green, got %v", rightSample)
+	}
+
+	// Verify corner masking still intact during active transition
+	cornerSample := img.RGBAAt(37, 140)
+	if cornerSample != colorBgSlate {
+		t.Fatalf("transition outer corner (37, 140) not masked with colorBgSlate: got %v, want %v", cornerSample, colorBgSlate)
+	}
+}

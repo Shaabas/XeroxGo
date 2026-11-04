@@ -829,9 +829,17 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 		state.PrinterModel = c.cfg.PrinterModel
 	}
 
-	c.renderHistoryMu.Lock()
-	c.renderHistory = append(c.renderHistory, state)
-	c.renderHistoryMu.Unlock()
+	// Only append logical state transitions to history, omitting intermediate animation frames
+	isIntermediateAnim := (state.TransitionFrom >= 0 &&
+		state.TransitionFrom != state.AdSlideIndex &&
+		state.TransitionProg > 0.0 &&
+		state.TransitionProg < 1.0)
+
+	if !isIntermediateAnim {
+		c.renderHistoryMu.Lock()
+		c.renderHistory = append(c.renderHistory, state)
+		c.renderHistoryMu.Unlock()
+	}
 
 	c.currentModeMu.Lock()
 	c.currentMode = state.Mode
@@ -854,7 +862,11 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 }
 
 func (c *Client) idleCarouselLoop(ctx context.Context) {
-	ticker := time.NewTicker(c.cfg.IdleCarouselInterval)
+	interval := c.cfg.IdleCarouselInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -864,18 +876,60 @@ func (c *Client) idleCarouselLoop(ctx context.Context) {
 		case <-ticker.C:
 			c.currentModeMu.Lock()
 			isIdle := (c.currentMode == ui_ipc.ModeIdle)
-			if isIdle {
-				c.adSlideIndex = (c.adSlideIndex + 1) % 3
-				slideIdx := c.adSlideIndex
+			fromIdx := c.adSlideIndex
+			toIdx := (c.adSlideIndex + 1) % 3
+			c.adSlideIndex = toIdx
+			c.currentModeMu.Unlock()
+
+			if !isIdle {
+				continue
+			}
+
+			// Smooth horizontal slide transition over 500ms in 15 frames (~33ms per frame, 30 FPS)
+			const (
+				totalSteps   = 15
+				stepDuration = 33 * time.Millisecond
+			)
+
+			for step := 1; step <= totalSteps; step++ {
+				// Abort immediately if context is canceled or a job arrives
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				c.currentModeMu.Lock()
+				stillIdle := (c.currentMode == ui_ipc.ModeIdle)
 				c.currentModeMu.Unlock()
+
+				if !stillIdle {
+					break
+				}
+
+				prog := float64(step) / float64(totalSteps)
+				transFrom := fromIdx
+				if step == totalSteps {
+					transFrom = -1
+					prog = 1.0
+				}
+
 				_ = c.renderScreen(ui_ipc.ScreenState{
-					Mode:         ui_ipc.ModeIdle,
-					QRContent:    c.cfg.IdleQRContent,
-					Message:      "Ready to print",
-					AdSlideIndex: slideIdx,
+					Mode:           ui_ipc.ModeIdle,
+					QRContent:      c.cfg.IdleQRContent,
+					Message:        "Ready to print",
+					AdSlideIndex:   toIdx,
+					TransitionFrom: transFrom,
+					TransitionProg: prog,
 				})
-			} else {
-				c.currentModeMu.Unlock()
+
+				if step < totalSteps {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(stepDuration):
+					}
+				}
 			}
 		}
 	}

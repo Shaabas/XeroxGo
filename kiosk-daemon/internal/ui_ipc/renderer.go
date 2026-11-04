@@ -42,7 +42,9 @@ type ScreenState struct {
 	CurrentPage     int
 	TotalPages      int
 	PrinterModel    string
-	AdSlideIndex    int // 0: Quick & Easy, 1: High Quality Prints, 2: Skip The Queue
+	AdSlideIndex    int     // 0: Quick & Easy, 1: High Quality Prints, 2: Skip The Queue
+	TransitionFrom  int     // -1 if static; 0, 1, or 2 if transitioning from that slide
+	TransitionProg  float64 // 0.0 to 1.0 progress of slide transition
 }
 
 type Sink func(*image.RGBA) error
@@ -196,9 +198,7 @@ type AdSlide struct {
 	Desc    string
 	Tag     string
 	Subline string
-	C0      color.RGBA
-	C1      color.RGBA
-	C2      color.RGBA
+	Color   color.RGBA
 }
 
 var adSlides = [3]AdSlide{
@@ -207,76 +207,175 @@ var adSlides = [3]AdSlide{
 		Desc:    "Direct UPI payment. No coins, no cash needed.",
 		Tag:     "TOUCHLESS MOBILE PRINTING",
 		Subline: "Scan QR with any phone  •  Upload PDF  •  Instant UPI  •  Collect print",
-		C0:      color.RGBA{R: 30, G: 58, B: 138, A: 255},  // #1E3A8A
-		C1:      color.RGBA{R: 37, G: 99, B: 235, A: 255},  // #2563EB
-		C2:      color.RGBA{R: 79, G: 70, B: 229, A: 255},  // #4F46E5
+		Color:   color.RGBA{R: 37, G: 99, B: 235, A: 255}, // #2563EB Prominent Blue
 	},
 	{
 		Title:   "High Quality Prints",
 		Desc:    "Crisp laser documents ready in seconds.",
 		Tag:     "CAMPUS PRINT PORTAL",
 		Subline: "Single & Double-Sided (Duplex)  •  Full Color & Monochrome  •  600 DPI",
-		C0:      color.RGBA{R: 6, G: 95, B: 70, A: 255},    // #065F46
-		C1:      color.RGBA{R: 16, G: 185, B: 129, A: 255}, // #10B981
-		C2:      color.RGBA{R: 5, G: 150, B: 105, A: 255},  // #059669
+		Color:   color.RGBA{R: 16, G: 185, B: 129, A: 255}, // #10B981 Prominent Green
 	},
 	{
 		Title:   "Skip The Queue",
 		Desc:    "Pick up your print job with your 4-digit code.",
 		Tag:     "EXPRESS CAMPUS PICKUP",
 		Subline: "Upload from anywhere on campus  •  Release with your PIN in seconds",
-		C0:      color.RGBA{R: 88, G: 28, B: 135, A: 255},  // #581C87
-		C1:      color.RGBA{R: 124, G: 58, B: 237, A: 255}, // #7C3AED
-		C2:      color.RGBA{R: 217, G: 119, B: 6, A: 255},  // #D97706
+		Color:   color.RGBA{R: 124, G: 58, B: 237, A: 255}, // #7C3AED Prominent Purple
 	},
+}
+
+var (
+	adSlideImgs [3]*image.RGBA
+
+	cachedQRContent string
+	cachedQRImg     image.Image
+	qrCacheMu       sync.Mutex
+)
+
+// initAdSlides pre-renders the 3 promotional slides into memory buffers once at startup.
+// This guarantees zero-latency, zero-alloc performance during 30 FPS carousel transitions.
+func initAdSlides() {
+	for k := 0; k < 3; k++ {
+		slide := adSlides[k]
+		img := image.NewRGBA(image.Rect(0, 0, 1203, 840))
+
+		// 1. Solid prominent color background (no gradients)
+		fillRect(img, img.Bounds(), slide.Color)
+
+		// 2. Tag Pill (no close button)
+		tagW := measureTextWidth(faceBold18, slide.Tag)
+		tagRect := image.Rect(63, 70, 63+tagW+40, 116)
+		fillRoundedRect(img, tagRect, 10, color.RGBA{R: 255, G: 255, B: 255, A: 45})
+		strokeRoundedRect(img, tagRect, 10, 1, color.RGBA{R: 255, G: 255, B: 255, A: 85})
+		drawText(img, faceBold18, slide.Tag, tagRect.Min.X+20, tagRect.Min.Y+7, colorTextWhite)
+
+		// 3. Main Hero Slide Title & Description
+		drawText(img, faceBold56, slide.Title, 63, 190, colorTextWhite)
+		drawText(img, faceReg28, slide.Desc, 63, 280, color.RGBA{R: 241, G: 245, B: 249, A: 245})
+
+		// 4. Frosted feature card
+		featureRect := image.Rect(63, 380, 1140, 490)
+		fillRoundedRect(img, featureRect, 16, color.RGBA{R: 255, G: 255, B: 255, A: 32})
+		strokeRoundedRect(img, featureRect, 16, 1, color.RGBA{R: 255, G: 255, B: 255, A: 65})
+		drawText(img, faceReg22, slide.Subline, 98, 418, color.RGBA{R: 255, G: 255, B: 255, A: 245})
+
+		// 5. Prompt subtext
+		drawText(img, faceReg20, "Scan the QR code on the right with your phone camera to begin printing", 63, 590, color.RGBA{R: 226, G: 232, B: 240, A: 225})
+
+		adSlideImgs[k] = img
+	}
+}
+
+func getQRCodeImage(content string) (image.Image, error) {
+	qrCacheMu.Lock()
+	defer qrCacheMu.Unlock()
+	if content == cachedQRContent && cachedQRImg != nil {
+		return cachedQRImg, nil
+	}
+	qrBytes, err := qrcode.Encode(content, qrcode.Medium, 400)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode QR code: %w", err)
+	}
+	img, err := png.Decode(bytes.NewReader(qrBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode QR PNG: %w", err)
+	}
+	cachedQRContent = content
+	cachedQRImg = img
+	return img, nil
 }
 
 func renderIdle(dst *image.RGBA, state ScreenState) error {
 	// 1. Left Card: Ad Card (occupies full [37, 140, 1240, 980] bounds, no redundant white card)
 	adCard := image.Rect(37, 140, 1240, 980)
+	cardW := adCard.Dx()
+	cardH := adCard.Dy()
 
-	// Pick active slide (0, 1, or 2)
-	slideIndex := state.AdSlideIndex % 3
-	if slideIndex < 0 {
-		slideIndex = (slideIndex + 3) % 3
+	toIdx := (state.AdSlideIndex%3 + 3) % 3
+	isTransition := state.TransitionFrom >= 0 &&
+		state.TransitionFrom != state.AdSlideIndex &&
+		state.TransitionProg > 0.0 &&
+		state.TransitionProg < 1.0
+
+	var fromIdx int
+	var offset int
+	var easeProg float64
+
+	if isTransition {
+		fromIdx = (state.TransitionFrom%3 + 3) % 3
+		p := state.TransitionProg
+		if p < 0.0 {
+			p = 0.0
+		} else if p > 1.0 {
+			p = 1.0
+		}
+		// Cubic Hermite smoothstep ease-in-out: e = p * p * (3 - 2 * p)
+		easeProg = p * p * (3.0 - 2.0*p)
+		offset = int(easeProg*float64(cardW) + 0.5)
+		if offset < 0 {
+			offset = 0
+		} else if offset > cardW {
+			offset = cardW
+		}
+	} else {
+		fromIdx = toIdx
+		offset = 0
+		easeProg = 0.0
 	}
-	slide := adSlides[slideIndex]
 
-	// 135-degree true CSS linear gradient filling the full left card with rx=24
-	fillRoundedGradient(dst, adCard, 24, slide.C0, slide.C1, slide.C2)
+	wFrom := cardW - offset
+	wTo := offset
 
-	// Top row: Tag Pill (No close button!)
-	tagW := measureTextWidth(faceBold18, slide.Tag)
-	tagRect := image.Rect(100, 210, 100+tagW+40, 256)
-	fillRoundedRect(dst, tagRect, 10, color.RGBA{R: 255, G: 255, B: 255, A: 45})
-	strokeRoundedRect(dst, tagRect, 10, 1, color.RGBA{R: 255, G: 255, B: 255, A: 85})
-	drawText(dst, faceBold18, slide.Tag, tagRect.Min.X+20, tagRect.Min.Y+7, colorTextWhite)
+	// Blit horizontal sliding track row-by-row with assembly-optimized byte slice copies
+	for y := 0; y < cardH; y++ {
+		dstY := adCard.Min.Y + y
+		dstRowStart := dstY*dst.Stride + adCard.Min.X*4
+		dstRow := dst.Pix[dstRowStart : dstRowStart+cardW*4]
+		srcYStride := y * adSlideImgs[0].Stride
 
-	// Main Hero Slide Title & Description
-	drawText(dst, faceBold56, slide.Title, 100, 330, colorTextWhite)
-	drawText(dst, faceReg28, slide.Desc, 100, 420, color.RGBA{R: 241, G: 245, B: 249, A: 245})
+		if wFrom > 0 {
+			srcFrom := adSlideImgs[fromIdx].Pix[srcYStride+offset*4 : srcYStride+cardW*4]
+			copy(dstRow[0:wFrom*4], srcFrom)
+		}
+		if wTo > 0 {
+			srcTo := adSlideImgs[toIdx].Pix[srcYStride : srcYStride+offset*4]
+			copy(dstRow[wFrom*4:cardW*4], srcTo)
+		}
+	}
 
-	// Frosted feature card
-	featureRect := image.Rect(100, 520, 1177, 630)
-	fillRoundedRect(dst, featureRect, 16, color.RGBA{R: 255, G: 255, B: 255, A: 32})
-	strokeRoundedRect(dst, featureRect, 16, 1, color.RGBA{R: 255, G: 255, B: 255, A: 65})
-	drawText(dst, faceReg22, slide.Subline, 135, 558, color.RGBA{R: 255, G: 255, B: 255, A: 245})
-
-	// Prompt subtext
-	drawText(dst, faceReg20, "Scan the QR code on the right with your phone camera to begin printing", 100, 730, color.RGBA{R: 226, G: 232, B: 240, A: 225})
+	// Anti-aliased corner masking with rx=24 against slate background
+	maskCardCorners(dst, adCard, 24, colorBgSlate)
 
 	// Bottom Carousel Indicators matching mobile frontend (.banner-indicators)
-	// Centered at x=638: active pill (w=44) + 2 inactive dots (w=10)
+	// Stationary centered at x=638, morphing widths and cross-fading alphas during transition
 	curX := 592
 	for k := 0; k < 3; k++ {
-		if k == slideIndex {
-			pill := image.Rect(curX, 885, curX+44, 895)
-			fillRoundedRect(dst, pill, 5, color.RGBA{R: 255, G: 255, B: 255, A: 255})
-			curX += 44 + 14
+		var w int
+		var alpha uint8
+		if isTransition {
+			if k == fromIdx {
+				w = int(44.0 - 34.0*easeProg + 0.5)
+				alpha = uint8(255.0 - 140.0*easeProg + 0.5)
+			} else if k == toIdx {
+				w = int(10.0 + 34.0*easeProg + 0.5)
+				alpha = uint8(115.0 + 140.0*easeProg + 0.5)
+			} else {
+				w = 10
+				alpha = 115
+			}
 		} else {
-			drawCircle(dst, curX+5, 890, 5, color.RGBA{R: 255, G: 255, B: 255, A: 115})
-			curX += 10 + 14
+			if k == toIdx {
+				w = 44
+				alpha = 255
+			} else {
+				w = 10
+				alpha = 115
+			}
 		}
+		pill := image.Rect(curX, 885, curX+w, 895)
+		fillRoundedRect(dst, pill, 5, color.RGBA{R: 255, G: 255, B: 255, A: alpha})
+		curX += w + 14
 	}
 
 	// 2. Right Card: QR Code + Onboarding Steps
@@ -289,14 +388,10 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	qrTitleW := measureTextWidth(faceReg18, qrTitle)
 	drawText(dst, faceReg18, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 172, colorTextPrimary)
 
-	// QR Code Generation
-	qrBytes, err := qrcode.Encode(state.QRContent, qrcode.Medium, 400)
+	// QR Code Generation (Cached for zero-lag performance)
+	qrImg, err := getQRCodeImage(state.QRContent)
 	if err != nil {
-		return fmt.Errorf("failed to encode QR code: %w", err)
-	}
-	qrImg, err := png.Decode(bytes.NewReader(qrBytes))
-	if err != nil {
-		return fmt.Errorf("failed to decode QR PNG: %w", err)
+		return err
 	}
 
 	// QR code is placed directly on the card without extra border box

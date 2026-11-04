@@ -95,7 +95,68 @@ func initUIAssets() {
 				rawLogoImg = img
 			}
 		}
+
+		// 3. Pre-render solid-color ad slide cards for zero-latency carousel transitions
+		initAdSlides()
 	})
+}
+
+// maskCardCorners clips the 4 corners of a rectangular region r with radius,
+// anti-aliasing and blending any pixel outside the radius with the background color bg.
+func maskCardCorners(dst *image.RGBA, r image.Rectangle, radius int, bg color.RGBA) {
+	if radius <= 0 {
+		return
+	}
+	w := r.Dx()
+	h := r.Dy()
+	if radius > w/2 {
+		radius = w / 2
+	}
+	if radius > h/2 {
+		radius = h / 2
+	}
+
+	rF := float64(radius)
+	bgA := float64(bg.A) / 255.0
+
+	maskCorner := func(cornerMinX, cornerMinY, cornerMaxX, cornerMaxY int, cx, cy float64) {
+		for y := cornerMinY; y < cornerMaxY; y++ {
+			fy := float64(y) + 0.5
+			dy := fy - cy
+			rowStart := y*dst.Stride + cornerMinX*4
+			rowEnd := y*dst.Stride + cornerMaxX*4
+			for p, x := rowStart, cornerMinX; p < rowEnd; p, x = p+4, x+1 {
+				fx := float64(x) + 0.5
+				dx := fx - cx
+				dist := math.Sqrt(dx*dx + dy*dy)
+				if dist > rF-0.5 {
+					if dist >= rF+0.5 {
+						dst.Pix[p+0] = bg.R
+						dst.Pix[p+1] = bg.G
+						dst.Pix[p+2] = bg.B
+						dst.Pix[p+3] = bg.A
+					} else {
+						cardAlpha := (rF + 0.5) - dist
+						invCardAlpha := 1.0 - cardAlpha
+						dst.Pix[p+0] = uint8(float64(dst.Pix[p+0])*cardAlpha + float64(bg.R)*invCardAlpha*bgA)
+						dst.Pix[p+1] = uint8(float64(dst.Pix[p+1])*cardAlpha + float64(bg.G)*invCardAlpha*bgA)
+						dst.Pix[p+2] = uint8(float64(dst.Pix[p+2])*cardAlpha + float64(bg.B)*invCardAlpha*bgA)
+						dst.Pix[p+3] = 255
+					}
+				}
+			}
+		}
+	}
+
+	cx0 := float64(r.Min.X + radius)
+	cy0 := float64(r.Min.Y + radius)
+	cx1 := float64(r.Max.X - radius)
+	cy1 := float64(r.Max.Y - radius)
+
+	maskCorner(r.Min.X, r.Min.Y, r.Min.X+radius, r.Min.Y+radius, cx0, cy0)
+	maskCorner(r.Max.X-radius, r.Min.Y, r.Max.X, r.Min.Y+radius, cx1, cy0)
+	maskCorner(r.Min.X, r.Max.Y-radius, r.Min.X+radius, r.Max.Y, cx0, cy1)
+	maskCorner(r.Max.X-radius, r.Max.Y-radius, r.Max.X, r.Max.Y, cx1, cy1)
 }
 
 // drawText renders text starting at top-left position (x, y) using the given font face and color.
