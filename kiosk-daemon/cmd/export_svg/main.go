@@ -194,30 +194,30 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
       </g>
 
       <!-- 3 Numbered Steps -->
-      <g id="Steps" transform="translate(1350, 716)">
+      <g id="Steps" transform="translate(1348, 716)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">1</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Upload your file &amp; choose print settings</text>
+          <text x="50" y="25" fill="#1E293B" font-size="22" font-weight="700">Upload your file &amp; choose print settings</text>
         </g>
 
         <!-- Step 2 -->
         <g id="Step2" transform="translate(0, 68)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">2</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Pay with UPI (GPay, PhonePe, Paytm)</text>
+          <text x="50" y="25" fill="#1E293B" font-size="22" font-weight="700">Pay with UPI (GPay, PhonePe, Paytm)</text>
         </g>
 
         <!-- Step 3 -->
         <g id="Step3" transform="translate(0, 136)">
           <circle cx="18" cy="18" r="18" fill="#10B981"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect your prints from the tray below</text>
+          <text x="50" y="25" fill="#1E293B" font-size="22" font-weight="700">Collect your prints from the tray below</text>
         </g>
       </g>
 
-      <text x="1585" y="970" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private and automatically deleted after printing</text>
+      <text x="1585" y="975" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private and automatically deleted after printing</text>
     </g>
   </g>
 </svg>`,

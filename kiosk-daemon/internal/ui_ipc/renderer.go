@@ -539,7 +539,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	pillW := measureTextWidth(faceBold24, displayLink)
 	drawText(base, faceBold24, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 642, colorPrimaryBlue)
 
-	// 3 Numbered Steps - Option A
+	// 3 Numbered Steps - Option A (mathematically centered with 68px left/right margins)
 	steps := []struct {
 		num    string
 		title  string
@@ -556,17 +556,17 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		if s.isLast {
 			circleCol = colorSuccessGreen
 		}
-		drawCircle(base, 1368, y+18, 18, circleCol)
+		drawCircle(base, 1366, y+18, 18, circleCol)
 		numW := measureTextWidth(faceBold20, s.num)
-		drawText(base, faceBold20, s.num, 1368-numW/2, y+7, colorTextWhite)
+		drawText(base, faceBold20, s.num, 1366-numW/2, y+9, colorTextWhite)
 
-		drawText(base, faceBold22, s.title, 1400, y+6, colorTextPrimary)
+		drawText(base, faceBold22, s.title, 1398, y+7, colorTextPrimary)
 	}
 
 	// Security badge / footer text inside right card - Layman's terms & larger font (18px)
 	secText := "Your files are private and automatically deleted after printing"
 	secW := measureTextWidth(faceReg18, secText)
-	drawText(base, faceReg18, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 965, colorTextSecondary)
+	drawText(base, faceReg18, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 961, colorTextSecondary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
