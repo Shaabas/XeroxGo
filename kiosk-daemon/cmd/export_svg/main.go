@@ -179,22 +179,22 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
       <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
       <!-- Headline & Subtitle -->
-      <text x="1585" y="180" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan QR to Get Started</text>
-      <text x="1585" y="210" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Point your phone camera here, or visit website below</text>
+      <text x="1585" y="186" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan QR to Get Started</text>
+      <text x="1585" y="214" fill="#334155" font-size="20" font-weight="700" text-anchor="middle">Point your phone camera here, or visit website below</text>
 
       <!-- QR Code Image (360x360) -->
-      <g id="QRCode" transform="translate(1405, 230)">
+      <g id="QRCode" transform="translate(1405, 236)">
         <image width="360" height="360" href="data:image/png;base64,%s" preserveAspectRatio="xMidYMid meet"/>
       </g>
 
-      <!-- Fallback Pill with Website Link -->
-      <g id="ActionPill" transform="translate(1325, 612)">
-        <rect width="520" height="52" rx="26" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-        <text x="260" y="32" fill="#1D4ED8" font-size="18" font-weight="700" text-anchor="middle">Can't scan? Open browser &amp; go to xeroxgo.vercel.app</text>
+      <!-- Action Pill with Website Link -->
+      <g id="ActionPill" transform="translate(1355, 626)">
+        <rect width="460" height="56" rx="28" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+        <text x="230" y="36" fill="#2563EB" font-size="24" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
       </g>
 
       <!-- 3 Numbered Steps -->
-      <g id="Steps" transform="translate(1350, 706)">
+      <g id="Steps" transform="translate(1350, 716)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
@@ -217,7 +217,7 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
         </g>
       </g>
 
-      <text x="1585" y="975" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
+      <text x="1585" y="970" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private and automatically deleted after printing</text>
     </g>
   </g>
 </svg>`,
