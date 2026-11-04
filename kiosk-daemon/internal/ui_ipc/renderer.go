@@ -190,10 +190,65 @@ func drawHeaderBadge(dst *image.RGBA, mode ScreenMode) {
 }
 
 func renderIdle(dst *image.RGBA, state ScreenState) error {
-	// 1. Left Card: Ad Card (Blank as designed by user for advertising / campus notices)
+	// 1. Left Card: Ad Card containing mobile frontend Promo Banner Carousel placeholder
 	leftCard := image.Rect(37, 140, 1240, 980)
 	fillRoundedRect(dst, leftCard, 24, colorCardBg)
 	strokeRoundedRect(dst, leftCard, 24, 2, colorBorder)
+
+	// Inset promo banner container matching mobile frontend's .banner-container
+	bannerRect := image.Rect(67, 170, 1210, 950)
+	// 135-degree linear gradient from #1E3A8A (rgb 30,58,138) to #2563EB (rgb 37,99,235) to #4F46E5 (rgb 79,70,229)
+	fillRoundedGradient(dst, bannerRect, 20,
+		color.RGBA{R: 30, G: 58, B: 138, A: 255},
+		color.RGBA{R: 37, G: 99, B: 235, A: 255},
+		color.RGBA{R: 79, G: 70, B: 229, A: 255},
+	)
+
+	// Top row: Tag Pill & Close Button
+	tagRect := image.Rect(110, 210, 320, 248)
+	fillRoundedRect(dst, tagRect, 10, color.RGBA{R: 255, G: 255, B: 255, A: 40})
+	strokeRoundedRect(dst, tagRect, 10, 1, color.RGBA{R: 255, G: 255, B: 255, A: 80})
+	tagText := "CAMPUS PROMOTION"
+	tagW := measureTextWidth(faceBold18, tagText)
+	drawText(dst, faceBold18, tagText, tagRect.Min.X+(tagRect.Dx()-tagW)/2, tagRect.Min.Y+5, colorTextWhite)
+
+	// Close button at top right
+	drawCloseButton(dst, 1160, 229, 18)
+
+	// Slide 1 Hero: "Quick & Easy"
+	drawText(dst, faceBold48, "Quick & Easy", 110, 285, colorTextWhite)
+	drawText(dst, faceReg24, "Direct UPI payment. No coins, no cash needed.", 110, 350, color.RGBA{R: 241, G: 245, B: 249, A: 240})
+
+	// Slide 2 & 3 Feature Highlights (Translucent cards matching mobile promo content)
+	card1 := image.Rect(110, 420, 1165, 540)
+	fillRoundedRect(dst, card1, 16, color.RGBA{R: 255, G: 255, B: 255, A: 28})
+	strokeRoundedRect(dst, card1, 16, 1, color.RGBA{R: 255, G: 255, B: 255, A: 60})
+	pill1 := image.Rect(135, 442, 245, 474)
+	fillRoundedRect(dst, pill1, 8, color.RGBA{R: 16, G: 185, B: 129, A: 220})
+	p1W := measureTextWidth(faceBold18, "QUALITY")
+	drawText(dst, faceBold18, "QUALITY", pill1.Min.X+(pill1.Dx()-p1W)/2, pill1.Min.Y+4, colorTextWhite)
+	drawText(dst, faceBold24, "High Quality Prints", 265, 444, colorTextWhite)
+	drawText(dst, faceReg20, "Crisp laser documents ready in seconds.", 135, 492, color.RGBA{R: 241, G: 245, B: 249, A: 230})
+
+	card2 := image.Rect(110, 565, 1165, 685)
+	fillRoundedRect(dst, card2, 16, color.RGBA{R: 255, G: 255, B: 255, A: 28})
+	strokeRoundedRect(dst, card2, 16, 1, color.RGBA{R: 255, G: 255, B: 255, A: 60})
+	pill2 := image.Rect(135, 587, 260, 619)
+	fillRoundedRect(dst, pill2, 8, color.RGBA{R: 245, G: 158, B: 11, A: 220})
+	p2W := measureTextWidth(faceBold18, "EXPRESS")
+	drawText(dst, faceBold18, "EXPRESS", pill2.Min.X+(pill2.Dx()-p2W)/2, pill2.Min.Y+4, colorTextWhite)
+	drawText(dst, faceBold24, "Skip The Queue", 280, 589, colorTextWhite)
+	drawText(dst, faceReg20, "Pick up your print job with your 4-digit code.", 135, 637, color.RGBA{R: 241, G: 245, B: 249, A: 230})
+
+	// Prompt subtext
+	drawText(dst, faceReg20, "Point your phone camera at the QR code on the right to start printing", 110, 735, color.RGBA{R: 226, G: 232, B: 240, A: 220})
+
+	// Bottom Carousel Indicators matching mobile frontend (.banner-indicators)
+	// Active pill (width 36, height 10) + 2 inactive dots (diameter 10)
+	indActive := image.Rect(598, 885, 634, 895)
+	fillRoundedRect(dst, indActive, 5, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	drawCircle(dst, 651, 890, 5, color.RGBA{R: 255, G: 255, B: 255, A: 115})
+	drawCircle(dst, 673, 890, 5, color.RGBA{R: 255, G: 255, B: 255, A: 115})
 
 	// 2. Right Card: QR Code + Onboarding Steps
 	rightCard := image.Rect(1268, 140, 1891, 980)
@@ -411,17 +466,37 @@ func drawProgressBar(dst *image.RGBA, x, y, width, height, current, total int, f
 
 func fillRect(dst *image.RGBA, r image.Rectangle, col color.RGBA) {
 	r = r.Intersect(dst.Bounds())
-	if r.Empty() {
+	if r.Empty() || col.A == 0 {
 		return
 	}
+	if col.A == 255 {
+		for y := r.Min.Y; y < r.Max.Y; y++ {
+			rowStart := y*dst.Stride + r.Min.X*4
+			rowEnd := y*dst.Stride + r.Max.X*4
+			for p := rowStart; p < rowEnd; p += 4 {
+				dst.Pix[p+0] = col.R
+				dst.Pix[p+1] = col.G
+				dst.Pix[p+2] = col.B
+				dst.Pix[p+3] = 255
+			}
+		}
+		return
+	}
+
+	alpha := float64(col.A) / 255.0
+	invAlpha := 1.0 - alpha
+	rF := float64(col.R) * alpha
+	gF := float64(col.G) * alpha
+	bF := float64(col.B) * alpha
+
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		rowStart := y*dst.Stride + r.Min.X*4
 		rowEnd := y*dst.Stride + r.Max.X*4
 		for p := rowStart; p < rowEnd; p += 4 {
-			dst.Pix[p+0] = col.R
-			dst.Pix[p+1] = col.G
-			dst.Pix[p+2] = col.B
-			dst.Pix[p+3] = col.A
+			dst.Pix[p+0] = uint8(rF + float64(dst.Pix[p+0])*invAlpha)
+			dst.Pix[p+1] = uint8(gF + float64(dst.Pix[p+1])*invAlpha)
+			dst.Pix[p+2] = uint8(bF + float64(dst.Pix[p+2])*invAlpha)
+			dst.Pix[p+3] = 255
 		}
 	}
 }

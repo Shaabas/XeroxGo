@@ -202,6 +202,122 @@ func fillRoundedRect(dst *image.RGBA, r image.Rectangle, radius int, col color.R
 	drawCorner(r.Max.X-radius, r.Max.Y-radius, r.Max.X, r.Max.Y, cx1, cy1)
 }
 
+// fillRoundedGradient fills a rectangle with rounded corners using a 135-degree 3-stop linear gradient.
+func fillRoundedGradient(dst *image.RGBA, r image.Rectangle, radius int, c0, c1, c2 color.RGBA) {
+	r = r.Intersect(dst.Bounds())
+	if r.Empty() {
+		return
+	}
+	w := r.Dx()
+	h := r.Dy()
+	if radius <= 0 {
+		radius = 0
+	}
+	if radius > w/2 {
+		radius = w / 2
+	}
+	if radius > h/2 {
+		radius = h / 2
+	}
+
+	rF := float64(radius)
+	cx0 := float64(r.Min.X + radius)
+	cy0 := float64(r.Min.Y + radius)
+	cx1 := float64(r.Max.X - radius)
+	cy1 := float64(r.Max.Y - radius)
+
+	wF := float64(w)
+	hF := float64(h)
+
+	r0, g0, b0 := float64(c0.R), float64(c0.G), float64(c0.B)
+	r1, g1, b1 := float64(c1.R), float64(c1.G), float64(c1.B)
+	r2, g2, b2 := float64(c2.R), float64(c2.G), float64(c2.B)
+
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		v := float64(y-r.Min.Y) / hF
+		fy := float64(y) + 0.5
+		isTop := y < r.Min.Y+radius
+		isBottom := y >= r.Max.Y-radius
+
+		rowStart := y*dst.Stride + r.Min.X*4
+		for x, p := r.Min.X, rowStart; x < r.Max.X; x, p = x+1, p+4 {
+			alpha := 1.0
+			fx := float64(x) + 0.5
+
+			if isTop && x < r.Min.X+radius {
+				dx := fx - cx0
+				dy := fy - cy0
+				dist := math.Sqrt(dx*dx + dy*dy)
+				if dist > rF+0.5 {
+					continue
+				}
+				if dist > rF-0.5 {
+					alpha = (rF + 0.5) - dist
+				}
+			} else if isTop && x >= r.Max.X-radius {
+				dx := fx - cx1
+				dy := fy - cy0
+				dist := math.Sqrt(dx*dx + dy*dy)
+				if dist > rF+0.5 {
+					continue
+				}
+				if dist > rF-0.5 {
+					alpha = (rF + 0.5) - dist
+				}
+			} else if isBottom && x < r.Min.X+radius {
+				dx := fx - cx0
+				dy := fy - cy1
+				dist := math.Sqrt(dx*dx + dy*dy)
+				if dist > rF+0.5 {
+					continue
+				}
+				if dist > rF-0.5 {
+					alpha = (rF + 0.5) - dist
+				}
+			} else if isBottom && x >= r.Max.X-radius {
+				dx := fx - cx1
+				dy := fy - cy1
+				dist := math.Sqrt(dx*dx + dy*dy)
+				if dist > rF+0.5 {
+					continue
+				}
+				if dist > rF-0.5 {
+					alpha = (rF + 0.5) - dist
+				}
+			}
+
+			u := float64(x-r.Min.X) / wF
+			t := (u + v) * 0.5
+
+			var cr, cg, cb float64
+			if t <= 0.5 {
+				f := t * 2.0
+				cr = r0 + f*(r1-r0)
+				cg = g0 + f*(g1-g0)
+				cb = b0 + f*(b1-b0)
+			} else {
+				f := (t - 0.5) * 2.0
+				cr = r1 + f*(r2-r1)
+				cg = g1 + f*(g2-g1)
+				cb = b1 + f*(b2-b1)
+			}
+
+			if alpha >= 1.0 {
+				dst.Pix[p+0] = uint8(cr)
+				dst.Pix[p+1] = uint8(cg)
+				dst.Pix[p+2] = uint8(cb)
+				dst.Pix[p+3] = 255
+			} else if alpha > 0 {
+				invAlpha := 1.0 - alpha
+				dst.Pix[p+0] = uint8(cr*alpha + float64(dst.Pix[p+0])*invAlpha)
+				dst.Pix[p+1] = uint8(cg*alpha + float64(dst.Pix[p+1])*invAlpha)
+				dst.Pix[p+2] = uint8(cb*alpha + float64(dst.Pix[p+2])*invAlpha)
+				dst.Pix[p+3] = 255
+			}
+		}
+	}
+}
+
 // strokeRoundedRect draws a rounded rectangle border of the specified thickness.
 func strokeRoundedRect(dst *image.RGBA, r image.Rectangle, radius, thickness int, col color.RGBA) {
 	if thickness <= 0 {
@@ -327,3 +443,39 @@ func drawLogo(dst *image.RGBA, x, y, targetHeight int) {
 	dstRect := image.Rect(x, y, x+targetWidth, y+targetHeight)
 	draw.BiLinear.Scale(dst, dstRect, rawLogoImg, b, draw.Over, nil)
 }
+
+// drawCloseButton renders a circular close button with a crisp 2px "×" icon.
+func drawCloseButton(dst *image.RGBA, cx, cy, radius int) {
+	drawCircle(dst, cx, cy, radius, color.RGBA{R: 255, G: 255, B: 255, A: 50})
+	arm := radius * 4 / 10
+	if arm < 3 {
+		arm = 3
+	}
+	col := color.RGBA{R: 255, G: 255, B: 255, A: 230}
+	for d := -arm; d <= arm; d++ {
+		setPixelClamped(dst, cx+d, cy+d, col)
+		setPixelClamped(dst, cx+d+1, cy+d, col)
+		setPixelClamped(dst, cx+d, cy-d, col)
+		setPixelClamped(dst, cx+d+1, cy-d, col)
+	}
+}
+
+func setPixelClamped(dst *image.RGBA, x, y int, col color.RGBA) {
+	if x >= dst.Bounds().Min.X && x < dst.Bounds().Max.X && y >= dst.Bounds().Min.Y && y < dst.Bounds().Max.Y {
+		offset := y*dst.Stride + x*4
+		if col.A == 255 {
+			dst.Pix[offset+0] = col.R
+			dst.Pix[offset+1] = col.G
+			dst.Pix[offset+2] = col.B
+			dst.Pix[offset+3] = 255
+		} else if col.A > 0 {
+			a := float64(col.A) / 255.0
+			inv := 1.0 - a
+			dst.Pix[offset+0] = uint8(float64(col.R)*a + float64(dst.Pix[offset+0])*inv)
+			dst.Pix[offset+1] = uint8(float64(col.G)*a + float64(dst.Pix[offset+1])*inv)
+			dst.Pix[offset+2] = uint8(float64(col.B)*a + float64(dst.Pix[offset+2])*inv)
+			dst.Pix[offset+3] = 255
+		}
+	}
+}
+
