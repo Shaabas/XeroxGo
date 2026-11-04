@@ -33,12 +33,14 @@ var (
 	faceReg22 font.Face
 	faceReg24 font.Face
 	faceReg28 font.Face
+	faceReg32 font.Face
 
 	faceBold18 font.Face
 	faceBold20 font.Face
 	faceBold22 font.Face
 	faceBold24 font.Face
 	faceBold28 font.Face
+	faceBold32 font.Face
 	faceBold36 font.Face
 	faceBold44 font.Face
 	faceBold48 font.Face
@@ -77,12 +79,14 @@ func initUIAssets() {
 		faceReg22 = makeFace(fReg, 22)
 		faceReg24 = makeFace(fReg, 24)
 		faceReg28 = makeFace(fReg, 28)
+		faceReg32 = makeFace(fReg, 32)
 
 		faceBold18 = makeFace(fBold, 18)
 		faceBold20 = makeFace(fBold, 20)
 		faceBold22 = makeFace(fBold, 22)
 		faceBold24 = makeFace(fBold, 24)
 		faceBold28 = makeFace(fBold, 28)
+		faceBold32 = makeFace(fBold, 32)
 		faceBold36 = makeFace(fBold, 36)
 		faceBold44 = makeFace(fBold, 44)
 		faceBold48 = makeFace(fBold, 48)

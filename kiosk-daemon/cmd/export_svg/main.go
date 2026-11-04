@@ -120,7 +120,7 @@ func buildCommonHeader(logoB64 string) string {
     <rect width="1920" height="110" fill="#FFFFFF"/>
     <line x1="0" y1="108" x2="1920" y2="108" stroke="#E2E8F0" stroke-width="2"/>
     <image x="80" y="31" width="360" height="48" href="data:image/png;base64,%s" preserveAspectRatio="xMidYMid meet"/>
-    <text x="480" y="62" fill="#64748B" font-size="18" font-weight="500">Upload, Print, Collect - It's that simple!</text>
+    <text x="480" y="64" fill="#64748B" font-size="22" font-weight="500">Upload, Print, Collect - It's that simple!</text>
   </g>
 `, logoB64)
 }
@@ -162,8 +162,8 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
       
       <!-- Slide Content -->
       <g id="SlideText" transform="translate(110, 480)">
-        <text x="0" y="0" fill="#FFFFFF" font-size="56" font-weight="800" letter-spacing="-0.02em">%s</text>
-        <text x="0" y="70" fill="#E2E8F0" font-size="28" font-weight="400">%s</text>
+        <text x="0" y="0" fill="#FFFFFF" font-size="60" font-weight="800" letter-spacing="-0.02em">%s</text>
+        <text x="0" y="75" fill="#E2E8F0" font-size="30" font-weight="400">%s</text>
       </g>
 
       <!-- Carousel Indicator Dots -->
@@ -179,7 +179,7 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
       <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
       <!-- QR Title -->
-      <text x="1585" y="180" fill="#1E293B" font-size="18" font-weight="600" text-anchor="middle">Scan with any phone to open your personal print portal</text>
+      <text x="1585" y="180" fill="#1E293B" font-size="22" font-weight="700" text-anchor="middle">Scan with your phone camera to start printing</text>
 
       <!-- QR Code Image -->
       <g id="QRCode" transform="translate(1385, 215)">
@@ -188,42 +188,42 @@ func buildCurrentIdleSVG(logoB64, qrB64 string, slide adSlideDef, slideNum int) 
 
       <!-- Action Pill with Website Link -->
       <g id="ActionPill" transform="translate(1355, 635)">
-        <rect width="460" height="56" rx="28" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-        <text x="230" y="36" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
+        <rect width="460" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+        <text x="230" y="38" fill="#2563EB" font-size="26" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
       </g>
 
       <!-- Numbered Steps -->
-      <g id="Steps" transform="translate(1365, 715)">
+      <g id="Steps" transform="translate(1355, 720)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
-          <circle cx="16" cy="16" r="16" fill="#2563EB"/>
-          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">1</text>
-          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Point camera at the QR code</text>
+          <circle cx="18" cy="18" r="18" fill="#2563EB"/>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">1</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Scan QR code with your phone</text>
         </g>
 
         <!-- Step 2 -->
         <g id="Step2" transform="translate(0, 58)">
-          <circle cx="16" cy="16" r="16" fill="#2563EB"/>
-          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">2</text>
-          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Upload document &amp; choose options</text>
+          <circle cx="18" cy="18" r="18" fill="#2563EB"/>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">2</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Choose document &amp; print options</text>
         </g>
 
         <!-- Step 3 -->
         <g id="Step3" transform="translate(0, 116)">
-          <circle cx="16" cy="16" r="16" fill="#2563EB"/>
-          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">3</text>
-          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Pay securely with instant UPI</text>
+          <circle cx="18" cy="18" r="18" fill="#2563EB"/>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Pay with UPI (GPay, PhonePe, Paytm)</text>
         </g>
 
         <!-- Step 4 -->
         <g id="Step4" transform="translate(0, 174)">
-          <circle cx="16" cy="16" r="16" fill="#10B981"/>
-          <text x="16" y="22" fill="#FFFFFF" font-size="16" font-weight="700" text-anchor="middle">4</text>
-          <text x="46" y="23" fill="#1E293B" font-size="20" font-weight="600">Collect prints from the output tray</text>
+          <circle cx="18" cy="18" r="18" fill="#10B981"/>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">4</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect prints from the tray below</text>
         </g>
       </g>
 
-      <text x="1585" y="990" fill="#94A3B8" font-size="14" font-weight="500" text-anchor="middle">End-to-End Encrypted Session • Files Deleted Immediately</text>
+      <text x="1585" y="995" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
     </g>
   </g>
 </svg>`,
@@ -249,21 +249,21 @@ func buildDownloadingSVG(logoB64 string) string {
   <g id="DownloadingCard">
     <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="90" y="240" fill="#2563EB" font-size="44" font-weight="800">DOWNLOADING DOCUMENT</text>
-    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="500">Receiving print job securely from XeroxGo cloud...</text>
+    <text x="90" y="225" fill="#2563EB" font-size="56" font-weight="800">Receiving Your Document...</text>
+    <text x="90" y="295" fill="#1E293B" font-size="32" font-weight="500">Your file is being sent to the printer. This only takes a few seconds.</text>
 
     <!-- Detail Pill -->
-    <rect x="90" y="345" width="620" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
-    <text x="115" y="377" fill="#2563EB" font-size="18" font-weight="500">Job ID: xg-order-883921 • Document: Lecture_Notes_CS101.pdf</text>
+    <rect x="90" y="360" width="700" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+    <text x="120" y="398" fill="#2563EB" font-size="22" font-weight="700">Document: Lecture_Notes_CS101.pdf • Order #883921</text>
 
     <!-- Progress Bar -->
     <g id="ProgressBar" transform="translate(90, 500)">
-      <rect width="1740" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
-      <rect x="2" y="2" width="1180" height="46" rx="8" fill="#2563EB"/>
+      <rect width="1740" height="56" rx="14" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
+      <rect x="2" y="2" width="1180" height="52" rx="12" fill="#2563EB"/>
     </g>
 
-    <text x="90" y="585" fill="#1E293B" font-size="24" font-weight="700">Download Progress: 68%</text>
-    <text x="90" y="630" fill="#64748B" font-size="20" font-weight="400">Secure encrypted download in progress. Printing will begin automatically.</text>
+    <text x="90" y="595" fill="#1E293B" font-size="32" font-weight="700">Getting ready: 68% completed</text>
+    <text x="90" y="650" fill="#64748B" font-size="24" font-weight="400">Printing will start automatically as soon as the file finishes loading.</text>
   </g>
 </svg>`)
 	return buf.String()
@@ -279,28 +279,24 @@ func buildPrintingSVG(logoB64 string) string {
   <g id="PrintingCard">
     <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="90" y="240" fill="#2563EB" font-size="44" font-weight="800">PRINTING DOCUMENT</text>
-    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="500">Please wait while your document prints...</text>
+    <text x="90" y="225" fill="#2563EB" font-size="56" font-weight="800">Printing Your Document...</text>
+    <text x="90" y="295" fill="#1E293B" font-size="32" font-weight="500">Your pages are printing right now. Please wait a moment...</text>
 
     <!-- Page Counter Pill -->
-    <rect x="90" y="345" width="240" height="50" rx="25" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-    <text x="210" y="377" fill="#2563EB" font-size="22" font-weight="700" text-anchor="middle">PAGE 2 OF 5</text>
+    <rect x="90" y="360" width="260" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+    <text x="220" y="399" fill="#2563EB" font-size="28" font-weight="700" text-anchor="middle">Page 2 of 5</text>
 
     <!-- Detail Pill -->
-    <rect x="350" y="345" width="580" height="50" rx="25" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.5"/>
-    <text x="375" y="377" fill="#64748B" font-size="18" font-weight="500">Job ID: xg-order-883921 • Duplex Simplex • 1 Copy</text>
+    <rect x="380" y="360" width="560" height="60" rx="30" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+    <text x="410" y="398" fill="#64748B" font-size="22" font-weight="600">Order #883921 • Single-sided • 1 Copy</text>
 
     <!-- Progress Bar -->
     <g id="ProgressBar" transform="translate(90, 500)">
-      <rect width="1740" height="50" rx="10" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
-      <rect x="2" y="2" width="694" height="46" rx="8" fill="#2563EB"/>
+      <rect width="1740" height="56" rx="14" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="2"/>
+      <rect x="2" y="2" width="694" height="52" rx="12" fill="#2563EB"/>
     </g>
 
-    <text x="90" y="585" fill="#1E293B" font-size="24" font-weight="700">Progress: 2 of 5 pages streamed to printer hardware</text>
-
-    <!-- Hardware Notice Pill -->
-    <rect x="90" y="640" width="960" height="65" rx="32" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
-    <text x="120" y="681" fill="#64748B" font-size="20" font-weight="400">Job is active on Brother DCP-T310. Pages will exit into output tray.</text>
+    <text x="90" y="595" fill="#1E293B" font-size="32" font-weight="700">Printing: 2 of 5 pages completed</text>
   </g>
 </svg>`)
 	return buf.String()
@@ -316,23 +312,23 @@ func buildCompletedSVG(logoB64 string) string {
   <g id="CompletedCard">
     <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="90" y="240" fill="#10B981" font-size="44" font-weight="800">PRINT COMPLETE</text>
-    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="500">Your print job has finished successfully.</text>
+    <text x="90" y="225" fill="#10B981" font-size="56" font-weight="800">All Done! Printing Finished</text>
+    <text x="90" y="295" fill="#1E293B" font-size="32" font-weight="500">Your document has finished printing successfully.</text>
 
     <!-- Detail Pill -->
-    <rect x="90" y="345" width="460" height="50" rx="25" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1.5"/>
-    <text x="115" y="377" fill="#047857" font-size="18" font-weight="500">Job ID: xg-order-883921 • Total Sheets: 5</text>
+    <rect x="90" y="360" width="460" height="60" rx="30" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
+    <text x="120" y="398" fill="#047857" font-size="22" font-weight="700">Order #883921 • 5 Sheets Printed</text>
 
     <!-- Collection Callout Banner -->
-    <rect x="90" y="430" width="1740" height="80" rx="20" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
-    <text x="960" y="480" fill="#047857" font-size="24" font-weight="700" text-anchor="middle">PLEASE COLLECT ALL PRINTED PAGES FROM THE OUTPUT TRAY</text>
+    <rect x="90" y="450" width="1740" height="95" rx="24" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="2"/>
+    <text x="960" y="508" fill="#047857" font-size="32" font-weight="700" text-anchor="middle">Please take all your printed pages from the tray below</text>
 
     <!-- Instructions Box -->
-    <rect x="90" y="540" width="1740" height="220" rx="20" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
-    <g id="Instructions" transform="translate(130, 600)">
-      <text x="0" y="0" fill="#1E293B" font-size="22" font-weight="500">1. Inspect all printed pages before leaving the kiosk area.</text>
-      <text x="0" y="45" fill="#1E293B" font-size="22" font-weight="500">2. Kiosk will reset to the idle screen for the next user.</text>
-      <text x="0" y="105" fill="#64748B" font-size="20" font-weight="400">Thank you for printing with XeroxGo!</text>
+    <rect x="90" y="580" width="1740" height="250" rx="20" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+    <g id="Instructions" transform="translate(140, 645)">
+      <text x="0" y="0" fill="#1E293B" font-size="28" font-weight="600">1. Double check that you've collected all your pages.</text>
+      <text x="0" y="55" fill="#1E293B" font-size="28" font-weight="600">2. This screen will reset automatically for the next user.</text>
+      <text x="0" y="115" fill="#64748B" font-size="24" font-weight="400">Thank you for using XeroxGo!</text>
     </g>
   </g>
 </svg>`)
@@ -349,23 +345,23 @@ func buildErrorSVG(logoB64 string) string {
   <g id="ErrorCard">
     <rect x="30" y="140" width="1860" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
 
-    <text x="90" y="240" fill="#EF4444" font-size="44" font-weight="800">PRINTER ATTENTION REQUIRED</text>
-    <text x="90" y="305" fill="#1E293B" font-size="24" font-weight="700">Printer paper tray 1 is empty or disconnected.</text>
+    <text x="90" y="225" fill="#EF4444" font-size="56" font-weight="800">Printer Needs Attention</text>
+    <text x="90" y="295" fill="#1E293B" font-size="32" font-weight="700">The printer has run out of paper or needs a quick check.</text>
 
     <!-- Detail Pill -->
-    <rect x="90" y="345" width="580" height="50" rx="25" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
-    <text x="115" y="377" fill="#DC2626" font-size="18" font-weight="500">Error Code: CUPS_MEDIA_EMPTY • Job ID: xg-order-883921</text>
+    <rect x="90" y="360" width="520" height="60" rx="30" fill="#FEF2F2" stroke="#FECACA" stroke-width="2"/>
+    <text x="120" y="398" fill="#DC2626" font-size="22" font-weight="700">Paper tray empty • Order #883921</text>
 
     <!-- Recovery Box -->
-    <g id="RecoveryInstructions" transform="translate(90, 430)">
-      <rect width="1740" height="530" rx="20" fill="#FFFBEB" stroke="#FDE68A" stroke-width="2"/>
-      <text x="40" y="48" fill="#B45309" font-size="22" font-weight="700">ACTIONABLE HARDWARE RECOVERY INSTRUCTIONS:</text>
+    <g id="RecoveryInstructions" transform="translate(90, 450)">
+      <rect width="1740" height="520" rx="20" fill="#FFFBEB" stroke="#FDE68A" stroke-width="2"/>
+      <text x="50" y="55" fill="#B45309" font-size="28" font-weight="700">What you can do to fix this:</text>
 
-      <g transform="translate(40, 110)">
-        <text x="0" y="0" fill="#1E293B" font-size="20" font-weight="500">1. Check paper tray 1 and refill standard A4 paper if depleted.</text>
-        <text x="0" y="65" fill="#1E293B" font-size="20" font-weight="500">2. If paper is jammed, follow printer front panel steps to clear and re-seat covers.</text>
-        <text x="0" y="130" fill="#1E293B" font-size="20" font-weight="500">3. Verify that the output area and paper exit tray are completely clear.</text>
-        <text x="0" y="195" fill="#1E293B" font-size="20" font-weight="500">4. If error persists, please notify the campus attendant or support.</text>
+      <g transform="translate(50, 125)">
+        <text x="0" y="0" fill="#1E293B" font-size="26" font-weight="600">1. Pull open the bottom paper tray and load standard A4 paper.</text>
+        <text x="0" y="65" fill="#1E293B" font-size="26" font-weight="600">2. If paper is stuck, gently remove it and firmly close the printer cover.</text>
+        <text x="0" y="130" fill="#1E293B" font-size="26" font-weight="600">3. Check that the printed output tray is empty and clear.</text>
+        <text x="0" y="195" fill="#1E293B" font-size="26" font-weight="600">4. If it still doesn't print, please alert the shop or campus attendant.</text>
       </g>
     </g>
   </g>
