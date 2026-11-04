@@ -502,10 +502,10 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	fillRoundedRect(base, rightCard, 24, colorCardBg)
 	strokeRoundedRect(base, rightCard, 24, 2, colorBorder)
 
-	// Headline above QR code - Layman's terms & larger font (22px)
-	qrTitle := "Scan with your phone camera to start printing"
-	qrTitleW := measureTextWidth(faceBold22, qrTitle)
-	drawText(base, faceBold22, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 172, colorTextPrimary)
+	// Headline above QR code - Catchy headline & larger font (28px Bold)
+	qrTitle := "Scan & Print in Seconds!"
+	qrTitleW := measureTextWidth(faceBold28, qrTitle)
+	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 165, colorTextPrimary)
 
 	// QR Code Generation (Cached for zero-lag performance)
 	qrImg, err := getQRCodeImage(qrContent)

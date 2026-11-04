@@ -48,7 +48,7 @@
       <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
       <!-- QR Title -->
-      <text x="1585" y="180" fill="#1E293B" font-size="22" font-weight="700" text-anchor="middle">Scan with your phone camera to start printing</text>
+      <text x="1585" y="186" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan &amp; Print in Seconds!</text>
 
       <!-- QR Code Image -->
       <g id="QRCode" transform="translate(1385, 215)">
