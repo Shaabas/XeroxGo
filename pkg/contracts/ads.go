@@ -23,3 +23,4 @@ type AdItem struct {
 	IsActive    bool      `json:"is_active"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
+

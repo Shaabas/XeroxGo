@@ -120,3 +120,4 @@ func TestAdsAndAdminAuth(t *testing.T) {
 		t.Fatalf("expected 3 ads after delete, got %d", len(afterDelete))
 	}
 }
+

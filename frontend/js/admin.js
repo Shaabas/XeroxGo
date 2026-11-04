@@ -713,3 +713,4 @@
   document.addEventListener('DOMContentLoaded', checkSession);
 
 })();
+

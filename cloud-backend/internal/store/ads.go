@@ -142,7 +142,7 @@ func (s *Store) BootstrapAdmin(ctx context.Context, username, initialPassword st
 	}
 
 	nowNs := time.Now().UTC().UnixNano()
-	q := "INSERT INTO admin_users (username, password_hash, created_at_ns, updated_at_ns) VALUES (?, ?, ?, ?)"
+	q := s.rebind("INSERT INTO admin_users (username, password_hash, created_at_ns, updated_at_ns) VALUES (?, ?, ?, ?) ON CONFLICT(username) DO NOTHING")
 	if _, err := s.db.ExecContext(ctx, q, strings.TrimSpace(username), pwdHash, nowNs, nowNs); err != nil {
 		return fmt.Errorf("bootstrap admin: insert: %w", err)
 	}
@@ -156,7 +156,7 @@ func (s *Store) AuthenticateAdmin(ctx context.Context, username, password string
 	}
 
 	var storedHash string
-	q := "SELECT password_hash FROM admin_users WHERE username = ?"
+	q := s.rebind("SELECT password_hash FROM admin_users WHERE username = ?")
 	err := s.db.QueryRowContext(ctx, q, strings.TrimSpace(username)).Scan(&storedHash)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -191,7 +191,7 @@ func (s *Store) UpdateAdminPassword(ctx context.Context, username, oldPassword, 
 	}
 
 	nowNs := time.Now().UTC().UnixNano()
-	q := "UPDATE admin_users SET password_hash = ?, updated_at_ns = ? WHERE username = ?"
+	q := s.rebind("UPDATE admin_users SET password_hash = ?, updated_at_ns = ? WHERE username = ?")
 	_, err = s.db.ExecContext(ctx, q, newHash, nowNs, username)
 	return err
 }
@@ -214,7 +214,7 @@ func (s *Store) CreateAdminSession(ctx context.Context, username string) (string
 	nowNs := now.UnixNano()
 	expiresNs := expiresAt.UnixNano()
 
-	q := "INSERT INTO admin_sessions (token_hash, username, expires_at_ns, created_at_ns) VALUES (?, ?, ?, ?)"
+	q := s.rebind("INSERT INTO admin_sessions (token_hash, username, expires_at_ns, created_at_ns) VALUES (?, ?, ?, ?)")
 	if _, err := s.db.ExecContext(ctx, q, tokenH, username, expiresNs, nowNs); err != nil {
 		return "", time.Time{}, fmt.Errorf("create session: insert: %w", err)
 	}
@@ -232,7 +232,7 @@ func (s *Store) ValidateAdminSession(ctx context.Context, rawToken string) (stri
 	nowNs := time.Now().UTC().UnixNano()
 
 	var username string
-	q := "SELECT username FROM admin_sessions WHERE token_hash = ? AND expires_at_ns > ?"
+	q := s.rebind("SELECT username FROM admin_sessions WHERE token_hash = ? AND expires_at_ns > ?")
 	err := s.db.QueryRowContext(ctx, q, tokenH, nowNs).Scan(&username)
 	if err != nil {
 		return "", false
@@ -246,7 +246,7 @@ func (s *Store) RevokeAdminSession(ctx context.Context, rawToken string) error {
 		return nil
 	}
 	tokenH := hashToken(rawToken)
-	q := "DELETE FROM admin_sessions WHERE token_hash = ?"
+	q := s.rebind("DELETE FROM admin_sessions WHERE token_hash = ?")
 	_, err := s.db.ExecContext(ctx, q, tokenH)
 	return err
 }
@@ -272,7 +272,7 @@ func (s *Store) fetchAdsQuery(ctx context.Context, q string) ([]contracts.AdItem
 	}
 	defer rows.Close()
 
-	var items []contracts.AdItem
+	items := []contracts.AdItem{}
 	for rows.Next() {
 		var (
 			it        contracts.AdItem
@@ -341,7 +341,7 @@ func (s *Store) SaveAd(ctx context.Context, ad contracts.AdItem) error {
 	}
 
 	// Use standard SQLite/Postgres UPSERT syntax
-	q := `INSERT INTO ads (
+	q := s.rebind(`INSERT INTO ads (
         id, title, description, ad_type, image_url,
         gradient_c0, gradient_c1, gradient_c2, link_url,
         sort_order, is_active, created_at_ns, updated_at_ns
@@ -357,7 +357,7 @@ func (s *Store) SaveAd(ctx context.Context, ad contracts.AdItem) error {
         link_url = excluded.link_url,
         sort_order = excluded.sort_order,
         is_active = excluded.is_active,
-        updated_at_ns = excluded.updated_at_ns;`
+        updated_at_ns = excluded.updated_at_ns;`)
 
 	_, err := s.db.ExecContext(
 		ctx,
@@ -387,7 +387,7 @@ func (s *Store) DeleteAd(ctx context.Context, id string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("delete ad: store is closed or nil")
 	}
-	q := "DELETE FROM ads WHERE id = ?"
+	q := s.rebind("DELETE FROM ads WHERE id = ?")
 	_, err := s.db.ExecContext(ctx, q, id)
 	return err
 }
@@ -404,7 +404,7 @@ func (s *Store) ReorderAds(ctx context.Context, orderedIDs []string) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, "UPDATE ads SET sort_order = ?, updated_at_ns = ? WHERE id = ?")
+	stmt, err := tx.PrepareContext(ctx, s.rebind("UPDATE ads SET sort_order = ?, updated_at_ns = ? WHERE id = ?"))
 	if err != nil {
 		return fmt.Errorf("reorder ads: prepare: %w", err)
 	}
@@ -419,3 +419,4 @@ func (s *Store) ReorderAds(ctx context.Context, orderedIDs []string) error {
 
 	return tx.Commit()
 }
+

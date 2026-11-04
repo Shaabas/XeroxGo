@@ -97,11 +97,13 @@ func (app *appServer) handlePublicAds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ads == nil {
+		ads = []contracts.AdItem{}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=10, stale-while-revalidate=60")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"ads": ads,
-	})
+	_ = json.NewEncoder(w).Encode(ads)
 }
 
 // handleAdminLogin handles POST /api/admin/login
@@ -466,3 +468,4 @@ func (app *appServer) handleServeAdImage(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
 	http.ServeFile(w, r, imagePath)
 }
+
