@@ -502,10 +502,15 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	fillRoundedRect(base, rightCard, 24, colorCardBg)
 	strokeRoundedRect(base, rightCard, 24, 2, colorBorder)
 
-	// Headline above QR code - Catchy headline & larger font (28px Bold)
-	qrTitle := "Scan & Print in Seconds!"
+	// Headline above QR code - Option A
+	qrTitle := "Scan QR to Get Started"
 	qrTitleW := measureTextWidth(faceBold28, qrTitle)
-	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 165, colorTextPrimary)
+	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 158, colorTextPrimary)
+
+	// Sub-caption below headline
+	qrSub := "Point your phone camera here, or visit website below"
+	qrSubW := measureTextWidth(faceReg18, qrSub)
+	drawText(base, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 194, colorTextSecondary)
 
 	// QR Code Generation (Cached for zero-lag performance)
 	qrImg, err := getQRCodeImage(qrContent)
@@ -513,11 +518,11 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		return nil, err
 	}
 
-	qrBounds := image.Rect(1385, 215, 1785, 615)
+	qrBounds := image.Rect(1405, 230, 1765, 590)
 	draw.Draw(base, qrBounds, qrImg, image.Point{}, draw.Src)
 
-	// Action pill under QR with website link
-	pillRect := image.Rect(1355, 635, 1815, 695)
+	// Action pill under QR with fallback website link
+	pillRect := image.Rect(1325, 612, 1845, 664)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
 	displayLink := "xeroxgo.vercel.app"
 	if strings.TrimSpace(qrContent) != "" {
@@ -530,38 +535,38 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 			displayLink = cleaned
 		}
 	}
-	pillW := measureTextWidth(faceBold24, displayLink)
-	drawText(base, faceBold24, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 655, colorPrimaryBlue)
+	pillText := fmt.Sprintf("Can't scan? Open browser & go to %s", displayLink)
+	pillW := measureTextWidth(faceBold18, pillText)
+	drawText(base, faceBold18, pillText, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 629, colorPrimaryBlue)
 
-	// 4 Numbered Steps - Layman's terms & bigger fonts (22px Bold)
+	// 3 Numbered Steps - Option A
 	steps := []struct {
 		num    string
 		title  string
 		isLast bool
 	}{
-		{"1", "Scan QR code with your phone", false},
-		{"2", "Choose document & print options", false},
-		{"3", "Pay with UPI (GPay, PhonePe, Paytm)", false},
-		{"4", "Collect prints from the tray below", true},
+		{"1", "Upload your file & choose print settings", false},
+		{"2", "Pay with UPI (GPay, PhonePe, Paytm)", false},
+		{"3", "Collect your prints from the tray below", true},
 	}
-	ySteps := []int{720, 778, 836, 894}
+	ySteps := []int{706, 774, 842}
 	for i, s := range steps {
 		y := ySteps[i]
 		circleCol := colorPrimaryBlue
 		if s.isLast {
 			circleCol = colorSuccessGreen
 		}
-		drawCircle(base, 1390, y+16, 17, circleCol)
+		drawCircle(base, 1368, y+18, 18, circleCol)
 		numW := measureTextWidth(faceBold20, s.num)
-		drawText(base, faceBold20, s.num, 1390-numW/2, y+5, colorTextWhite)
+		drawText(base, faceBold20, s.num, 1368-numW/2, y+7, colorTextWhite)
 
-		drawText(base, faceBold22, s.title, 1425, y+4, colorTextPrimary)
+		drawText(base, faceBold22, s.title, 1400, y+6, colorTextPrimary)
 	}
 
 	// Security badge / footer text inside right card - Layman's terms & larger font (18px)
 	secText := "Your files are private & deleted automatically after printing"
 	secW := measureTextWidth(faceReg18, secText)
-	drawText(base, faceReg18, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 990, colorTextSecondary)
+	drawText(base, faceReg18, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 955, colorTextSecondary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent

@@ -48,52 +48,46 @@
     <g id="RightCard_QROnboarding">
       <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
-      <!-- QR Title -->
-      <text x="1585" y="186" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan &amp; Print in Seconds!</text>
+      <!-- Headline & Subtitle -->
+      <text x="1585" y="180" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan QR to Get Started</text>
+      <text x="1585" y="210" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Point your phone camera here, or visit website below</text>
 
-      <!-- QR Code Image -->
-      <g id="QRCode" transform="translate(1385, 215)">
-        <image width="400" height="400" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
+      <!-- QR Code Image (360x360) -->
+      <g id="QRCode" transform="translate(1405, 230)">
+        <image width="360" height="360" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
       </g>
 
-      <!-- Action Pill with Website Link -->
-      <g id="ActionPill" transform="translate(1355, 635)">
-        <rect width="460" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-        <text x="230" y="38" fill="#2563EB" font-size="26" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
+      <!-- Fallback Pill with Website Link -->
+      <g id="ActionPill" transform="translate(1325, 612)">
+        <rect width="520" height="52" rx="26" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+        <text x="260" y="32" fill="#1D4ED8" font-size="18" font-weight="700" text-anchor="middle">Can't scan? Open browser &amp; go to xeroxgo.vercel.app</text>
       </g>
 
-      <!-- Numbered Steps -->
-      <g id="Steps" transform="translate(1355, 720)">
+      <!-- 3 Numbered Steps -->
+      <g id="Steps" transform="translate(1350, 706)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">1</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Scan QR code with your phone</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Upload your file &amp; choose print settings</text>
         </g>
 
         <!-- Step 2 -->
-        <g id="Step2" transform="translate(0, 58)">
+        <g id="Step2" transform="translate(0, 68)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">2</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Choose document &amp; print options</text>
-        </g>
-
-        <!-- Step 3 -->
-        <g id="Step3" transform="translate(0, 116)">
-          <circle cx="18" cy="18" r="18" fill="#2563EB"/>
-          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
           <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Pay with UPI (GPay, PhonePe, Paytm)</text>
         </g>
 
-        <!-- Step 4 -->
-        <g id="Step4" transform="translate(0, 174)">
+        <!-- Step 3 -->
+        <g id="Step3" transform="translate(0, 136)">
           <circle cx="18" cy="18" r="18" fill="#10B981"/>
-          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">4</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect prints from the tray below</text>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect your prints from the tray below</text>
         </g>
       </g>
 
-      <text x="1585" y="995" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
+      <text x="1585" y="975" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
     </g>
   </g>
 
@@ -139,52 +133,46 @@
     <g id="RightCard_QROnboarding">
       <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
-      <!-- QR Title -->
-      <text x="1585" y="186" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan &amp; Print in Seconds!</text>
+      <!-- Headline & Subtitle -->
+      <text x="1585" y="180" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan QR to Get Started</text>
+      <text x="1585" y="210" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Point your phone camera here, or visit website below</text>
 
-      <!-- QR Code Image -->
-      <g id="QRCode" transform="translate(1385, 215)">
-        <image width="400" height="400" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
+      <!-- QR Code Image (360x360) -->
+      <g id="QRCode" transform="translate(1405, 230)">
+        <image width="360" height="360" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
       </g>
 
-      <!-- Action Pill with Website Link -->
-      <g id="ActionPill" transform="translate(1355, 635)">
-        <rect width="460" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-        <text x="230" y="38" fill="#2563EB" font-size="26" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
+      <!-- Fallback Pill with Website Link -->
+      <g id="ActionPill" transform="translate(1325, 612)">
+        <rect width="520" height="52" rx="26" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+        <text x="260" y="32" fill="#1D4ED8" font-size="18" font-weight="700" text-anchor="middle">Can't scan? Open browser &amp; go to xeroxgo.vercel.app</text>
       </g>
 
-      <!-- Numbered Steps -->
-      <g id="Steps" transform="translate(1355, 720)">
+      <!-- 3 Numbered Steps -->
+      <g id="Steps" transform="translate(1350, 706)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">1</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Scan QR code with your phone</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Upload your file &amp; choose print settings</text>
         </g>
 
         <!-- Step 2 -->
-        <g id="Step2" transform="translate(0, 58)">
+        <g id="Step2" transform="translate(0, 68)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">2</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Choose document &amp; print options</text>
-        </g>
-
-        <!-- Step 3 -->
-        <g id="Step3" transform="translate(0, 116)">
-          <circle cx="18" cy="18" r="18" fill="#2563EB"/>
-          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
           <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Pay with UPI (GPay, PhonePe, Paytm)</text>
         </g>
 
-        <!-- Step 4 -->
-        <g id="Step4" transform="translate(0, 174)">
+        <!-- Step 3 -->
+        <g id="Step3" transform="translate(0, 136)">
           <circle cx="18" cy="18" r="18" fill="#10B981"/>
-          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">4</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect prints from the tray below</text>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect your prints from the tray below</text>
         </g>
       </g>
 
-      <text x="1585" y="995" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
+      <text x="1585" y="975" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
     </g>
   </g>
 
@@ -230,52 +218,46 @@
     <g id="RightCard_QROnboarding">
       <rect x="1280" y="140" width="610" height="910" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="2"/>
       
-      <!-- QR Title -->
-      <text x="1585" y="186" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan &amp; Print in Seconds!</text>
+      <!-- Headline & Subtitle -->
+      <text x="1585" y="180" fill="#1E293B" font-size="28" font-weight="700" text-anchor="middle">Scan QR to Get Started</text>
+      <text x="1585" y="210" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Point your phone camera here, or visit website below</text>
 
-      <!-- QR Code Image -->
-      <g id="QRCode" transform="translate(1385, 215)">
-        <image width="400" height="400" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
+      <!-- QR Code Image (360x360) -->
+      <g id="QRCode" transform="translate(1405, 230)">
+        <image width="360" height="360" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQAQMAAAC6caSPAAAABlBMVEX///8AAABVwtN+AAABxUlEQVR42uzbQW6rMBDG8UEssuQIOQpHI0fjKBzhLbNA+Gk8Y2JSCE4hrSr9Pz29RevfzrKZGVcIIYQQQsgfTRdSRv9JO8k1hEH0/xQI5AC5p5Wj/tNUukjJ5L9qIJBjpIt70tYrnFQZiTsTAjmP1PGcs5UTBHI+aYOT8m0JgXyIzDey1KGvQy8PsnuJQyD7JKss7MOvtXNyKipGIJBd8pQ2hH65J3cDgbwmer3epRsfR5+WrlW8ZEWuuiHDPwjkAJFLuMUDsLf1o9+tktTX6xUCeYt0QYnUjwK2r7xSiGWsNGs3MgRSTvz0G9Pdmjbk1dTq0QeBvEO0FL2EW7xVe/GOx1B5eTDo+rWJFQTySeKxxojBuQU3+TZuIJADxLpw3bJDYrGRfbMxrIdAComeexd/DWIDhb7K5lxb1SsEUkx8mlBn746qxYuj1a9ECKScPLV5Q3oQkrpw259wEEgZWX08ORewEMgJJJ+8i3fh5okVBHIKyWsEmbtwL29kCOTHiI8hpmzOtTV9gEC+RdqsskhNkp2/TYBASkh+I7fLTq/dyOsdEgikkCwfT5qyidXg+3PnvSUE8poQQgghhJBfyv8AAAD//wjEMkwk4z+BAAAAAElFTkSuQmCC" preserveAspectRatio="xMidYMid meet"/>
       </g>
 
-      <!-- Action Pill with Website Link -->
-      <g id="ActionPill" transform="translate(1355, 635)">
-        <rect width="460" height="60" rx="30" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
-        <text x="230" y="38" fill="#2563EB" font-size="26" font-weight="700" text-anchor="middle">xeroxgo.vercel.app</text>
+      <!-- Fallback Pill with Website Link -->
+      <g id="ActionPill" transform="translate(1325, 612)">
+        <rect width="520" height="52" rx="26" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="2"/>
+        <text x="260" y="32" fill="#1D4ED8" font-size="18" font-weight="700" text-anchor="middle">Can't scan? Open browser &amp; go to xeroxgo.vercel.app</text>
       </g>
 
-      <!-- Numbered Steps -->
-      <g id="Steps" transform="translate(1355, 720)">
+      <!-- 3 Numbered Steps -->
+      <g id="Steps" transform="translate(1350, 706)">
         <!-- Step 1 -->
         <g id="Step1" transform="translate(0, 0)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">1</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Scan QR code with your phone</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Upload your file &amp; choose print settings</text>
         </g>
 
         <!-- Step 2 -->
-        <g id="Step2" transform="translate(0, 58)">
+        <g id="Step2" transform="translate(0, 68)">
           <circle cx="18" cy="18" r="18" fill="#2563EB"/>
           <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">2</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Choose document &amp; print options</text>
-        </g>
-
-        <!-- Step 3 -->
-        <g id="Step3" transform="translate(0, 116)">
-          <circle cx="18" cy="18" r="18" fill="#2563EB"/>
-          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
           <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Pay with UPI (GPay, PhonePe, Paytm)</text>
         </g>
 
-        <!-- Step 4 -->
-        <g id="Step4" transform="translate(0, 174)">
+        <!-- Step 3 -->
+        <g id="Step3" transform="translate(0, 136)">
           <circle cx="18" cy="18" r="18" fill="#10B981"/>
-          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">4</text>
-          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect prints from the tray below</text>
+          <text x="18" y="25" fill="#FFFFFF" font-size="18" font-weight="700" text-anchor="middle">3</text>
+          <text x="50" y="26" fill="#1E293B" font-size="22" font-weight="700">Collect your prints from the tray below</text>
         </g>
       </g>
 
-      <text x="1585" y="995" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
+      <text x="1585" y="975" fill="#64748B" font-size="18" font-weight="500" text-anchor="middle">Your files are private &amp; deleted automatically after printing</text>
     </g>
   </g>
 
