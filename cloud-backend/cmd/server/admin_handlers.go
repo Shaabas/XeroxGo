@@ -53,6 +53,12 @@ func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request)
 
 	case http.MethodPut:
 		var req struct {
+			BWSimplexPricePaise    int64 `json:"bw_simplex_price_paise"`
+			BWDuplexPricePaise     int64 `json:"bw_duplex_price_paise"`
+			ColorSimplexPricePaise int64 `json:"color_simplex_price_paise"`
+			ColorDuplexPricePaise  int64 `json:"color_duplex_price_paise"`
+			ColorEnabled           bool  `json:"color_enabled"`
+			// Backwards compatibility for single-price payloads
 			BWPricePerSheetPaise    int64 `json:"bw_price_per_sheet_paise"`
 			ColorPricePerSheetPaise int64 `json:"color_price_per_sheet_paise"`
 		}
@@ -60,12 +66,31 @@ func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request)
 			writeJSONError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		if req.BWPricePerSheetPaise <= 0 || req.ColorPricePerSheetPaise <= 0 {
+		if req.BWSimplexPricePaise <= 0 && req.BWPricePerSheetPaise > 0 {
+			req.BWSimplexPricePaise = req.BWPricePerSheetPaise
+		}
+		if req.BWDuplexPricePaise <= 0 {
+			req.BWDuplexPricePaise = (req.BWSimplexPricePaise * 3) / 4
+			if req.BWDuplexPricePaise <= 0 {
+				req.BWDuplexPricePaise = 150
+			}
+		}
+		if req.ColorSimplexPricePaise <= 0 && req.ColorPricePerSheetPaise > 0 {
+			req.ColorSimplexPricePaise = req.ColorPricePerSheetPaise
+		}
+		if req.ColorDuplexPricePaise <= 0 {
+			req.ColorDuplexPricePaise = (req.ColorSimplexPricePaise * 3) / 4
+			if req.ColorDuplexPricePaise <= 0 {
+				req.ColorDuplexPricePaise = 750
+			}
+		}
+
+		if req.BWSimplexPricePaise <= 0 || req.BWDuplexPricePaise <= 0 || req.ColorSimplexPricePaise <= 0 || req.ColorDuplexPricePaise <= 0 {
 			writeJSONError(w, http.StatusBadRequest, "prices must be greater than zero")
 			return
 		}
 
-		if err := app.db.SetPricing(r.Context(), req.BWPricePerSheetPaise, req.ColorPricePerSheetPaise); err != nil {
+		if err := app.db.SetDetailedPricing(r.Context(), req.BWSimplexPricePaise, req.BWDuplexPricePaise, req.ColorSimplexPricePaise, req.ColorDuplexPricePaise, req.ColorEnabled); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save pricing: %v", err))
 			return
 		}
@@ -73,8 +98,13 @@ func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":                      "ok",
-			"bw_price_per_sheet_paise":    req.BWPricePerSheetPaise,
-			"color_price_per_sheet_paise": req.ColorPricePerSheetPaise,
+			"bw_simplex_price_paise":    req.BWSimplexPricePaise,
+			"bw_duplex_price_paise":     req.BWDuplexPricePaise,
+			"color_simplex_price_paise": req.ColorSimplexPricePaise,
+			"color_duplex_price_paise":  req.ColorDuplexPricePaise,
+			"color_enabled":             req.ColorEnabled,
+			"bw_price_per_sheet_paise":    req.BWSimplexPricePaise,
+			"color_price_per_sheet_paise": req.ColorSimplexPricePaise,
 		})
 
 	default:

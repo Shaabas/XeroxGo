@@ -55,6 +55,20 @@ func TestPricingDual(t *testing.T) {
 	if err := s.SetPricing(ctx, 200, -50); err == nil {
 		t.Fatalf("expected error for colorPrice < 0, got nil")
 	}
+
+	// 5. Test detailed 4-tier pricing and colorEnabled flag
+	if err := s.SetDetailedPricing(ctx, 200, 150, 1000, 750, true); err != nil {
+		t.Fatalf("SetDetailedPricing failed: %v", err)
+	}
+	p3, err := s.GetPricing(ctx)
+	if err != nil {
+		t.Fatalf("GetPricing failed: %v", err)
+	}
+	if p3.BWSimplexPricePaise != 200 || p3.BWDuplexPricePaise != 150 ||
+		p3.ColorSimplexPricePaise != 1000 || p3.ColorDuplexPricePaise != 750 ||
+		!p3.ColorEnabled {
+		t.Fatalf("unexpected p3: %+v", p3)
+	}
 }
 
 func TestAnalyticsAndOrderHistory(t *testing.T) {

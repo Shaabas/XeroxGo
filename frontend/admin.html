@@ -7,15 +7,23 @@
   <meta name="description" content="XeroxGO Admin Dashboard - Real-time management and kiosk synchronization." />
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
   <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png" />
-  <link rel="stylesheet" href="/css/admin.css?v=4" />
+  <link rel="stylesheet" href="/css/admin.css?v=5" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 </head>
 <body>
 
-  <!-- Full-Page Authentication View (Initial DOM) -->
-  <div id="auth-page" class="auth-page-container">
+  <!-- Initial Application Loader (Initialization Gate to prevent FOUC / flash of login on refresh) -->
+  <div id="app-loader" class="app-loader-container">
+    <div style="display:flex; flex-direction:column; align-items:center; gap:1rem;">
+      <img src="/assets/xeroxgo-full-logo-transparent.png" alt="XeroxGO" style="height:36px; width:auto; opacity:0.9;" />
+      <div class="spinner"></div>
+    </div>
+  </div>
+
+  <!-- Full-Page Authentication View (Default hidden; revealed strictly when unauthenticated) -->
+  <div id="auth-page" class="auth-page-container hidden">
     <div class="auth-card">
       <div class="auth-header">
         <img src="/assets/xeroxgo-full-logo-transparent.png" alt="XeroxGO" class="auth-logo" />
@@ -27,12 +35,12 @@
 
         <div class="form-group">
           <label class="form-label" for="login-username">Username</label>
-          <input id="login-username" class="form-input" type="text" value="admin" required autocomplete="username" />
+          <input id="login-username" class="form-input" type="text" placeholder="Username" required autocomplete="username" autofocus />
         </div>
 
         <div class="form-group">
           <label class="form-label" for="login-password">Password</label>
-          <input id="login-password" class="form-input" type="password" placeholder="••••••••" required autocomplete="current-password" autofocus />
+          <input id="login-password" class="form-input" type="password" placeholder="••••••••" required autocomplete="current-password" />
         </div>
 
         <button id="login-submit-btn" class="btn-primary auth-submit-btn" type="submit">
@@ -178,25 +186,69 @@
             </div>
 
             <form id="pricing-form">
-              <div class="form-group">
-                <label class="form-label" for="price-bw-input">Monochrome (B&amp;W) Price</label>
-                <div style="position:relative; display:flex; align-items:center;">
-                  <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
-                  <input id="price-bw-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
+              <!-- Black & White Section -->
+              <div style="font-size:0.8125rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted); margin-bottom:0.75rem;">
+                Black &amp; White (Monochrome)
+              </div>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem;">
+                <div class="form-group">
+                  <label class="form-label" for="price-bw-simplex-input">B&amp;W Single Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-bw-simplex-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed page.</div>
                 </div>
-                <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate charged per physical A4 sheet.</div>
+
+                <div class="form-group">
+                  <label class="form-label" for="price-bw-duplex-input">B&amp;W Double Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-bw-duplex-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed side.</div>
+                </div>
               </div>
 
-              <div class="form-group" style="margin-top:1.25rem;">
-                <label class="form-label" for="price-color-input">Color Print Price</label>
-                <div style="position:relative; display:flex; align-items:center;">
-                  <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
-                  <input id="price-color-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
+              <!-- Color Section -->
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; padding-top:1rem; border-top:1px solid var(--border);">
+                <div style="font-size:0.8125rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);">
+                  Color Printing
                 </div>
-                <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate charged per physical A4 sheet.</div>
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <span style="font-size:0.75rem; color:var(--text-muted);">Enable Kiosk Color</span>
+                  <label class="switch">
+                    <input type="checkbox" id="pricing-color-enabled-toggle" />
+                    <span class="slider"></span>
+                  </label>
+                </div>
               </div>
 
-              <div style="margin-top:2rem;">
+              <div id="pricing-hardware-notice" style="font-size:0.75rem; color:var(--text-muted); background:var(--bg-slate); padding:0.6rem 0.85rem; border-radius:var(--radius-sm); margin-bottom:1rem; border:1px solid var(--border);">
+                <strong>Kiosk Status:</strong> Production printer is Monochrome Laser. When disabled, mobile web orders are locked to B&amp;W.
+              </div>
+
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem;">
+                <div class="form-group">
+                  <label class="form-label" for="price-color-simplex-input">Color Single Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-color-simplex-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed page.</div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="price-color-duplex-input">Color Double Side</label>
+                  <div style="position:relative; display:flex; align-items:center;">
+                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
+                    <input id="price-color-duplex-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
+                  </div>
+                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed side.</div>
+                </div>
+              </div>
+
+              <div style="margin-top:1.5rem;">
                 <button id="pricing-save-btn" class="btn-primary" type="submit" style="width:100%;">
                   Save Rates
                 </button>
@@ -506,6 +558,6 @@
     </div>
   </template>
 
-  <script src="/js/admin.js?v=4"></script>
+  <script src="/js/admin.js?v=5"></script>
 </body>
 </html>

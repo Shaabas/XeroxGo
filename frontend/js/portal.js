@@ -20,8 +20,13 @@
     kioskID = 'kiosk-demo';
   }
   const devMode = container.dataset.devMode === 'true';
-  let bwPricePerSheetPaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
-  let colorPricePerSheetPaise = 1000;
+  let bwSimplexPricePaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
+  let bwDuplexPricePaise = 150;
+  let colorSimplexPricePaise = 1000;
+  let colorDuplexPricePaise = 750;
+  let colorHardwareEnabled = false;
+  let bwPricePerSheetPaise = bwSimplexPricePaise;
+  let colorPricePerSheetPaise = colorSimplexPricePaise;
 
   // --- State Variables ---
   let file = null;
@@ -188,10 +193,15 @@
   function updatePriceAndReviewSummary() {
     const selectedCount = getSelectedPagesCount();
     const isDouble = sides === 'Double-sided';
-    const sheetsPerCopy = isDouble ? Math.ceil(selectedCount / 2) : selectedCount;
-    const totalSheets = sheetsPerCopy * copies;
-    const activePrice = mode === 'Color' ? colorPricePerSheetPaise : bwPricePerSheetPaise;
-    const totalPricePaise = totalSheets * activePrice;
+    const totalPrintedPages = selectedCount * copies;
+
+    let activePrice;
+    if (mode === 'Color' && colorHardwareEnabled) {
+      activePrice = isDouble ? colorDuplexPricePaise : colorSimplexPricePaise;
+    } else {
+      activePrice = isDouble ? bwDuplexPricePaise : bwSimplexPricePaise;
+    }
+    const totalPricePaise = totalPrintedPages * activePrice;
 
     if (summaryFileName) summaryFileName.textContent = file ? file.name : '-';
     if (summaryPages) summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'}`;
@@ -588,16 +598,32 @@
       const res = await fetch('/api/pricing');
       if (res.ok) {
         const data = await res.json();
-        if (data.bw_price_per_sheet_paise) {
-          bwPricePerSheetPaise = data.bw_price_per_sheet_paise;
+        bwSimplexPricePaise = data.bw_simplex_price_paise || data.bw_price_per_sheet_paise || 200;
+        bwDuplexPricePaise = data.bw_duplex_price_paise || 150;
+        colorSimplexPricePaise = data.color_simplex_price_paise || data.color_price_per_sheet_paise || 1000;
+        colorDuplexPricePaise = data.color_duplex_price_paise || 750;
+        colorHardwareEnabled = Boolean(data.color_enabled);
+
+        bwPricePerSheetPaise = bwSimplexPricePaise;
+        colorPricePerSheetPaise = colorSimplexPricePaise;
+
+        // Hardware capability: if kiosk color printing is disabled, lock mobile UI to B&W
+        if (!colorHardwareEnabled) {
+          if (btnModeColor) btnModeColor.style.display = 'none';
+          mode = 'B&W';
+          if (btnModeBW) {
+            btnModeBW.classList.add('active');
+            btnModeBW.style.flex = '1';
+          }
+        } else {
+          if (btnModeColor) btnModeColor.style.display = 'flex';
+          if (btnModeBW) btnModeBW.style.flex = '';
         }
-        if (data.color_price_per_sheet_paise) {
-          colorPricePerSheetPaise = data.color_price_per_sheet_paise;
-        }
+
         const bwLabel = document.getElementById('price-bw-label');
-        if (bwLabel) bwLabel.textContent = `₹${(bwPricePerSheetPaise / 100).toFixed(2)}/sheet`;
+        if (bwLabel) bwLabel.textContent = `₹${(bwSimplexPricePaise / 100).toFixed(2)}/page`;
         const colorLabel = document.getElementById('price-color-label');
-        if (colorLabel) colorLabel.textContent = `₹${(colorPricePerSheetPaise / 100).toFixed(2)}/sheet`;
+        if (colorLabel) colorLabel.textContent = `₹${(colorSimplexPricePaise / 100).toFixed(2)}/page`;
         updatePriceAndReviewSummary();
       }
     } catch (_) {}

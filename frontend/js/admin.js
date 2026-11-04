@@ -41,9 +41,15 @@
     }
   }
 
-  // --- Session Validation ---
+  function removeAppLoader() {
+    const loader = document.getElementById('app-loader');
+    if (loader) loader.remove();
+  }
+
+  // --- Session Validation (Standard Initialization Gate: No FOUC / Login Flash) ---
   async function checkSession() {
     if (!authToken) {
+      removeAppLoader();
       showAuthPage();
       return;
     }
@@ -52,18 +58,22 @@
       const res = await apiRequest('/api/admin/me');
       if (res.ok) {
         const userData = await parseResponseJSON(res);
+        removeAppLoader();
         mountDashboard(userData);
       } else {
         localStorage.removeItem('xeroxgo_admin_token');
         authToken = '';
+        removeAppLoader();
         showAuthPage();
       }
     } catch (_) {
+      removeAppLoader();
       showAuthPage();
     }
   }
 
   function showAuthPage() {
+    removeAppLoader();
     const authPage = document.getElementById('auth-page');
     if (authPage) authPage.classList.remove('hidden');
 
@@ -138,8 +148,11 @@
     let activePreviewTab = 'mobile';
     let isEditingInModal = false;
 
-    let currentBWPricePaise = 200;
-    let currentColorPricePaise = 1000;
+    let currentBWSimplexPaise = 200;
+    let currentBWDuplexPaise = 150;
+    let currentColorSimplexPaise = 1000;
+    let currentColorDuplexPaise = 750;
+    let currentColorEnabled = false;
 
     let ordersFilter = {
       page: 0,
@@ -682,8 +695,11 @@
     // 3. PRICING CONTROLLER & COST ESTIMATOR
     // ==========================================
     const pricingForm = document.getElementById('pricing-form');
-    const priceBwInput = document.getElementById('price-bw-input');
-    const priceColorInput = document.getElementById('price-color-input');
+    const priceBwSimplexInput = document.getElementById('price-bw-simplex-input');
+    const priceBwDuplexInput = document.getElementById('price-bw-duplex-input');
+    const priceColorSimplexInput = document.getElementById('price-color-simplex-input');
+    const priceColorDuplexInput = document.getElementById('price-color-duplex-input');
+    const pricingColorEnabledToggle = document.getElementById('pricing-color-enabled-toggle');
     const pricingSaveBtn = document.getElementById('pricing-save-btn');
 
     const calcPagesInput = document.getElementById('calc-pages-input');
@@ -697,11 +713,17 @@
         if (!res.ok) throw new Error('Failed to load pricing');
         const data = await parseResponseJSON(res);
 
-        currentBWPricePaise = data.bw_price_per_sheet_paise || 200;
-        currentColorPricePaise = data.color_price_per_sheet_paise || 1000;
+        currentBWSimplexPaise = data.bw_simplex_price_paise || data.bw_price_per_sheet_paise || 200;
+        currentBWDuplexPaise = data.bw_duplex_price_paise || 150;
+        currentColorSimplexPaise = data.color_simplex_price_paise || data.color_price_per_sheet_paise || 1000;
+        currentColorDuplexPaise = data.color_duplex_price_paise || 750;
+        currentColorEnabled = Boolean(data.color_enabled);
 
-        if (priceBwInput) priceBwInput.value = (currentBWPricePaise / 100).toFixed(2);
-        if (priceColorInput) priceColorInput.value = (currentColorPricePaise / 100).toFixed(2);
+        if (priceBwSimplexInput) priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
+        if (priceBwDuplexInput) priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
+        if (priceColorSimplexInput) priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
+        if (priceColorDuplexInput) priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
+        if (pricingColorEnabledToggle) pricingColorEnabledToggle.checked = currentColorEnabled;
 
         updateCostEstimator();
       } catch (err) {
@@ -713,14 +735,18 @@
       if (!calcPagesInput) return;
       const pages = Math.max(1, parseInt(calcPagesInput.value, 10) || 1);
       const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
-
       const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
 
-      const bwRate = priceBwInput && priceBwInput.value ? parseFloat(priceBwInput.value) : (currentBWPricePaise / 100);
-      const colorRate = priceColorInput && priceColorInput.value ? parseFloat(priceColorInput.value) : (currentColorPricePaise / 100);
+      const bwRate = isDuplex
+        ? (priceBwDuplexInput && priceBwDuplexInput.value ? parseFloat(priceBwDuplexInput.value) : (currentBWDuplexPaise / 100))
+        : (priceBwSimplexInput && priceBwSimplexInput.value ? parseFloat(priceBwSimplexInput.value) : (currentBWSimplexPaise / 100));
 
-      const bwCost = sheets * bwRate;
-      const colorCost = sheets * colorRate;
+      const colorRate = isDuplex
+        ? (priceColorDuplexInput && priceColorDuplexInput.value ? parseFloat(priceColorDuplexInput.value) : (currentColorDuplexPaise / 100))
+        : (priceColorSimplexInput && priceColorSimplexInput.value ? parseFloat(priceColorSimplexInput.value) : (currentColorSimplexPaise / 100));
+
+      const bwCost = pages * bwRate;
+      const colorCost = pages * colorRate;
 
       if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
       if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
@@ -731,17 +757,26 @@
     document.querySelectorAll('input[name="calc-duplex"]').forEach(r => {
       r.addEventListener('change', updateCostEstimator);
     });
-    if (priceBwInput) priceBwInput.addEventListener('input', updateCostEstimator);
-    if (priceColorInput) priceColorInput.addEventListener('input', updateCostEstimator);
+    if (priceBwSimplexInput) priceBwSimplexInput.addEventListener('input', updateCostEstimator);
+    if (priceBwDuplexInput) priceBwDuplexInput.addEventListener('input', updateCostEstimator);
+    if (priceColorSimplexInput) priceColorSimplexInput.addEventListener('input', updateCostEstimator);
+    if (priceColorDuplexInput) priceColorDuplexInput.addEventListener('input', updateCostEstimator);
+    if (pricingColorEnabledToggle) pricingColorEnabledToggle.addEventListener('change', updateCostEstimator);
 
     if (pricingForm) {
       pricingForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const bw = parseFloat(priceBwInput.value);
-        const color = parseFloat(priceColorInput.value);
+        const bwSimplex = parseFloat(priceBwSimplexInput.value);
+        const bwDuplex = parseFloat(priceBwDuplexInput.value);
+        const colorSimplex = parseFloat(priceColorSimplexInput.value);
+        const colorDuplex = parseFloat(priceColorDuplexInput.value);
+        const colorEnabled = pricingColorEnabledToggle ? pricingColorEnabledToggle.checked : false;
 
-        if (isNaN(bw) || bw <= 0 || isNaN(color) || color <= 0) {
-          alert('Prices must be valid positive numbers.');
+        if (isNaN(bwSimplex) || bwSimplex <= 0 ||
+            isNaN(bwDuplex) || bwDuplex <= 0 ||
+            isNaN(colorSimplex) || colorSimplex <= 0 ||
+            isNaN(colorDuplex) || colorDuplex <= 0) {
+          alert('All prices must be valid positive numbers.');
           return;
         }
 
@@ -752,8 +787,11 @@
           const res = await apiRequest('/api/admin/pricing', {
             method: 'PUT',
             body: {
-              bw_price_per_sheet_paise: Math.round(bw * 100),
-              color_price_per_sheet_paise: Math.round(color * 100)
+              bw_simplex_price_paise: Math.round(bwSimplex * 100),
+              bw_duplex_price_paise: Math.round(bwDuplex * 100),
+              color_simplex_price_paise: Math.round(colorSimplex * 100),
+              color_duplex_price_paise: Math.round(colorDuplex * 100),
+              color_enabled: colorEnabled
             }
           });
 
@@ -762,8 +800,12 @@
             throw new Error(data.error || 'Failed to save');
           }
 
-          currentBWPricePaise = Math.round(bw * 100);
-          currentColorPricePaise = Math.round(color * 100);
+          currentBWSimplexPaise = Math.round(bwSimplex * 100);
+          currentBWDuplexPaise = Math.round(bwDuplex * 100);
+          currentColorSimplexPaise = Math.round(colorSimplex * 100);
+          currentColorDuplexPaise = Math.round(colorDuplex * 100);
+          currentColorEnabled = colorEnabled;
+
           updateCostEstimator();
           showToast('Print rates saved');
         } catch (err) {

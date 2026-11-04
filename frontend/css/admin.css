@@ -609,6 +609,18 @@ input:checked + .slider:before {
   to { transform: translateY(0); opacity: 1; }
 }
 
+/* Initialization Gate App Loader */
+.app-loader-container {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg-slate);
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+}
+
 /* Full-Page Dedicated Authentication */
 .auth-page-container {
   min-height: 100vh;

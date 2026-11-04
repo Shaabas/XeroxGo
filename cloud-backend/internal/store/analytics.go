@@ -10,8 +10,14 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-// PricingConfig represents per-sheet pricing for monochrome and color prints.
+// PricingConfig represents comprehensive pricing for monochrome and color prints (simplex and duplex)
+// along with hardware capabilities.
 type PricingConfig struct {
+	BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
+	BWDuplexPricePaise     int64     `json:"bw_duplex_price_paise"`
+	ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
+	ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
+	ColorEnabled           bool      `json:"color_enabled"`
 	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
 	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
 	UpdatedAt               time.Time `json:"updated_at"`
@@ -29,8 +35,16 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	var legacyPrice, bwPrice, colorPrice, updatedNS int64
-	err := s.db.QueryRowContext(ctx, "SELECT price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise, updated_at_ns FROM pricing WHERE id = 1;").Scan(&legacyPrice, &bwPrice, &colorPrice, &updatedNS)
+	var legacyPrice, bwPrice, colorPrice, bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
+	var colorEnabledInt int
+	var updatedNS int64
+	query := "SELECT price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise, bw_simplex_price_paise, bw_duplex_price_paise, color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns FROM pricing WHERE id = 1;"
+	err := s.db.QueryRowContext(ctx, query).Scan(
+		&legacyPrice, &bwPrice, &colorPrice,
+		&bwSimplex, &bwDuplex,
+		&colorSimplex, &colorDuplex,
+		&colorEnabledInt, &updatedNS,
+	)
 	if err == sql.ErrNoRows {
 		return PricingConfig{}, fmt.Errorf("get pricing: pricing has not been configured")
 	}
@@ -38,26 +52,49 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	if bwPrice <= 0 {
-		if legacyPrice > 0 {
-			bwPrice = legacyPrice
+	if bwSimplex <= 0 {
+		if bwPrice > 0 {
+			bwSimplex = bwPrice
+		} else if legacyPrice > 0 {
+			bwSimplex = legacyPrice
 		} else {
-			bwPrice = 200
+			bwSimplex = 200
 		}
 	}
-	if colorPrice <= 0 {
-		colorPrice = 1000
+	if bwDuplex <= 0 {
+		bwDuplex = (bwSimplex * 3) / 4
+		if bwDuplex <= 0 {
+			bwDuplex = 150
+		}
+	}
+	if colorSimplex <= 0 {
+		if colorPrice > 0 {
+			colorSimplex = colorPrice
+		} else {
+			colorSimplex = 1000
+		}
+	}
+	if colorDuplex <= 0 {
+		colorDuplex = (colorSimplex * 3) / 4
+		if colorDuplex <= 0 {
+			colorDuplex = 750
+		}
 	}
 
 	return PricingConfig{
-		BWPricePerSheetPaise:    bwPrice,
-		ColorPricePerSheetPaise: colorPrice,
+		BWSimplexPricePaise:    bwSimplex,
+		BWDuplexPricePaise:     bwDuplex,
+		ColorSimplexPricePaise: colorSimplex,
+		ColorDuplexPricePaise:  colorDuplex,
+		ColorEnabled:           colorEnabledInt == 1,
+		BWPricePerSheetPaise:    bwSimplex,
+		ColorPricePerSheetPaise: colorSimplex,
 		UpdatedAt:               time.Unix(0, updatedNS).UTC(),
 	}, nil
 }
 
-// SetPricing updates or inserts the dual pricing configuration.
-func (s *Store) SetPricing(ctx context.Context, bwPrice, colorPrice int64) error {
+// SetDetailedPricing updates or inserts the complete 4-tier pricing and color hardware configuration.
+func (s *Store) SetDetailedPricing(ctx context.Context, bwSimplex, bwDuplex, colorSimplex, colorDuplex int64, colorEnabled bool) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("set pricing: store is closed or nil")
 	}
@@ -67,28 +104,64 @@ func (s *Store) SetPricing(ctx context.Context, bwPrice, colorPrice int64) error
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("set pricing: %w", err)
 	}
-	if bwPrice <= 0 {
-		return fmt.Errorf("set pricing: bwPrice must be > 0, got %d", bwPrice)
+	if bwSimplex <= 0 {
+		return fmt.Errorf("set pricing: bwSimplex must be > 0, got %d", bwSimplex)
 	}
-	if colorPrice <= 0 {
-		return fmt.Errorf("set pricing: colorPrice must be > 0, got %d", colorPrice)
+	if bwDuplex <= 0 {
+		return fmt.Errorf("set pricing: bwDuplex must be > 0, got %d", bwDuplex)
+	}
+	if colorSimplex <= 0 {
+		return fmt.Errorf("set pricing: colorSimplex must be > 0, got %d", colorSimplex)
+	}
+	if colorDuplex <= 0 {
+		return fmt.Errorf("set pricing: colorDuplex must be > 0, got %d", colorDuplex)
+	}
+
+	colorEnabledInt := 0
+	if colorEnabled {
+		colorEnabledInt = 1
 	}
 
 	updatedNS := time.Now().UTC().UnixNano()
 	query := `
-INSERT INTO pricing (id, price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise, updated_at_ns)
-VALUES (1, ?, ?, ?, ?)
+INSERT INTO pricing (id, price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise,
+                     bw_simplex_price_paise, bw_duplex_price_paise,
+                     color_simplex_price_paise, color_duplex_price_paise,
+                     color_enabled, updated_at_ns)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     price_per_sheet_paise = excluded.price_per_sheet_paise,
     bw_price_per_sheet_paise = excluded.bw_price_per_sheet_paise,
     color_price_per_sheet_paise = excluded.color_price_per_sheet_paise,
+    bw_simplex_price_paise = excluded.bw_simplex_price_paise,
+    bw_duplex_price_paise = excluded.bw_duplex_price_paise,
+    color_simplex_price_paise = excluded.color_simplex_price_paise,
+    color_duplex_price_paise = excluded.color_duplex_price_paise,
+    color_enabled = excluded.color_enabled,
     updated_at_ns = excluded.updated_at_ns;
 `
-	_, err := s.db.ExecContext(ctx, s.rebind(query), bwPrice, bwPrice, colorPrice, updatedNS)
+	_, err := s.db.ExecContext(ctx, s.rebind(query),
+		bwSimplex, bwSimplex, colorSimplex,
+		bwSimplex, bwDuplex,
+		colorSimplex, colorDuplex,
+		colorEnabledInt, updatedNS)
 	if err != nil {
 		return fmt.Errorf("set pricing: %w", err)
 	}
 	return nil
+}
+
+// SetPricing updates or inserts the dual pricing configuration (backward compatible).
+func (s *Store) SetPricing(ctx context.Context, bwPrice, colorPrice int64) error {
+	bwDuplex := (bwPrice * 3) / 4
+	if bwDuplex <= 0 {
+		bwDuplex = 150
+	}
+	colorDuplex := (colorPrice * 3) / 4
+	if colorDuplex <= 0 {
+		colorDuplex = 750
+	}
+	return s.SetDetailedPricing(ctx, bwPrice, bwDuplex, colorPrice, colorDuplex, false)
 }
 
 // DailyTrendItem represents volume and revenue aggregated by calendar day.

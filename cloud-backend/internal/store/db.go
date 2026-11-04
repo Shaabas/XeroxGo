@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS pricing (
         CHECK (bw_price_per_sheet_paise > 0),
     color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
         CHECK (color_price_per_sheet_paise > 0),
+    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
+        CHECK (bw_simplex_price_paise > 0),
+    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
+        CHECK (bw_duplex_price_paise > 0),
+    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
+        CHECK (color_simplex_price_paise > 0),
+    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
+        CHECK (color_duplex_price_paise > 0),
+    color_enabled INTEGER NOT NULL DEFAULT 0,
     updated_at_ns BIGINT NOT NULL
 );
 
@@ -165,6 +174,11 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
 		pgMigrations := []string{
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
 			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
 		}
 		for _, mig := range pgMigrations {
@@ -262,6 +276,15 @@ CREATE TABLE IF NOT EXISTS pricing (
         CHECK (bw_price_per_sheet_paise > 0),
     color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
         CHECK (color_price_per_sheet_paise > 0),
+    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
+        CHECK (bw_simplex_price_paise > 0),
+    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
+        CHECK (bw_duplex_price_paise > 0),
+    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
+        CHECK (color_simplex_price_paise > 0),
+    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
+        CHECK (color_duplex_price_paise > 0),
+    color_enabled INTEGER NOT NULL DEFAULT 0,
     updated_at_ns BIGINT NOT NULL
 );
 
@@ -344,6 +367,21 @@ func migrateSQLiteSchema(db *sql.DB) error {
 	}
 	if !colsPricing["color_price_per_sheet_paise"] {
 		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
+	}
+	if !colsPricing["bw_simplex_price_paise"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 200;")
+	}
+	if !colsPricing["bw_duplex_price_paise"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 150;")
+	}
+	if !colsPricing["color_simplex_price_paise"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
+	}
+	if !colsPricing["color_duplex_price_paise"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 750;")
+	}
+	if !colsPricing["color_enabled"] {
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_enabled INTEGER NOT NULL DEFAULT 0;")
 	}
 
 	colsConfigs := make(map[string]bool)

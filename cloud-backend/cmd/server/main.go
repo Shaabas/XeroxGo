@@ -713,6 +713,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		colorMode = "BW"
 	}
 
+	pricing, err := s.db.GetPricing(r.Context())
+	if err == nil && !pricing.ColorEnabled {
+		// Hardware enforcement: coerce to BW if kiosk color is disabled
+		colorMode = "BW"
+	}
+
 	normRes, err := pdf.NormalizeAndCountMode(r.Context(), tmpInputName, outputPath, copies, duplexMode, colorMode)
 	if err != nil {
 		_ = os.Remove(outputPath)
@@ -720,19 +726,29 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pricing, err := s.db.GetPricing(r.Context())
-	var pricePerSheet int64
+	var unitPrice int64
+	isDuplex := duplexMode != "simplex"
 	if err == nil {
 		if colorMode == "COLOR" {
-			pricePerSheet = pricing.ColorPricePerSheetPaise
+			if isDuplex {
+				unitPrice = pricing.ColorDuplexPricePaise
+			} else {
+				unitPrice = pricing.ColorSimplexPricePaise
+			}
 		} else {
-			pricePerSheet = pricing.BWPricePerSheetPaise
+			if isDuplex {
+				unitPrice = pricing.BWDuplexPricePaise
+			} else {
+				unitPrice = pricing.BWSimplexPricePaise
+			}
 		}
 	}
-	if pricePerSheet <= 0 {
-		pricePerSheet = s.cfg.pricePerSheetPaise
+	if unitPrice <= 0 {
+		unitPrice = s.cfg.pricePerSheetPaise
 	}
-	totalPricePaise, err := payments.CalculatePricePaise(normRes.TotalSheets, pricePerSheet)
+
+	totalPrintedPages := normRes.TotalPages * copies
+	totalPricePaise, err := payments.CalculatePricePaise(totalPrintedPages, unitPrice)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, "failed to calculate price", http.StatusInternalServerError)
@@ -787,7 +803,8 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"total_sheets":          normRes.TotalSheets,
 		"copies":                copies,
 		"duplex":                string(duplexMode),
-		"price_per_sheet_paise": pricePerSheet,
+		"price_per_sheet_paise": unitPrice,
+		"unit_price_paise":      unitPrice,
 		"total_price_paise":     totalPricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
 	})
