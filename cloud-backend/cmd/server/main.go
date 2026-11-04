@@ -163,9 +163,17 @@ const portalHTML = `<!DOCTYPE html>
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="upload-icon" style="margin:0 auto 0.5rem; display:block;">
             <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
           </svg>
-          <div class="upload-text">Click to upload or drag and drop</div>
-          <div class="upload-subtext">Supported formats: PDF, Word, PowerPoint, Excel, Images</div>
-          <div class="upload-subtext">Max size: 25 MB</div>
+          <div class="upload-text" style="font-weight:600; font-size:1.05rem;">Tap to upload or drag &amp; drop</div>
+          
+          <div class="upload-format-tags">
+            <span class="format-badge format-pdf">PDF</span>
+            <span class="format-badge format-word">Word (.docx)</span>
+            <span class="format-badge format-ppt">Slides (.pptx)</span>
+            <span class="format-badge format-excel">Excel (.xlsx)</span>
+            <span class="format-badge format-img">Photos (JPG, PNG)</span>
+          </div>
+
+          <div class="upload-subtext" style="font-size:0.8rem; color:var(--text-secondary); margin-top:0.5rem;">Auto-converted to print-ready A4 • Max 25 MB</div>
         </div>
 
         <div id="file-preview-card" class="file-preview animate-slide-up hidden" style="flex-direction:column; align-items:stretch; gap:0.75rem;">
