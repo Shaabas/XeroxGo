@@ -215,7 +215,8 @@
     try {
       const res = await apiRequest('/api/admin/ads');
       if (!res.ok) throw new Error('Failed to load ads');
-      ads = await res.json();
+      const data = await res.json();
+      ads = Array.isArray(data) ? data : (data.ads || []);
       renderAdList();
       initPreviewCarousel();
     } catch (err) {

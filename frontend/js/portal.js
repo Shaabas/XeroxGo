@@ -271,7 +271,8 @@
     try {
       const res = await fetch('/api/ads');
       if (!res.ok) return;
-      const ads = await res.json();
+      const data = await res.json();
+      const ads = Array.isArray(data) ? data : (data.ads || []);
       if (!Array.isArray(ads) || ads.length === 0) return;
 
       if (!bannerTrack || !bannerDots) return;
