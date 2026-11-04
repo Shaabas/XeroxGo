@@ -53,6 +53,14 @@ func clearLoginAttempts(ip string) {
 	delete(loginAttempts, ip)
 }
 
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error": message,
+	})
+}
+
 func getClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
@@ -87,13 +95,13 @@ func (app *appServer) authenticateAdminRequest(r *http.Request) (string, bool) {
 // handlePublicAds handles GET /api/ads (public endpoint for mobile portal & kiosk boot)
 func (app *appServer) handlePublicAds(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	ads, err := app.db.GetActiveAds(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to fetch ads: %v", err), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to fetch ads: %v", err))
 		return
 	}
 
@@ -109,13 +117,13 @@ func (app *appServer) handlePublicAds(w http.ResponseWriter, r *http.Request) {
 // handleAdminLogin handles POST /api/admin/login
 func (app *appServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	ip := getClientIP(r)
 	if isRateLimited(ip) {
-		http.Error(w, "too many failed login attempts, please try again in 15 minutes", http.StatusTooManyRequests)
+		writeJSONError(w, http.StatusTooManyRequests, "too many failed login attempts, please try again in 15 minutes")
 		return
 	}
 
@@ -124,14 +132,14 @@ func (app *appServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	ok, err := app.db.AuthenticateAdmin(r.Context(), req.Username, req.Password)
 	if err != nil || !ok {
 		recordFailedLogin(ip)
-		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 
@@ -139,7 +147,7 @@ func (app *appServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 
 	token, expiresAt, err := app.db.CreateAdminSession(r.Context(), req.Username)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to create session: %v", err), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create session: %v", err))
 		return
 	}
 
@@ -165,7 +173,7 @@ func (app *appServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 // handleAdminLogout handles POST /api/admin/logout
 func (app *appServer) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
@@ -198,7 +206,7 @@ func (app *appServer) handleAdminLogout(w http.ResponseWriter, r *http.Request) 
 func (app *appServer) handleAdminMe(w http.ResponseWriter, r *http.Request) {
 	user, ok := app.authenticateAdminRequest(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -217,12 +225,12 @@ func (app *appServer) handleAdminMe(w http.ResponseWriter, r *http.Request) {
 // handleAdminPassword handles POST /api/admin/password
 func (app *appServer) handleAdminPassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	user, ok := app.authenticateAdminRequest(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -231,12 +239,12 @@ func (app *appServer) handleAdminPassword(w http.ResponseWriter, r *http.Request
 		NewPassword     string `json:"new_password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	if err := app.db.UpdateAdminPassword(r.Context(), user, req.CurrentPassword, req.NewPassword); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -248,7 +256,7 @@ func (app *appServer) handleAdminPassword(w http.ResponseWriter, r *http.Request
 func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 	_, ok := app.authenticateAdminRequest(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -261,7 +269,7 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 			// List all ads including drafts
 			ads, err := app.db.GetAllAds(r.Context())
 			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to get ads: %v", err), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get ads: %v", err))
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -271,7 +279,7 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 			// Create new ad
 			var ad contracts.AdItem
 			if err := json.NewDecoder(r.Body).Decode(&ad); err != nil {
-				http.Error(w, "invalid request body", http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "invalid request body")
 				return
 			}
 			if strings.TrimSpace(ad.ID) == "" {
@@ -280,12 +288,12 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 				ad.ID = "ad-" + hex.EncodeToString(b)
 			}
 			if strings.TrimSpace(ad.Title) == "" {
-				http.Error(w, "title is required", http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "title is required")
 				return
 			}
 
 			if err := app.db.SaveAd(r.Context(), ad); err != nil {
-				http.Error(w, fmt.Sprintf("failed to save ad: %v", err), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save ad: %v", err))
 				return
 			}
 
@@ -298,22 +306,22 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "ad": ad})
 			return
 		}
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 
 	case path == "reorder":
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		var req struct {
 			Order []string `json:"order"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid request body", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
 		if err := app.db.ReorderAds(r.Context(), req.Order); err != nil {
-			http.Error(w, fmt.Sprintf("failed to reorder ads: %v", err), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to reorder ads: %v", err))
 			return
 		}
 
@@ -330,16 +338,16 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			var ad contracts.AdItem
 			if err := json.NewDecoder(r.Body).Decode(&ad); err != nil {
-				http.Error(w, "invalid request body", http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "invalid request body")
 				return
 			}
 			ad.ID = adID
 			if strings.TrimSpace(ad.Title) == "" {
-				http.Error(w, "title is required", http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "title is required")
 				return
 			}
 			if err := app.db.SaveAd(r.Context(), ad); err != nil {
-				http.Error(w, fmt.Sprintf("failed to update ad: %v", err), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to update ad: %v", err))
 				return
 			}
 
@@ -352,7 +360,7 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if r.Method == http.MethodDelete {
 			if err := app.db.DeleteAd(r.Context(), adID); err != nil {
-				http.Error(w, fmt.Sprintf("failed to delete ad: %v", err), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to delete ad: %v", err))
 				return
 			}
 
@@ -364,32 +372,32 @@ func (app *appServer) handleAdminAds(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 			return
 		}
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
 // handleAdminUploadImage handles POST /api/admin/upload-image
 func (app *appServer) handleAdminUploadImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	_, ok := app.authenticateAdminRequest(r)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
 	// 5 MB max
 	r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
 	if err := r.ParseMultipartForm(5 * 1024 * 1024); err != nil {
-		http.Error(w, "file too large (max 5 MB)", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "file too large (max 5 MB)")
 		return
 	}
 
 	file, header, err := r.FormFile("image")
 	if err != nil {
-		http.Error(w, "missing 'image' file in form", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "missing 'image' file in form")
 		return
 	}
 	defer file.Close()
@@ -407,7 +415,7 @@ func (app *appServer) handleAdminUploadImage(w http.ResponseWriter, r *http.Requ
 	case "image/webp":
 		ext = ".webp"
 	default:
-		http.Error(w, "unsupported image type (allowed: PNG, JPEG, WebP)", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "unsupported image type (allowed: PNG, JPEG, WebP)")
 		return
 	}
 
@@ -419,20 +427,20 @@ func (app *appServer) handleAdminUploadImage(w http.ResponseWriter, r *http.Requ
 
 	uploadDir := filepath.Join(app.cfg.jobsDir, "ad_images")
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		http.Error(w, "failed to create upload directory", http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "failed to create upload directory")
 		return
 	}
 
 	destPath := filepath.Join(uploadDir, filename)
 	destFile, err := os.Create(destPath)
 	if err != nil {
-		http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "failed to save uploaded file")
 		return
 	}
 	defer destFile.Close()
 
 	if _, err := io.Copy(destFile, file); err != nil {
-		http.Error(w, "failed to write file content", http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "failed to write file content")
 		return
 	}
 
@@ -448,7 +456,7 @@ func (app *appServer) handleAdminUploadImage(w http.ResponseWriter, r *http.Requ
 // handleServeAdImage serves images uploaded at /api/ads/images/{filename}
 func (app *appServer) handleServeAdImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
