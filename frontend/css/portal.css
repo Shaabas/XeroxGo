@@ -181,56 +181,6 @@ body {
   margin-top: 0.25rem;
 }
 
-.upload-format-tags {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 0.35rem;
-  margin-top: 0.75rem;
-}
-
-.format-badge {
-  display: inline-flex;
-  align-items: center;
-  font-size: 0.75rem;
-  font-weight: 600;
-  padding: 0.2rem 0.55rem;
-  border-radius: 9999px;
-  background-color: #EFF6FF;
-  color: #1D4ED8;
-  border: 1px solid #DBEAFE;
-  letter-spacing: 0.02em;
-}
-
-.format-badge.format-pdf {
-  background-color: #FEF2F2;
-  color: #DC2626;
-  border-color: #FECACA;
-}
-
-.format-badge.format-word {
-  background-color: #EFF6FF;
-  color: #2563EB;
-  border-color: #BFDBFE;
-}
-
-.format-badge.format-ppt {
-  background-color: #FFF7ED;
-  color: #EA580C;
-  border-color: #FED7AA;
-}
-
-.format-badge.format-excel {
-  background-color: #ECFDF5;
-  color: #059669;
-  border-color: #A7F3D0;
-}
-
-.format-badge.format-img {
-  background-color: #FAF5FF;
-  color: #7E22CE;
-  border-color: #E9D5FF;
-}
 
 /* File Preview */
 .file-preview {
