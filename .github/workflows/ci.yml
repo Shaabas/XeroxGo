@@ -42,9 +42,11 @@ jobs:
       - name: Deploy to Vercel Production
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           if [ -n "$VERCEL_TOKEN" ]; then
-            npx vercel deploy frontend --prod --yes --token="$VERCEL_TOKEN"
+            npx vercel deploy frontend --prod --yes --token="$VERCEL_TOKEN" --scope=team_oAAV8253FapfKa0b93unTxt7
           else
             echo "VERCEL_TOKEN secret not configured; skipping automated Vercel deploy."
           fi
