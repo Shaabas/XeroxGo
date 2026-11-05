@@ -7,8 +7,11 @@ XEROXGO_CLOUD_WS_URL=wss://xeroxgo-cloud.onrender.com/ws
 # Unique identifier for this physical kiosk unit
 XEROXGO_KIOSK_ID=kiosk-demo
 
-# CUPS printer queue name (e.g. DCPT310)
-XEROXGO_CUPS_PRINTER=DCPT310
+# CUPS printer queue name (e.g. HPTank)
+XEROXGO_CUPS_PRINTER=HPTank
+
+# Printer model name displayed on kiosk screen
+XEROXGO_PRINTER_MODEL="HP LaserJet Tank 1020w"
 
 # URL rendered on the idle QR code
 XEROXGO_IDLE_QR_CONTENT=https://xeroxgo.vercel.app

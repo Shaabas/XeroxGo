@@ -37,6 +37,7 @@ ExecStart=/home/xg1/xeroxgo-kiosk \
   --cloud-url=${XEROXGO_CLOUD_WS_URL} \
   --kiosk-id=${XEROXGO_KIOSK_ID} \
   --cups-printer=${XEROXGO_CUPS_PRINTER} \
+  --printer-model="${XEROXGO_PRINTER_MODEL}" \
   --state-db=/var/kiosk/state.db \
   --download-dir=/var/kiosk/jobs \
   --framebuffer=/dev/fb0 \
