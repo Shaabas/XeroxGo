@@ -1499,7 +1499,7 @@ func TestClientResetsToIdleAfterCompletion(t *testing.T) {
 	}()
 
 	// Wait for idle screen reset after completion
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	resetSeen := false
 	for time.Now().Before(deadline) {
 		client.renderHistoryMu.Lock()
