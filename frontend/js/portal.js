@@ -47,8 +47,6 @@
   let activeOrderID = null;
   let pollTimer = null;
   let activePageIndex = 0;
-  let zoom = 1.0;
-  let isFullscreen = false;
   let deferredPwaPrompt = null;
 
   // --- DOM Elements ---
@@ -73,8 +71,6 @@
   const fileNameDisplay = document.getElementById('file-name-display');
   const fileMetaDisplay = document.getElementById('file-meta-display');
   const removeFileBtn = document.getElementById('remove-file-btn');
-  const btnViewDoc = document.getElementById('btn-view-doc');
-  const btnEditPages = document.getElementById('btn-edit-pages');
   const uploadAlert = document.getElementById('upload-alert');
 
   const printOptionsSection = document.getElementById('print-options-section');
@@ -122,29 +118,22 @@
   const upiPayButtonContainer = document.getElementById('upi-pay-container');
   const statusSuccessAlert = document.getElementById('status-success-alert');
 
-  // Modal DOM
-  const editorModalOverlay = document.getElementById('editor-modal-overlay');
-  const editorModalCloseBtn = document.getElementById('editor-modal-close-btn');
-  const editorModalTitle = document.getElementById('editor-modal-title');
-  const btnPrevPage = document.getElementById('btn-prev-page');
-  const btnNextPage = document.getElementById('btn-next-page');
-  const modalPageIndicator = document.getElementById('modal-page-indicator');
-  const btnToggleInclude = document.getElementById('btn-toggle-include');
-  const btnZoomOut = document.getElementById('btn-zoom-out');
-  const btnZoomReset = document.getElementById('btn-zoom-reset');
-  const btnZoomIn = document.getElementById('btn-zoom-in');
-  const btnFullscreen = document.getElementById('btn-fullscreen');
-  const mainCanvas = document.getElementById('main-preview-canvas');
-  const canvasLoadingSpinner = document.getElementById('canvas-loading-spinner');
-  const btnSelectAll = document.getElementById('btn-select-all');
-  const btnDeselectAll = document.getElementById('btn-deselect-all');
-  const btnRotateAll = document.getElementById('btn-rotate-all');
-  const modalCustomRangeInput = document.getElementById('modal-custom-range-input');
-  const thumbnailCarousel = document.getElementById('thumbnail-carousel');
+  // Live Sheet Preview DOM
+  const liveSheetContainer = document.getElementById('live-sheet-container');
+  const paperSheet = document.getElementById('paper-sheet');
+  const livePreviewCanvas = document.getElementById('live-preview-canvas');
+  const sheetLoadingSpinner = document.getElementById('sheet-loading-spinner');
+  const previewColorBadge = document.getElementById('preview-color-badge');
+  const previewSheetBadge = document.getElementById('preview-sheet-badge');
+  const sheetPageIndicator = document.getElementById('sheet-page-indicator');
+  const btnSheetPrev = document.getElementById('btn-sheet-prev');
+  const btnSheetNext = document.getElementById('btn-sheet-next');
+  const btnSheetFlip = document.getElementById('btn-sheet-flip');
+  const sheetFlipText = document.getElementById('sheet-flip-text');
 
   // --- Initialize PDF.js worker if available ---
-  if (window.pdfjsLib) {
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/vendor/pdf.worker.min.mjs';
+  if (window.pdfjsLib && !window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
   }
 
   // --- Helper: Parse Custom Range String ---
@@ -564,6 +553,8 @@
       }
 
       updatePriceAndReviewSummary();
+      activePageIndex = 0;
+      renderLiveSheet();
     } catch (err) {
       console.error('File load failed:', err);
       showError(err.message || 'Failed to process document. Please verify the file is valid.');
@@ -588,6 +579,10 @@
       uploadArea.classList.remove('hidden');
     }
     if (filePreviewCard) filePreviewCard.classList.add('hidden');
+    if (livePreviewCanvas) {
+      const ctx = livePreviewCanvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, livePreviewCanvas.width, livePreviewCanvas.height);
+    }
     updatePriceAndReviewSummary();
   }
 
@@ -628,7 +623,7 @@
       if (customRangeBox) customRangeBox.classList.add('hidden');
       pageList.forEach(p => p.selected = true);
       updatePriceAndReviewSummary();
-      renderThumbnails();
+      renderLiveSheet();
     });
   }
 
@@ -644,9 +639,6 @@
 
   function applyCustomRange(rangeStr) {
     customPageRange = rangeStr;
-    if (modalCustomRangeInput && modalCustomRangeInput !== document.activeElement) {
-      modalCustomRangeInput.value = rangeStr;
-    }
     if (customRangeInput && customRangeInput !== document.activeElement) {
       customRangeInput.value = rangeStr;
     }
@@ -663,8 +655,7 @@
       }
     }
     updatePriceAndReviewSummary();
-    renderThumbnails();
-    updateModalPill();
+    renderLiveSheet();
   }
 
   if (customRangeInput) {
@@ -699,6 +690,7 @@
       btnModeBW.classList.add('active');
       if (btnModeColor) btnModeColor.classList.remove('active');
       updatePriceAndReviewSummary();
+      renderLiveSheet();
     });
   }
 
@@ -708,6 +700,7 @@
       btnModeColor.classList.add('active');
       if (btnModeBW) btnModeBW.classList.remove('active');
       updatePriceAndReviewSummary();
+      renderLiveSheet();
     });
   }
 
@@ -754,6 +747,7 @@
       btnSideSingle.classList.add('active');
       btnSideDouble.classList.remove('active');
       updatePriceAndReviewSummary();
+      renderLiveSheet();
     });
   }
 
@@ -763,6 +757,7 @@
       btnSideDouble.classList.add('active');
       btnSideSingle.classList.remove('active');
       updatePriceAndReviewSummary();
+      renderLiveSheet();
     });
   }
 
@@ -773,248 +768,160 @@
     });
   }
 
-  // --- Document Review & Page Editor Modal ---
-  function openEditorModal() {
-    if (!file) {
-      showError('Please upload a document first.');
+  // --- Live Print-Ready Sheet Preview Engine ---
+  let renderTask = null;
+
+  async function renderLiveSheet() {
+    if (!livePreviewCanvas || !pdfJsDoc || pageList.length === 0) return;
+
+    // Determine the list of pages selected to print
+    const printablePages = pageList.filter(p => p.selected);
+    if (printablePages.length === 0) {
+      if (previewSheetBadge) previewSheetBadge.textContent = '0 pages selected';
+      if (sheetPageIndicator) sheetPageIndicator.textContent = 'No pages selected';
+      if (btnSheetPrev) btnSheetPrev.disabled = true;
+      if (btnSheetNext) btnSheetNext.disabled = true;
+      if (btnSheetFlip) btnSheetFlip.classList.add('hidden');
       return;
     }
-    if (editorModalTitle) editorModalTitle.textContent = file.name;
-    if (editorModalOverlay) editorModalOverlay.classList.remove('hidden');
-    renderCurrentPage();
-    renderThumbnails();
-    updateModalPill();
-  }
 
-  function closeEditorModal() {
-    if (editorModalOverlay) editorModalOverlay.classList.add('hidden');
-  }
-
-  if (btnViewDoc) btnViewDoc.addEventListener('click', openEditorModal);
-  if (btnEditPages) btnEditPages.addEventListener('click', openEditorModal);
-  if (editorModalCloseBtn) editorModalCloseBtn.addEventListener('click', closeEditorModal);
-
-  function updateModalPill() {
-    if (!pageList[activePageIndex]) return;
-    const isIncluded = pageList[activePageIndex].selected;
-    if (btnToggleInclude) {
-      btnToggleInclude.style.backgroundColor = isIncluded ? '#DCFCE7' : '#FEE2E2';
-      btnToggleInclude.style.color = isIncluded ? '#166534' : '#991B1B';
-      btnToggleInclude.innerHTML = isIncluded
-        ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Included'
-        : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> Excluded';
+    // Ensure activePageIndex points to a valid selected page
+    let activePageObj = pageList[activePageIndex];
+    if (!activePageObj || !activePageObj.selected) {
+      activePageObj = printablePages[0];
+      activePageIndex = activePageObj.originalIndex;
     }
-    if (modalPageIndicator) {
-      modalPageIndicator.textContent = `Page ${pageList.length > 0 ? activePageIndex + 1 : 0} of ${pageList.length}`;
+
+    // Find position in printablePages
+    const selIdx = printablePages.findIndex(p => p.originalIndex === activePageIndex);
+    const totalPrintable = printablePages.length;
+
+    // 1. Color vs B&W WYSIWYG reaction
+    if (mode === 'B&W') {
+      livePreviewCanvas.classList.add('preview-bw');
+      livePreviewCanvas.classList.remove('preview-color');
+      if (previewColorBadge) {
+        previewColorBadge.className = 'sheet-badge badge-bw';
+        previewColorBadge.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 0 20z" fill="currentColor"/></svg> B&amp;W Preview';
+      }
+    } else {
+      livePreviewCanvas.classList.remove('preview-bw');
+      livePreviewCanvas.classList.add('preview-color');
+      if (previewColorBadge) {
+        previewColorBadge.className = 'sheet-badge badge-color';
+        previewColorBadge.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/></svg> Color Preview';
+      }
     }
-    if (btnPrevPage) btnPrevPage.disabled = activePageIndex <= 0;
-    if (btnNextPage) btnNextPage.disabled = activePageIndex >= pageList.length - 1;
-  }
 
-  async function renderCurrentPage() {
-    if (!mainCanvas || !pdfJsDoc || pageList.length === 0) return;
-    const pageObj = pageList[activePageIndex];
-    if (!pageObj) return;
+    // 2. Duplex vs Simplex Sheet Calculation
+    if (sides === 'Double-sided') {
+      const sheetNum = Math.floor(selIdx / 2) + 1;
+      const totalSheets = Math.ceil(totalPrintable / 2);
+      const isFront = (selIdx % 2 === 0);
 
-    if (canvasLoadingSpinner) canvasLoadingSpinner.classList.remove('hidden');
+      if (previewSheetBadge) {
+        previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalSheets} (${isFront ? 'Front' : 'Back'})`;
+      }
+
+      // Flip button
+      if (btnSheetFlip && sheetFlipText) {
+        if (isFront && selIdx + 1 < totalPrintable) {
+          btnSheetFlip.classList.remove('hidden');
+          sheetFlipText.textContent = `Flip to Back (Pg ${printablePages[selIdx + 1].originalIndex + 1})`;
+          btnSheetFlip.onclick = () => {
+            activePageIndex = printablePages[selIdx + 1].originalIndex;
+            renderLiveSheet();
+          };
+        } else if (!isFront && selIdx - 1 >= 0) {
+          btnSheetFlip.classList.remove('hidden');
+          sheetFlipText.textContent = `Flip to Front (Pg ${printablePages[selIdx - 1].originalIndex + 1})`;
+          btnSheetFlip.onclick = () => {
+            activePageIndex = printablePages[selIdx - 1].originalIndex;
+            renderLiveSheet();
+          };
+        } else {
+          btnSheetFlip.classList.add('hidden');
+        }
+      }
+    } else {
+      // Simplex (Single-sided)
+      const sheetNum = selIdx + 1;
+      if (previewSheetBadge) {
+        previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalPrintable}`;
+      }
+      if (btnSheetFlip) {
+        btnSheetFlip.classList.add('hidden');
+      }
+    }
+
+    // 3. Page Stepper
+    if (sheetPageIndicator) {
+      if (totalPrintable === totalDocPages) {
+        sheetPageIndicator.textContent = `Page ${activePageObj.originalIndex + 1} of ${totalDocPages}`;
+      } else {
+        sheetPageIndicator.textContent = `Page ${activePageObj.originalIndex + 1} (${selIdx + 1} of ${totalPrintable})`;
+      }
+    }
+
+    if (btnSheetPrev) btnSheetPrev.disabled = (selIdx <= 0);
+    if (btnSheetNext) btnSheetNext.disabled = (selIdx >= totalPrintable - 1);
+
+    // --- Render Canvas Page ---
+    if (sheetLoadingSpinner) sheetLoadingSpinner.classList.remove('hidden');
+
+    if (renderTask) {
+      try { renderTask.cancel(); } catch (_) {}
+      renderTask = null;
+    }
 
     try {
-      const pdfPage = await pdfJsDoc.getPage(pageObj.originalIndex + 1);
-      const rotation = (pdfPage.rotate + pageObj.rotation) % 360;
+      const pdfPage = await pdfJsDoc.getPage(activePageObj.originalIndex + 1);
+      const rotation = pdfPage.rotate % 360;
       const baseViewport = pdfPage.getViewport({ scale: 1.0, rotation });
-      const maxWidth = isFullscreen ? window.innerWidth * 0.8 : 360;
-      const fitScale = Math.min(2.0, Math.max(0.5, (maxWidth / baseViewport.width) * zoom));
-      const viewport = pdfPage.getViewport({ scale: fitScale, rotation });
 
-      mainCanvas.width = viewport.width;
-      mainCanvas.height = viewport.height;
-      const ctx = mainCanvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
+      const scale = (containerWidth / baseViewport.width) * dpr;
+      const viewport = pdfPage.getViewport({ scale, rotation });
 
-      await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+      livePreviewCanvas.width = viewport.width;
+      livePreviewCanvas.height = viewport.height;
+      livePreviewCanvas.style.width = '100%';
+      livePreviewCanvas.style.height = 'auto';
+
+      const ctx = livePreviewCanvas.getContext('2d');
+      renderTask = pdfPage.render({ canvasContext: ctx, viewport });
+      await renderTask.promise;
+      renderTask = null;
     } catch (err) {
-      console.warn('Canvas page render error:', err);
+      if (err && err.name !== 'RenderingCancelledException') {
+        console.warn('Live sheet render error:', err);
+      }
     } finally {
-      if (canvasLoadingSpinner) canvasLoadingSpinner.classList.add('hidden');
+      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
     }
   }
 
-  if (btnPrevPage) {
-    btnPrevPage.addEventListener('click', () => {
-      if (activePageIndex > 0) {
-        activePageIndex--;
-        updateModalPill();
-        renderCurrentPage();
+  // Stepper Event Listeners
+  if (btnSheetPrev) {
+    btnSheetPrev.addEventListener('click', () => {
+      const printablePages = pageList.filter(p => p.selected);
+      const selIdx = printablePages.findIndex(p => p.originalIndex === activePageIndex);
+      if (selIdx > 0) {
+        activePageIndex = printablePages[selIdx - 1].originalIndex;
+        renderLiveSheet();
       }
     });
   }
 
-  if (btnNextPage) {
-    btnNextPage.addEventListener('click', () => {
-      if (activePageIndex < pageList.length - 1) {
-        activePageIndex++;
-        updateModalPill();
-        renderCurrentPage();
+  if (btnSheetNext) {
+    btnSheetNext.addEventListener('click', () => {
+      const printablePages = pageList.filter(p => p.selected);
+      const selIdx = printablePages.findIndex(p => p.originalIndex === activePageIndex);
+      if (selIdx < printablePages.length - 1) {
+        activePageIndex = printablePages[selIdx + 1].originalIndex;
+        renderLiveSheet();
       }
-    });
-  }
-
-  if (btnToggleInclude) {
-    btnToggleInclude.addEventListener('click', () => {
-      if (pageList[activePageIndex]) {
-        pageList[activePageIndex].selected = !pageList[activePageIndex].selected;
-        updateModalPill();
-        updatePriceAndReviewSummary();
-        renderThumbnails();
-      }
-    });
-  }
-
-  if (btnZoomIn) {
-    btnZoomIn.addEventListener('click', () => {
-      zoom = Math.min(2.0, zoom + 0.2);
-      if (btnZoomReset) btnZoomReset.textContent = Math.round(zoom * 100) + '%';
-      renderCurrentPage();
-    });
-  }
-
-  if (btnZoomOut) {
-    btnZoomOut.addEventListener('click', () => {
-      zoom = Math.max(0.6, zoom - 0.2);
-      if (btnZoomReset) btnZoomReset.textContent = Math.round(zoom * 100) + '%';
-      renderCurrentPage();
-    });
-  }
-
-  if (btnZoomReset) {
-    btnZoomReset.addEventListener('click', () => {
-      zoom = 1.0;
-      btnZoomReset.textContent = '100%';
-      renderCurrentPage();
-    });
-  }
-
-  if (btnFullscreen) {
-    btnFullscreen.addEventListener('click', () => {
-      isFullscreen = !isFullscreen;
-      renderCurrentPage();
-    });
-  }
-
-  if (btnSelectAll) {
-    btnSelectAll.addEventListener('click', () => {
-      pageList.forEach(p => p.selected = true);
-      updateModalPill();
-      updatePriceAndReviewSummary();
-      renderThumbnails();
-    });
-  }
-
-  if (btnDeselectAll) {
-    btnDeselectAll.addEventListener('click', () => {
-      pageList.forEach(p => p.selected = false);
-      updateModalPill();
-      updatePriceAndReviewSummary();
-      renderThumbnails();
-    });
-  }
-
-  if (btnRotateAll) {
-    btnRotateAll.addEventListener('click', () => {
-      pageList.forEach(p => p.rotation = (p.rotation + 90) % 360);
-      renderCurrentPage();
-      renderThumbnails();
-    });
-  }
-
-  if (modalCustomRangeInput) {
-    modalCustomRangeInput.addEventListener('input', (e) => {
-      applyCustomRange(e.target.value);
-    });
-  }
-
-  function renderThumbnails() {
-    if (!thumbnailCarousel) return;
-    thumbnailCarousel.innerHTML = '';
-
-    pageList.forEach((pageObj, idx) => {
-      const thumb = document.createElement('div');
-      thumb.className = 'thumb-item';
-      thumb.style.flexShrink = '0';
-      thumb.style.width = '80px';
-      thumb.style.border = `2px solid ${idx === activePageIndex ? 'var(--primary-color)' : pageObj.selected ? '#93C5FD' : '#FCA5A5'}`;
-      thumb.style.borderRadius = '6px';
-      thumb.style.backgroundColor = '#FFFFFF';
-      thumb.style.padding = '4px';
-      thumb.style.cursor = 'pointer';
-      thumb.style.display = 'flex';
-      thumb.style.flexDirection = 'column';
-      thumb.style.alignItems = 'center';
-
-      thumb.innerHTML = `
-        <div style="display:flex;width:100%;justify-content:space-between;align-items:center;margin-bottom:2px;">
-          <span style="font-size:0.7rem;font-weight:700;color:#334155;">P.${idx + 1}</span>
-          <input type="checkbox" ${pageObj.selected ? 'checked' : ''} style="cursor:pointer;" class="thumb-check">
-        </div>
-        <div style="width:100%;height:64px;background-color:${pageObj.selected ? '#F8FAFC' : '#FEF2F2'};border-radius:4px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;">
-          <div style="transform:rotate(${pageObj.rotation}deg);transition:transform 0.2s ease;">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="${pageObj.selected ? '#2563EB' : '#EF4444'}" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-          </div>
-          ${pageObj.rotation > 0 ? `<span style="position:absolute;bottom:2px;right:2px;font-size:0.6rem;font-weight:800;background:#DBEAFE;color:#1E40AF;padding:0 3px;border-radius:3px;">${pageObj.rotation}°</span>` : ''}
-        </div>
-        <div style="display:flex;gap:3px;margin-top:4px;width:100%;justify-content:center;">
-          <button type="button" class="thumb-btn-rot" style="border:none;background:#E0F2FE;color:#0369A1;border-radius:3px;padding:2px 4px;cursor:pointer;" title="Rotate 90°">↻</button>
-          <button type="button" class="thumb-btn-del" style="border:none;background:#FEE2E2;color:#B91C1C;border-radius:3px;padding:2px 4px;cursor:pointer;" title="Delete Page">🗑</button>
-        </div>
-      `;
-
-      thumb.addEventListener('click', () => {
-        activePageIndex = idx;
-        updateModalPill();
-        renderCurrentPage();
-        renderThumbnails();
-      });
-
-      const chk = thumb.querySelector('.thumb-check');
-      if (chk) {
-        chk.addEventListener('click', (e) => {
-          e.stopPropagation();
-          pageObj.selected = chk.checked;
-          updateModalPill();
-          updatePriceAndReviewSummary();
-          renderThumbnails();
-        });
-      }
-
-      const rot = thumb.querySelector('.thumb-btn-rot');
-      if (rot) {
-        rot.addEventListener('click', (e) => {
-          e.stopPropagation();
-          pageObj.rotation = (pageObj.rotation + 90) % 360;
-          if (idx === activePageIndex) renderCurrentPage();
-          renderThumbnails();
-        });
-      }
-
-      const del = thumb.querySelector('.thumb-btn-del');
-      if (del) {
-        del.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if (pageList.length <= 1) {
-            alert('Document must have at least 1 page.');
-            return;
-          }
-          pageList.splice(idx, 1);
-          if (activePageIndex >= pageList.length) {
-            activePageIndex = Math.max(0, pageList.length - 1);
-          }
-          updateModalPill();
-          updatePriceAndReviewSummary();
-          renderCurrentPage();
-          renderThumbnails();
-        });
-      }
-
-      thumbnailCarousel.appendChild(thumb);
     });
   }
 

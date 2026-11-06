@@ -181,15 +181,42 @@ const portalHTML = `<!DOCTYPE html>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
             </button>
           </div>
-          <div style="display:flex; gap:0.5rem; margin-top:0.25rem;">
-            <button id="btn-view-doc" type="button" class="btn" style="flex:1; padding:0.45rem 0.75rem; border-radius:var(--radius-md); border:1px solid var(--border-color); background:#F8FAFC; color:var(--text-primary); font-weight:600; font-size:0.85rem; display:inline-flex; align-items:center; justify-content:center; gap:0.35rem; cursor:pointer;">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-              View
-            </button>
-            <button id="btn-edit-pages" type="button" class="btn" style="flex:1; padding:0.45rem 0.75rem; border-radius:var(--radius-md); border:1px solid var(--primary-color); background:rgba(37,99,235,0.05); color:var(--primary-color); font-weight:600; font-size:0.85rem; display:inline-flex; align-items:center; justify-content:center; gap:0.35rem; cursor:pointer;">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-              Edit Pages
-            </button>
+          <!-- Live Print-Ready Sheet Preview -->
+          <div id="live-sheet-container" class="live-sheet-container">
+            <!-- Sheet Header / Status Badges -->
+            <div class="sheet-badges-bar">
+              <span id="preview-color-badge" class="sheet-badge badge-bw">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 0 20z" fill="currentColor"/></svg>
+                B&amp;W Preview
+              </span>
+              <span id="preview-sheet-badge" class="sheet-badge badge-sheet">Sheet 1 of 1</span>
+            </div>
+
+            <!-- Authentic Paper Sheet -->
+            <div id="paper-sheet" class="paper-sheet">
+              <div id="sheet-loading-spinner" class="sheet-spinner hidden">
+                <svg class="spin" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                <span>Rendering preview...</span>
+              </div>
+              <canvas id="live-preview-canvas" class="live-preview-canvas preview-bw"></canvas>
+            </div>
+
+            <!-- Sheet Footer Controls -->
+            <div class="sheet-controls-bar">
+              <div class="sheet-pager">
+                <button id="btn-sheet-prev" type="button" class="sheet-nav-btn" title="Previous Page" disabled>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+                </button>
+                <span id="sheet-page-indicator" class="sheet-page-text">Page 1 of 1</span>
+                <button id="btn-sheet-next" type="button" class="sheet-nav-btn" title="Next Page" disabled>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+                </button>
+              </div>
+              <button id="btn-sheet-flip" type="button" class="sheet-flip-btn hidden" title="Flip double-sided sheet">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><polyline points="21 3 21 8 16 8"/></svg>
+                <span id="sheet-flip-text">Flip to Back</span>
+              </button>
+            </div>
           </div>
         </div>
         <div id="upload-alert" class="alert alert-error hidden"></div>
@@ -442,83 +469,6 @@ const portalHTML = `<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Document Review & Page Editor Modal -->
-    <div id="editor-modal-overlay" class="modal-overlay hidden">
-      <div class="editor-modal animate-scale-up" onclick="event.stopPropagation();">
-        <!-- Modal Header -->
-        <div style="padding:1rem 1.25rem; border-bottom:1px solid var(--border-color); display:flex; align-items:center; justify-content:space-between; background:#F8FAFC;">
-          <div style="display:flex; align-items:center; gap:0.5rem; overflow:hidden;">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-            <span id="editor-modal-title" style="font-weight:700; font-size:1rem; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Document Preview</span>
-          </div>
-          <button id="editor-modal-close-btn" class="remove-btn" type="button" aria-label="Close modal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
-        </div>
-
-        <!-- Modal Toolbar -->
-        <div style="padding:0.75rem 1.25rem; border-bottom:1px solid var(--border-color); display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:0.5rem; background:#FFFFFF;">
-          <!-- Pager Controls -->
-          <div style="display:flex; align-items:center; gap:0.35rem;">
-            <button id="btn-prev-page" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Previous Page">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
-            </button>
-            <span id="modal-page-indicator" style="font-size:0.82rem; font-weight:600; color:#334155; min-width:85px; text-align:center;">Page 1 of 1</span>
-            <button id="btn-next-page" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Next Page">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            </button>
-            <button id="btn-toggle-include" type="button" style="margin-left:0.5rem; display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:12px; font-size:0.75rem; font-weight:700; border:none; background:#DCFCE7; color:#166534; cursor:pointer;">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Included
-            </button>
-          </div>
-
-          <!-- Zoom Controls -->
-          <div style="display:flex; align-items:center; gap:0.35rem;">
-            <button id="btn-zoom-out" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Zoom Out">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-            </button>
-            <button id="btn-zoom-reset" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:3px 8px; font-size:0.75rem; font-weight:600; cursor:pointer;" title="Reset Zoom">
-              100%
-            </button>
-            <button id="btn-zoom-in" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer;" title="Zoom In">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-            </button>
-            <button id="btn-fullscreen" type="button" style="border:1px solid #CBD5E1; background:#FFFFFF; border-radius:6px; padding:4px 8px; cursor:pointer; margin-left:0.25rem;" title="Fullscreen Preview">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
-            </button>
-          </div>
-        </div>
-
-        <!-- Canvas Preview Area -->
-        <div style="position:relative; background-color:#F1F5F9; min-height:260px; max-height:48vh; display:flex; align-items:center; justify-content:center; overflow:auto; padding:1rem;">
-          <div id="canvas-loading-spinner" class="hidden" style="display:flex; flex-direction:column; align-items:center; gap:0.5rem; color:#64748B;">
-            <svg class="spin" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-            <span style="font-size:0.85rem;">Rendering page preview...</span>
-          </div>
-          <canvas id="main-preview-canvas" style="display:block; max-width:100%; height:auto; border-radius:4px; box-shadow:0 4px 12px rgba(0,0,0,0.12); background-color:#FFFFFF;"></canvas>
-        </div>
-
-        <!-- Action Strip & Thumbnail Carousel -->
-        <div style="padding:0.75rem 1.25rem; background:#FFFFFF; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:0.5rem;">
-          <div style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:0.5rem;">
-            <div style="display:flex; gap:0.35rem;">
-              <button id="btn-select-all" type="button" style="font-size:0.78rem; font-weight:600; padding:4px 8px; border-radius:4px; border:1px solid #93C5FD; background:#FFFFFF; cursor:pointer;">Select All</button>
-              <button id="btn-deselect-all" type="button" style="font-size:0.78rem; font-weight:600; padding:4px 8px; border-radius:4px; border:1px solid #93C5FD; background:#FFFFFF; cursor:pointer;">Deselect All</button>
-              <button id="btn-rotate-all" type="button" style="font-size:0.78rem; font-weight:600; padding:4px 8px; border-radius:4px; border:1px solid #93C5FD; background:#FFFFFF; cursor:pointer; display:flex; align-items:center; gap:3px;">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><polyline points="21 3 21 8 16 8"/></svg>
-                Rotate All
-              </button>
-            </div>
-            <div style="display:flex; align-items:center; gap:0.35rem;">
-              <span style="font-size:0.78rem; font-weight:600; color:#1E40AF;">Range:</span>
-              <input id="modal-custom-range-input" type="text" placeholder="e.g. 1-3, 5" style="width:100px; padding:3px 6px; border-radius:4px; border:1px solid #93C5FD; font-size:0.78rem; font-family:monospace;" />
-            </div>
-          </div>
-          <!-- Horizontal Thumbnails -->
-          <div id="thumbnail-carousel" style="display:flex; gap:0.65rem; overflow-x:auto; padding-bottom:0.5rem; padding-top:0.25rem;"></div>
-        </div>
-      </div>
-    </div>
   </div>
 </body>
 </html>`
