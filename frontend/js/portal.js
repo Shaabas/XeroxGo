@@ -123,6 +123,10 @@
   const paperSheet = document.getElementById('paper-sheet');
   const livePreviewCanvas = document.getElementById('live-preview-canvas');
   const sheetLoadingSpinner = document.getElementById('sheet-loading-spinner');
+  const sheetSpinnerText = document.getElementById('sheet-spinner-text');
+  const sheetFallback = document.getElementById('sheet-fallback');
+  const sheetFallbackTitle = document.getElementById('sheet-fallback-title');
+  const sheetFallbackDesc = document.getElementById('sheet-fallback-desc');
   const previewColorBadge = document.getElementById('preview-color-badge');
   const previewSheetBadge = document.getElementById('preview-sheet-badge');
   const sheetPageIndicator = document.getElementById('sheet-page-indicator');
@@ -131,9 +135,73 @@
   const btnSheetFlip = document.getElementById('btn-sheet-flip');
   const sheetFlipText = document.getElementById('sheet-flip-text');
 
-  // --- Initialize PDF.js worker if available ---
-  if (window.pdfjsLib && !window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
+  // Preview State & Resource Management
+  let imageElement = null;
+  let imageBlobUrl = null;
+  let isImageDoc = false;
+
+  let activeRenderTask = null;
+  let currentRenderGen = 0;
+  const MAX_CACHED_PAGES = 3;
+  const pageRenderCache = new Map();
+
+  function clearPageCache() {
+    pageRenderCache.clear();
+  }
+
+  function showFallbackPreview(title, desc) {
+    if (sheetFallback) {
+      sheetFallback.classList.remove('hidden');
+      sheetFallback.style.display = 'flex';
+      if (sheetFallbackTitle) sheetFallbackTitle.textContent = title || 'Preview Unavailable';
+      if (sheetFallbackDesc) sheetFallbackDesc.textContent = desc || 'Document is ready to print';
+    }
+    if (livePreviewCanvas) livePreviewCanvas.style.display = 'none';
+    if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
+  }
+
+  function hideFallbackPreview() {
+    if (sheetFallback) {
+      sheetFallback.classList.add('hidden');
+      sheetFallback.style.display = 'none';
+    }
+    if (livePreviewCanvas) livePreviewCanvas.style.display = 'block';
+  }
+
+  // --- Ensure PDF.js is available with absolute workerSrc ---
+  async function ensurePdfjs() {
+    if (window.pdfjsLib) {
+      if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+        try {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('/vendor/pdf.worker.min.mjs', window.location.href).href;
+        } catch (_) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
+        }
+      }
+      return window.pdfjsLib;
+    }
+    return new Promise((resolve) => {
+      let resolved = false;
+      const onReady = (e) => {
+        if (resolved) return;
+        resolved = true;
+        window.removeEventListener('pdfjs-ready', onReady);
+        resolve(e.detail || window.pdfjsLib);
+      };
+      window.addEventListener('pdfjs-ready', onReady);
+      if (window.pdfjsLib) {
+        resolved = true;
+        window.removeEventListener('pdfjs-ready', onReady);
+        resolve(window.pdfjsLib);
+      }
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          window.removeEventListener('pdfjs-ready', onReady);
+          resolve(window.pdfjsLib || null);
+        }
+      }, 2500);
+    });
   }
 
   // --- Helper: Parse Custom Range String ---
@@ -438,6 +506,11 @@
     const maxHeight = 841.89 - (margin * 2);
     const { width, height } = embeddedImage.scaleToFit(maxWidth, maxHeight);
 
+    const rotationDeg = (pageList[0]?.rotation || 0) % 360;
+    if (rotationDeg !== 0) {
+      page.setRotation(window.PDFLib.degrees(rotationDeg));
+    }
+
     page.drawImage(embeddedImage, {
       x: (595.28 - width) / 2,
       y: (841.89 - height) / 2,
@@ -482,62 +555,109 @@
       return;
     }
 
+    // Clean up previous file resources before loading new one
+    if (activeRenderTask) {
+      try { activeRenderTask.cancel(); } catch (_) {}
+      activeRenderTask = null;
+    }
+    currentRenderGen++;
+    clearPageCache();
+    if (imageBlobUrl) {
+      URL.revokeObjectURL(imageBlobUrl);
+      imageBlobUrl = null;
+    }
+    imageElement = null;
+    if (pdfJsDoc) {
+      try { pdfJsDoc.destroy(); } catch (_) {}
+      pdfJsDoc = null;
+    }
+    pdfLibDoc = null;
+    hideFallbackPreview();
+
     try {
       file = selectedFile;
       let buffer = null;
 
-      if (isPDF) {
-        buffer = await selectedFile.arrayBuffer();
+      if (isImage) {
+        // Direct Image Preview: bypass heavy PDF conversion for instant render
+        isImageDoc = true;
         convertedPdfBytes = null;
-      } else if (isImage) {
-        if (uploadArea) {
-          uploadArea.innerHTML = `
-            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 0;">
-              <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
-              <div style="font-weight:600; color:var(--text-primary); font-size:1rem;">Formatting image into print page...</div>
-            </div>
-          `;
+        totalDocPages = 1;
+        pageList = [{
+          originalIndex: 0,
+          rotation: 0,
+          selected: true
+        }];
+
+        const imgUrl = URL.createObjectURL(selectedFile);
+        imageBlobUrl = imgUrl;
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = () => reject(new Error('Failed to load image file.'));
+          img.src = imgUrl;
+        });
+        imageElement = img;
+      } else {
+        isImageDoc = false;
+
+        if (isPDF) {
+          buffer = await selectedFile.arrayBuffer();
+          convertedPdfBytes = null;
+        } else if (isOffice) {
+          if (uploadArea) {
+            uploadArea.innerHTML = `
+              <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 0;">
+                <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
+                <div style="font-weight:600; color:var(--text-primary); font-size:1rem;">Converting document to PDF...</div>
+                <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.25rem;">This only takes a couple of seconds</div>
+              </div>
+            `;
+          }
+          const pdfArrayBuffer = await convertDocumentOnServer(selectedFile);
+          buffer = pdfArrayBuffer;
+          convertedPdfBytes = new Uint8Array(pdfArrayBuffer);
         }
-        const pdfBytes = await convertImageToPdf(selectedFile);
-        buffer = pdfBytes.buffer;
-        convertedPdfBytes = pdfBytes;
-      } else if (isOffice) {
-        if (uploadArea) {
-          uploadArea.innerHTML = `
-            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 0;">
-              <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
-              <div style="font-weight:600; color:var(--text-primary); font-size:1rem;">Converting document to PDF...</div>
-              <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.25rem;">This only takes a couple of seconds</div>
-            </div>
-          `;
+
+        // Parse with PDFLib
+        if (!window.PDFLib) {
+          throw new Error('PDF processing library not loaded.');
         }
-        const pdfArrayBuffer = await convertDocumentOnServer(selectedFile);
-        buffer = pdfArrayBuffer;
-        convertedPdfBytes = new Uint8Array(pdfArrayBuffer);
-      }
+        pdfLibDoc = await window.PDFLib.PDFDocument.load(buffer.slice(0));
+        totalDocPages = pdfLibDoc.getPageCount();
 
-      // Parse with PDFLib
-      if (!window.PDFLib) {
-        throw new Error('PDF processing library not loaded.');
-      }
-      pdfLibDoc = await window.PDFLib.PDFDocument.load(buffer.slice(0));
-      totalDocPages = pdfLibDoc.getPageCount();
+        // Initialize page list
+        pageList = Array.from({ length: totalDocPages }, (_, i) => ({
+          originalIndex: i,
+          rotation: 0,
+          selected: true
+        }));
 
-      // Initialize page list
-      pageList = Array.from({ length: totalDocPages }, (_, i) => ({
-        originalIndex: i,
-        rotation: 0,
-        selected: true
-      }));
-
-      // Parse with PDF.js for preview canvas
-      if (window.pdfjsLib) {
-        try {
-          const typedArray = new Uint8Array(buffer.slice(0));
-          pdfJsDoc = await window.pdfjsLib.getDocument({ data: typedArray }).promise;
-        } catch (jsErr) {
-          console.warn('PDF.js preview load error:', jsErr);
-          pdfJsDoc = null;
+        // Parse with PDF.js for preview canvas (with resilient fallback for mobile WebViews)
+        const pdfjs = await ensurePdfjs();
+        if (pdfjs) {
+          try {
+            const typedArray = new Uint8Array(buffer.slice(0));
+            const loadingTask = pdfjs.getDocument({
+              data: typedArray,
+              cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/cmaps/',
+              cMapPacked: true,
+            });
+            pdfJsDoc = await loadingTask.promise;
+          } catch (workerErr) {
+            console.warn('PDF.js standard worker load error, attempting fallback:', workerErr);
+            try {
+              const typedArray = new Uint8Array(buffer.slice(0));
+              const fallbackTask = pdfjs.getDocument({
+                data: typedArray,
+                disableWorker: true,
+              });
+              pdfJsDoc = await fallbackTask.promise;
+            } catch (fallbackErr) {
+              console.error('PDF.js fallback load error:', fallbackErr);
+              pdfJsDoc = null;
+            }
+          }
         }
       }
 
@@ -563,11 +683,28 @@
   }
 
   function resetFile() {
+    if (activeRenderTask) {
+      try { activeRenderTask.cancel(); } catch (_) {}
+      activeRenderTask = null;
+    }
+    currentRenderGen++;
+    clearPageCache();
+
+    if (imageBlobUrl) {
+      URL.revokeObjectURL(imageBlobUrl);
+      imageBlobUrl = null;
+    }
+    imageElement = null;
+    isImageDoc = false;
+
+    if (pdfJsDoc) {
+      try { pdfJsDoc.destroy(); } catch (_) {}
+      pdfJsDoc = null;
+    }
+    pdfLibDoc = null;
     file = null;
     fileBuffer = null;
     convertedPdfBytes = null;
-    pdfLibDoc = null;
-    pdfJsDoc = null;
     totalDocPages = 0;
     pageList = [];
     customPageRange = '';
@@ -583,6 +720,12 @@
       const ctx = livePreviewCanvas.getContext('2d');
       if (ctx) ctx.clearRect(0, 0, livePreviewCanvas.width, livePreviewCanvas.height);
     }
+    if (sheetPageIndicator) sheetPageIndicator.textContent = 'Page 1 of 1';
+    if (previewSheetBadge) previewSheetBadge.textContent = 'Sheet 1 of 1';
+    if (btnSheetPrev) btnSheetPrev.disabled = true;
+    if (btnSheetNext) btnSheetNext.disabled = true;
+    if (btnSheetFlip) btnSheetFlip.classList.add('hidden');
+    hideFallbackPreview();
     updatePriceAndReviewSummary();
   }
 
@@ -769,10 +912,8 @@
   }
 
   // --- Live Print-Ready Sheet Preview Engine ---
-  let renderTask = null;
-
   async function renderLiveSheet() {
-    if (!livePreviewCanvas || !pdfJsDoc || pageList.length === 0) return;
+    if (!livePreviewCanvas || pageList.length === 0) return;
 
     // Determine the list of pages selected to print
     const printablePages = pageList.filter(p => p.selected);
@@ -782,6 +923,7 @@
       if (btnSheetPrev) btnSheetPrev.disabled = true;
       if (btnSheetNext) btnSheetNext.disabled = true;
       if (btnSheetFlip) btnSheetFlip.classList.add('hidden');
+      showFallbackPreview('No Pages Selected', 'Please select at least one page to print');
       return;
     }
 
@@ -866,39 +1008,145 @@
     if (btnSheetPrev) btnSheetPrev.disabled = (selIdx <= 0);
     if (btnSheetNext) btnSheetNext.disabled = (selIdx >= totalPrintable - 1);
 
-    // --- Render Canvas Page ---
-    if (sheetLoadingSpinner) sheetLoadingSpinner.classList.remove('hidden');
+    // 4. Case A: Direct Image Preview (Instant, zero conversion, low memory)
+    if (isImageDoc && imageElement) {
+      hideFallbackPreview();
+      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
 
-    if (renderTask) {
-      try { renderTask.cancel(); } catch (_) {}
-      renderTask = null;
+      const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const canvasW = Math.round(containerWidth * dpr);
+      const canvasH = Math.round(containerWidth * Math.SQRT2 * dpr);
+
+      livePreviewCanvas.width = canvasW;
+      livePreviewCanvas.height = canvasH;
+      livePreviewCanvas.style.width = '100%';
+      livePreviewCanvas.style.height = 'auto';
+      livePreviewCanvas.style.aspectRatio = '1 / 1.4142';
+      if (paperSheet) paperSheet.style.aspectRatio = '1 / 1.4142';
+
+      const ctx = livePreviewCanvas.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+
+      const marginRatio = 0.06; // standard A4 printable margin
+      const maxW = canvasW * (1 - 2 * marginRatio);
+      const maxH = canvasH * (1 - 2 * marginRatio);
+
+      const rotation = (activePageObj.rotation || 0) % 360;
+      const isRotated90 = (rotation === 90 || rotation === 270);
+      const effW = isRotated90 ? imageElement.naturalHeight || imageElement.height : imageElement.naturalWidth || imageElement.width;
+      const effH = isRotated90 ? imageElement.naturalWidth || imageElement.width : imageElement.naturalHeight || imageElement.height;
+
+      const scale = Math.min(maxW / effW, maxH / effH);
+      const drawW = (imageElement.naturalWidth || imageElement.width) * scale;
+      const drawH = (imageElement.naturalHeight || imageElement.height) * scale;
+
+      ctx.save();
+      ctx.translate(canvasW / 2, canvasH / 2);
+      if (rotation !== 0) {
+        ctx.rotate((rotation * Math.PI) / 180);
+      }
+      ctx.drawImage(imageElement, -drawW / 2, -drawH / 2, drawW, drawH);
+      ctx.restore();
+      return;
     }
+
+    // 5. Case B: PDF Document Preview
+    if (!pdfJsDoc) {
+      showFallbackPreview('Preview Unavailable', `Document is valid (${totalDocPages} ${totalDocPages === 1 ? 'page' : 'pages'}) and ready to print`);
+      return;
+    }
+
+    // Cancel obsolete rendering task before starting a new one
+    if (activeRenderTask) {
+      try { activeRenderTask.cancel(); } catch (_) {}
+      activeRenderTask = null;
+    }
+
+    const renderGen = ++currentRenderGen;
+    const pageKey = `${activePageObj.originalIndex}_rot${activePageObj.rotation || 0}`;
+
+    // Check LRU page render cache
+    if (pageRenderCache.has(pageKey)) {
+      const cached = pageRenderCache.get(pageKey);
+      livePreviewCanvas.width = cached.width;
+      livePreviewCanvas.height = cached.height;
+      livePreviewCanvas.style.width = '100%';
+      livePreviewCanvas.style.height = 'auto';
+      livePreviewCanvas.style.aspectRatio = `${cached.viewportWidth} / ${cached.viewportHeight}`;
+      if (paperSheet) paperSheet.style.aspectRatio = `${cached.viewportWidth} / ${cached.viewportHeight}`;
+
+      const ctx = livePreviewCanvas.getContext('2d');
+      ctx.drawImage(cached.canvas, 0, 0);
+
+      pageRenderCache.delete(pageKey);
+      pageRenderCache.set(pageKey, cached);
+
+      hideFallbackPreview();
+      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
+      return;
+    }
+
+    hideFallbackPreview();
+    if (sheetLoadingSpinner) sheetLoadingSpinner.classList.remove('hidden');
 
     try {
       const pdfPage = await pdfJsDoc.getPage(activePageObj.originalIndex + 1);
-      const rotation = pdfPage.rotate % 360;
+      if (renderGen !== currentRenderGen) return;
+
+      const rotation = ((pdfPage.rotate || 0) + (activePageObj.rotation || 0)) % 360;
       const baseViewport = pdfPage.getViewport({ scale: 1.0, rotation });
 
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2); // Cap at 2 for mobile memory safety
       const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
       const scale = (containerWidth / baseViewport.width) * dpr;
       const viewport = pdfPage.getViewport({ scale, rotation });
 
-      livePreviewCanvas.width = viewport.width;
-      livePreviewCanvas.height = viewport.height;
+      livePreviewCanvas.width = Math.round(viewport.width);
+      livePreviewCanvas.height = Math.round(viewport.height);
       livePreviewCanvas.style.width = '100%';
       livePreviewCanvas.style.height = 'auto';
+      livePreviewCanvas.style.aspectRatio = `${viewport.width} / ${viewport.height}`;
+      if (paperSheet) paperSheet.style.aspectRatio = `${viewport.width} / ${viewport.height}`;
 
       const ctx = livePreviewCanvas.getContext('2d');
-      renderTask = pdfPage.render({ canvasContext: ctx, viewport });
-      await renderTask.promise;
-      renderTask = null;
-    } catch (err) {
-      if (err && err.name !== 'RenderingCancelledException') {
-        console.warn('Live sheet render error:', err);
+      activeRenderTask = pdfPage.render({ canvasContext: ctx, viewport });
+      await activeRenderTask.promise;
+      activeRenderTask = null;
+
+      if (renderGen !== currentRenderGen) return;
+
+      // Cache rendered page bitmap (max 3 items in memory)
+      const offscreen = document.createElement('canvas');
+      offscreen.width = livePreviewCanvas.width;
+      offscreen.height = livePreviewCanvas.height;
+      const offCtx = offscreen.getContext('2d');
+      offCtx.drawImage(livePreviewCanvas, 0, 0);
+
+      if (pageRenderCache.size >= MAX_CACHED_PAGES) {
+        const oldestKey = pageRenderCache.keys().next().value;
+        pageRenderCache.delete(oldestKey);
       }
+      pageRenderCache.set(pageKey, {
+        canvas: offscreen,
+        width: livePreviewCanvas.width,
+        height: livePreviewCanvas.height,
+        viewportWidth: viewport.width,
+        viewportHeight: viewport.height,
+      });
+
+      hideFallbackPreview();
+    } catch (err) {
+      if (err && err.name === 'RenderingCancelledException') {
+        return; // Expected cancellation from fast user interaction
+      }
+      console.warn('Live sheet render error:', err);
+      showFallbackPreview('Preview Unavailable', 'Document is ready to print');
     } finally {
-      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
+      if (renderGen === currentRenderGen && sheetLoadingSpinner) {
+        sheetLoadingSpinner.classList.add('hidden');
+      }
     }
   }
 
@@ -934,13 +1182,25 @@
       throw new Error('Please select at least 1 page to print.');
     }
 
+    const pdfName = file.name.replace(/\.[^/.]+$/, "") + ".pdf";
+
+    if (isImageDoc) {
+      if (!convertedPdfBytes) {
+        if (sheetLoadingSpinner) {
+          sheetLoadingSpinner.classList.remove('hidden');
+          if (sheetSpinnerText) sheetSpinnerText.textContent = 'Formatting PDF for printer...';
+        }
+        convertedPdfBytes = await convertImageToPdf(file);
+        if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
+      }
+      return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
+    }
+
     const hasEdits = (
       selectedPages.length < totalDocPages ||
       selectedPages.some(p => p.rotation !== 0) ||
       selectedPages.some((p, idx) => p.originalIndex !== idx)
     );
-
-    const pdfName = file.name.replace(/\.[^/.]+$/, "") + ".pdf";
 
     if (!hasEdits) {
       if (convertedPdfBytes) {
