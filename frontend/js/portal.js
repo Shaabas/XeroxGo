@@ -521,23 +521,166 @@
     return await pdfDoc.save();
   }
 
-  async function convertDocumentOnServer(selectedFile) {
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>'"]/g, tag => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      "'": '&#39;',
+      '"': '&quot;'
+    }[tag] || tag));
+  }
+
+  let activeConversion = null; // { abortController, pollTimeoutId, jobId }
+  let conversionGen = 0;
+
+  function cancelActiveConversion() {
+    if (activeConversion) {
+      if (activeConversion.abortController) {
+        try { activeConversion.abortController.abort(); } catch (_) {}
+      }
+      if (activeConversion.pollTimeoutId) {
+        clearTimeout(activeConversion.pollTimeoutId);
+      }
+      activeConversion = null;
+    }
+  }
+
+  async function convertDocumentOnServer(selectedFile, thisGen) {
+    const abortController = new AbortController();
+    activeConversion = { abortController, pollTimeoutId: null, jobId: null };
+
+    if (uploadArea) {
+      uploadArea.innerHTML = `
+        <div id="office-conversion-card" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 1rem; width:100%; box-sizing:border-box;">
+          <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
+          <div id="conv-status-title" style="font-weight:700; color:var(--text-primary); font-size:1rem; text-align:center;">Uploading document...</div>
+          <div id="conv-status-desc" style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.25rem; text-align:center;">Converting document to print-ready PDF</div>
+          <div style="width:100%; max-width:240px; background:#E2E8F0; border-radius:999px; height:6px; margin-top:1rem; overflow:hidden;">
+            <div id="conv-progress-fill" style="width:20%; height:100%; background:var(--primary-color); border-radius:999px; transition:width 0.4s ease;"></div>
+          </div>
+          <button id="btn-cancel-conversion" type="button" style="margin-top:0.9rem; background:transparent; border:none; color:var(--text-secondary); font-size:0.825rem; cursor:pointer; text-decoration:underline;">
+            Cancel
+          </button>
+        </div>
+      `;
+      const cancelBtn = document.getElementById('btn-cancel-conversion');
+      if (cancelBtn) {
+        cancelBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          cancelActiveConversion();
+          resetFile();
+        });
+      }
+    }
+
     const formData = new FormData();
     formData.append('file', selectedFile);
-    const resp = await fetch('/api/convert', {
+
+    // 1. Submit asynchronous conversion job
+    const resp = await fetch('/api/conversions', {
       method: 'POST',
       body: formData,
+      signal: abortController.signal
     });
     if (!resp.ok) {
       const errText = await resp.text();
-      throw new Error(errText || 'Document conversion failed on server');
+      throw new Error(errText || 'Failed to submit document for conversion');
     }
-    return await resp.arrayBuffer();
+    const createData = await resp.json();
+    if (thisGen !== conversionGen) return null;
+    activeConversion.jobId = createData.job_id;
+
+    // 2. Poll conversion status every 1-2s with backoff
+    let pollDelay = 1000;
+    const maxPollDuration = 90000; // 90 seconds
+    const startTime = Date.now();
+    let status = createData.status;
+    let downloadUrl = null;
+
+    while (status === 'queued' || status === 'processing') {
+      if (thisGen !== conversionGen) return null;
+      if (Date.now() - startTime > maxPollDuration) {
+        throw new Error('Document conversion timed out after 90 seconds. Please try again.');
+      }
+
+      const titleEl = document.getElementById('conv-status-title');
+      const descEl = document.getElementById('conv-status-desc');
+      const fillEl = document.getElementById('conv-progress-fill');
+
+      if (status === 'queued') {
+        if (titleEl) titleEl.textContent = 'Waiting in queue...';
+        if (descEl) descEl.textContent = 'Conversion worker is currently preparing';
+        if (fillEl) fillEl.style.width = '45%';
+      } else if (status === 'processing') {
+        if (titleEl) titleEl.textContent = 'Converting document to PDF...';
+        if (descEl) descEl.textContent = 'LibreOffice engine is processing pages';
+        if (fillEl) fillEl.style.width = '75%';
+      }
+
+      await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(resolve, pollDelay);
+        activeConversion.pollTimeoutId = timeoutId;
+        const abortHandler = () => {
+          clearTimeout(timeoutId);
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+        abortController.signal.addEventListener('abort', abortHandler, { once: true });
+      });
+
+      if (thisGen !== conversionGen) return null;
+
+      const pollResp = await fetch(`/api/conversions/${encodeURIComponent(createData.job_id)}?token=${encodeURIComponent(createData.token)}`, {
+        signal: abortController.signal
+      });
+      if (!pollResp.ok) {
+        const errText = await pollResp.text();
+        throw new Error(errText || 'Failed to check conversion status');
+      }
+      const pollData = await pollResp.json();
+      status = pollData.status;
+
+      if (status === 'completed') {
+        downloadUrl = pollData.download_url;
+        break;
+      } else if (status === 'failed') {
+        throw new Error(pollData.error_message || 'Document conversion failed on server');
+      }
+
+      // Exponential backoff capped at 2500ms
+      pollDelay = Math.min(Math.round(pollDelay * 1.25), 2500);
+    }
+
+    if (!downloadUrl) {
+      throw new Error('Conversion completed but download URL was not provided');
+    }
+
+    const titleEl = document.getElementById('conv-status-title');
+    const descEl = document.getElementById('conv-status-desc');
+    const fillEl = document.getElementById('conv-progress-fill');
+    if (titleEl) titleEl.textContent = 'Downloading converted PDF...';
+    if (descEl) descEl.textContent = 'Preparing live preview';
+    if (fillEl) fillEl.style.width = '95%';
+
+    // 3. Fetch converted PDF
+    const dlResp = await fetch(downloadUrl, { signal: abortController.signal });
+    if (!dlResp.ok) {
+      const errText = await dlResp.text();
+      throw new Error(errText || 'Failed to download converted PDF');
+    }
+    const pdfArrayBuffer = await dlResp.arrayBuffer();
+    if (thisGen !== conversionGen) return null;
+    return pdfArrayBuffer;
   }
 
   async function handleFile(selectedFile) {
     clearError();
     if (!selectedFile) return;
+
+    cancelActiveConversion();
+    conversionGen++;
+    const thisConversionGen = conversionGen;
 
     const nameLower = selectedFile.name.toLowerCase();
     const isPDF = nameLower.endsWith('.pdf') || selectedFile.type === 'application/pdf';
@@ -605,16 +748,8 @@
           buffer = await selectedFile.arrayBuffer();
           convertedPdfBytes = null;
         } else if (isOffice) {
-          if (uploadArea) {
-            uploadArea.innerHTML = `
-              <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 0;">
-                <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
-                <div style="font-weight:600; color:var(--text-primary); font-size:1rem;">Converting document to PDF...</div>
-                <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.25rem;">This only takes a couple of seconds</div>
-              </div>
-            `;
-          }
-          const pdfArrayBuffer = await convertDocumentOnServer(selectedFile);
+          const pdfArrayBuffer = await convertDocumentOnServer(selectedFile, thisConversionGen);
+          if (thisConversionGen !== conversionGen || !pdfArrayBuffer) return;
           buffer = pdfArrayBuffer;
           convertedPdfBytes = new Uint8Array(pdfArrayBuffer);
         }
@@ -676,13 +811,48 @@
       activePageIndex = 0;
       renderLiveSheet();
     } catch (err) {
+      if (err.name === 'AbortError') {
+        resetFile();
+        return;
+      }
       console.error('File load failed:', err);
       showError(err.message || 'Failed to process document. Please verify the file is valid.');
-      resetFile();
+      if (uploadArea && isOffice) {
+        uploadArea.innerHTML = `
+          <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 1rem; width:100%; box-sizing:border-box;">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--danger-color)" stroke-width="2" style="margin-bottom:0.75rem;">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <div style="font-weight:700; color:var(--text-primary); font-size:1rem; text-align:center;">Conversion Failed</div>
+            <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.35rem; text-align:center; max-width:320px;">
+              ${escapeHtml(err.message || 'Unable to convert this document.')}
+            </div>
+            <div style="display:flex; gap:0.75rem; margin-top:1rem;">
+              <button id="btn-retry-conversion" type="button" class="btn btn-primary" style="padding:0.45rem 1rem; font-size:0.85rem;">
+                Retry Conversion
+              </button>
+              <button id="btn-cancel-retry" type="button" class="btn" style="background:#E2E8F0; color:var(--text-primary); padding:0.45rem 1rem; font-size:0.85rem;">
+                Choose Another File
+              </button>
+            </div>
+          </div>
+        `;
+        document.getElementById('btn-retry-conversion')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          handleFile(selectedFile);
+        });
+        document.getElementById('btn-cancel-retry')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          resetFile();
+        });
+      } else {
+        resetFile();
+      }
     }
   }
 
   function resetFile() {
+    cancelActiveConversion();
     if (activeRenderTask) {
       try { activeRenderTask.cancel(); } catch (_) {}
       activeRenderTask = null;

@@ -165,6 +165,22 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
     expires_at_ns BIGINT NOT NULL,
     created_at_ns BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversions (
+    id TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    file_size BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT NOT NULL DEFAULT '',
+    input_path TEXT NOT NULL,
+    output_path TEXT NOT NULL DEFAULT '',
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
+CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
 `
 		if _, err := db.Exec(schema); err != nil {
 			_ = db.Close()
@@ -180,6 +196,9 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
 			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
+			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
+			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
+			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
 		}
 		for _, mig := range pgMigrations {
 			if _, err := db.Exec(mig); err != nil {
@@ -333,6 +352,22 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
     expires_at_ns BIGINT NOT NULL,
     created_at_ns BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversions (
+    id TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    file_size BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT NOT NULL DEFAULT '',
+    input_path TEXT NOT NULL,
+    output_path TEXT NOT NULL DEFAULT '',
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
+CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
 `
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
@@ -401,6 +436,24 @@ func migrateSQLiteSchema(db *sql.DB) error {
 	if !colsConfigs["color_mode"] {
 		_, _ = db.Exec("ALTER TABLE print_configs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
 	}
+
+	_, _ = db.Exec(`
+CREATE TABLE IF NOT EXISTS conversions (
+    id TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    file_size BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT NOT NULL DEFAULT '',
+    input_path TEXT NOT NULL,
+    output_path TEXT NOT NULL DEFAULT '',
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    expires_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
+CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
+`)
 	return nil
 }
 

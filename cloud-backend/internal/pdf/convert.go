@@ -36,6 +36,10 @@ var (
 		".tif":  true,
 		".tiff": true,
 	}
+
+	// libreOfficeSem limits concurrent LibreOffice processes.
+	// Initialized to capacity 1 to prevent memory exhaustion on low-memory servers (e.g. Render 512MB).
+	libreOfficeSem = make(chan struct{}, 1)
 )
 
 // IsSupportedFormat returns true if the filename extension is an accepted format (PDF, Office, or Image).
@@ -92,6 +96,14 @@ func ConvertToPDF(ctx context.Context, inputPath, originalFilename, outputPath s
 	// 2. Validate extension per specification
 	if !supportedOfficeExts[ext] && !supportedImageExts[ext] {
 		return fmt.Errorf("unsupported file format %q: only PDF, Office documents (DOCX, PPTX, XLSX, ODT, RTF) and Images (JPG, PNG, WEBP) are supported", ext)
+	}
+
+	// Limit concurrent LibreOffice processes to 1 to preserve memory on low-memory servers (e.g. Render)
+	select {
+	case libreOfficeSem <- struct{}{}:
+		defer func() { <-libreOfficeSem }()
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for conversion worker: %w", ctx.Err())
 	}
 
 	// 3. Create isolated working directory and user profile

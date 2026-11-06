@@ -45,9 +45,10 @@ type serverConfig struct {
 }
 
 type appServer struct {
-	cfg *serverConfig
-	db  *store.Store
-	hub *ws.Hub
+	cfg      *serverConfig
+	db       *store.Store
+	hub      *ws.Hub
+	convWake chan struct{}
 }
 
 const portalHTML = `<!DOCTYPE html>
@@ -1323,9 +1324,10 @@ func main() {
 	}
 
 	app := &appServer{
-		cfg: cfg,
-		db:  storeDB,
-		hub: hub,
+		cfg:      cfg,
+		db:       storeDB,
+		hub:      hub,
+		convWake: make(chan struct{}, 1),
 	}
 
 	mux := http.NewServeMux()
@@ -1347,6 +1349,8 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/convert", app.handleConvert)
+	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
+	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
 	mux.HandleFunc("/api/k/", app.handleUpload)
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -1417,6 +1421,8 @@ func main() {
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go app.startConversionWorker(sigCtx)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
