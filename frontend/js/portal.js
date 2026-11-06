@@ -46,7 +46,7 @@
   let userName = '';
   let activeOrderID = null;
   let pollTimer = null;
-  let activePageIndex = 0;
+  let activeSideIndex = 0;
   let deferredPwaPrompt = null;
 
   // --- DOM Elements ---
@@ -208,7 +208,8 @@
   function parseCustomPages(rangeStr, maxPages) {
     if (!rangeStr || !rangeStr.trim()) return [];
     const parts = rangeStr.split(',');
-    const selected = new Set();
+    const selected = [];
+    const seen = new Set();
 
     for (let part of parts) {
       part = part.trim();
@@ -217,19 +218,30 @@
       if (part.includes('-')) {
         const segs = part.split('-');
         if (segs.length !== 2) return null;
-        const start = parseInt(segs[0], 10);
-        const end = parseInt(segs[1], 10);
-        if (isNaN(start) || isNaN(end) || start < 1 || start > end || start > maxPages) return null;
-        for (let i = start; i <= Math.min(end, maxPages); i++) {
-          selected.add(i - 1);
+        const startStr = segs[0].trim();
+        const endStr = segs[1].trim();
+        if (!startStr || !endStr) return null;
+        const start = parseInt(startStr, 10);
+        const end = parseInt(endStr, 10);
+        if (isNaN(start) || isNaN(end) || start < 1 || start > end || end > maxPages) return null;
+        for (let i = start; i <= end; i++) {
+          const idx = i - 1;
+          if (!seen.has(idx)) {
+            seen.add(idx);
+            selected.push(idx);
+          }
         }
       } else {
         const p = parseInt(part, 10);
         if (isNaN(p) || p < 1 || p > maxPages) return null;
-        selected.add(p - 1);
+        const idx = p - 1;
+        if (!seen.has(idx)) {
+          seen.add(idx);
+          selected.push(idx);
+        }
       }
     }
-    return Array.from(selected);
+    return selected;
   }
 
   // --- Helper: Format Currency ---
@@ -252,6 +264,8 @@
     const selectedCount = getSelectedPagesCount();
     const isDouble = sides === 'Double-sided';
     const totalPrintedPages = selectedCount * copies;
+    const sheetsPerCopy = isDouble ? Math.ceil(selectedCount / 2) : selectedCount;
+    const totalPhysicalSheets = sheetsPerCopy * copies;
 
     let activePrice;
     if (mode === 'Color' && colorHardwareEnabled) {
@@ -262,9 +276,15 @@
     const totalPricePaise = totalPrintedPages * activePrice;
 
     if (summaryFileName) summaryFileName.textContent = file ? file.name : '-';
-    if (summaryPages) summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'}`;
+    if (summaryPages) {
+      if (copies > 1) {
+        summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'} · ${totalPrintedPages} sides`;
+      } else {
+        summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'}`;
+      }
+    }
     if (summaryOptions) {
-      summaryOptions.textContent = `${mode} · ${isDouble ? 'Double Side' : 'Single Side'} · 1 page/sheet`;
+      summaryOptions.textContent = `${mode} · ${isDouble ? 'Double Side' : 'Single Side'} · ${totalPhysicalSheets} ${totalPhysicalSheets === 1 ? 'physical sheet' : 'physical sheets'}`;
     }
     if (summaryCopies) summaryCopies.textContent = `${copies} ${copies === 1 ? 'copy' : 'copies'}`;
     if (summaryPrice) summaryPrice.textContent = formatRupees(totalPricePaise);
@@ -808,7 +828,7 @@
       }
 
       updatePriceAndReviewSummary();
-      activePageIndex = 0;
+      activeSideIndex = 0;
       renderLiveSheet();
     } catch (err) {
       if (err.name === 'AbortError') {
@@ -878,7 +898,7 @@
     totalDocPages = 0;
     pageList = [];
     customPageRange = '';
-    activePageIndex = 0;
+    activeSideIndex = 0;
     if (fileInput) fileInput.value = '';
     if (uploadSection) uploadSection.classList.remove('hidden');
     if (uploadArea) {
@@ -967,6 +987,7 @@
         });
       }
     }
+    activeSideIndex = 0;
     updatePriceAndReviewSummary();
     renderLiveSheet();
   }
@@ -1059,6 +1080,7 @@
       sides = 'Single-sided';
       btnSideSingle.classList.add('active');
       btnSideDouble.classList.remove('active');
+      activeSideIndex = 0;
       updatePriceAndReviewSummary();
       renderLiveSheet();
     });
@@ -1069,6 +1091,7 @@
       sides = 'Double-sided';
       btnSideDouble.classList.add('active');
       btnSideSingle.classList.remove('active');
+      activeSideIndex = 0;
       updatePriceAndReviewSummary();
       renderLiveSheet();
     });
@@ -1097,16 +1120,13 @@
       return;
     }
 
-    // Ensure activePageIndex points to a valid selected page
-    let activePageObj = pageList[activePageIndex];
-    if (!activePageObj || !activePageObj.selected) {
-      activePageObj = printablePages[0];
-      activePageIndex = activePageObj.originalIndex;
-    }
-
-    // Find position in printablePages
-    const selIdx = printablePages.findIndex(p => p.originalIndex === activePageIndex);
     const totalPrintable = printablePages.length;
+    const isDouble = (sides === 'Double-sided');
+    const totalSheets = isDouble ? Math.ceil(totalPrintable / 2) : totalPrintable;
+    const totalSides = (isDouble && totalPrintable % 2 !== 0) ? totalPrintable + 1 : totalPrintable;
+
+    if (activeSideIndex < 0) activeSideIndex = 0;
+    if (activeSideIndex >= totalSides) activeSideIndex = totalSides - 1;
 
     // 1. Color vs B&W WYSIWYG reaction
     if (mode === 'B&W') {
@@ -1125,39 +1145,41 @@
       }
     }
 
-    // 2. Duplex vs Simplex Sheet Calculation
-    if (sides === 'Double-sided') {
-      const sheetNum = Math.floor(selIdx / 2) + 1;
-      const totalSheets = Math.ceil(totalPrintable / 2);
-      const isFront = (selIdx % 2 === 0);
+    // 2. Duplex vs Simplex Sheet Calculation & Badges
+    const isBlankSide = (isDouble && activeSideIndex === totalPrintable);
+    const sheetNum = isDouble ? Math.floor(activeSideIndex / 2) + 1 : activeSideIndex + 1;
+    const isFront = isDouble ? (activeSideIndex % 2 === 0) : true;
 
-      if (previewSheetBadge) {
-        previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalSheets} (${isFront ? 'Front' : 'Back'})`;
+    if (isDouble) {
+      if (isBlankSide) {
+        if (previewSheetBadge) previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalSheets} (Back - Blank)`;
+      } else {
+        if (previewSheetBadge) previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalSheets} (${isFront ? 'Front' : 'Back'})`;
       }
 
       // Flip button
       if (btnSheetFlip && sheetFlipText) {
-        if (isFront && selIdx + 1 < totalPrintable) {
-          btnSheetFlip.classList.remove('hidden');
-          sheetFlipText.textContent = `Flip to Back (Pg ${printablePages[selIdx + 1].originalIndex + 1})`;
+        btnSheetFlip.classList.remove('hidden');
+        if (isFront) {
+          if (activeSideIndex + 1 < totalPrintable) {
+            sheetFlipText.textContent = `Flip to Back (Pg ${printablePages[activeSideIndex + 1].originalIndex + 1})`;
+          } else {
+            sheetFlipText.textContent = `Flip to Back (Blank)`;
+          }
           btnSheetFlip.onclick = () => {
-            activePageIndex = printablePages[selIdx + 1].originalIndex;
-            renderLiveSheet();
-          };
-        } else if (!isFront && selIdx - 1 >= 0) {
-          btnSheetFlip.classList.remove('hidden');
-          sheetFlipText.textContent = `Flip to Front (Pg ${printablePages[selIdx - 1].originalIndex + 1})`;
-          btnSheetFlip.onclick = () => {
-            activePageIndex = printablePages[selIdx - 1].originalIndex;
+            activeSideIndex++;
             renderLiveSheet();
           };
         } else {
-          btnSheetFlip.classList.add('hidden');
+          sheetFlipText.textContent = `Flip to Front (Pg ${printablePages[activeSideIndex - 1].originalIndex + 1})`;
+          btnSheetFlip.onclick = () => {
+            activeSideIndex--;
+            renderLiveSheet();
+          };
         }
       }
     } else {
       // Simplex (Single-sided)
-      const sheetNum = selIdx + 1;
       if (previewSheetBadge) {
         previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalPrintable}`;
       }
@@ -1168,17 +1190,63 @@
 
     // 3. Page Stepper
     if (sheetPageIndicator) {
-      if (totalPrintable === totalDocPages) {
-        sheetPageIndicator.textContent = `Page ${activePageObj.originalIndex + 1} of ${totalDocPages}`;
+      if (isBlankSide) {
+        sheetPageIndicator.textContent = `Blank Page (Back of Sheet ${sheetNum})`;
       } else {
-        sheetPageIndicator.textContent = `Page ${activePageObj.originalIndex + 1} (${selIdx + 1} of ${totalPrintable})`;
+        const activePg = printablePages[activeSideIndex];
+        if (totalPrintable === totalDocPages) {
+          sheetPageIndicator.textContent = `Page ${activePg.originalIndex + 1} of ${totalDocPages}`;
+        } else {
+          sheetPageIndicator.textContent = `Page ${activePg.originalIndex + 1} (${activeSideIndex + 1} of ${totalPrintable})`;
+        }
       }
     }
 
-    if (btnSheetPrev) btnSheetPrev.disabled = (selIdx <= 0);
-    if (btnSheetNext) btnSheetNext.disabled = (selIdx >= totalPrintable - 1);
+    if (btnSheetPrev) btnSheetPrev.disabled = (activeSideIndex <= 0);
+    if (btnSheetNext) btnSheetNext.disabled = (activeSideIndex >= totalSides - 1);
 
-    // 4. Case A: Direct Image Preview (Instant, zero conversion, low memory)
+    // 4. Case A: Blank Back of Odd Duplex Sheet
+    if (isBlankSide) {
+      hideFallbackPreview();
+      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
+
+      const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const canvasW = Math.round(containerWidth * dpr);
+      const canvasH = Math.round(containerWidth * Math.SQRT2 * dpr);
+
+      livePreviewCanvas.width = canvasW;
+      livePreviewCanvas.height = canvasH;
+      livePreviewCanvas.style.width = '100%';
+      livePreviewCanvas.style.height = 'auto';
+      livePreviewCanvas.style.aspectRatio = '1 / 1.4142';
+      if (paperSheet) paperSheet.style.aspectRatio = '1 / 1.4142';
+
+      const ctx = livePreviewCanvas.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+
+      // Subtle dashed border to represent paper boundary
+      ctx.strokeStyle = '#E2E8F0';
+      ctx.lineWidth = Math.round(2 * dpr);
+      ctx.strokeRect(16 * dpr, 16 * dpr, canvasW - 32 * dpr, canvasH - 32 * dpr);
+
+      // Blank page watermark
+      ctx.fillStyle = '#94A3B8';
+      ctx.font = `600 ${Math.round(14 * dpr)}px Inter, -apple-system, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Blank Page', canvasW / 2, canvasH / 2 - (10 * dpr));
+
+      ctx.fillStyle = '#CBD5E1';
+      ctx.font = `400 ${Math.round(11 * dpr)}px Inter, -apple-system, sans-serif`;
+      ctx.fillText(`(Back of Sheet ${sheetNum})`, canvasW / 2, canvasH / 2 + (12 * dpr));
+      return;
+    }
+
+    const activePageObj = printablePages[activeSideIndex];
+
+    // 5. Case B: Direct Image Preview (Instant, zero conversion, low memory)
     if (isImageDoc && imageElement) {
       hideFallbackPreview();
       if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
@@ -1222,7 +1290,7 @@
       return;
     }
 
-    // 5. Case B: PDF Document Preview
+    // 6. Case C: PDF Document Preview
     if (!pdfJsDoc) {
       showFallbackPreview('Preview Unavailable', `Document is valid (${totalDocPages} ${totalDocPages === 1 ? 'page' : 'pages'}) and ready to print`);
       return;
@@ -1323,10 +1391,8 @@
   // Stepper Event Listeners
   if (btnSheetPrev) {
     btnSheetPrev.addEventListener('click', () => {
-      const printablePages = pageList.filter(p => p.selected);
-      const selIdx = printablePages.findIndex(p => p.originalIndex === activePageIndex);
-      if (selIdx > 0) {
-        activePageIndex = printablePages[selIdx - 1].originalIndex;
+      if (activeSideIndex > 0) {
+        activeSideIndex--;
         renderLiveSheet();
       }
     });
@@ -1335,15 +1401,18 @@
   if (btnSheetNext) {
     btnSheetNext.addEventListener('click', () => {
       const printablePages = pageList.filter(p => p.selected);
-      const selIdx = printablePages.findIndex(p => p.originalIndex === activePageIndex);
-      if (selIdx < printablePages.length - 1) {
-        activePageIndex = printablePages[selIdx + 1].originalIndex;
+      const isDouble = (sides === 'Double-sided');
+      const totalSides = (isDouble && printablePages.length % 2 !== 0)
+        ? printablePages.length + 1
+        : printablePages.length;
+      if (activeSideIndex < totalSides - 1) {
+        activeSideIndex++;
         renderLiveSheet();
       }
     });
   }
 
-  // --- Document Upload & Local PDF Extraction ---
+  // --- Document Upload Preparation ---
   async function prepareUploadDocument() {
     if (!file) return file;
 
@@ -1366,40 +1435,11 @@
       return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
     }
 
-    const hasEdits = (
-      selectedPages.length < totalDocPages ||
-      selectedPages.some(p => p.rotation !== 0) ||
-      selectedPages.some((p, idx) => p.originalIndex !== idx)
-    );
-
-    if (!hasEdits) {
-      if (convertedPdfBytes) {
-        return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
-      }
-      return file;
+    if (convertedPdfBytes) {
+      return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
     }
 
-    // Extract selected pages and rotations using PDFLib
-    try {
-      const sourceBuffer = convertedPdfBytes ? convertedPdfBytes : await file.arrayBuffer();
-      const srcDoc = await window.PDFLib.PDFDocument.load(sourceBuffer);
-      const outDoc = await window.PDFLib.PDFDocument.create();
-
-      for (const p of selectedPages) {
-        const [copiedPage] = await outDoc.copyPages(srcDoc, [p.originalIndex]);
-        if (p.rotation > 0) {
-          const curRot = copiedPage.getRotation().angle;
-          copiedPage.setRotation(window.PDFLib.degrees((curRot + p.rotation) % 360));
-        }
-        outDoc.addPage(copiedPage);
-      }
-
-      const outBytes = await outDoc.save();
-      return new File([outBytes], pdfName, { type: 'application/pdf' });
-    } catch (extractErr) {
-      console.error('PDF page extraction failed:', extractErr);
-      throw new Error('Failed to extract selected PDF pages: ' + (extractErr.message || extractErr));
-    }
+    return file;
   }
 
   async function handleOrderSubmission() {
@@ -1429,6 +1469,9 @@
       formData.append('copies', copies.toString());
       formData.append('duplex', sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
       formData.append('color_mode', mode === 'Color' ? 'COLOR' : 'BW');
+      if (pageSelection === 'Custom Range' && customPageRange && customPageRange.trim()) {
+        formData.append('page_range', customPageRange.trim());
+      }
 
       // 3. Submit to server
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;

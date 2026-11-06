@@ -713,7 +713,14 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		colorMode = "BW"
 	}
 
-	normRes, err := pdf.NormalizeAndCountMode(r.Context(), normalizedInputPath, outputPath, copies, duplexMode, colorMode)
+	pageRange := strings.TrimSpace(r.FormValue("page_range"))
+
+	normRes, err := pdf.NormalizeAndCountWithOptions(r.Context(), normalizedInputPath, outputPath, pdf.NormalizeOptions{
+		Copies:    copies,
+		Duplex:    duplexMode,
+		ColorMode: colorMode,
+		PageRange: pageRange,
+	})
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
