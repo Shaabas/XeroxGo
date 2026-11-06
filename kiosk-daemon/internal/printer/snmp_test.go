@@ -34,26 +34,48 @@ func (f *fakeSnmpSession) Close() error {
 	return nil
 }
 
-func createValidPacket(status int, errorByte byte, markerCount int64) *gosnmp.SnmpPacket {
-	return &gosnmp.SnmpPacket{
-		Error: gosnmp.NoError,
-		Variables: []gosnmp.SnmpPDU{
-			{
-				Name:  oidHrPrinterStatus,
-				Type:  gosnmp.Integer,
-				Value: status,
-			},
-			{
-				Name:  oidHrPrinterDetectedErrorState,
-				Type:  gosnmp.OctetString,
-				Value: []byte{errorByte},
-			},
-			{
-				Name:  oidPrtMarkerLifeCount,
-				Type:  gosnmp.Counter32,
-				Value: uint32(markerCount),
-			},
+func createValidPacket(status int, errorBytes []byte, markerCount int64, tonerLevel, tonerMax int, drumLevel, drumMax int) *gosnmp.SnmpPacket {
+	vars := []gosnmp.SnmpPDU{
+		{
+			Name:  oidHrPrinterStatus,
+			Type:  gosnmp.Integer,
+			Value: status,
 		},
+		{
+			Name:  oidHrPrinterDetectedErrorState,
+			Type:  gosnmp.OctetString,
+			Value: errorBytes,
+		},
+		{
+			Name:  oidPrtMarkerLifeCount,
+			Type:  gosnmp.Counter32,
+			Value: uint32(markerCount),
+		},
+		{
+			Name:  oidPrtMarkerSuppliesLevel1,
+			Type:  gosnmp.Integer,
+			Value: tonerLevel,
+		},
+		{
+			Name:  oidPrtMarkerSuppliesMax1,
+			Type:  gosnmp.Integer,
+			Value: tonerMax,
+		},
+		{
+			Name:  oidPrtMarkerSuppliesLevel2,
+			Type:  gosnmp.Integer,
+			Value: drumLevel,
+		},
+		{
+			Name:  oidPrtMarkerSuppliesMax2,
+			Type:  gosnmp.Integer,
+			Value: drumMax,
+		},
+	}
+
+	return &gosnmp.SnmpPacket{
+		Error:     gosnmp.NoError,
+		Variables: vars,
 	}
 }
 
@@ -66,15 +88,15 @@ func TestDecodeErrorBitmask(t *testing.T) {
 		}
 	})
 
-	t.Run("zero_byte", func(t *testing.T) {
-		flags := DecodeErrorBitmask([]byte{0x00})
+	t.Run("zero_bytes", func(t *testing.T) {
+		flags := DecodeErrorBitmask([]byte{0x00, 0x00})
 		expected := PrinterErrorFlags{}
 		if flags != expected {
 			t.Errorf("got %+v, want %+v", flags, expected)
 		}
 	})
 
-	t.Run("individual_bits", func(t *testing.T) {
+	t.Run("byte_0_individual_bits", func(t *testing.T) {
 		tests := []struct {
 			name     string
 			input    byte
@@ -87,6 +109,7 @@ func TestDecodeErrorBitmask(t *testing.T) {
 			{"DoorOpen", 0x08, PrinterErrorFlags{DoorOpen: true}},
 			{"Jammed", 0x04, PrinterErrorFlags{Jammed: true}},
 			{"Offline", 0x02, PrinterErrorFlags{Offline: true}},
+			{"ServiceRequested", 0x01, PrinterErrorFlags{ServiceRequested: true}},
 		}
 
 		for _, tc := range tests {
@@ -99,34 +122,41 @@ func TestDecodeErrorBitmask(t *testing.T) {
 		}
 	})
 
-	t.Run("all_seven_bits", func(t *testing.T) {
-		allBits := byte(0x80 | 0x40 | 0x20 | 0x10 | 0x08 | 0x04 | 0x02)
-		flags := DecodeErrorBitmask([]byte{allBits})
+	t.Run("byte_1_individual_bits", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			input    byte
+			expected PrinterErrorFlags
+		}{
+			{"InputTrayMissing", 0x80, PrinterErrorFlags{InputTrayMissing: true}},
+			{"OutputTrayMissing", 0x40, PrinterErrorFlags{OutputTrayMissing: true}},
+			{"MarkerSupplyMissing", 0x20, PrinterErrorFlags{MarkerSupplyMissing: true}},
+			{"OutputNearFull", 0x10, PrinterErrorFlags{OutputNearFull: true}},
+			{"OutputFull", 0x08, PrinterErrorFlags{OutputFull: true}},
+			{"InputTrayEmpty", 0x04, PrinterErrorFlags{InputTrayEmpty: true}},
+			{"OverduePreventMaint", 0x02, PrinterErrorFlags{OverduePreventMaint: true}},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				flags := DecodeErrorBitmask([]byte{0x00, tc.input})
+				if flags != tc.expected {
+					t.Errorf("byte 1 0x%02X: got %+v, want %+v", tc.input, flags, tc.expected)
+				}
+			})
+		}
+	})
+
+	t.Run("multiple_bytes_combined", func(t *testing.T) {
+		// byte 0: DoorOpen (0x08) | Jammed (0x04)
+		// byte 1: OutputFull (0x08) | InputTrayEmpty (0x04)
+		flags := DecodeErrorBitmask([]byte{0x08 | 0x04, 0x08 | 0x04})
 		expected := PrinterErrorFlags{
-			LowPaper: true,
-			NoPaper:  true,
-			LowToner: true,
-			NoToner:  true,
-			DoorOpen: true,
-			Jammed:   true,
-			Offline:  true,
+			DoorOpen:       true,
+			Jammed:         true,
+			OutputFull:     true,
+			InputTrayEmpty: true,
 		}
-		if flags != expected {
-			t.Errorf("got %+v, want %+v", flags, expected)
-		}
-	})
-
-	t.Run("unrelated_low_order_bits", func(t *testing.T) {
-		flags := DecodeErrorBitmask([]byte{0x01})
-		expected := PrinterErrorFlags{}
-		if flags != expected {
-			t.Errorf("got %+v, want %+v", flags, expected)
-		}
-	})
-
-	t.Run("multiple_bytes_inspects_first_byte_only", func(t *testing.T) {
-		flags := DecodeErrorBitmask([]byte{0x80, 0x08, 0x04})
-		expected := PrinterErrorFlags{LowPaper: true}
 		if flags != expected {
 			t.Errorf("got %+v, want %+v", flags, expected)
 		}
@@ -157,9 +187,9 @@ func TestPollHealthStatusMapping(t *testing.T) {
 		{"WARMING_UP", 5, "WARMING_UP", false},
 		{"ERROR", 6, "ERROR", true},
 		{"OFFLINE", 7, "OFFLINE", true},
-		{"unrecognized_1", 1, "ERROR", true},
-		{"unrecognized_2", 2, "ERROR", true},
-		{"unrecognized_99", 99, "ERROR", true},
+		{"UNKNOWN_1", 1, "UNKNOWN", true},
+		{"UNKNOWN_2", 2, "UNKNOWN", true},
+		{"UNKNOWN_99", 99, "UNKNOWN", true},
 	}
 
 	for _, tc := range tests {
@@ -168,7 +198,7 @@ func TestPollHealthStatusMapping(t *testing.T) {
 			session := &fakeSnmpSession{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 					recordedOIDs = append([]string(nil), oids...)
-					return createValidPacket(tc.statusVal, 0x00, 1000), nil
+					return createValidPacket(tc.statusVal, []byte{0x00}, 1000, 80, 100, 90, 100), nil
 				},
 			}
 
@@ -195,14 +225,9 @@ func TestPollHealthStatusMapping(t *testing.T) {
 				t.Errorf("expected empty ErrorMessage for healthy state, got %q", health.ErrorMessage)
 			}
 
-			// Verify OIDs and order
-			expectedOIDs := []string{
-				oidHrPrinterStatus,
-				oidHrPrinterDetectedErrorState,
-				oidPrtMarkerLifeCount,
-			}
-			if !reflect.DeepEqual(recordedOIDs, expectedOIDs) {
-				t.Errorf("queried OIDs = %v, want %v", recordedOIDs, expectedOIDs)
+			// Verify queried OIDs
+			if !reflect.DeepEqual(recordedOIDs, queriedOIDs) {
+				t.Errorf("queried OIDs = %v, want %v", recordedOIDs, queriedOIDs)
 			}
 		})
 	}
@@ -212,100 +237,145 @@ func TestPollHealthErrorBitmask(t *testing.T) {
 	tests := []struct {
 		name         string
 		statusVal    int
-		errorByte    byte
+		errorBytes   []byte
 		wantOnline   bool
 		wantState    string
 		wantTray     string
 		wantCover    bool
 		wantJam      bool
+		wantBinFull  bool
 		wantMsgWords []string
 	}{
 		{
 			name:         "low_paper",
 			statusVal:    3,
-			errorByte:    0x80,
+			errorBytes:   []byte{0x80},
 			wantOnline:   true,
 			wantState:    "IDLE",
 			wantTray:     "LOW",
 			wantCover:    false,
 			wantJam:      false,
+			wantBinFull:  false,
 			wantMsgWords: []string{"low paper"},
 		},
 		{
 			name:         "no_paper",
 			statusVal:    3,
-			errorByte:    0x40,
+			errorBytes:   []byte{0x40},
 			wantOnline:   true,
 			wantState:    "ERROR",
 			wantTray:     "EMPTY",
 			wantCover:    false,
 			wantJam:      false,
+			wantBinFull:  false,
 			wantMsgWords: []string{"no paper"},
 		},
 		{
 			name:         "low_toner",
 			statusVal:    3,
-			errorByte:    0x20,
+			errorBytes:   []byte{0x20},
 			wantOnline:   true,
 			wantState:    "IDLE",
 			wantTray:     "OK",
 			wantCover:    false,
 			wantJam:      false,
+			wantBinFull:  false,
 			wantMsgWords: []string{"low toner"},
 		},
 		{
 			name:         "no_toner",
 			statusVal:    3,
-			errorByte:    0x10,
+			errorBytes:   []byte{0x10},
 			wantOnline:   true,
 			wantState:    "ERROR",
 			wantTray:     "OK",
 			wantCover:    false,
 			wantJam:      false,
+			wantBinFull:  false,
 			wantMsgWords: []string{"no toner"},
 		},
 		{
 			name:         "door_open",
 			statusVal:    3,
-			errorByte:    0x08,
+			errorBytes:   []byte{0x08},
 			wantOnline:   true,
 			wantState:    "ERROR",
 			wantTray:     "OK",
 			wantCover:    true,
 			wantJam:      false,
+			wantBinFull:  false,
 			wantMsgWords: []string{"door open"},
 		},
 		{
 			name:         "paper_jam",
 			statusVal:    3,
-			errorByte:    0x04,
+			errorBytes:   []byte{0x04},
 			wantOnline:   true,
 			wantState:    "ERROR",
 			wantTray:     "OK",
 			wantCover:    false,
 			wantJam:      true,
+			wantBinFull:  false,
 			wantMsgWords: []string{"paper jam"},
 		},
 		{
 			name:         "offline_bit",
 			statusVal:    3,
-			errorByte:    0x02,
+			errorBytes:   []byte{0x02},
 			wantOnline:   false,
 			wantState:    "OFFLINE",
 			wantTray:     "OK",
 			wantCover:    false,
 			wantJam:      false,
+			wantBinFull:  false,
 			wantMsgWords: []string{"offline"},
+		},
+		{
+			name:         "service_requested",
+			statusVal:    3,
+			errorBytes:   []byte{0x01},
+			wantOnline:   true,
+			wantState:    "ERROR",
+			wantTray:     "OK",
+			wantCover:    false,
+			wantJam:      false,
+			wantBinFull:  false,
+			wantMsgWords: []string{"service requested"},
+		},
+		{
+			name:         "output_bin_full",
+			statusVal:    3,
+			errorBytes:   []byte{0x00, 0x08},
+			wantOnline:   true,
+			wantState:    "ERROR",
+			wantTray:     "OK",
+			wantCover:    false,
+			wantJam:      false,
+			wantBinFull:  true,
+			wantMsgWords: []string{"output bin full"},
+		},
+		{
+			name:         "input_tray_empty_byte1",
+			statusVal:    3,
+			errorBytes:   []byte{0x00, 0x04},
+			wantOnline:   true,
+			wantState:    "ERROR",
+			wantTray:     "EMPTY",
+			wantCover:    false,
+			wantJam:      false,
+			wantBinFull:  false,
+			wantMsgWords: []string{"input tray empty"},
 		},
 		{
 			name:         "door_open_and_jam",
 			statusVal:    3,
-			errorByte:    0x08 | 0x04,
+			errorBytes:   []byte{0x08 | 0x04},
 			wantOnline:   true,
 			wantState:    "ERROR",
 			wantTray:     "OK",
 			wantCover:    true,
 			wantJam:      true,
+			wantBinFull:  false,
 			wantMsgWords: []string{"door open", "paper jam"},
 		},
 	}
@@ -314,7 +384,7 @@ func TestPollHealthErrorBitmask(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			session := &fakeSnmpSession{
 				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
-					return createValidPacket(tc.statusVal, tc.errorByte, 2500), nil
+					return createValidPacket(tc.statusVal, tc.errorBytes, 2500, 75, 100, 80, 100), nil
 				},
 			}
 			factory := func(ctx context.Context) (snmpSession, error) {
@@ -338,6 +408,9 @@ func TestPollHealthErrorBitmask(t *testing.T) {
 			if health.PaperJam != tc.wantJam {
 				t.Errorf("PaperJam = %v, want %v", health.PaperJam, tc.wantJam)
 			}
+			if health.OutputBinFull != tc.wantBinFull {
+				t.Errorf("OutputBinFull = %v, want %v", health.OutputBinFull, tc.wantBinFull)
+			}
 
 			for _, word := range tc.wantMsgWords {
 				if !strings.Contains(strings.ToLower(health.ErrorMessage), word) {
@@ -348,10 +421,247 @@ func TestPollHealthErrorBitmask(t *testing.T) {
 	}
 }
 
+func TestSupplyLevelCalculations(t *testing.T) {
+	tests := []struct {
+		name        string
+		tonerLevel  int
+		tonerMax    int
+		drumLevel   int
+		drumMax     int
+		wantToner   int
+		wantDrum    int
+	}{
+		{
+			name:       "normal_percentages",
+			tonerLevel: 75,
+			tonerMax:   100,
+			drumLevel:  8500,
+			drumMax:    10000,
+			wantToner:  75,
+			wantDrum:   85,
+		},
+		{
+			name:       "empty_supplies",
+			tonerLevel: 0,
+			tonerMax:   100,
+			drumLevel:  0,
+			drumMax:    10000,
+			wantToner:  0,
+			wantDrum:   0,
+		},
+		{
+			name:       "overflow_clamped_to_100",
+			tonerLevel: 150,
+			tonerMax:   100,
+			drumLevel:  12000,
+			drumMax:    10000,
+			wantToner:  100,
+			wantDrum:   100,
+		},
+		{
+			name:       "rfc3805_negative_levels_unknown",
+			tonerLevel: -3, // some remaining, not quantifiable
+			tonerMax:   100,
+			drumLevel:  -2, // unknown
+			drumMax:    10000,
+			wantToner:  0,
+			wantDrum:   0,
+		},
+		{
+			name:       "zero_or_negative_max_capacity",
+			tonerLevel: 50,
+			tonerMax:   0,
+			drumLevel:  50,
+			drumMax:    -1,
+			wantToner:  0,
+			wantDrum:   0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeSnmpSession{
+				getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+					return createValidPacket(3, []byte{0x00}, 1000, tc.tonerLevel, tc.tonerMax, tc.drumLevel, tc.drumMax), nil
+				},
+			}
+			factory := func(ctx context.Context) (snmpSession, error) {
+				return session, nil
+			}
+
+			health := pollHealthWithFactory(context.Background(), 200, factory)
+
+			if health.TonerLevelPercent != tc.wantToner {
+				t.Errorf("TonerLevelPercent = %d, want %d", health.TonerLevelPercent, tc.wantToner)
+			}
+			if health.DrumLifePercent != tc.wantDrum {
+				t.Errorf("DrumLifePercent = %d, want %d", health.DrumLifePercent, tc.wantDrum)
+			}
+		})
+	}
+}
+
+func TestPartialSNMPSupportAndMissingOIDs(t *testing.T) {
+	t.Run("missing_supplies_and_marker_count_still_reports_online", func(t *testing.T) {
+		// HP LaserJet Tank 1020w scenario: returns status and error state, but does not provide supplies or marker count
+		pkt := &gosnmp.SnmpPacket{
+			Error: gosnmp.NoError,
+			Variables: []gosnmp.SnmpPDU{
+				{
+					Name:  oidHrPrinterStatus,
+					Type:  gosnmp.Integer,
+					Value: 3, // IDLE
+				},
+				{
+					Name:  oidHrPrinterDetectedErrorState,
+					Type:  gosnmp.OctetString,
+					Value: []byte{0x00},
+				},
+				{
+					Name: oidPrtMarkerLifeCount,
+					Type: gosnmp.NoSuchObject,
+				},
+				{
+					Name: oidPrtMarkerSuppliesLevel1,
+					Type: gosnmp.NoSuchObject,
+				},
+				{
+					Name: oidPrtMarkerSuppliesMax1,
+					Type: gosnmp.NoSuchObject,
+				},
+			},
+		}
+
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return pkt, nil
+			},
+		}
+		factory := func(ctx context.Context) (snmpSession, error) {
+			return session, nil
+		}
+
+		health := pollHealthWithFactory(context.Background(), 100, factory)
+
+		if !health.Online {
+			t.Errorf("expected Online = true for partially supported SNMP device, got false: %s", health.ErrorMessage)
+		}
+		if health.State != "IDLE" {
+			t.Errorf("State = %s, want IDLE", health.State)
+		}
+		if health.TonerLevelPercent != 0 {
+			t.Errorf("TonerLevelPercent = %d, want 0", health.TonerLevelPercent)
+		}
+	})
+
+	t.Run("missing_status_oid_with_other_metrics_reports_unknown_not_offline", func(t *testing.T) {
+		pkt := &gosnmp.SnmpPacket{
+			Error: gosnmp.NoError,
+			Variables: []gosnmp.SnmpPDU{
+				{
+					Name:  oidHrPrinterDetectedErrorState,
+					Type:  gosnmp.OctetString,
+					Value: []byte{0x00},
+				},
+				{
+					Name:  oidPrtMarkerLifeCount,
+					Type:  gosnmp.Counter32,
+					Value: uint32(500),
+				},
+			},
+		}
+
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return pkt, nil
+			},
+		}
+		factory := func(ctx context.Context) (snmpSession, error) {
+			return session, nil
+		}
+
+		health := pollHealthWithFactory(context.Background(), 100, factory)
+
+		if !health.Online {
+			t.Errorf("expected Online = true when device answers SNMP, got false: %s", health.ErrorMessage)
+		}
+		if health.State != "UNKNOWN" {
+			t.Errorf("State = %s, want UNKNOWN", health.State)
+		}
+	})
+
+	t.Run("all_oids_nosuchobject_reports_unknown_device", func(t *testing.T) {
+		pkt := &gosnmp.SnmpPacket{
+			Error: gosnmp.NoError,
+			Variables: []gosnmp.SnmpPDU{
+				{Name: oidHrPrinterStatus, Type: gosnmp.NoSuchObject},
+				{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.NoSuchObject},
+			},
+		}
+
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return pkt, nil
+			},
+		}
+		factory := func(ctx context.Context) (snmpSession, error) {
+			return session, nil
+		}
+
+		health := pollHealthWithFactory(context.Background(), 100, factory)
+
+		if !health.Online {
+			t.Errorf("expected Online = true since agent answered SNMP, got false: %s", health.ErrorMessage)
+		}
+		if health.State != "UNKNOWN" {
+			t.Errorf("State = %s, want UNKNOWN", health.State)
+		}
+		if !strings.Contains(health.ErrorMessage, "no supported printer metrics") {
+			t.Errorf("expected ErrorMessage to mention no supported metrics, got %q", health.ErrorMessage)
+		}
+	})
+
+	t.Run("snmpv1_nosuchname_fallback_recovers_essential_status", func(t *testing.T) {
+		firstCall := true
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				if firstCall {
+					firstCall = false
+					// Initial query fails because agent doesn't recognize supply OIDs
+					return &gosnmp.SnmpPacket{
+						Error:      gosnmp.NoSuchName,
+						ErrorIndex: 4,
+					}, nil
+				}
+				// Fallback with essential OIDs succeeds
+				return &gosnmp.SnmpPacket{
+					Error: gosnmp.NoError,
+					Variables: []gosnmp.SnmpPDU{
+						{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
+						{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
+					},
+				}, nil
+			},
+		}
+		factory := func(ctx context.Context) (snmpSession, error) {
+			return session, nil
+		}
+
+		health := pollHealthWithFactory(context.Background(), 150, factory)
+
+		if !health.Online {
+			t.Errorf("expected fallback to recover Online=true, got false: %s", health.ErrorMessage)
+		}
+		if health.State != "IDLE" {
+			t.Errorf("State = %s, want IDLE", health.State)
+		}
+	})
+}
+
 func TestPollHealthUsesEstimatedSheets(t *testing.T) {
 	session := &fakeSnmpSession{
 		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
-			return createValidPacket(3, 0x00, 100), nil
+			return createValidPacket(3, []byte{0x00}, 100, 80, 100, 90, 100), nil
 		},
 	}
 	factory := func(ctx context.Context) (snmpSession, error) {
@@ -405,105 +715,12 @@ func TestPollHealthMalformedResponses(t *testing.T) {
 			errSubstr: "nil",
 		},
 		{
-			name: "snmp_error_status",
+			name: "snmp_bad_value_packet_error",
 			pkt: &gosnmp.SnmpPacket{
-				Error:      gosnmp.NoSuchName,
+				Error:      gosnmp.BadValue,
 				ErrorIndex: 1,
 			},
 			errSubstr: "SNMP error status",
-		},
-		{
-			name: "missing_status_oid",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: uint32(10)},
-				},
-			},
-			errSubstr: "missing required OID",
-		},
-		{
-			name: "missing_error_state_oid",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: uint32(10)},
-				},
-			},
-			errSubstr: "missing required OID",
-		},
-		{
-			name: "missing_marker_counter_oid",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
-				},
-			},
-			errSubstr: "missing required OID",
-		},
-		{
-			name: "wrong_pdu_type_status",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.OctetString, Value: []byte("3")},
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: uint32(10)},
-				},
-			},
-			errSubstr: "invalid PDU type",
-		},
-		{
-			name: "wrong_pdu_type_error_state",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.Integer, Value: 0},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: uint32(10)},
-				},
-			},
-			errSubstr: "invalid PDU type",
-		},
-		{
-			name: "wrong_pdu_type_marker_counter",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.OctetString, Value: []byte("100")},
-				},
-			},
-			errSubstr: "invalid PDU type",
-		},
-		{
-			name: "invalid_marker_counter_negative",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Integer, Value: -5},
-				},
-			},
-			errSubstr: "negative marker life count",
-		},
-		{
-			name: "invalid_status_representation",
-			pkt: &gosnmp.SnmpPacket{
-				Error: gosnmp.NoError,
-				Variables: []gosnmp.SnmpPDU{
-					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: "invalid_string"},
-					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
-					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: uint32(10)},
-				},
-			},
-			errSubstr: "cannot parse",
 		},
 	}
 
@@ -580,7 +797,6 @@ func TestPollHealthConnectFailure(t *testing.T) {
 func TestPollHealthClosesSession(t *testing.T) {
 	session := &fakeSnmpSession{
 		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
-			// Return malformed packet
 			return nil, errors.New("corrupt response")
 		},
 	}

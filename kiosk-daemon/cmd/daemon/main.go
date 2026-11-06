@@ -228,6 +228,9 @@ func main() {
 	stateDB := flag.String("state-db", "/var/kiosk/state.db", "SQLite state database path")
 	downloadDir := flag.String("download-dir", "/var/kiosk/jobs", "Directory for downloaded PDF jobs")
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
+	snmpTarget := flag.String("snmp-target", "", "SNMP target address (defaults to host from -printer-addr)")
+	snmpCommunity := flag.String("snmp-community", "public", "SNMP community string for printer monitoring (read-only)")
+	snmpPort := flag.Int("snmp-port", 161, "SNMP port (default 161)")
 	cupsPrinter := flag.String("cups-printer", "", "CUPS queue name (e.g. DCPT310). When set, jobs are sent via CUPS instead of raw TCP port 9100")
 	cupsQueue := flag.String("cups-queue", "", "Alias for -cups-printer")
 	printerModel := flag.String("printer-model", "", "Printer model name displayed on screen (default: Brother DCP-T310 for CUPS, Brother HL-L5210DN for PJL)")
@@ -368,6 +371,9 @@ func main() {
 		KioskID:                  *kioskID,
 		StateStore:               stateStore,
 		PrinterAddr:              actualPrinterAddr,
+		SNMPTarget:               *snmpTarget,
+		SNMPCommunity:            *snmpCommunity,
+		SNMPPort:                 *snmpPort,
 		CUPSQueue:                *cupsPrinter,
 		PrinterModel:             effectivePrinterModel,
 		DownloadDir:              *downloadDir,

@@ -42,6 +42,9 @@ type ClientConfig struct {
 	KioskID                  string
 	StateStore               *state.Store
 	PrinterAddr              string
+	SNMPTarget               string
+	SNMPCommunity            string
+	SNMPPort                 int
 	CUPSQueue                string
 	PrinterModel             string
 	DownloadDir              string
@@ -142,21 +145,29 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	poller := cfg.MockHealth
 	if poller == nil {
-		if strings.TrimSpace(cfg.CUPSQueue) != "" {
-			cupsQ := strings.TrimSpace(cfg.CUPSQueue)
-			poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-				return printer.PollCUPSHealth(ctx, cupsQ, estimatedSheets)
-			}
-		} else {
-			targetHost := "192.168.99.2"
+		targetHost := strings.TrimSpace(cfg.SNMPTarget)
+		if targetHost == "" {
 			if h, _, err := net.SplitHostPort(cfg.PrinterAddr); err == nil && h != "" {
 				targetHost = h
 			} else if strings.TrimSpace(cfg.PrinterAddr) != "" {
 				targetHost = strings.TrimSpace(cfg.PrinterAddr)
 			}
-			poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-				return printer.PollHealthTarget(ctx, targetHost, estimatedSheets)
-			}
+		}
+
+		snmpCfg := printer.DefaultSNMPConfig()
+		if targetHost != "" {
+			snmpCfg.Target = targetHost
+		}
+		if cfg.SNMPPort > 0 {
+			snmpCfg.Port = cfg.SNMPPort
+		}
+		if cfg.SNMPCommunity != "" {
+			snmpCfg.Community = cfg.SNMPCommunity
+		}
+
+		cupsQ := strings.TrimSpace(cfg.CUPSQueue)
+		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return printer.PollCombinedHealth(ctx, nil, cupsQ, snmpCfg, estimatedSheets)
 		}
 	}
 
