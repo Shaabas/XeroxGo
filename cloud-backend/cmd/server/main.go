@@ -289,7 +289,7 @@ const portalHTML = `<!DOCTYPE html>
               <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #64748B, #334155);"></div>
               <div style="text-align:left;">
                 <div style="color:var(--text-primary); font-weight:600;">B&amp;W</div>
-                <div id="price-bw-label" style="font-size:0.875rem; color:var(--text-secondary);">₹2.00/sheet</div>
+                <div id="price-bw-label" style="font-size:0.875rem; color:var(--text-secondary);">₹2.00/side</div>
               </div>
             </div>
           </button>
@@ -298,7 +298,7 @@ const portalHTML = `<!DOCTYPE html>
               <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #F59E0B, #3B82F6);"></div>
               <div style="text-align:left;">
                 <div style="color:var(--text-primary); font-weight:600;">Color</div>
-                <div id="price-color-label" style="font-size:0.875rem; color:var(--text-secondary);">₹10.00/sheet</div>
+                <div id="price-color-label" style="font-size:0.875rem; color:var(--text-secondary);">₹10.00/side</div>
               </div>
             </div>
           </button>
@@ -728,7 +728,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var unitPrice int64
-	isDuplex := duplexMode != "simplex"
+	isDuplex := duplexMode != contracts.DuplexSimplex
 	if err == nil {
 		if colorMode == "COLOR" {
 			if isDuplex {
@@ -746,6 +746,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if unitPrice <= 0 {
 		unitPrice = s.cfg.pricePerSheetPaise
+	}
+	if unitPrice <= 0 {
+		unitPrice = 200
 	}
 
 	totalPrintedPages := normRes.TotalPages * copies
@@ -805,6 +808,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"copies":                copies,
 		"duplex":                string(duplexMode),
 		"price_per_sheet_paise": unitPrice,
+		"price_per_side_paise":  unitPrice,
 		"unit_price_paise":      unitPrice,
 		"total_price_paise":     totalPricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
@@ -1096,6 +1100,7 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 				Entity struct {
 					ID      string `json:"id"`
 					OrderID string `json:"order_id"`
+					Amount  int64  `json:"amount"`
 					Status  string `json:"status"`
 					Notes   struct {
 						OrderID string `json:"order_id"`
@@ -1130,6 +1135,18 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		eventID = "evt_" + orderID
 	}
 
+	order, err := s.db.GetOrder(r.Context(), orderID)
+	if err != nil || order == nil {
+		http.Error(w, "order not found", http.StatusBadRequest)
+		return
+	}
+
+	// Requirement 10 & 19: Verify the actual Razorpay order amount equals the stored order amount in paise.
+	if parsed.Payload.Payment.Entity.Amount > 0 && parsed.Payload.Payment.Entity.Amount != order.PricePaise {
+		http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", order.PricePaise, parsed.Payload.Payment.Entity.Amount), http.StatusBadRequest)
+		return
+	}
+
 	recorded, err := s.db.RecordWebhook(r.Context(), eventID)
 	if err != nil {
 		http.Error(w, "failed to record webhook", http.StatusInternalServerError)
@@ -1138,12 +1155,6 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 	if !recorded {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"duplicate"}`))
-		return
-	}
-
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusBadRequest)
 		return
 	}
 

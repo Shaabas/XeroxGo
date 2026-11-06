@@ -246,7 +246,39 @@
 
   // --- Helper: Format Currency ---
   function formatRupees(paise) {
-    return '₹' + (paise / 100).toFixed(0);
+    if (typeof paise !== 'number' || isNaN(paise) || paise <= 0) return '₹0';
+    const rupees = paise / 100;
+    if (paise % 100 === 0) {
+      return '₹' + rupees.toFixed(0);
+    }
+    return '₹' + rupees.toFixed(2);
+  }
+
+  // --- Quote State Tracking ---
+  let pricingLoaded = false;
+  let backendConfirmedPricePaise = null;
+  let backendConfirmedOrderID = null;
+
+  function invalidateQuote() {
+    backendConfirmedPricePaise = null;
+    backendConfirmedOrderID = null;
+    activeOrderID = null;
+  }
+
+  // --- Helper: Dynamic Rate Labels ---
+  function updateRateLabels() {
+    const isDouble = sides === 'Double-sided';
+    const activeBwRate = isDouble ? bwDuplexPricePaise : bwSimplexPricePaise;
+    const activeColorRate = isDouble ? colorDuplexPricePaise : colorSimplexPricePaise;
+
+    const bwLabel = document.getElementById('price-bw-label');
+    if (bwLabel) {
+      bwLabel.textContent = `₹${(activeBwRate / 100).toFixed(2)}/side`;
+    }
+    const colorLabel = document.getElementById('price-color-label');
+    if (colorLabel) {
+      colorLabel.textContent = `₹${(activeColorRate / 100).toFixed(2)}/side`;
+    }
   }
 
   // --- Helper: Get Ordered Printable Pages ---
@@ -280,7 +312,9 @@
     } else {
       activePrice = isDouble ? bwDuplexPricePaise : bwSimplexPricePaise;
     }
-    const totalPricePaise = totalPrintedPages * activePrice;
+    const isPriceValid = pricingLoaded && (activePrice > 0);
+    const estimatedPricePaise = isPriceValid ? (totalPrintedPages * activePrice) : 0;
+    const displayPricePaise = (backendConfirmedPricePaise !== null) ? backendConfirmedPricePaise : estimatedPricePaise;
 
     if (summaryFileName) summaryFileName.textContent = file ? file.name : '-';
     if (summaryPages) {
@@ -294,7 +328,16 @@
       summaryOptions.textContent = `${mode} · ${isDouble ? 'Double Side' : 'Single Side'} · ${totalPhysicalSheets} ${totalPhysicalSheets === 1 ? 'physical sheet' : 'physical sheets'}`;
     }
     if (summaryCopies) summaryCopies.textContent = `${copies} ${copies === 1 ? 'copy' : 'copies'}`;
-    if (summaryPrice) summaryPrice.textContent = formatRupees(totalPricePaise);
+    if (summaryPrice) summaryPrice.textContent = formatRupees(displayPricePaise);
+
+    // Requirement 13: Prevent checkout while pricing is pending, invalid, or inconsistent
+    if (btnPayUpi) {
+      if (!file || selectedCount === 0 || !isPriceValid || displayPricePaise <= 0) {
+        btnPayUpi.disabled = true;
+      } else {
+        btnPayUpi.disabled = false;
+      }
+    }
 
     // Update feedback for custom range if visible
     if (pageSelection === 'Custom Range') {
@@ -908,6 +951,7 @@
     customPageRange = '';
     activeSideIndex = 0;
     copies = 1;
+    invalidateQuote();
     if (copiesValDisplay) copiesValDisplay.textContent = '1';
     if (btnPageSelectionAll) btnPageSelectionAll.classList.add('active');
     if (btnPageSelectionCustom) btnPageSelectionCustom.classList.remove('active');
@@ -931,6 +975,7 @@
     if (btnSheetNext) btnSheetNext.disabled = true;
     if (btnSheetFlip) btnSheetFlip.classList.add('hidden');
     hideFallbackPreview();
+    updateRateLabels();
     updatePriceAndReviewSummary();
   }
 
@@ -966,6 +1011,7 @@
   if (btnPageSelectionAll) {
     btnPageSelectionAll.addEventListener('click', () => {
       pageSelection = 'All Pages';
+      invalidateQuote();
       btnPageSelectionAll.classList.add('active');
       btnPageSelectionCustom.classList.remove('active');
       if (customRangeBox) customRangeBox.classList.add('hidden');
@@ -978,6 +1024,7 @@
   if (btnPageSelectionCustom) {
     btnPageSelectionCustom.addEventListener('click', () => {
       pageSelection = 'Custom Range';
+      invalidateQuote();
       btnPageSelectionCustom.classList.add('active');
       btnPageSelectionAll.classList.remove('active');
       if (customRangeBox) customRangeBox.classList.remove('hidden');
@@ -986,6 +1033,7 @@
   }
 
   function applyCustomRange(rangeStr) {
+    invalidateQuote();
     customPageRange = rangeStr;
     if (customRangeInput && customRangeInput !== document.activeElement) {
       customRangeInput.value = rangeStr;
@@ -1017,6 +1065,7 @@
     copiesDecBtn.addEventListener('click', () => {
       if (copies > 1) {
         copies--;
+        invalidateQuote();
         copiesValDisplay.textContent = copies;
         updatePriceAndReviewSummary();
       }
@@ -1027,6 +1076,7 @@
     copiesIncBtn.addEventListener('click', () => {
       if (copies < 99) {
         copies++;
+        invalidateQuote();
         copiesValDisplay.textContent = copies;
         updatePriceAndReviewSummary();
       }
@@ -1036,8 +1086,10 @@
   if (btnModeBW) {
     btnModeBW.addEventListener('click', () => {
       mode = 'B&W';
+      invalidateQuote();
       btnModeBW.classList.add('active');
       if (btnModeColor) btnModeColor.classList.remove('active');
+      updateRateLabels();
       updatePriceAndReviewSummary();
       renderLiveSheet();
     });
@@ -1046,8 +1098,10 @@
   if (btnModeColor) {
     btnModeColor.addEventListener('click', () => {
       mode = 'Color';
+      invalidateQuote();
       btnModeColor.classList.add('active');
       if (btnModeBW) btnModeBW.classList.remove('active');
+      updateRateLabels();
       updatePriceAndReviewSummary();
       renderLiveSheet();
     });
@@ -1062,10 +1116,11 @@
         bwDuplexPricePaise = data.bw_duplex_price_paise || 150;
         colorSimplexPricePaise = data.color_simplex_price_paise || data.color_price_per_sheet_paise || 1000;
         colorDuplexPricePaise = data.color_duplex_price_paise || 750;
-        colorHardwareEnabled = Boolean(data.color_enabled);
+        colorHardwareEnabled = (typeof data.color_enabled === 'boolean') ? data.color_enabled : true;
 
         bwPricePerSheetPaise = bwSimplexPricePaise;
         colorPricePerSheetPaise = colorSimplexPricePaise;
+        pricingLoaded = true;
 
         // Hardware capability: if kiosk color printing is disabled, lock mobile UI to B&W
         if (!colorHardwareEnabled) {
@@ -1080,22 +1135,29 @@
           if (btnModeBW) btnModeBW.style.flex = '';
         }
 
-        const bwLabel = document.getElementById('price-bw-label');
-        if (bwLabel) bwLabel.textContent = `₹${(bwSimplexPricePaise / 100).toFixed(2)}/page`;
-        const colorLabel = document.getElementById('price-color-label');
-        if (colorLabel) colorLabel.textContent = `₹${(colorSimplexPricePaise / 100).toFixed(2)}/page`;
+        updateRateLabels();
+        updatePriceAndReviewSummary();
+      } else {
+        pricingLoaded = true;
+        updateRateLabels();
         updatePriceAndReviewSummary();
       }
-    } catch (_) {}
+    } catch (_) {
+      pricingLoaded = true;
+      updateRateLabels();
+      updatePriceAndReviewSummary();
+    }
   }
   fetchPricing();
 
   if (btnSideSingle) {
     btnSideSingle.addEventListener('click', () => {
       sides = 'Single-sided';
+      invalidateQuote();
       btnSideSingle.classList.add('active');
       btnSideDouble.classList.remove('active');
       activeSideIndex = 0;
+      updateRateLabels();
       updatePriceAndReviewSummary();
       renderLiveSheet();
     });
@@ -1104,9 +1166,11 @@
   if (btnSideDouble) {
     btnSideDouble.addEventListener('click', () => {
       sides = 'Double-sided';
+      invalidateQuote();
       btnSideDouble.classList.add('active');
       btnSideSingle.classList.remove('active');
       activeSideIndex = 0;
+      updateRateLabels();
       updatePriceAndReviewSummary();
       renderLiveSheet();
     });
@@ -1460,6 +1524,11 @@
   async function handleOrderSubmission() {
     if (reviewAlert) reviewAlert.classList.add('hidden');
 
+    if (!pricingLoaded) {
+      showError('Pricing is loading. Please wait a moment.');
+      return;
+    }
+
     if (!file) {
       showError('Please upload a document first.');
       return;
@@ -1468,6 +1537,15 @@
     const selectedCount = getSelectedPagesCount();
     if (selectedCount === 0) {
       showError('Please select at least 1 page to print.');
+      return;
+    }
+
+    const isDouble = (sides === 'Double-sided');
+    const activePrice = (mode === 'Color' && colorHardwareEnabled)
+      ? (isDouble ? colorDuplexPricePaise : colorSimplexPricePaise)
+      : (isDouble ? bwDuplexPricePaise : bwSimplexPricePaise);
+    if (activePrice <= 0) {
+      showError('Unable to proceed: pricing is invalid or unavailable.');
       return;
     }
 
@@ -1502,6 +1580,13 @@
 
       const data = await resp.json();
       activeOrderID = data.order_id;
+      backendConfirmedPricePaise = data.total_price_paise;
+      backendConfirmedOrderID = data.order_id;
+
+      // Update summary price with authoritative backend price
+      if (summaryPrice) {
+        summaryPrice.textContent = formatRupees(data.total_price_paise);
+      }
 
       // 4. Transition to Status Section
       if (uploadSection) uploadSection.classList.add('hidden');
@@ -1534,6 +1619,26 @@
             devSimulatePaymentBtn.disabled = false;
           }
         };
+      } else if (!devMode && typeof window.Razorpay === 'function') {
+        // Requirement 10 & 19: Razorpay order amount strictly matches confirmed backend order price in paise
+        try {
+          const rzp = new window.Razorpay({
+            key: container.dataset.razorpayKeyId || 'rzp_test_placeholder',
+            amount: data.total_price_paise,
+            currency: 'INR',
+            name: 'XeroxGo',
+            description: `Print Order (${data.display_code || data.order_id})`,
+            notes: {
+              order_id: data.order_id
+            },
+            handler: function() {
+              startPolling(activeOrderID);
+            }
+          });
+          rzp.open();
+        } catch (rzpErr) {
+          console.warn('Razorpay checkout initialization notice:', rzpErr);
+        }
       }
 
       // Start live order status polling

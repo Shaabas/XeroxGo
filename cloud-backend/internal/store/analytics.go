@@ -20,6 +20,8 @@ type PricingConfig struct {
 	ColorEnabled           bool      `json:"color_enabled"`
 	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
 	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
+	BWPricePerSidePaise    int64     `json:"bw_price_per_side_paise,omitempty"`
+	ColorPricePerSidePaise int64     `json:"color_price_per_side_paise,omitempty"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
@@ -89,6 +91,8 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		ColorEnabled:           colorEnabledInt == 1,
 		BWPricePerSheetPaise:    bwSimplex,
 		ColorPricePerSheetPaise: colorSimplex,
+		BWPricePerSidePaise:    bwSimplex,
+		ColorPricePerSidePaise: colorSimplex,
 		UpdatedAt:               time.Unix(0, updatedNS).UTC(),
 	}, nil
 }
