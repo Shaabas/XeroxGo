@@ -249,15 +249,22 @@
     return '₹' + (paise / 100).toFixed(0);
   }
 
+  // --- Helper: Get Ordered Printable Pages ---
+  function getPrintablePages() {
+    if (!file || pageList.length === 0) return [];
+    if (pageSelection === 'Custom Range') {
+      if (!customPageRange.trim()) return pageList;
+      const selectedIndices = parseCustomPages(customPageRange, totalDocPages);
+      if (selectedIndices === null) return [];
+      return selectedIndices.map(idx => pageList[idx]).filter(Boolean);
+    }
+    return pageList.filter(p => p.selected);
+  }
+
   // --- Helper: Calculate Selected Count & Price ---
   function getSelectedPagesCount() {
     if (!file) return 0;
-    if (pageSelection === 'Custom Range') {
-      const parsed = parseCustomPages(customPageRange, totalDocPages);
-      if (parsed === null) return 0;
-      return parsed.length;
-    }
-    return pageList.filter(p => p.selected).length;
+    return getPrintablePages().length;
   }
 
   function updatePriceAndReviewSummary() {
@@ -897,8 +904,16 @@
     convertedPdfBytes = null;
     totalDocPages = 0;
     pageList = [];
+    pageSelection = 'All Pages';
     customPageRange = '';
     activeSideIndex = 0;
+    copies = 1;
+    if (copiesValDisplay) copiesValDisplay.textContent = '1';
+    if (btnPageSelectionAll) btnPageSelectionAll.classList.add('active');
+    if (btnPageSelectionCustom) btnPageSelectionCustom.classList.remove('active');
+    if (customRangeBox) customRangeBox.classList.add('hidden');
+    if (customRangeInput) customRangeInput.value = '';
+    if (customRangeFeedback) customRangeFeedback.textContent = '';
     if (fileInput) fileInput.value = '';
     if (uploadSection) uploadSection.classList.remove('hidden');
     if (uploadArea) {
@@ -1108,8 +1123,8 @@
   async function renderLiveSheet() {
     if (!livePreviewCanvas || pageList.length === 0) return;
 
-    // Determine the list of pages selected to print
-    const printablePages = pageList.filter(p => p.selected);
+    // Determine the list of pages selected to print in requested order
+    const printablePages = getPrintablePages();
     if (printablePages.length === 0) {
       if (previewSheetBadge) previewSheetBadge.textContent = '0 pages selected';
       if (sheetPageIndicator) sheetPageIndicator.textContent = 'No pages selected';
@@ -1400,7 +1415,7 @@
 
   if (btnSheetNext) {
     btnSheetNext.addEventListener('click', () => {
-      const printablePages = pageList.filter(p => p.selected);
+      const printablePages = getPrintablePages();
       const isDouble = (sides === 'Double-sided');
       const totalSides = (isDouble && printablePages.length % 2 !== 0)
         ? printablePages.length + 1
@@ -1416,8 +1431,8 @@
   async function prepareUploadDocument() {
     if (!file) return file;
 
-    const selectedPages = pageList.filter(p => p.selected);
-    if (selectedPages.length === 0) {
+    const printablePages = getPrintablePages();
+    if (printablePages.length === 0) {
       throw new Error('Please select at least 1 page to print.');
     }
 

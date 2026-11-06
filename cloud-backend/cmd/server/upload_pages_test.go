@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -276,3 +278,210 @@ func TestUpload_DuplexOddPagesFinalSheetBlankBackInPDF(t *testing.T) {
 		t.Errorf("Command.Duplex = %v, want DUPLEX_LONG_EDGE", order.Command.Duplex)
 	}
 }
+
+func getPageText(t *testing.T, pdfPath string, pageNum int) string {
+	t.Helper()
+	cmd := exec.Command("pdftotext", "-f", strconv.Itoa(pageNum), "-l", strconv.Itoa(pageNum), pdfPath, "-")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pdftotext page %d failed: %s: %v", pageNum, strings.TrimSpace(string(out)), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func getPDFPageCount(t *testing.T, pdfPath string) int {
+	t.Helper()
+	cmd := exec.Command("qpdf", "--show-npages", pdfPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("qpdf --show-npages failed: %s: %v", strings.TrimSpace(string(out)), err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("failed to parse page count %q: %v", strings.TrimSpace(string(out)), err)
+	}
+	return count
+}
+
+func TestUpload_10PagePDF_Select_2_4_6_Simplex(t *testing.T) {
+	// Requirement 11: Test a 10-page PDF selecting 2,4,6 and verify the backend output contains exactly those pages in order.
+	app, mux := setupUploadTestServer(t)
+	tmpDir := t.TempDir()
+
+	doc10p := createTestPDFWithPages(t, tmpDir, 10)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	fileBytes, err := os.ReadFile(doc10p)
+	if err != nil {
+		t.Fatalf("failed to read doc10p: %v", err)
+	}
+	part, _ := writer.CreateFormFile("file", "document10p.pdf")
+	_, _ = part.Write(fileBytes)
+	_ = writer.WriteField("copies", "1")
+	_ = writer.WriteField("duplex", "SIMPLEX")
+	_ = writer.WriteField("page_range", "2,4,6")
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rr := httptest.NewRecorder()
+
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload failed with code %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json parse error: %v", err)
+	}
+
+	if int(resp["total_pages"].(float64)) != 3 {
+		t.Errorf("total_pages = %v, want 3", resp["total_pages"])
+	}
+	if int(resp["total_sheets"].(float64)) != 3 {
+		t.Errorf("total_sheets = %v, want 3", resp["total_sheets"])
+	}
+
+	orderID := resp["order_id"].(string)
+	h := sha256.Sum256([]byte(orderID))
+	outputPath := filepath.Join(app.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
+
+	actualPages := getPDFPageCount(t, outputPath)
+	if actualPages != 3 {
+		t.Fatalf("output PDF total pages = %d, want 3", actualPages)
+	}
+
+	p1 := getPageText(t, outputPath, 1)
+	p2 := getPageText(t, outputPath, 2)
+	p3 := getPageText(t, outputPath, 3)
+
+	if !strings.Contains(p1, "Page 2") {
+		t.Errorf("output PDF Page 1 content = %q, want Page 2", p1)
+	}
+	if !strings.Contains(p2, "Page 4") {
+		t.Errorf("output PDF Page 2 content = %q, want Page 4", p2)
+	}
+	if !strings.Contains(p3, "Page 6") {
+		t.Errorf("output PDF Page 3 content = %q, want Page 6", p3)
+	}
+}
+
+func TestUpload_10PagePDF_Select_2_4_6_Duplex(t *testing.T) {
+	// Requirement 12: Test the same selection in duplex: sheet 1 = pages 2/4, sheet 2 = page 6/blank.
+	// Requirement 13: Test 3 pages x 2 duplex copies = 6 printed sides and 4 physical sheets.
+	app, mux := setupUploadTestServer(t)
+	tmpDir := t.TempDir()
+
+	doc10p := createTestPDFWithPages(t, tmpDir, 10)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	fileBytes, _ := os.ReadFile(doc10p)
+	part, _ := writer.CreateFormFile("file", "document10p.pdf")
+	_, _ = part.Write(fileBytes)
+	_ = writer.WriteField("copies", "2")
+	_ = writer.WriteField("duplex", "DUPLEX_LONG_EDGE")
+	_ = writer.WriteField("page_range", "2,4,6")
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rr := httptest.NewRecorder()
+
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload failed with code %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json parse error: %v", err)
+	}
+
+	if int(resp["total_pages"].(float64)) != 3 {
+		t.Errorf("total_pages = %v, want 3", resp["total_pages"])
+	}
+	if int(resp["total_sheets"].(float64)) != 4 {
+		t.Errorf("total_sheets = %v, want 4 (ceil(3/2)*2 sheets)", resp["total_sheets"])
+	}
+	if int(resp["copies"].(float64)) != 2 {
+		t.Errorf("copies = %v, want 2", resp["copies"])
+	}
+	if int64(resp["total_price_paise"].(float64)) != 1200 {
+		t.Errorf("total_price_paise = %v, want 1200 (6 printed sides * 200 paise)", resp["total_price_paise"])
+	}
+
+	orderID := resp["order_id"].(string)
+	h := sha256.Sum256([]byte(orderID))
+	outputPath := filepath.Join(app.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
+
+	// Padded PDF must have 4 pages per copy boundary
+	actualPages := getPDFPageCount(t, outputPath)
+	if actualPages != 4 {
+		t.Fatalf("output PDF total pages = %d, want 4", actualPages)
+	}
+
+	// Sheet 1: Front = Page 2, Back = Page 4
+	p1 := getPageText(t, outputPath, 1)
+	p2 := getPageText(t, outputPath, 2)
+	// Sheet 2: Front = Page 6, Back = Blank
+	p3 := getPageText(t, outputPath, 3)
+	p4 := getPageText(t, outputPath, 4)
+
+	if !strings.Contains(p1, "Page 2") {
+		t.Errorf("Sheet 1 Front content = %q, want Page 2", p1)
+	}
+	if !strings.Contains(p2, "Page 4") {
+		t.Errorf("Sheet 1 Back content = %q, want Page 4", p2)
+	}
+	if !strings.Contains(p3, "Page 6") {
+		t.Errorf("Sheet 2 Front content = %q, want Page 6", p3)
+	}
+	if strings.TrimSpace(p4) != "" {
+		t.Errorf("Sheet 2 Back content = %q, want blank", p4)
+	}
+}
+
+func TestUpload_OfficeConvertedPDF_WithPageRange(t *testing.T) {
+	// Requirement 14: Test Office-converted PDFs with page selection
+	_, mux := setupUploadTestServer(t)
+	tmpDir := t.TempDir()
+
+	// Create a text file that converts into a 1-page PDF
+	txtFile := filepath.Join(tmpDir, "assignment.txt")
+	if err := os.WriteFile(txtFile, []byte("Assignment Document Header\nHello XeroxGo!"), 0600); err != nil {
+		t.Fatalf("failed to write txt file: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	fileBytes, _ := os.ReadFile(txtFile)
+	part, _ := writer.CreateFormFile("file", "assignment.txt")
+	_, _ = part.Write(fileBytes)
+	_ = writer.WriteField("copies", "1")
+	_ = writer.WriteField("duplex", "SIMPLEX")
+	_ = writer.WriteField("page_range", "1")
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rr := httptest.NewRecorder()
+
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload failed: code %d, body: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+
+	if int(resp["total_pages"].(float64)) != 1 {
+		t.Errorf("total_pages = %v, want 1", resp["total_pages"])
+	}
+	if int(resp["total_sheets"].(float64)) != 1 {
+		t.Errorf("total_sheets = %v, want 1", resp["total_sheets"])
+	}
+}
+
