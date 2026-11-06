@@ -617,6 +617,34 @@
     }
   }
 
+  async function convertDocumentSynchronously(selectedFile, signal, thisGen) {
+    const titleEl = document.getElementById('conv-status-title');
+    const descEl = document.getElementById('conv-status-desc');
+    const fillEl = document.getElementById('conv-progress-fill');
+    if (titleEl) titleEl.textContent = 'Converting document to PDF...';
+    if (descEl) descEl.textContent = 'Processing with server conversion engine';
+    if (fillEl) fillEl.style.width = '70%';
+
+    const formData = new FormData();
+    formData.append('file', selectedFile);
+
+    const resp = await fetch('/api/convert', {
+      method: 'POST',
+      body: formData,
+      signal: signal
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(errText || 'Conversion failed on server');
+    }
+
+    if (fillEl) fillEl.style.width = '95%';
+    const pdfArrayBuffer = await resp.arrayBuffer();
+    if (thisGen !== conversionGen) return null;
+    return pdfArrayBuffer;
+  }
+
   async function convertDocumentOnServer(selectedFile, thisGen) {
     const abortController = new AbortController();
     activeConversion = { abortController, pollTimeoutId: null, jobId: null };
@@ -648,12 +676,25 @@
     const formData = new FormData();
     formData.append('file', selectedFile);
 
-    // 1. Submit asynchronous conversion job
-    const resp = await fetch('/api/conversions', {
-      method: 'POST',
-      body: formData,
-      signal: abortController.signal
-    });
+    // 1. Submit asynchronous conversion job with fallback to synchronous /api/convert
+    let resp;
+    try {
+      resp = await fetch('/api/conversions', {
+        method: 'POST',
+        body: formData,
+        signal: abortController.signal
+      });
+    } catch (fetchErr) {
+      if (fetchErr.name === 'AbortError') throw fetchErr;
+      console.warn('Network error on /api/conversions, falling back to /api/convert:', fetchErr);
+      return await convertDocumentSynchronously(selectedFile, abortController.signal, thisGen);
+    }
+
+    if (resp.status === 404) {
+      console.warn('/api/conversions returned 404, falling back to /api/convert');
+      return await convertDocumentSynchronously(selectedFile, abortController.signal, thisGen);
+    }
+
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(errText || 'Failed to submit document for conversion');
@@ -704,6 +745,10 @@
       const pollResp = await fetch(`/api/conversions/${encodeURIComponent(createData.job_id)}?token=${encodeURIComponent(createData.token)}`, {
         signal: abortController.signal
       });
+      if (pollResp.status === 404) {
+        console.warn('Poll endpoint returned 404, falling back to /api/convert');
+        return await convertDocumentSynchronously(selectedFile, abortController.signal, thisGen);
+      }
       if (!pollResp.ok) {
         const errText = await pollResp.text();
         throw new Error(errText || 'Failed to check conversion status');
