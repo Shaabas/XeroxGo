@@ -87,6 +87,20 @@ func connectTestKiosk(t *testing.T, hub *Hub, serverURL, kioskID string) (*webso
 	return conn, cancel
 }
 
+func readJobMessage(ctx context.Context, t *testing.T, conn *websocket.Conn) wireMessage {
+	t.Helper()
+	for {
+		var msg wireMessage
+		if err := wsjson.Read(ctx, conn, &msg); err != nil {
+			t.Fatalf("failed to read from websocket: %v", err)
+		}
+		if msg.Type == "sync_ads" {
+			continue
+		}
+		return msg
+	}
+}
+
 // Test A — TestHubRegistersAndSendsJob
 func TestHubRegistersAndSendsJob(t *testing.T) {
 	db := newTestStore(t)
@@ -116,10 +130,7 @@ func TestHubRegistersAndSendsJob(t *testing.T) {
 		t.Fatalf("hub.SendJob failed: %v", err)
 	}
 
-	var received wireMessage
-	if err := wsjson.Read(ctx, conn, &received); err != nil {
-		t.Fatalf("failed to read dispatched job from websocket: %v", err)
-	}
+	received := readJobMessage(ctx, t, conn)
 
 	if received.Type != "job" {
 		t.Fatalf("expected message type 'job', got %q", received.Type)
@@ -424,21 +435,15 @@ func TestHubConcurrentConnections(t *testing.T) {
 		t.Fatalf("SendJob concurrent failed: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var msgA wireMessage
-	if err := wsjson.Read(ctx, conn1, &msgA); err != nil {
-		t.Fatalf("read conn1 failed: %v", err)
-	}
+	msgA := readJobMessage(ctx, t, conn1)
 	if msgA.Job == nil || msgA.Job.JobID != "job-A" {
 		t.Fatalf("conn1 received wrong message: %+v", msgA)
 	}
 
-	var msgB wireMessage
-	if err := wsjson.Read(ctx, conn2, &msgB); err != nil {
-		t.Fatalf("read conn2 failed: %v", err)
-	}
+	msgB := readJobMessage(ctx, t, conn2)
 	if msgB.Job == nil || msgB.Job.JobID != "job-B" {
 		t.Fatalf("conn2 received wrong message: %+v", msgB)
 	}

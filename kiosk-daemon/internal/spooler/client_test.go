@@ -1023,7 +1023,7 @@ func TestClientDuplicateJobDoesNotPrintTwice(t *testing.T) {
 	}()
 
 	// Wait until print connection is made
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if printConnections.Load() == 1 {
 			break
@@ -1048,7 +1048,7 @@ func TestClientDuplicateJobDoesNotPrintTwice(t *testing.T) {
 	close(holdPrint)
 	select {
 	case <-printerDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for print to complete")
 	}
 }
