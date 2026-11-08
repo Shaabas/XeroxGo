@@ -1,60 +1,62 @@
 /**
  * XeroxGo Mobile Upload & Print Portal
- * Pure vanilla JavaScript implementation reproducing the reference UI flow.
+ * Responsive Mobile UX matching reference design:
+ * 1. Files Cart (Multi-file upload, document cards, delete, preview, edit settings, review order)
+ * 2. Document Settings (Page selection, copies stepper, B&W/Color, single/double sided, orientation, 1-up/2-up)
+ * 3. Print Preview (PDF.js canvas rendering, Sheet X of Y (Front/Back) pager, Flip Sheet action)
+ * 4. Checkout/PIN (4 large PIN boxes, 15m expiration, Copy PIN, order summary, live kiosk status)
  */
 
 (function () {
   'use strict';
 
   // --- Configuration from DOM ---
-  const container = document.querySelector('.app-container');
+  const container = document.getElementById('app-container') || document.querySelector('.app-container');
   if (!container) return;
 
-  let kioskID = container.dataset.kioskId;
+  let kioskID = container.dataset.kioskId || 'kiosk-demo';
   const pathMatch = window.location.pathname.match(/\/k\/([^/]+)/);
   const searchParams = new URLSearchParams(window.location.search);
   const urlKiosk = (pathMatch && pathMatch[1]) || searchParams.get('kiosk_id');
   if (urlKiosk) {
     kioskID = urlKiosk;
-  } else if (!kioskID) {
-    kioskID = 'kiosk-demo';
   }
   const devMode = container.dataset.devMode === 'true';
+
+  // Rates in paise (Authoritative defaults)
   let bwSimplexPricePaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
   let bwDuplexPricePaise = 150;
   let colorSimplexPricePaise = 1000;
   let colorDuplexPricePaise = 750;
   let colorHardwareEnabled = false;
-  let bwPricePerSheetPaise = bwSimplexPricePaise;
-  let colorPricePerSheetPaise = colorSimplexPricePaise;
 
-  // --- State Variables ---
-  let file = null;
-  let fileBuffer = null;
-  let convertedPdfBytes = null;
-  let pdfLibDoc = null;
-  let pdfJsDoc = null;
-  let totalDocPages = 0;
-  let pageList = [];
-  let pageSelection = 'All Pages';
-  let customPageRange = '';
-  let customRangeError = '';
-  let copies = 1;
-  let mode = 'B&W';
-  let sides = 'Single-sided';
-  let pagesPerSheet = '1';
-  let userName = '';
-  let activeOrderID = null;
-  let pollTimer = null;
-  let activeSideIndex = 0;
-  let deferredPwaPrompt = null;
+  // --- Views DOM ---
+  const viewCart = document.getElementById('view-cart');
+  const viewSettings = document.getElementById('view-settings');
+  const viewPreview = document.getElementById('view-preview');
+  const viewCheckout = document.getElementById('view-checkout');
 
-  // --- DOM Elements ---
+  // View 1 (Cart) DOM
+  const cartUploadCard = document.getElementById('cart-upload-card');
+  const btnChooseFiles = document.getElementById('btn-choose-files');
+  const fileInput = document.getElementById('file-input');
+  const uploadProcessingIndicator = document.getElementById('upload-processing-indicator');
+  const uploadProcessingText = document.getElementById('upload-processing-text');
+  const cartAlert = document.getElementById('cart-alert');
+  const cartDocList = document.getElementById('cart-doc-list');
+  const cartEmptyPlaceholder = document.getElementById('cart-empty-placeholder');
+  const cartBottomBar = document.getElementById('cart-bottom-bar');
+  const cartDocsCount = document.getElementById('cart-docs-count');
+  const cartTotalAmount = document.getElementById('cart-total-amount');
+  const btnReviewOrder = document.getElementById('btn-review-order');
+
+  // Banner Carousel DOM
   const bannerTrack = document.getElementById('banner-track');
   const bannerDots = document.getElementById('banner-dots');
   const bannerCloseBtn = document.getElementById('banner-close-btn');
-  const bannerContainer = document.getElementById('promo-banner');
+  const promoBanner = document.getElementById('promo-banner');
 
+  // PWA DOM
   const pwaInstallBanner = document.getElementById('pwa-install-banner');
   const pwaDismissBtn = document.getElementById('pwa-dismiss-btn');
   const pwaInstallBtn = document.getElementById('pwa-install-btn');
@@ -63,150 +65,114 @@
   const pwaGuideModal = document.getElementById('pwa-guide-modal');
   const pwaModalCloseBtn = document.getElementById('pwa-modal-close-btn');
   const pwaModalGotItBtn = document.getElementById('pwa-modal-gotit-btn');
+  let deferredPwaPrompt = null;
 
-  const uploadSection = document.getElementById('upload-section');
-  const uploadArea = document.getElementById('upload-area');
-  const fileInput = document.getElementById('file-input');
-  const filePreviewCard = document.getElementById('file-preview-card');
-  const fileNameDisplay = document.getElementById('file-name-display');
-  const fileMetaDisplay = document.getElementById('file-meta-display');
-  const removeFileBtn = document.getElementById('remove-file-btn');
-  const uploadAlert = document.getElementById('upload-alert');
+  // View 2 (Settings) DOM
+  const btnSettingsBack = document.getElementById('btn-settings-back');
+  const settingsFilename = document.getElementById('settings-filename');
+  const btnSettingsMenu = document.getElementById('btn-settings-menu');
+  const settingsMenuDropdown = document.getElementById('settings-menu-dropdown');
+  const menuOptReset = document.getElementById('menu-opt-reset');
+  const menuOptDelete = document.getElementById('menu-opt-delete');
 
-  const printOptionsSection = document.getElementById('print-options-section');
-  const btnPageSelectionAll = document.getElementById('btn-page-selection-all');
-  const btnPageSelectionCustom = document.getElementById('btn-page-selection-custom');
-  const customRangeBox = document.getElementById('custom-range-box');
-  const customRangeInput = document.getElementById('custom-range-input');
-  const customRangeFeedback = document.getElementById('custom-range-feedback');
+  const btnOptAllPages = document.getElementById('btn-opt-all-pages');
+  const btnOptCustomRange = document.getElementById('btn-opt-custom-range');
+  const settingsCustomRangeWrapper = document.getElementById('settings-custom-range-wrapper');
+  const inputCustomRange = document.getElementById('input-custom-range');
+  const customRangeError = document.getElementById('custom-range-error');
 
-  const copiesDecBtn = document.getElementById('copies-dec');
-  const copiesIncBtn = document.getElementById('copies-inc');
-  const copiesValDisplay = document.getElementById('copies-val');
+  const btnCopiesMinus = document.getElementById('btn-copies-minus');
+  const btnCopiesPlus = document.getElementById('btn-copies-plus');
+  const copiesCountDisplay = document.getElementById('copies-count-display');
 
-  const btnModeBW = document.getElementById('btn-mode-bw');
-  const btnModeColor = document.getElementById('btn-mode-color');
-  const btnSideSingle = document.getElementById('btn-side-single');
-  const btnSideDouble = document.getElementById('btn-side-double');
+  const cardModeBw = document.getElementById('card-mode-bw');
+  const cardModeColor = document.getElementById('card-mode-color');
+  const settingsBwPriceLabel = document.getElementById('settings-bw-price-label');
+  const settingsColorPriceLabel = document.getElementById('settings-color-price-label');
 
-  const btnNUp1 = document.getElementById('btn-nup-1');
-  const btnNUp2 = document.getElementById('btn-nup-2');
+  const cardSideSingle = document.getElementById('card-side-single');
+  const cardSideDouble = document.getElementById('card-side-double');
 
-  const reviewSection = document.getElementById('review-section');
-  const reviewCard = document.getElementById('review-card');
-  const summaryFileName = document.getElementById('summary-file-name');
-  const summaryPages = document.getElementById('summary-pages');
-  const summaryOptions = document.getElementById('summary-options');
-  const summaryCopies = document.getElementById('summary-copies');
-  const summaryPrice = document.getElementById('summary-price');
-  const btnEditSettings = document.getElementById('btn-edit-settings');
-  const userNameInput = document.getElementById('user-name-input');
-  const btnPayUpi = document.getElementById('btn-pay-upi');
-  const uploadProgressCard = document.getElementById('upload-progress-card');
-  const uploadProgressBar = document.getElementById('upload-progress-bar');
-  const reviewAlert = document.getElementById('review-alert');
+  const btnOrientAuto = document.getElementById('btn-orient-auto');
+  const btnOrientPortrait = document.getElementById('btn-orient-portrait');
+  const btnOrientLandscape = document.getElementById('btn-orient-landscape');
 
-  // Status & Tracking DOM
-  const statusSection = document.getElementById('status-section');
-  const statusDisplayCode = document.getElementById('status-display-code');
-  const statusBadge = document.getElementById('status-badge');
-  const statusProgressFill = document.getElementById('status-progress-fill');
-  const statusPagesText = document.getElementById('status-pages-text');
-  const statusSheetsText = document.getElementById('status-sheets-text');
-  const statusErrorAlert = document.getElementById('status-error-alert');
-  const devSimulatePaymentBtn = document.getElementById('dev-simulate-payment-btn');
-  const upiPayButtonContainer = document.getElementById('upi-pay-container');
-  const statusSuccessAlert = document.getElementById('status-success-alert');
+  const cardNup1 = document.getElementById('card-nup-1');
+  const cardNup2 = document.getElementById('card-nup-2');
 
-  // Live Sheet Preview DOM
-  const liveSheetContainer = document.getElementById('live-sheet-container');
-  const paperSheet = document.getElementById('paper-sheet');
-  const livePreviewCanvas = document.getElementById('live-preview-canvas');
-  const sheetLoadingSpinner = document.getElementById('sheet-loading-spinner');
-  const sheetSpinnerText = document.getElementById('sheet-spinner-text');
-  const sheetFallback = document.getElementById('sheet-fallback');
-  const sheetFallbackTitle = document.getElementById('sheet-fallback-title');
-  const sheetFallbackDesc = document.getElementById('sheet-fallback-desc');
-  const previewColorBadge = document.getElementById('preview-color-badge');
-  const previewSheetBadge = document.getElementById('preview-sheet-badge');
-  const sheetPageIndicator = document.getElementById('sheet-page-indicator');
-  const btnSheetPrev = document.getElementById('btn-sheet-prev');
-  const btnSheetNext = document.getElementById('btn-sheet-next');
+  const btnSaveDocSettings = document.getElementById('btn-save-doc-settings');
+  const saveSettingsPrice = document.getElementById('save-settings-price');
+
+  // View 3 (Preview) DOM
+  const btnPreviewBack = document.getElementById('btn-preview-back');
+  const previewFilename = document.getElementById('preview-filename');
+  const btnPreviewMenu = document.getElementById('btn-preview-menu');
+  const previewMenuDropdown = document.getElementById('preview-menu-dropdown');
+  const previewMenuSettings = document.getElementById('preview-menu-settings');
+
+  const previewLoadingSpinner = document.getElementById('preview-loading-spinner');
+  const previewErrorBox = document.getElementById('preview-error-box');
+  const previewCanvas = document.getElementById('preview-canvas');
+  const btnSheetLeft = document.getElementById('btn-sheet-left');
+  const btnSheetRight = document.getElementById('btn-sheet-right');
+  const previewSheetIndicator = document.getElementById('preview-sheet-indicator');
   const btnSheetFlip = document.getElementById('btn-sheet-flip');
-  const sheetFlipText = document.getElementById('sheet-flip-text');
 
-  // Preview State & Resource Management
-  let imageElement = null;
-  let imageBlobUrl = null;
-  let isImageDoc = false;
+  // View 4 (Checkout) DOM
+  const pinBoxes = [
+    document.getElementById('pin-box-0'),
+    document.getElementById('pin-box-1'),
+    document.getElementById('pin-box-2'),
+    document.getElementById('pin-box-3')
+  ];
+  const pinExpiryText = document.getElementById('pin-expiry-text');
+  const btnCopyPin = document.getElementById('btn-copy-pin');
+  const btnCopyPinLabel = document.getElementById('btn-copy-pin-label');
+  const checkoutDocsCount = document.getElementById('checkout-docs-count');
+  const checkoutTotalAmount = document.getElementById('checkout-total-amount');
+  const checkoutLiveStatusBox = document.getElementById('checkout-live-status-box');
+  const checkoutStatusPill = document.getElementById('checkout-status-pill');
+  const checkoutProgressBar = document.getElementById('checkout-progress-bar');
+  const checkoutStatusMsg = document.getElementById('checkout-status-msg');
+  const btnStartNewOrder = document.getElementById('btn-start-new-order');
 
+  // --- Application State ---
+  let cartItems = [];
+  let activeSettingsDocId = null;
+  let draftSettings = null;
+
+  let activePreviewDocId = null;
+  let currentPreviewSheet = 1;
+  let currentPreviewSide = 'front';
   let activeRenderTask = null;
-  let currentRenderGen = 0;
-  const MAX_CACHED_PAGES = 3;
-  const pageRenderCache = new Map();
 
-  function clearPageCache() {
-    pageRenderCache.clear();
+  let activeOrderId = null;
+  let activeDisplayCode = '';
+  let orderPollTimer = null;
+  let expiryCountdownTimer = null;
+
+  // --- Formatting Helpers ---
+  function formatRupees(paise) {
+    if (typeof paise !== 'number' || isNaN(paise) || paise < 0) return '₹0.00';
+    return '₹' + (paise / 100).toFixed(2);
   }
 
-  function showFallbackPreview(title, desc) {
-    if (sheetFallback) {
-      sheetFallback.classList.remove('hidden');
-      sheetFallback.style.display = 'flex';
-      if (sheetFallbackTitle) sheetFallbackTitle.textContent = title || 'Preview Unavailable';
-      if (sheetFallbackDesc) sheetFallbackDesc.textContent = desc || 'Document is ready to print';
-    }
-    if (livePreviewCanvas) livePreviewCanvas.style.display = 'none';
-    if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>'"]/g, tag => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      "'": '&#39;',
+      '"': '&quot;'
+    }[tag] || tag));
   }
 
-  function hideFallbackPreview() {
-    if (sheetFallback) {
-      sheetFallback.classList.add('hidden');
-      sheetFallback.style.display = 'none';
-    }
-    if (livePreviewCanvas) livePreviewCanvas.style.display = 'block';
-  }
-
-  // --- Ensure PDF.js is available with absolute workerSrc ---
-  async function ensurePdfjs() {
-    if (window.pdfjsLib) {
-      if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
-        try {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('/vendor/pdf.worker.min.mjs', window.location.href).href;
-        } catch (_) {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
-        }
-      }
-      return window.pdfjsLib;
-    }
-    return new Promise((resolve) => {
-      let resolved = false;
-      const onReady = (e) => {
-        if (resolved) return;
-        resolved = true;
-        window.removeEventListener('pdfjs-ready', onReady);
-        resolve(e.detail || window.pdfjsLib);
-      };
-      window.addEventListener('pdfjs-ready', onReady);
-      if (window.pdfjsLib) {
-        resolved = true;
-        window.removeEventListener('pdfjs-ready', onReady);
-        resolve(window.pdfjsLib);
-      }
-      setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          window.removeEventListener('pdfjs-ready', onReady);
-          resolve(window.pdfjsLib || null);
-        }
-      }, 2500);
-    });
-  }
-
-  // --- Helper: Parse Custom Range String ---
+  // Parses ranges like "1-3, 5" into 1-based page numbers [1, 2, 3, 5]
   function parseCustomPages(rangeStr, maxPages) {
-    if (!rangeStr || !rangeStr.trim()) return [];
+    if (!rangeStr || !rangeStr.trim()) {
+      return { valid: false, error: 'Please enter a page range (e.g. 1-3, 5)', pages: [] };
+    }
     const parts = rangeStr.split(',');
     const selected = [];
     const seen = new Set();
@@ -217,324 +183,213 @@
 
       if (part.includes('-')) {
         const segs = part.split('-');
-        if (segs.length !== 2) return null;
-        const startStr = segs[0].trim();
-        const endStr = segs[1].trim();
-        if (!startStr || !endStr) return null;
-        const start = parseInt(startStr, 10);
-        const end = parseInt(endStr, 10);
-        if (isNaN(start) || isNaN(end) || start < 1 || start > end || end > maxPages) return null;
+        if (segs.length !== 2) {
+          return { valid: false, error: `Invalid range format: "${part}"`, pages: [] };
+        }
+        const start = parseInt(segs[0].trim(), 10);
+        const end = parseInt(segs[1].trim(), 10);
+        if (isNaN(start) || isNaN(end) || start < 1 || start > end) {
+          return { valid: false, error: `Invalid range bounds: "${part}"`, pages: [] };
+        }
+        if (end > maxPages) {
+          return { valid: false, error: `Page ${end} exceeds total pages (${maxPages})`, pages: [] };
+        }
         for (let i = start; i <= end; i++) {
-          const idx = i - 1;
-          if (!seen.has(idx)) {
-            seen.add(idx);
-            selected.push(idx);
+          if (!seen.has(i)) {
+            seen.add(i);
+            selected.push(i);
           }
         }
       } else {
         const p = parseInt(part, 10);
-        if (isNaN(p) || p < 1 || p > maxPages) return null;
-        const idx = p - 1;
-        if (!seen.has(idx)) {
-          seen.add(idx);
-          selected.push(idx);
+        if (isNaN(p) || p < 1) {
+          return { valid: false, error: `Invalid page number: "${part}"`, pages: [] };
+        }
+        if (p > maxPages) {
+          return { valid: false, error: `Page ${p} exceeds total pages (${maxPages})`, pages: [] };
+        }
+        if (!seen.has(p)) {
+          seen.add(p);
+          selected.push(p);
         }
       }
     }
-    return selected;
-  }
 
-  // --- Helper: Format Currency ---
-  function formatRupees(paise) {
-    if (typeof paise !== 'number' || isNaN(paise) || paise <= 0) return '₹0';
-    const rupees = paise / 100;
-    if (paise % 100 === 0) {
-      return '₹' + rupees.toFixed(0);
+    if (selected.length === 0) {
+      return { valid: false, error: 'No valid pages selected', pages: [] };
     }
-    return '₹' + rupees.toFixed(2);
+    return { valid: true, error: null, pages: selected };
   }
 
-  // --- Quote State Tracking ---
-  let pricingLoaded = false;
-  let backendConfirmedPricePaise = null;
-  let backendConfirmedOrderID = null;
-
-  function invalidateQuote() {
-    backendConfirmedPricePaise = null;
-    backendConfirmedOrderID = null;
-    activeOrderID = null;
-  }
-
-  // --- Helper: Dynamic Rate Labels ---
-  function updateRateLabels() {
-    const isDouble = sides === 'Double-sided';
-    const activeBwRate = isDouble ? bwDuplexPricePaise : bwSimplexPricePaise;
-    const activeColorRate = isDouble ? colorDuplexPricePaise : colorSimplexPricePaise;
-
-    const bwLabel = document.getElementById('price-bw-label');
-    if (bwLabel) {
-      bwLabel.textContent = `₹${(activeBwRate / 100).toFixed(2)}/side`;
+  // Authoritative per-document price calculation in integer paise
+  function calculateDocPrice(totalPages, settings) {
+    let pagesCount = totalPages;
+    if (settings.pageSelection === 'Custom Range' && settings.customPageRange) {
+      const parsed = parseCustomPages(settings.customPageRange, totalPages);
+      if (parsed.valid && parsed.pages.length > 0) {
+        pagesCount = parsed.pages.length;
+      }
     }
-    const colorLabel = document.getElementById('price-color-label');
-    if (colorLabel) {
-      colorLabel.textContent = `₹${(activeColorRate / 100).toFixed(2)}/side`;
-    }
-  }
 
-  // --- Helper: Get Ordered Printable Pages ---
-  function getPrintablePages() {
-    if (!file || pageList.length === 0) return [];
-    if (pageSelection === 'Custom Range') {
-      if (!customPageRange.trim()) return pageList;
-      const selectedIndices = parseCustomPages(customPageRange, totalDocPages);
-      if (selectedIndices === null) return [];
-      return selectedIndices.map(idx => pageList[idx]).filter(Boolean);
-    }
-    return pageList.filter(p => p.selected);
-  }
-
-  // --- Helper: Calculate Selected Count & Price ---
-  function getSelectedPagesCount() {
-    if (!file) return 0;
-    return getPrintablePages().length;
-  }
-
-  function updatePriceAndReviewSummary() {
-    const selectedCount = getSelectedPagesCount();
-    const isDouble = sides === 'Double-sided';
-    const totalPrintedPages = selectedCount * copies;
-    const sheetsPerCopy = isDouble ? Math.ceil(selectedCount / 2) : selectedCount;
-    const totalPhysicalSheets = sheetsPerCopy * copies;
-
-    let activePrice;
-    if (mode === 'Color' && colorHardwareEnabled) {
-      activePrice = isDouble ? colorDuplexPricePaise : colorSimplexPricePaise;
+    let ratePaise = bwSimplexPricePaise;
+    if (settings.mode === 'Color') {
+      ratePaise = (settings.sides === 'Double-sided') ? colorDuplexPricePaise : colorSimplexPricePaise;
     } else {
-      activePrice = isDouble ? bwDuplexPricePaise : bwSimplexPricePaise;
+      ratePaise = (settings.sides === 'Double-sided') ? bwDuplexPricePaise : bwSimplexPricePaise;
     }
-    const isPriceValid = pricingLoaded && (activePrice > 0);
-    const estimatedPricePaise = isPriceValid ? (totalPrintedPages * activePrice) : 0;
-    const displayPricePaise = (backendConfirmedPricePaise !== null) ? backendConfirmedPricePaise : estimatedPricePaise;
 
-    if (summaryFileName) summaryFileName.textContent = file ? file.name : '-';
-    if (summaryPages) {
-      if (copies > 1) {
-        summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'} · ${totalPrintedPages} sides`;
-      } else {
-        summaryPages.textContent = `${selectedCount} ${selectedCount === 1 ? 'page' : 'pages'}`;
+    return pagesCount * settings.copies * ratePaise;
+  }
+
+  function getDocSelectedPages(totalPages, settings) {
+    if (settings.pageSelection === 'Custom Range' && settings.customPageRange) {
+      const parsed = parseCustomPages(settings.customPageRange, totalPages);
+      if (parsed.valid && parsed.pages.length > 0) {
+        return parsed.pages;
       }
     }
-    if (summaryOptions) {
-      summaryOptions.textContent = `${mode} · ${isDouble ? 'Double Side' : 'Single Side'} · ${totalPhysicalSheets} ${totalPhysicalSheets === 1 ? 'physical sheet' : 'physical sheets'}`;
-    }
-    if (summaryCopies) summaryCopies.textContent = `${copies} ${copies === 1 ? 'copy' : 'copies'}`;
-    if (summaryPrice) summaryPrice.textContent = formatRupees(displayPricePaise);
+    return Array.from({ length: totalPages }, (_, i) => i + 1);
+  }
 
-    // Requirement 13: Prevent checkout while pricing is pending, invalid, or inconsistent
-    if (btnPayUpi) {
-      if (!file || selectedCount === 0 || !isPriceValid || displayPricePaise <= 0) {
-        btnPayUpi.disabled = true;
-      } else {
-        btnPayUpi.disabled = false;
+  // --- View Navigation ---
+  function switchView(viewName, docId) {
+    [viewCart, viewSettings, viewPreview, viewCheckout].forEach(v => {
+      if (v) {
+        v.classList.remove('active-view');
+        v.classList.add('hidden');
+      }
+    });
+
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (viewName === 'cart') {
+      if (viewCart) {
+        viewCart.classList.remove('hidden');
+        viewCart.classList.add('active-view');
+      }
+      renderCart();
+    } else if (viewName === 'settings') {
+      if (viewSettings) {
+        viewSettings.classList.remove('hidden');
+        viewSettings.classList.add('active-view');
+      }
+      openSettings(docId);
+    } else if (viewName === 'preview') {
+      if (viewPreview) {
+        viewPreview.classList.remove('hidden');
+        viewPreview.classList.add('active-view');
+      }
+      openPreview(docId);
+    } else if (viewName === 'checkout') {
+      if (viewCheckout) {
+        viewCheckout.classList.remove('hidden');
+        viewCheckout.classList.add('active-view');
       }
     }
-
-    // Update feedback for custom range if visible
-    if (pageSelection === 'Custom Range') {
-      if (!customPageRange.trim()) {
-        customRangeFeedback.textContent = 'Enter pages to print (e.g. 1-3, 5)';
-        customRangeFeedback.style.color = 'var(--text-secondary)';
-      } else {
-        const parsed = parseCustomPages(customPageRange, totalDocPages);
-        if (parsed === null) {
-          customRangeFeedback.textContent = 'Invalid format or page number out of bounds';
-          customRangeFeedback.style.color = 'var(--danger-color)';
-        } else {
-          customRangeFeedback.textContent = `Selected ${parsed.length} page(s)`;
-          customRangeFeedback.style.color = 'var(--text-secondary)';
-        }
-      }
-    }
   }
 
-  // --- Promo Banner Carousel ---
-  let currentSlide = 0;
-  let totalSlides = 3;
-  let bannerTimer = null;
+  // --- View 1: Cart Implementation ---
+  function renderCart() {
+    if (!cartDocList) return;
 
-  function setSlide(index) {
-    if (totalSlides <= 0) return;
-    currentSlide = (index + totalSlides) % totalSlides;
-    if (bannerTrack) {
-      bannerTrack.style.transform = `translateX(-${currentSlide * 100}%)`;
+    if (cartItems.length === 0) {
+      cartDocList.innerHTML = '';
+      if (cartEmptyPlaceholder) cartEmptyPlaceholder.classList.remove('hidden');
+      if (cartBottomBar) cartBottomBar.classList.add('hidden');
+      return;
     }
-    if (bannerDots) {
-      const dots = bannerDots.querySelectorAll('.indicator');
-      dots.forEach((dot, idx) => {
-        dot.classList.toggle('active', idx === currentSlide);
+
+    if (cartEmptyPlaceholder) cartEmptyPlaceholder.classList.add('hidden');
+    if (cartBottomBar) cartBottomBar.classList.remove('hidden');
+
+    let totalCartPaise = 0;
+    cartDocList.innerHTML = '';
+
+    cartItems.forEach((item, index) => {
+      const itemPrice = calculateDocPrice(item.totalPages, item.settings);
+      item.pricePaise = itemPrice;
+      totalCartPaise += itemPrice;
+
+      const card = document.createElement('div');
+      card.className = 'doc-card';
+      card.dataset.id = item.id;
+
+      const pageCountText = item.settings.pageSelection === 'Custom Range' && item.settings.customPageRange
+        ? `${item.selectedPages.length} pages`
+        : `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
+
+      const sidesText = item.settings.sides === 'Double-sided' ? 'Double-sided' : 'Single-sided';
+      const metaText = `${pageCountText} · ${item.settings.mode} · ${sidesText}`;
+
+      const iconSvg = item.isImage
+        ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>`
+        : `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>`;
+
+      card.innerHTML = `
+        <div class="doc-card-top">
+          <div class="doc-icon-box">${iconSvg}</div>
+          <div class="doc-info">
+            <h4 class="doc-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h4>
+            <div class="doc-meta">${metaText}</div>
+          </div>
+          <div class="doc-price">${formatRupees(itemPrice)}</div>
+        </div>
+        <div class="doc-card-bottom">
+          <button type="button" class="btn-doc-delete" data-id="${item.id}">Delete</button>
+          <div class="doc-actions-right">
+            <button type="button" class="btn-doc-preview" data-id="${item.id}">Preview</button>
+            <button type="button" class="btn-doc-edit" data-id="${item.id}">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>
+              </svg>
+              Edit print settings
+            </button>
+          </div>
+        </div>
+      `;
+
+      // Event listeners
+      card.querySelector('.btn-doc-delete').addEventListener('click', (e) => {
+        e.stopPropagation();
+        removeDoc(item.id);
       });
-    }
-  }
 
-  function startBannerAutoSlide() {
-    if (bannerTimer) clearInterval(bannerTimer);
-    if (totalSlides > 1) {
-      bannerTimer = setInterval(() => {
-        setSlide(currentSlide + 1);
-      }, 5000);
-    }
-  }
-
-  function bindBannerDots() {
-    if (bannerDots) {
-      bannerDots.querySelectorAll('.indicator').forEach((dot, idx) => {
-        dot.addEventListener('click', () => {
-          setSlide(idx);
-          startBannerAutoSlide();
-        });
+      card.querySelector('.btn-doc-preview').addEventListener('click', (e) => {
+        e.stopPropagation();
+        switchView('preview', item.id);
       });
-    }
-  }
 
-  if (bannerCloseBtn && bannerContainer) {
-    bannerCloseBtn.addEventListener('click', () => {
-      if (bannerTimer) clearInterval(bannerTimer);
-      bannerContainer.style.display = 'none';
+      card.querySelector('.btn-doc-edit').addEventListener('click', (e) => {
+        e.stopPropagation();
+        switchView('settings', item.id);
+      });
+
+      cartDocList.appendChild(card);
     });
-  }
 
-  bindBannerDots();
-  startBannerAutoSlide();
-
-  // Dynamic Ad Fetching & Synchronization
-  async function loadDynamicAds() {
-    try {
-      const res = await fetch('/api/ads');
-      if (!res.ok) return;
-      const data = await res.json();
-      const ads = Array.isArray(data) ? data : (data.ads || []);
-      if (!Array.isArray(ads) || ads.length === 0) return;
-
-      if (!bannerTrack || !bannerDots) return;
-
-      // Render dynamic slides
-      bannerTrack.innerHTML = '';
-      bannerDots.innerHTML = '';
-
-      ads.forEach((ad, idx) => {
-        const slide = document.createElement('div');
-        slide.className = 'banner-slide';
-        if (ad.type === 'image' && ad.image_url) {
-          slide.style.background = `url('${ad.image_url}') center/cover no-repeat`;
-        } else {
-          const c0 = ad.gradient_c0 || '#1E3A8A';
-          const c1 = ad.gradient_c1 || '#2563EB';
-          const c2 = ad.gradient_c2 || '#4F46E5';
-          slide.style.background = `linear-gradient(135deg, ${c0} 0%, ${c1} 50%, ${c2} 100%)`;
-        }
-
-        if (ad.link_url && (ad.link_url.startsWith('https://') || ad.link_url.startsWith('http://'))) {
-          slide.style.cursor = 'pointer';
-          slide.title = `Open ${ad.link_url}`;
-          slide.addEventListener('click', () => {
-            window.open(ad.link_url, '_blank', 'noopener,noreferrer');
-          });
-        }
-
-        const titleEl = document.createElement('div');
-        titleEl.className = 'banner-title';
-        titleEl.textContent = ad.title || '';
-
-        const descEl = document.createElement('div');
-        descEl.className = 'banner-desc';
-        descEl.textContent = ad.description || '';
-
-        slide.appendChild(titleEl);
-        slide.appendChild(descEl);
-        bannerTrack.appendChild(slide);
-
-        const dot = document.createElement('div');
-        dot.className = `indicator ${idx === 0 ? 'active' : ''}`;
-        bannerDots.appendChild(dot);
-      });
-
-      totalSlides = ads.length;
-      currentSlide = 0;
-      setSlide(0);
-      bindBannerDots();
-      startBannerAutoSlide();
-    } catch (_) {
-      // Graceful fallback to static HTML slides
+    if (cartDocsCount) {
+      cartDocsCount.textContent = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
+    }
+    if (cartTotalAmount) {
+      cartTotalAmount.textContent = formatRupees(totalCartPaise);
     }
   }
 
-  loadDynamicAds();
-
-  // --- PWA Installation Banner & Guide ---
-  window.addEventListener('beforeinstallprompt', (e) => {
-    e.preventDefault();
-    deferredPwaPrompt = e;
-    if (pwaInstallBanner) pwaInstallBanner.classList.remove('hidden');
-  });
-
-  if (pwaDismissBtn && pwaInstallBanner && pwaMiniPill) {
-    pwaDismissBtn.addEventListener('click', () => {
-      pwaInstallBanner.classList.add('hidden');
-      pwaMiniPill.classList.remove('hidden');
-    });
+  function removeDoc(docId) {
+    cartItems = cartItems.filter(item => item.id !== docId);
+    renderCart();
   }
 
-  function triggerPwaInstall() {
-    if (deferredPwaPrompt) {
-      deferredPwaPrompt.prompt();
-      deferredPwaPrompt.userChoice.then(() => {
-        deferredPwaPrompt = null;
-      });
-    } else {
-      if (pwaGuideModal) pwaGuideModal.classList.remove('hidden');
-    }
-  }
-
-  if (pwaInstallBtn) pwaInstallBtn.addEventListener('click', triggerPwaInstall);
-  if (pwaPillBtn) pwaPillBtn.addEventListener('click', triggerPwaInstall);
-
-  if (pwaModalCloseBtn && pwaGuideModal) {
-    pwaModalCloseBtn.addEventListener('click', () => pwaGuideModal.classList.add('hidden'));
-  }
-  if (pwaModalGotItBtn && pwaGuideModal) {
-    pwaModalGotItBtn.addEventListener('click', () => pwaGuideModal.classList.add('hidden'));
-  }
-  if (pwaGuideModal) {
-    pwaGuideModal.addEventListener('click', (e) => {
-      if (e.target === pwaGuideModal) pwaGuideModal.classList.add('hidden');
-    });
-  }
-
-  // --- File Selection & Inspection ---
-  const defaultUploadAreaHTML = uploadArea ? uploadArea.innerHTML : '';
+  // --- Document Ingestion & Conversion ---
   const officeExtensions = ['.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.odt', '.ods', '.odp', '.rtf', '.txt'];
-  const imageExtensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'];
-
-  function showError(msg) {
-    if (uploadAlert) {
-      uploadAlert.textContent = msg;
-      uploadAlert.classList.remove('hidden');
-    }
-  }
-
-  function clearError() {
-    if (uploadAlert) {
-      uploadAlert.textContent = '';
-      uploadAlert.classList.add('hidden');
-    }
-  }
+  const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.bmp'];
 
   async function convertImageToPdf(selectedFile) {
     if (!window.PDFLib) {
       throw new Error('PDF processing library not loaded.');
     }
     const pdfDoc = await window.PDFLib.PDFDocument.create();
-    const page = pdfDoc.addPage([595.28, 841.89]); // A4 in points (72 DPI)
+    const page = pdfDoc.addPage([595.28, 841.89]); // A4 (72 DPI)
 
     const nameLower = selectedFile.name.toLowerCase();
     const isJpg = nameLower.endsWith('.jpg') || nameLower.endsWith('.jpeg') || selectedFile.type === 'image/jpeg';
@@ -548,7 +403,6 @@
       const bytes = await selectedFile.arrayBuffer();
       embeddedImage = await pdfDoc.embedPng(bytes);
     } else {
-      // For BMP, WEBP, etc: render to canvas and export as PNG
       const dataUrl = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
@@ -571,15 +425,10 @@
       embeddedImage = await pdfDoc.embedPng(pngBytes);
     }
 
-    const margin = 36; // 0.5 inch margins
+    const margin = 36;
     const maxWidth = 595.28 - (margin * 2);
     const maxHeight = 841.89 - (margin * 2);
     const { width, height } = embeddedImage.scaleToFit(maxWidth, maxHeight);
-
-    const rotationDeg = (pageList[0]?.rotation || 0) % 360;
-    if (rotationDeg !== 0) {
-      page.setRotation(window.PDFLib.degrees(rotationDeg));
-    }
 
     page.drawImage(embeddedImage, {
       x: (595.28 - width) / 2,
@@ -591,1176 +440,833 @@
     return await pdfDoc.save();
   }
 
-  function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/[&<>'"]/g, tag => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      "'": '&#39;',
-      '"': '&quot;'
-    }[tag] || tag));
-  }
-
-  let activeConversion = null; // { abortController, pollTimeoutId, jobId }
-  let conversionGen = 0;
-
-  function cancelActiveConversion() {
-    if (activeConversion) {
-      if (activeConversion.abortController) {
-        try { activeConversion.abortController.abort(); } catch (_) {}
-      }
-      if (activeConversion.pollTimeoutId) {
-        clearTimeout(activeConversion.pollTimeoutId);
-      }
-      activeConversion = null;
-    }
-  }
-
-  async function convertDocumentSynchronously(selectedFile, signal, thisGen) {
-    const titleEl = document.getElementById('conv-status-title');
-    const descEl = document.getElementById('conv-status-desc');
-    const fillEl = document.getElementById('conv-progress-fill');
-    if (titleEl) titleEl.textContent = 'Converting document to PDF...';
-    if (descEl) descEl.textContent = 'Processing with server conversion engine';
-    if (fillEl) fillEl.style.width = '70%';
-
+  async function convertDocumentOnServer(selectedFile) {
     const formData = new FormData();
     formData.append('file', selectedFile);
 
-    const resp = await fetch('/api/convert', {
-      method: 'POST',
-      body: formData,
-      signal: signal
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(errText || 'Conversion failed on server');
-    }
-
-    if (fillEl) fillEl.style.width = '95%';
-    const pdfArrayBuffer = await resp.arrayBuffer();
-    if (thisGen !== conversionGen) return null;
-    return pdfArrayBuffer;
-  }
-
-  async function convertDocumentOnServer(selectedFile, thisGen) {
-    const abortController = new AbortController();
-    activeConversion = { abortController, pollTimeoutId: null, jobId: null };
-
-    if (uploadArea) {
-      uploadArea.innerHTML = `
-        <div id="office-conversion-card" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 1rem; width:100%; box-sizing:border-box;">
-          <div style="width:36px; height:36px; border:3px solid #E2E8F0; border-top-color:#2563EB; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:0.75rem;"></div>
-          <div id="conv-status-title" style="font-weight:700; color:var(--text-primary); font-size:1rem; text-align:center;">Uploading document...</div>
-          <div id="conv-status-desc" style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.25rem; text-align:center;">Converting document to print-ready PDF</div>
-          <div style="width:100%; max-width:240px; background:#E2E8F0; border-radius:999px; height:6px; margin-top:1rem; overflow:hidden;">
-            <div id="conv-progress-fill" style="width:20%; height:100%; background:var(--primary-color); border-radius:999px; transition:width 0.4s ease;"></div>
-          </div>
-          <button id="btn-cancel-conversion" type="button" style="margin-top:0.9rem; background:transparent; border:none; color:var(--text-secondary); font-size:0.825rem; cursor:pointer; text-decoration:underline;">
-            Cancel
-          </button>
-        </div>
-      `;
-      const cancelBtn = document.getElementById('btn-cancel-conversion');
-      if (cancelBtn) {
-        cancelBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          cancelActiveConversion();
-          resetFile();
-        });
-      }
-    }
-
-    const formData = new FormData();
-    formData.append('file', selectedFile);
-
-    // 1. Submit asynchronous conversion job with fallback to synchronous /api/convert
     let resp;
     try {
-      resp = await fetch('/api/conversions', {
-        method: 'POST',
-        body: formData,
-        signal: abortController.signal
-      });
-    } catch (fetchErr) {
-      if (fetchErr.name === 'AbortError') throw fetchErr;
-      console.warn('Network error on /api/conversions, falling back to /api/convert:', fetchErr);
-      return await convertDocumentSynchronously(selectedFile, abortController.signal, thisGen);
+      resp = await fetch('/api/conversions', { method: 'POST', body: formData });
+    } catch (_) {
+      resp = await fetch('/api/convert', { method: 'POST', body: formData });
+      if (!resp.ok) throw new Error('Document conversion failed');
+      return await resp.arrayBuffer();
     }
 
     if (resp.status === 404) {
-      console.warn('/api/conversions returned 404, falling back to /api/convert');
-      return await convertDocumentSynchronously(selectedFile, abortController.signal, thisGen);
+      const fallbackResp = await fetch('/api/convert', { method: 'POST', body: formData });
+      if (!fallbackResp.ok) throw new Error('Document conversion failed');
+      return await fallbackResp.arrayBuffer();
     }
 
     if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(errText || 'Failed to submit document for conversion');
+      const err = await resp.text();
+      throw new Error(err || 'Document conversion request failed');
     }
-    const createData = await resp.json();
-    if (thisGen !== conversionGen) return null;
-    activeConversion.jobId = createData.job_id;
 
-    // 2. Poll conversion status every 1-2s with backoff
-    let pollDelay = 1000;
-    const maxPollDuration = 90000; // 90 seconds
-    const startTime = Date.now();
+    const createData = await resp.json();
+    const jobId = createData.job_id;
     let status = createData.status;
     let downloadUrl = null;
 
+    const startTime = Date.now();
     while (status === 'queued' || status === 'processing') {
-      if (thisGen !== conversionGen) return null;
-      if (Date.now() - startTime > maxPollDuration) {
-        throw new Error('Document conversion timed out after 90 seconds. Please try again.');
+      if (Date.now() - startTime > 90000) {
+        throw new Error('Document conversion timed out');
       }
-
-      const titleEl = document.getElementById('conv-status-title');
-      const descEl = document.getElementById('conv-status-desc');
-      const fillEl = document.getElementById('conv-progress-fill');
-
-      if (status === 'queued') {
-        if (titleEl) titleEl.textContent = 'Waiting in queue...';
-        if (descEl) descEl.textContent = 'Conversion worker is currently preparing';
-        if (fillEl) fillEl.style.width = '45%';
-      } else if (status === 'processing') {
-        if (titleEl) titleEl.textContent = 'Converting document to PDF...';
-        if (descEl) descEl.textContent = 'LibreOffice engine is processing pages';
-        if (fillEl) fillEl.style.width = '75%';
-      }
-
-      await new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(resolve, pollDelay);
-        activeConversion.pollTimeoutId = timeoutId;
-        const abortHandler = () => {
-          clearTimeout(timeoutId);
-          reject(new DOMException('Aborted', 'AbortError'));
-        };
-        abortController.signal.addEventListener('abort', abortHandler, { once: true });
-      });
-
-      if (thisGen !== conversionGen) return null;
-
-      const pollResp = await fetch(`/api/conversions/${encodeURIComponent(createData.job_id)}?token=${encodeURIComponent(createData.token)}`, {
-        signal: abortController.signal
-      });
-      if (pollResp.status === 404) {
-        console.warn('Poll endpoint returned 404, falling back to /api/convert');
-        return await convertDocumentSynchronously(selectedFile, abortController.signal, thisGen);
-      }
-      if (!pollResp.ok) {
-        const errText = await pollResp.text();
-        throw new Error(errText || 'Failed to check conversion status');
-      }
+      await new Promise(r => setTimeout(r, 1200));
+      const pollResp = await fetch(`/api/conversions/${jobId}`);
+      if (!pollResp.ok) throw new Error('Failed to query conversion progress');
       const pollData = await pollResp.json();
       status = pollData.status;
-
       if (status === 'completed') {
         downloadUrl = pollData.download_url;
         break;
       } else if (status === 'failed') {
-        throw new Error(pollData.error_message || 'Document conversion failed on server');
+        throw new Error(pollData.error_message || 'Conversion engine failed');
       }
-
-      // Exponential backoff capped at 2500ms
-      pollDelay = Math.min(Math.round(pollDelay * 1.25), 2500);
     }
 
-    if (!downloadUrl) {
-      throw new Error('Conversion completed but download URL was not provided');
-    }
-
-    const titleEl = document.getElementById('conv-status-title');
-    const descEl = document.getElementById('conv-status-desc');
-    const fillEl = document.getElementById('conv-progress-fill');
-    if (titleEl) titleEl.textContent = 'Downloading converted PDF...';
-    if (descEl) descEl.textContent = 'Preparing live preview';
-    if (fillEl) fillEl.style.width = '95%';
-
-    // 3. Fetch converted PDF
-    const dlResp = await fetch(downloadUrl, { signal: abortController.signal });
-    if (!dlResp.ok) {
-      const errText = await dlResp.text();
-      throw new Error(errText || 'Failed to download converted PDF');
-    }
-    const pdfArrayBuffer = await dlResp.arrayBuffer();
-    if (thisGen !== conversionGen) return null;
-    return pdfArrayBuffer;
+    if (!downloadUrl) throw new Error('Conversion result URL missing');
+    const pdfResp = await fetch(downloadUrl);
+    if (!pdfResp.ok) throw new Error('Failed to download converted PDF');
+    return await pdfResp.arrayBuffer();
   }
 
-  async function handleFile(selectedFile) {
-    clearError();
-    if (!selectedFile) return;
+  async function handleFiles(files) {
+    if (!files || files.length === 0) return;
+    if (cartAlert) cartAlert.classList.add('hidden');
 
-    cancelActiveConversion();
-    conversionGen++;
-    const thisConversionGen = conversionGen;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const nameLower = file.name.toLowerCase();
+      const isOffice = officeExtensions.some(ext => nameLower.endsWith(ext));
+      const isImage = imageExtensions.some(ext => nameLower.endsWith(ext)) || file.type.startsWith('image/');
+      const isPdf = nameLower.endsWith('.pdf') || file.type === 'application/pdf';
 
-    const nameLower = selectedFile.name.toLowerCase();
-    const isPDF = nameLower.endsWith('.pdf') || selectedFile.type === 'application/pdf';
-    const isOffice = officeExtensions.some(ext => nameLower.endsWith(ext));
-    const isImage = imageExtensions.some(ext => nameLower.endsWith(ext)) || selectedFile.type.startsWith('image/');
+      if (!isPdf && !isOffice && !isImage) {
+        showCartError(`Unsupported file format: ${file.name}`);
+        continue;
+      }
 
-    if (!isPDF && !isOffice && !isImage) {
-      showError('Unsupported file format. Please upload PDF, Word (DOCX/DOC), PowerPoint (PPTX), Excel (XLSX), or Images (JPG, PNG).');
+      if (uploadProcessingIndicator && uploadProcessingText) {
+        uploadProcessingIndicator.classList.remove('hidden');
+        uploadProcessingText.textContent = isOffice
+          ? `Converting ${file.name}...`
+          : `Processing ${file.name}...`;
+      }
+
+      try {
+        let pdfBytes = null;
+        if (isPdf) {
+          pdfBytes = await file.arrayBuffer();
+        } else if (isImage) {
+          pdfBytes = await convertImageToPdf(file);
+        } else if (isOffice) {
+          pdfBytes = await convertDocumentOnServer(file);
+        }
+
+        if (!window.pdfjsLib) {
+          throw new Error('PDF viewing engine not initialized');
+        }
+
+        const loadingTask = window.pdfjsLib.getDocument({ data: pdfBytes.slice(0) });
+        const pdfDoc = await loadingTask.promise;
+        const totalPages = pdfDoc.numPages;
+
+        const defaultSides = totalPages > 1 ? 'Double-sided' : 'Single-sided';
+        const item = {
+          id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+          file: file,
+          name: file.name,
+          pdfBytes: pdfBytes,
+          pdfDoc: pdfDoc,
+          totalPages: totalPages,
+          isImage: isImage,
+          isOffice: isOffice,
+          settings: {
+            pageSelection: 'All Pages',
+            customPageRange: '',
+            copies: 1,
+            mode: 'B&W',
+            sides: defaultSides,
+            orientation: 'Auto',
+            pagesPerSheet: '1'
+          },
+          selectedPages: Array.from({ length: totalPages }, (_, idx) => idx + 1),
+          pricePaise: 0
+        };
+
+        item.pricePaise = calculateDocPrice(totalPages, item.settings);
+        cartItems.push(item);
+      } catch (err) {
+        console.error('File processing error:', err);
+        showCartError(`Failed to process ${file.name}: ${err.message || err}`);
+      }
+    }
+
+    if (uploadProcessingIndicator) {
+      uploadProcessingIndicator.classList.add('hidden');
+    }
+    renderCart();
+  }
+
+  function showCartError(msg) {
+    if (!cartAlert) return;
+    cartAlert.textContent = msg;
+    cartAlert.classList.remove('hidden');
+    setTimeout(() => {
+      cartAlert.classList.add('hidden');
+    }, 6000);
+  }
+
+  // --- View 2: Document Settings Implementation ---
+  function openSettings(docId) {
+    activeSettingsDocId = docId;
+    const doc = cartItems.find(d => d.id === docId);
+    if (!doc) {
+      switchView('cart');
       return;
     }
 
-    const maxSizeBytes = 25 * 1024 * 1024; // 25 MiB backend limit
-    if (selectedFile.size > maxSizeBytes) {
-      showError('File size exceeds the 25 MB limit.');
+    draftSettings = JSON.parse(JSON.stringify(doc.settings));
+    if (settingsFilename) settingsFilename.textContent = doc.name;
+
+    // Rate labels
+    if (settingsBwPriceLabel) settingsBwPriceLabel.textContent = `${formatRupees(bwSimplexPricePaise)}/side`;
+    if (settingsColorPriceLabel) settingsColorPriceLabel.textContent = `${formatRupees(colorSimplexPricePaise)}/side`;
+
+    syncSettingsUI(doc);
+  }
+
+  function syncSettingsUI(doc) {
+    // 1. Page Selection
+    if (draftSettings.pageSelection === 'Custom Range') {
+      btnOptCustomRange.classList.add('active');
+      btnOptAllPages.classList.remove('active');
+      settingsCustomRangeWrapper.classList.remove('hidden');
+      inputCustomRange.value = draftSettings.customPageRange;
+    } else {
+      btnOptAllPages.classList.add('active');
+      btnOptCustomRange.classList.remove('active');
+      settingsCustomRangeWrapper.classList.add('hidden');
+    }
+    if (customRangeError) customRangeError.classList.add('hidden');
+
+    // 2. Copies
+    if (copiesCountDisplay) copiesCountDisplay.textContent = draftSettings.copies;
+
+    // 3. Print Mode
+    cardModeBw.classList.toggle('active', draftSettings.mode === 'B&W');
+    cardModeColor.classList.toggle('active', draftSettings.mode === 'Color');
+
+    // 4. Print Sides
+    cardSideSingle.classList.toggle('active', draftSettings.sides === 'Single-sided');
+    cardSideDouble.classList.toggle('active', draftSettings.sides === 'Double-sided');
+
+    // 5. Orientation
+    btnOrientAuto.classList.toggle('active', draftSettings.orientation === 'Auto');
+    btnOrientPortrait.classList.toggle('active', draftSettings.orientation === 'Portrait');
+    btnOrientLandscape.classList.toggle('active', draftSettings.orientation === 'Landscape');
+
+    // 6. Pages per sheet
+    cardNup1.classList.add('active');
+    cardNup2.classList.remove('active');
+
+    // Live bottom price button
+    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+    if (saveSettingsPrice) {
+      saveSettingsPrice.textContent = formatRupees(livePrice);
+    }
+  }
+
+  function setupSettingsEventListeners() {
+    btnSettingsBack.addEventListener('click', () => switchView('cart'));
+
+    // Dropdown menu
+    btnSettingsMenu.addEventListener('click', (e) => {
+      e.stopPropagation();
+      settingsMenuDropdown.classList.toggle('hidden');
+    });
+    document.addEventListener('click', () => {
+      if (settingsMenuDropdown) settingsMenuDropdown.classList.add('hidden');
+    });
+
+    menuOptReset.addEventListener('click', () => {
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (!doc) return;
+      draftSettings = {
+        pageSelection: 'All Pages',
+        customPageRange: '',
+        copies: 1,
+        mode: 'B&W',
+        sides: doc.totalPages > 1 ? 'Double-sided' : 'Single-sided',
+        orientation: 'Auto',
+        pagesPerSheet: '1'
+      };
+      syncSettingsUI(doc);
+    });
+
+    menuOptDelete.addEventListener('click', () => {
+      if (activeSettingsDocId) {
+        removeDoc(activeSettingsDocId);
+        switchView('cart');
+      }
+    });
+
+    // Page Selection buttons
+    btnOptAllPages.addEventListener('click', () => {
+      draftSettings.pageSelection = 'All Pages';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+
+    btnOptCustomRange.addEventListener('click', () => {
+      draftSettings.pageSelection = 'Custom Range';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+      if (inputCustomRange) inputCustomRange.focus();
+    });
+
+    inputCustomRange.addEventListener('input', (e) => {
+      draftSettings.customPageRange = e.target.value.trim();
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (!doc) return;
+      const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
+      if (!parsed.valid && draftSettings.customPageRange.length > 0) {
+        customRangeError.textContent = parsed.error;
+        customRangeError.classList.remove('hidden');
+      } else {
+        customRangeError.classList.add('hidden');
+      }
+      const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+      if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+    });
+
+    // Copies Stepper
+    btnCopiesMinus.addEventListener('click', () => {
+      if (draftSettings.copies > 1) {
+        draftSettings.copies--;
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) syncSettingsUI(doc);
+      }
+    });
+
+    btnCopiesPlus.addEventListener('click', () => {
+      if (draftSettings.copies < 99) {
+        draftSettings.copies++;
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) syncSettingsUI(doc);
+      }
+    });
+
+    // Print Mode Cards
+    cardModeBw.addEventListener('click', () => {
+      draftSettings.mode = 'B&W';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+
+    cardModeColor.addEventListener('click', () => {
+      draftSettings.mode = 'Color';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+
+    // Print Sides Cards
+    cardSideSingle.addEventListener('click', () => {
+      draftSettings.sides = 'Single-sided';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+
+    cardSideDouble.addEventListener('click', () => {
+      draftSettings.sides = 'Double-sided';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+
+    // Orientation
+    btnOrientAuto.addEventListener('click', () => {
+      draftSettings.orientation = 'Auto';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+    btnOrientPortrait.addEventListener('click', () => {
+      draftSettings.orientation = 'Portrait';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+    btnOrientLandscape.addEventListener('click', () => {
+      draftSettings.orientation = 'Landscape';
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (doc) syncSettingsUI(doc);
+    });
+
+    // Save Settings Button
+    btnSaveDocSettings.addEventListener('click', () => {
+      const doc = cartItems.find(d => d.id === activeSettingsDocId);
+      if (!doc) return;
+
+      if (draftSettings.pageSelection === 'Custom Range') {
+        const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
+        if (!parsed.valid) {
+          customRangeError.textContent = parsed.error;
+          customRangeError.classList.remove('hidden');
+          return;
+        }
+      }
+
+      doc.settings = JSON.parse(JSON.stringify(draftSettings));
+      doc.selectedPages = getDocSelectedPages(doc.totalPages, doc.settings);
+      doc.pricePaise = calculateDocPrice(doc.totalPages, doc.settings);
+
+      switchView('cart');
+    });
+  }
+
+  // --- View 3: Print Preview Implementation ---
+  function openPreview(docId) {
+    activePreviewDocId = docId;
+    const doc = cartItems.find(d => d.id === docId);
+    if (!doc) {
+      switchView('cart');
       return;
     }
 
-    // Clean up previous file resources before loading new one
-    if (activeRenderTask) {
-      try { activeRenderTask.cancel(); } catch (_) {}
-      activeRenderTask = null;
+    if (previewFilename) previewFilename.textContent = doc.name;
+    currentPreviewSheet = 1;
+    currentPreviewSide = 'front';
+
+    renderPreviewSheet();
+  }
+
+  async function renderPreviewSheet() {
+    const doc = cartItems.find(d => d.id === activePreviewDocId);
+    if (!doc || !doc.pdfDoc) return;
+
+    const isDuplex = doc.settings.sides === 'Double-sided';
+    const pages = doc.selectedPages;
+    const totalSheets = isDuplex ? Math.ceil(pages.length / 2) : pages.length;
+
+    // Bounds check
+    if (currentPreviewSheet < 1) currentPreviewSheet = 1;
+    if (currentPreviewSheet > totalSheets) currentPreviewSheet = totalSheets;
+
+    // Pager indicators
+    if (btnSheetLeft) btnSheetLeft.disabled = (currentPreviewSheet <= 1);
+    if (btnSheetRight) btnSheetRight.disabled = (currentPreviewSheet >= totalSheets);
+
+    if (previewSheetIndicator) {
+      if (isDuplex) {
+        const sideLabel = currentPreviewSide === 'front' ? 'Front' : 'Back';
+        previewSheetIndicator.textContent = `Sheet ${currentPreviewSheet} of ${totalSheets} (${sideLabel})`;
+      } else {
+        previewSheetIndicator.textContent = `Sheet ${currentPreviewSheet} of ${totalSheets}`;
+      }
     }
-    currentRenderGen++;
-    clearPageCache();
-    if (imageBlobUrl) {
-      URL.revokeObjectURL(imageBlobUrl);
-      imageBlobUrl = null;
+
+    // Determine 1-based PDF page index
+    let pageNumToRender = null;
+    if (!isDuplex) {
+      pageNumToRender = pages[currentPreviewSheet - 1];
+    } else {
+      if (currentPreviewSide === 'front') {
+        pageNumToRender = pages[(currentPreviewSheet - 1) * 2];
+      } else {
+        const backIdx = (currentPreviewSheet - 1) * 2 + 1;
+        pageNumToRender = backIdx < pages.length ? pages[backIdx] : null;
+      }
     }
-    imageElement = null;
-    if (pdfJsDoc) {
-      try { pdfJsDoc.destroy(); } catch (_) {}
-      pdfJsDoc = null;
-    }
-    pdfLibDoc = null;
-    hideFallbackPreview();
+
+    if (previewLoadingSpinner) previewLoadingSpinner.classList.remove('hidden');
+    if (previewErrorBox) previewErrorBox.classList.add('hidden');
 
     try {
-      file = selectedFile;
-      let buffer = null;
-
-      if (isImage) {
-        // Direct Image Preview: bypass heavy PDF conversion for instant render
-        isImageDoc = true;
-        convertedPdfBytes = null;
-        totalDocPages = 1;
-        pageList = [{
-          originalIndex: 0,
-          rotation: 0,
-          selected: true
-        }];
-
-        const imgUrl = URL.createObjectURL(selectedFile);
-        imageBlobUrl = imgUrl;
-        const img = new Image();
-        await new Promise((resolve, reject) => {
-          img.onload = resolve;
-          img.onerror = () => reject(new Error('Failed to load image file.'));
-          img.src = imgUrl;
-        });
-        imageElement = img;
-      } else {
-        isImageDoc = false;
-
-        if (isPDF) {
-          buffer = await selectedFile.arrayBuffer();
-          convertedPdfBytes = null;
-        } else if (isOffice) {
-          const pdfArrayBuffer = await convertDocumentOnServer(selectedFile, thisConversionGen);
-          if (thisConversionGen !== conversionGen || !pdfArrayBuffer) return;
-          buffer = pdfArrayBuffer;
-          convertedPdfBytes = new Uint8Array(pdfArrayBuffer);
-        }
-
-        // Parse with PDFLib
-        if (!window.PDFLib) {
-          throw new Error('PDF processing library not loaded.');
-        }
-        pdfLibDoc = await window.PDFLib.PDFDocument.load(buffer.slice(0));
-        totalDocPages = pdfLibDoc.getPageCount();
-
-        // Initialize page list
-        pageList = Array.from({ length: totalDocPages }, (_, i) => ({
-          originalIndex: i,
-          rotation: 0,
-          selected: true
-        }));
-
-        // Parse with PDF.js for preview canvas (with resilient fallback for mobile WebViews)
-        const pdfjs = await ensurePdfjs();
-        if (pdfjs) {
-          try {
-            const typedArray = new Uint8Array(buffer.slice(0));
-            const loadingTask = pdfjs.getDocument({
-              data: typedArray,
-              cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/cmaps/',
-              cMapPacked: true,
-            });
-            pdfJsDoc = await loadingTask.promise;
-          } catch (workerErr) {
-            console.warn('PDF.js standard worker load error, attempting fallback:', workerErr);
-            try {
-              const typedArray = new Uint8Array(buffer.slice(0));
-              const fallbackTask = pdfjs.getDocument({
-                data: typedArray,
-                disableWorker: true,
-              });
-              pdfJsDoc = await fallbackTask.promise;
-            } catch (fallbackErr) {
-              console.error('PDF.js fallback load error:', fallbackErr);
-              pdfJsDoc = null;
-            }
-          }
-        }
+      if (activeRenderTask) {
+        try { activeRenderTask.cancel(); } catch (_) {}
+        activeRenderTask = null;
       }
 
-      // Update UI
-      if (uploadArea) {
-        uploadArea.innerHTML = defaultUploadAreaHTML;
-        uploadArea.classList.add('hidden');
-      }
-      if (filePreviewCard) filePreviewCard.classList.remove('hidden');
-      if (fileNameDisplay) fileNameDisplay.textContent = file.name;
-      if (fileMetaDisplay) {
-        fileMetaDisplay.textContent = `${totalDocPages} ${totalDocPages === 1 ? 'page' : 'pages'} • ${(file.size / (1024 * 1024)).toFixed(2)} MB`;
-      }
+      const canvas = previewCanvas;
+      const ctx = canvas.getContext('2d');
 
-      updatePriceAndReviewSummary();
-      activeSideIndex = 0;
-      renderLiveSheet();
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        resetFile();
+      if (pageNumToRender === null) {
+        // Blank back sheet for odd duplex
+        canvas.width = 300;
+        canvas.height = 424;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '600 15px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Blank Page', canvas.width / 2, canvas.height / 2 - 10);
+        ctx.font = '12px system-ui, sans-serif';
+        ctx.fillText('(Duplex padding sheet)', canvas.width / 2, canvas.height / 2 + 12);
+        if (previewLoadingSpinner) previewLoadingSpinner.classList.add('hidden');
         return;
       }
-      console.error('File load failed:', err);
-      showError(err.message || 'Failed to process document. Please verify the file is valid.');
-      if (uploadArea && isOffice) {
-        uploadArea.innerHTML = `
-          <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem 1rem; width:100%; box-sizing:border-box;">
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--danger-color)" stroke-width="2" style="margin-bottom:0.75rem;">
-              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-            </svg>
-            <div style="font-weight:700; color:var(--text-primary); font-size:1rem; text-align:center;">Conversion Failed</div>
-            <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:0.35rem; text-align:center; max-width:320px;">
-              ${escapeHtml(err.message || 'Unable to convert this document.')}
-            </div>
-            <div style="display:flex; gap:0.75rem; margin-top:1rem;">
-              <button id="btn-retry-conversion" type="button" class="btn btn-primary" style="padding:0.45rem 1rem; font-size:0.85rem;">
-                Retry Conversion
-              </button>
-              <button id="btn-cancel-retry" type="button" class="btn" style="background:#E2E8F0; color:var(--text-primary); padding:0.45rem 1rem; font-size:0.85rem;">
-                Choose Another File
-              </button>
-            </div>
-          </div>
-        `;
-        document.getElementById('btn-retry-conversion')?.addEventListener('click', (e) => {
-          e.stopPropagation();
-          handleFile(selectedFile);
-        });
-        document.getElementById('btn-cancel-retry')?.addEventListener('click', (e) => {
-          e.stopPropagation();
-          resetFile();
-        });
-      } else {
-        resetFile();
-      }
-    }
-  }
 
-  function resetFile() {
-    cancelActiveConversion();
-    if (activeRenderTask) {
-      try { activeRenderTask.cancel(); } catch (_) {}
-      activeRenderTask = null;
-    }
-    currentRenderGen++;
-    clearPageCache();
+      const page = await doc.pdfDoc.getPage(pageNumToRender);
+      const viewport = page.getViewport({ scale: 1.0 });
 
-    if (imageBlobUrl) {
-      URL.revokeObjectURL(imageBlobUrl);
-      imageBlobUrl = null;
-    }
-    imageElement = null;
-    isImageDoc = false;
+      // Scale to fit ~300px width
+      const targetWidth = 300;
+      const scale = targetWidth / viewport.width;
+      const scaledViewport = page.getViewport({ scale: scale });
 
-    if (pdfJsDoc) {
-      try { pdfJsDoc.destroy(); } catch (_) {}
-      pdfJsDoc = null;
-    }
-    pdfLibDoc = null;
-    file = null;
-    fileBuffer = null;
-    convertedPdfBytes = null;
-    totalDocPages = 0;
-    pageList = [];
-    pageSelection = 'All Pages';
-    customPageRange = '';
-    activeSideIndex = 0;
-    copies = 1;
-    invalidateQuote();
-    if (copiesValDisplay) copiesValDisplay.textContent = '1';
-    if (btnPageSelectionAll) btnPageSelectionAll.classList.add('active');
-    if (btnPageSelectionCustom) btnPageSelectionCustom.classList.remove('active');
-    if (customRangeBox) customRangeBox.classList.add('hidden');
-    if (customRangeInput) customRangeInput.value = '';
-    if (customRangeFeedback) customRangeFeedback.textContent = '';
-    if (fileInput) fileInput.value = '';
-    if (uploadSection) uploadSection.classList.remove('hidden');
-    if (uploadArea) {
-      uploadArea.innerHTML = defaultUploadAreaHTML;
-      uploadArea.classList.remove('hidden');
-    }
-    if (filePreviewCard) filePreviewCard.classList.add('hidden');
-    if (livePreviewCanvas) {
-      const ctx = livePreviewCanvas.getContext('2d');
-      if (ctx) ctx.clearRect(0, 0, livePreviewCanvas.width, livePreviewCanvas.height);
-    }
-    if (sheetPageIndicator) sheetPageIndicator.textContent = 'Page 1 of 1';
-    if (previewSheetBadge) previewSheetBadge.textContent = 'Sheet 1 of 1';
-    if (btnSheetPrev) btnSheetPrev.disabled = true;
-    if (btnSheetNext) btnSheetNext.disabled = true;
-    if (btnSheetFlip) btnSheetFlip.classList.add('hidden');
-    hideFallbackPreview();
-    updateRateLabels();
-    updatePriceAndReviewSummary();
-  }
+      canvas.width = scaledViewport.width;
+      canvas.height = scaledViewport.height;
 
-  if (uploadArea) {
-    uploadArea.addEventListener('click', () => fileInput && fileInput.click());
-    uploadArea.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      uploadArea.classList.add('drag-active');
-    });
-    uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('drag-active'));
-    uploadArea.addEventListener('drop', (e) => {
-      e.preventDefault();
-      uploadArea.classList.remove('drag-active');
-      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-        handleFile(e.dataTransfer.files[0]);
-      }
-    });
-  }
+      const renderContext = {
+        canvasContext: ctx,
+        viewport: scaledViewport
+      };
 
-  if (fileInput) {
-    fileInput.addEventListener('change', (e) => {
-      if (e.target.files && e.target.files[0]) {
-        handleFile(e.target.files[0]);
-      }
-    });
-  }
-
-  if (removeFileBtn) {
-    removeFileBtn.addEventListener('click', resetFile);
-  }
-
-  // --- Print Settings Interactions ---
-  if (btnPageSelectionAll) {
-    btnPageSelectionAll.addEventListener('click', () => {
-      pageSelection = 'All Pages';
-      invalidateQuote();
-      btnPageSelectionAll.classList.add('active');
-      btnPageSelectionCustom.classList.remove('active');
-      if (customRangeBox) customRangeBox.classList.add('hidden');
-      pageList.forEach(p => p.selected = true);
-      updatePriceAndReviewSummary();
-      renderLiveSheet();
-    });
-  }
-
-  if (btnPageSelectionCustom) {
-    btnPageSelectionCustom.addEventListener('click', () => {
-      pageSelection = 'Custom Range';
-      invalidateQuote();
-      btnPageSelectionCustom.classList.add('active');
-      btnPageSelectionAll.classList.remove('active');
-      if (customRangeBox) customRangeBox.classList.remove('hidden');
-      applyCustomRange(customRangeInput ? customRangeInput.value : '');
-    });
-  }
-
-  function applyCustomRange(rangeStr) {
-    invalidateQuote();
-    customPageRange = rangeStr;
-    if (customRangeInput && customRangeInput !== document.activeElement) {
-      customRangeInput.value = rangeStr;
-    }
-
-    if (!rangeStr.trim()) {
-      pageList.forEach(p => p.selected = true);
-    } else {
-      const selected = parseCustomPages(rangeStr, totalDocPages);
-      if (selected !== null) {
-        const set = new Set(selected);
-        pageList.forEach((p, idx) => {
-          p.selected = set.has(idx);
-        });
-      }
-    }
-    activeSideIndex = 0;
-    updatePriceAndReviewSummary();
-    renderLiveSheet();
-  }
-
-  if (customRangeInput) {
-    customRangeInput.addEventListener('input', (e) => {
-      applyCustomRange(e.target.value);
-    });
-  }
-
-  if (copiesDecBtn && copiesValDisplay) {
-    copiesDecBtn.addEventListener('click', () => {
-      if (copies > 1) {
-        copies--;
-        invalidateQuote();
-        copiesValDisplay.textContent = copies;
-        updatePriceAndReviewSummary();
-      }
-    });
-  }
-
-  if (copiesIncBtn && copiesValDisplay) {
-    copiesIncBtn.addEventListener('click', () => {
-      if (copies < 99) {
-        copies++;
-        invalidateQuote();
-        copiesValDisplay.textContent = copies;
-        updatePriceAndReviewSummary();
-      }
-    });
-  }
-
-  if (btnModeBW) {
-    btnModeBW.addEventListener('click', () => {
-      mode = 'B&W';
-      invalidateQuote();
-      btnModeBW.classList.add('active');
-      if (btnModeColor) btnModeColor.classList.remove('active');
-      updateRateLabels();
-      updatePriceAndReviewSummary();
-      renderLiveSheet();
-    });
-  }
-
-  if (btnModeColor) {
-    btnModeColor.addEventListener('click', () => {
-      mode = 'Color';
-      invalidateQuote();
-      btnModeColor.classList.add('active');
-      if (btnModeBW) btnModeBW.classList.remove('active');
-      updateRateLabels();
-      updatePriceAndReviewSummary();
-      renderLiveSheet();
-    });
-  }
-
-  async function fetchPricing() {
-    try {
-      const res = await fetch('/api/pricing');
-      if (res.ok) {
-        const data = await res.json();
-        bwSimplexPricePaise = data.bw_simplex_price_paise || data.bw_price_per_sheet_paise || 200;
-        bwDuplexPricePaise = data.bw_duplex_price_paise || 150;
-        colorSimplexPricePaise = data.color_simplex_price_paise || data.color_price_per_sheet_paise || 1000;
-        colorDuplexPricePaise = data.color_duplex_price_paise || 750;
-        colorHardwareEnabled = (typeof data.color_enabled === 'boolean') ? data.color_enabled : true;
-
-        bwPricePerSheetPaise = bwSimplexPricePaise;
-        colorPricePerSheetPaise = colorSimplexPricePaise;
-        pricingLoaded = true;
-
-        // Hardware capability: if kiosk color printing is disabled, lock mobile UI to B&W
-        if (!colorHardwareEnabled) {
-          if (btnModeColor) btnModeColor.style.display = 'none';
-          mode = 'B&W';
-          if (btnModeBW) {
-            btnModeBW.classList.add('active');
-            btnModeBW.style.flex = '1';
-          }
-        } else {
-          if (btnModeColor) btnModeColor.style.display = 'flex';
-          if (btnModeBW) btnModeBW.style.flex = '';
-        }
-
-        updateRateLabels();
-        updatePriceAndReviewSummary();
-      } else {
-        pricingLoaded = true;
-        updateRateLabels();
-        updatePriceAndReviewSummary();
-      }
-    } catch (_) {
-      pricingLoaded = true;
-      updateRateLabels();
-      updatePriceAndReviewSummary();
-    }
-  }
-  fetchPricing();
-
-  if (btnSideSingle) {
-    btnSideSingle.addEventListener('click', () => {
-      sides = 'Single-sided';
-      invalidateQuote();
-      btnSideSingle.classList.add('active');
-      btnSideDouble.classList.remove('active');
-      activeSideIndex = 0;
-      updateRateLabels();
-      updatePriceAndReviewSummary();
-      renderLiveSheet();
-    });
-  }
-
-  if (btnSideDouble) {
-    btnSideDouble.addEventListener('click', () => {
-      sides = 'Double-sided';
-      invalidateQuote();
-      btnSideDouble.classList.add('active');
-      btnSideSingle.classList.remove('active');
-      activeSideIndex = 0;
-      updateRateLabels();
-      updatePriceAndReviewSummary();
-      renderLiveSheet();
-    });
-  }
-
-  // Edit Settings Button scrolls to Section 2
-  if (btnEditSettings && printOptionsSection) {
-    btnEditSettings.addEventListener('click', () => {
-      printOptionsSection.scrollIntoView({ behavior: 'smooth' });
-    });
-  }
-
-  // --- Live Print-Ready Sheet Preview Engine ---
-  async function renderLiveSheet() {
-    if (!livePreviewCanvas || pageList.length === 0) return;
-
-    // Determine the list of pages selected to print in requested order
-    const printablePages = getPrintablePages();
-    if (printablePages.length === 0) {
-      if (previewSheetBadge) previewSheetBadge.textContent = '0 pages selected';
-      if (sheetPageIndicator) sheetPageIndicator.textContent = 'No pages selected';
-      if (btnSheetPrev) btnSheetPrev.disabled = true;
-      if (btnSheetNext) btnSheetNext.disabled = true;
-      if (btnSheetFlip) btnSheetFlip.classList.add('hidden');
-      showFallbackPreview('No Pages Selected', 'Please select at least one page to print');
-      return;
-    }
-
-    const totalPrintable = printablePages.length;
-    const isDouble = (sides === 'Double-sided');
-    const totalSheets = isDouble ? Math.ceil(totalPrintable / 2) : totalPrintable;
-    const totalSides = (isDouble && totalPrintable % 2 !== 0) ? totalPrintable + 1 : totalPrintable;
-
-    if (activeSideIndex < 0) activeSideIndex = 0;
-    if (activeSideIndex >= totalSides) activeSideIndex = totalSides - 1;
-
-    // 1. Color vs B&W WYSIWYG reaction
-    if (mode === 'B&W') {
-      livePreviewCanvas.classList.add('preview-bw');
-      livePreviewCanvas.classList.remove('preview-color');
-      if (previewColorBadge) {
-        previewColorBadge.className = 'sheet-badge badge-bw';
-        previewColorBadge.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 0 20z" fill="currentColor"/></svg> B&amp;W Preview';
-      }
-    } else {
-      livePreviewCanvas.classList.remove('preview-bw');
-      livePreviewCanvas.classList.add('preview-color');
-      if (previewColorBadge) {
-        previewColorBadge.className = 'sheet-badge badge-color';
-        previewColorBadge.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/></svg> Color Preview';
-      }
-    }
-
-    // 2. Duplex vs Simplex Sheet Calculation & Badges
-    const isBlankSide = (isDouble && activeSideIndex === totalPrintable);
-    const sheetNum = isDouble ? Math.floor(activeSideIndex / 2) + 1 : activeSideIndex + 1;
-    const isFront = isDouble ? (activeSideIndex % 2 === 0) : true;
-
-    if (isDouble) {
-      if (isBlankSide) {
-        if (previewSheetBadge) previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalSheets} (Back - Blank)`;
-      } else {
-        if (previewSheetBadge) previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalSheets} (${isFront ? 'Front' : 'Back'})`;
-      }
-
-      // Flip button
-      if (btnSheetFlip && sheetFlipText) {
-        btnSheetFlip.classList.remove('hidden');
-        if (isFront) {
-          if (activeSideIndex + 1 < totalPrintable) {
-            sheetFlipText.textContent = `Flip to Back (Pg ${printablePages[activeSideIndex + 1].originalIndex + 1})`;
-          } else {
-            sheetFlipText.textContent = `Flip to Back (Blank)`;
-          }
-          btnSheetFlip.onclick = () => {
-            activeSideIndex++;
-            renderLiveSheet();
-          };
-        } else {
-          sheetFlipText.textContent = `Flip to Front (Pg ${printablePages[activeSideIndex - 1].originalIndex + 1})`;
-          btnSheetFlip.onclick = () => {
-            activeSideIndex--;
-            renderLiveSheet();
-          };
-        }
-      }
-    } else {
-      // Simplex (Single-sided)
-      if (previewSheetBadge) {
-        previewSheetBadge.textContent = `Sheet ${sheetNum} of ${totalPrintable}`;
-      }
-      if (btnSheetFlip) {
-        btnSheetFlip.classList.add('hidden');
-      }
-    }
-
-    // 3. Page Stepper
-    if (sheetPageIndicator) {
-      if (isBlankSide) {
-        sheetPageIndicator.textContent = `Blank Page (Back of Sheet ${sheetNum})`;
-      } else {
-        const activePg = printablePages[activeSideIndex];
-        if (totalPrintable === totalDocPages) {
-          sheetPageIndicator.textContent = `Page ${activePg.originalIndex + 1} of ${totalDocPages}`;
-        } else {
-          sheetPageIndicator.textContent = `Page ${activePg.originalIndex + 1} (${activeSideIndex + 1} of ${totalPrintable})`;
-        }
-      }
-    }
-
-    if (btnSheetPrev) btnSheetPrev.disabled = (activeSideIndex <= 0);
-    if (btnSheetNext) btnSheetNext.disabled = (activeSideIndex >= totalSides - 1);
-
-    // 4. Case A: Blank Back of Odd Duplex Sheet
-    if (isBlankSide) {
-      hideFallbackPreview();
-      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
-
-      const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const canvasW = Math.round(containerWidth * dpr);
-      const canvasH = Math.round(containerWidth * Math.SQRT2 * dpr);
-
-      livePreviewCanvas.width = canvasW;
-      livePreviewCanvas.height = canvasH;
-      livePreviewCanvas.style.width = '100%';
-      livePreviewCanvas.style.height = 'auto';
-      livePreviewCanvas.style.aspectRatio = '1 / 1.4142';
-      if (paperSheet) paperSheet.style.aspectRatio = '1 / 1.4142';
-
-      const ctx = livePreviewCanvas.getContext('2d');
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, canvasW, canvasH);
-
-      // Subtle dashed border to represent paper boundary
-      ctx.strokeStyle = '#E2E8F0';
-      ctx.lineWidth = Math.round(2 * dpr);
-      ctx.strokeRect(16 * dpr, 16 * dpr, canvasW - 32 * dpr, canvasH - 32 * dpr);
-
-      // Blank page watermark
-      ctx.fillStyle = '#94A3B8';
-      ctx.font = `600 ${Math.round(14 * dpr)}px Inter, -apple-system, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('Blank Page', canvasW / 2, canvasH / 2 - (10 * dpr));
-
-      ctx.fillStyle = '#CBD5E1';
-      ctx.font = `400 ${Math.round(11 * dpr)}px Inter, -apple-system, sans-serif`;
-      ctx.fillText(`(Back of Sheet ${sheetNum})`, canvasW / 2, canvasH / 2 + (12 * dpr));
-      return;
-    }
-
-    const activePageObj = printablePages[activeSideIndex];
-
-    // 5. Case B: Direct Image Preview (Instant, zero conversion, low memory)
-    if (isImageDoc && imageElement) {
-      hideFallbackPreview();
-      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
-
-      const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const canvasW = Math.round(containerWidth * dpr);
-      const canvasH = Math.round(containerWidth * Math.SQRT2 * dpr);
-
-      livePreviewCanvas.width = canvasW;
-      livePreviewCanvas.height = canvasH;
-      livePreviewCanvas.style.width = '100%';
-      livePreviewCanvas.style.height = 'auto';
-      livePreviewCanvas.style.aspectRatio = '1 / 1.4142';
-      if (paperSheet) paperSheet.style.aspectRatio = '1 / 1.4142';
-
-      const ctx = livePreviewCanvas.getContext('2d');
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, canvasW, canvasH);
-
-      const marginRatio = 0.06; // standard A4 printable margin
-      const maxW = canvasW * (1 - 2 * marginRatio);
-      const maxH = canvasH * (1 - 2 * marginRatio);
-
-      const rotation = (activePageObj.rotation || 0) % 360;
-      const isRotated90 = (rotation === 90 || rotation === 270);
-      const effW = isRotated90 ? imageElement.naturalHeight || imageElement.height : imageElement.naturalWidth || imageElement.width;
-      const effH = isRotated90 ? imageElement.naturalWidth || imageElement.width : imageElement.naturalHeight || imageElement.height;
-
-      const scale = Math.min(maxW / effW, maxH / effH);
-      const drawW = (imageElement.naturalWidth || imageElement.width) * scale;
-      const drawH = (imageElement.naturalHeight || imageElement.height) * scale;
-
-      ctx.save();
-      ctx.translate(canvasW / 2, canvasH / 2);
-      if (rotation !== 0) {
-        ctx.rotate((rotation * Math.PI) / 180);
-      }
-      ctx.drawImage(imageElement, -drawW / 2, -drawH / 2, drawW, drawH);
-      ctx.restore();
-      return;
-    }
-
-    // 6. Case C: PDF Document Preview
-    if (!pdfJsDoc) {
-      showFallbackPreview('Preview Unavailable', `Document is valid (${totalDocPages} ${totalDocPages === 1 ? 'page' : 'pages'}) and ready to print`);
-      return;
-    }
-
-    // Cancel obsolete rendering task before starting a new one
-    if (activeRenderTask) {
-      try { activeRenderTask.cancel(); } catch (_) {}
-      activeRenderTask = null;
-    }
-
-    const renderGen = ++currentRenderGen;
-    const pageKey = `${activePageObj.originalIndex}_rot${activePageObj.rotation || 0}`;
-
-    // Check LRU page render cache
-    if (pageRenderCache.has(pageKey)) {
-      const cached = pageRenderCache.get(pageKey);
-      livePreviewCanvas.width = cached.width;
-      livePreviewCanvas.height = cached.height;
-      livePreviewCanvas.style.width = '100%';
-      livePreviewCanvas.style.height = 'auto';
-      livePreviewCanvas.style.aspectRatio = `${cached.viewportWidth} / ${cached.viewportHeight}`;
-      if (paperSheet) paperSheet.style.aspectRatio = `${cached.viewportWidth} / ${cached.viewportHeight}`;
-
-      const ctx = livePreviewCanvas.getContext('2d');
-      ctx.drawImage(cached.canvas, 0, 0);
-
-      pageRenderCache.delete(pageKey);
-      pageRenderCache.set(pageKey, cached);
-
-      hideFallbackPreview();
-      if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
-      return;
-    }
-
-    hideFallbackPreview();
-    if (sheetLoadingSpinner) sheetLoadingSpinner.classList.remove('hidden');
-
-    try {
-      const pdfPage = await pdfJsDoc.getPage(activePageObj.originalIndex + 1);
-      if (renderGen !== currentRenderGen) return;
-
-      const rotation = ((pdfPage.rotate || 0) + (activePageObj.rotation || 0)) % 360;
-      const baseViewport = pdfPage.getViewport({ scale: 1.0, rotation });
-
-      const dpr = Math.min(window.devicePixelRatio || 1, 2); // Cap at 2 for mobile memory safety
-      const containerWidth = Math.min(340, (paperSheet && paperSheet.clientWidth) || 340);
-      const scale = (containerWidth / baseViewport.width) * dpr;
-      const viewport = pdfPage.getViewport({ scale, rotation });
-
-      livePreviewCanvas.width = Math.round(viewport.width);
-      livePreviewCanvas.height = Math.round(viewport.height);
-      livePreviewCanvas.style.width = '100%';
-      livePreviewCanvas.style.height = 'auto';
-      livePreviewCanvas.style.aspectRatio = `${viewport.width} / ${viewport.height}`;
-      if (paperSheet) paperSheet.style.aspectRatio = `${viewport.width} / ${viewport.height}`;
-
-      const ctx = livePreviewCanvas.getContext('2d');
-      activeRenderTask = pdfPage.render({ canvasContext: ctx, viewport });
+      activeRenderTask = page.render(renderContext);
       await activeRenderTask.promise;
       activeRenderTask = null;
 
-      if (renderGen !== currentRenderGen) return;
-
-      // Cache rendered page bitmap (max 3 items in memory)
-      const offscreen = document.createElement('canvas');
-      offscreen.width = livePreviewCanvas.width;
-      offscreen.height = livePreviewCanvas.height;
-      const offCtx = offscreen.getContext('2d');
-      offCtx.drawImage(livePreviewCanvas, 0, 0);
-
-      if (pageRenderCache.size >= MAX_CACHED_PAGES) {
-        const oldestKey = pageRenderCache.keys().next().value;
-        pageRenderCache.delete(oldestKey);
+      // Apply grayscale filter if B&W
+      if (doc.settings.mode === 'B&W') {
+        canvas.style.filter = 'grayscale(100%) contrast(105%)';
+      } else {
+        canvas.style.filter = 'none';
       }
-      pageRenderCache.set(pageKey, {
-        canvas: offscreen,
-        width: livePreviewCanvas.width,
-        height: livePreviewCanvas.height,
-        viewportWidth: viewport.width,
-        viewportHeight: viewport.height,
-      });
-
-      hideFallbackPreview();
-    } catch (err) {
-      if (err && err.name === 'RenderingCancelledException') {
-        return; // Expected cancellation from fast user interaction
+    } catch (renderErr) {
+      if (renderErr.name !== 'RenderingCancelledException') {
+        console.error('Preview render error:', renderErr);
+        if (previewErrorBox) previewErrorBox.classList.remove('hidden');
       }
-      console.warn('Live sheet render error:', err);
-      showFallbackPreview('Preview Unavailable', 'Document is ready to print');
     } finally {
-      if (renderGen === currentRenderGen && sheetLoadingSpinner) {
-        sheetLoadingSpinner.classList.add('hidden');
-      }
+      if (previewLoadingSpinner) previewLoadingSpinner.classList.add('hidden');
     }
   }
 
-  // Stepper Event Listeners
-  if (btnSheetPrev) {
-    btnSheetPrev.addEventListener('click', () => {
-      if (activeSideIndex > 0) {
-        activeSideIndex--;
-        renderLiveSheet();
+  function setupPreviewEventListeners() {
+    btnPreviewBack.addEventListener('click', () => switchView('cart'));
+
+    btnSheetLeft.addEventListener('click', () => {
+      if (currentPreviewSheet > 1) {
+        currentPreviewSheet--;
+        currentPreviewSide = 'front';
+        renderPreviewSheet();
       }
     });
-  }
 
-  if (btnSheetNext) {
-    btnSheetNext.addEventListener('click', () => {
-      const printablePages = getPrintablePages();
-      const isDouble = (sides === 'Double-sided');
-      const totalSides = (isDouble && printablePages.length % 2 !== 0)
-        ? printablePages.length + 1
-        : printablePages.length;
-      if (activeSideIndex < totalSides - 1) {
-        activeSideIndex++;
-        renderLiveSheet();
+    btnSheetRight.addEventListener('click', () => {
+      const doc = cartItems.find(d => d.id === activePreviewDocId);
+      if (!doc) return;
+      const isDuplex = doc.settings.sides === 'Double-sided';
+      const totalSheets = isDuplex ? Math.ceil(doc.selectedPages.length / 2) : doc.selectedPages.length;
+      if (currentPreviewSheet < totalSheets) {
+        currentPreviewSheet++;
+        currentPreviewSide = 'front';
+        renderPreviewSheet();
       }
     });
-  }
 
-  // --- Document Upload Preparation ---
-  async function prepareUploadDocument() {
-    if (!file) return file;
-
-    const printablePages = getPrintablePages();
-    if (printablePages.length === 0) {
-      throw new Error('Please select at least 1 page to print.');
-    }
-
-    const pdfName = file.name.replace(/\.[^/.]+$/, "") + ".pdf";
-
-    if (isImageDoc) {
-      if (!convertedPdfBytes) {
-        if (sheetLoadingSpinner) {
-          sheetLoadingSpinner.classList.remove('hidden');
-          if (sheetSpinnerText) sheetSpinnerText.textContent = 'Formatting PDF for printer...';
+    btnSheetFlip.addEventListener('click', () => {
+      const doc = cartItems.find(d => d.id === activePreviewDocId);
+      if (!doc) return;
+      if (doc.settings.sides === 'Double-sided') {
+        currentPreviewSide = currentPreviewSide === 'front' ? 'back' : 'front';
+        renderPreviewSheet();
+      } else {
+        // Simplex - navigate to next sheet if available
+        if (btnSheetRight && !btnSheetRight.disabled) {
+          btnSheetRight.click();
         }
-        convertedPdfBytes = await convertImageToPdf(file);
-        if (sheetLoadingSpinner) sheetLoadingSpinner.classList.add('hidden');
       }
-      return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
-    }
+    });
 
-    if (convertedPdfBytes) {
-      return new File([convertedPdfBytes], pdfName, { type: 'application/pdf' });
-    }
+    btnPreviewMenu.addEventListener('click', (e) => {
+      e.stopPropagation();
+      previewMenuDropdown.classList.toggle('hidden');
+    });
 
-    return file;
+    previewMenuSettings.addEventListener('click', () => {
+      if (activePreviewDocId) {
+        switchView('settings', activePreviewDocId);
+      }
+    });
   }
 
-  async function handleOrderSubmission() {
-    if (reviewAlert) reviewAlert.classList.add('hidden');
-
-    if (!pricingLoaded) {
-      showError('Pricing is loading. Please wait a moment.');
+  // --- View 4: Checkout & Order Submission Implementation ---
+  async function submitOrder() {
+    if (cartItems.length === 0) {
+      showCartError('Please add at least one document to print.');
       return;
     }
 
-    if (!file) {
-      showError('Please upload a document first.');
-      return;
-    }
-
-    const selectedCount = getSelectedPagesCount();
-    if (selectedCount === 0) {
-      showError('Please select at least 1 page to print.');
-      return;
-    }
-
-    const isDouble = (sides === 'Double-sided');
-    const activePrice = (mode === 'Color' && colorHardwareEnabled)
-      ? (isDouble ? colorDuplexPricePaise : colorSimplexPricePaise)
-      : (isDouble ? bwDuplexPricePaise : bwSimplexPricePaise);
-    if (activePrice <= 0) {
-      showError('Unable to proceed: pricing is invalid or unavailable.');
-      return;
-    }
-
-    if (btnPayUpi) btnPayUpi.disabled = true;
-    if (uploadProgressCard) uploadProgressCard.classList.remove('hidden');
+    btnReviewOrder.disabled = true;
+    const originalText = btnReviewOrder.innerHTML;
+    btnReviewOrder.innerHTML = `<span>Preparing order...</span>`;
 
     try {
-      // 1. Process custom page range / rotation if present
-      const uploadDoc = await prepareUploadDocument();
-
-      // 2. Prepare FormData
       const formData = new FormData();
-      formData.append('file', uploadDoc);
-      formData.append('copies', copies.toString());
-      formData.append('duplex', sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
-      formData.append('color_mode', mode === 'Color' ? 'COLOR' : 'BW');
-      if (pageSelection === 'Custom Range' && customPageRange && customPageRange.trim()) {
-        formData.append('page_range', customPageRange.trim());
+      const metadata = [];
+
+      for (let i = 0; i < cartItems.length; i++) {
+        const item = cartItems[i];
+        let filePayload = item.file;
+        if (item.pdfBytes && (item.isImage || item.isOffice)) {
+          const pdfBlob = new Blob([item.pdfBytes], { type: 'application/pdf' });
+          const safeName = item.name.replace(/\.[^.]+$/, '') + '.pdf';
+          filePayload = new File([pdfBlob], safeName, { type: 'application/pdf' });
+        }
+        formData.append('files', filePayload);
+
+        metadata.push({
+          copies: item.settings.copies,
+          duplex: item.settings.sides === 'Double-sided',
+          color_mode: item.settings.mode === 'Color' ? 'color' : 'bw',
+          page_range: item.settings.pageSelection === 'Custom Range' ? item.settings.customPageRange : ''
+        });
       }
 
-      // 3. Submit to server
+      formData.append('metadata', JSON.stringify(metadata));
+
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;
-      const resp = await fetch(uploadUrl, {
-        method: 'POST',
-        body: formData
-      });
+      const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
 
       if (!resp.ok) {
         const errText = await resp.text();
-        throw new Error(errText || `Upload failed (${resp.status})`);
+        throw new Error(errText || 'Failed to submit order to kiosk');
       }
 
       const data = await resp.json();
-      activeOrderID = data.order_id;
-      backendConfirmedPricePaise = data.total_price_paise;
-      backendConfirmedOrderID = data.order_id;
+      activeOrderId = data.order_id;
+      activeDisplayCode = String(data.display_code || '0000');
 
-      // Update summary price with authoritative backend price
-      if (summaryPrice) {
-        summaryPrice.textContent = formatRupees(data.total_price_paise);
-      }
-
-      // 4. Transition to Status Section
-      if (uploadSection) uploadSection.classList.add('hidden');
-      if (printOptionsSection) printOptionsSection.classList.add('hidden');
-      if (reviewSection) reviewSection.classList.add('hidden');
-      if (uploadArea) uploadArea.classList.add('hidden');
-      if (filePreviewCard) filePreviewCard.classList.add('hidden');
-      if (statusSection) statusSection.classList.remove('hidden');
-
-      statusDisplayCode.textContent = data.display_code || '----';
-      updateStatusDisplay(data.status, 0, data.total_pages, 0, data.total_sheets, '');
-
-      // Dev Mode payment button
-      if (devMode && devSimulatePaymentBtn) {
-        devSimulatePaymentBtn.classList.remove('hidden');
-        devSimulatePaymentBtn.onclick = async () => {
-          devSimulatePaymentBtn.disabled = true;
-          try {
-            const simResp = await fetch(`/api/orders/${encodeURIComponent(activeOrderID)}/simulate-payment`, {
-              method: 'POST'
-            });
-            if (!simResp.ok) {
-              const errData = await simResp.json().catch(() => ({}));
-              throw new Error(errData.error || 'Payment simulation failed');
-            }
-            const simData = await simResp.json();
-            updateStatusDisplay(simData.status, 0, data.total_pages, 0, data.total_sheets, '');
-          } catch (simErr) {
-            alert(simErr.message);
-            devSimulatePaymentBtn.disabled = false;
-          }
-        };
-      } else if (!devMode && typeof window.Razorpay === 'function') {
-        // Requirement 10 & 19: Razorpay order amount strictly matches confirmed backend order price in paise
-        try {
-          const rzp = new window.Razorpay({
-            key: container.dataset.razorpayKeyId || 'rzp_test_placeholder',
-            amount: data.total_price_paise,
-            currency: 'INR',
-            name: 'XeroxGo',
-            description: `Print Order (${data.display_code || data.order_id})`,
-            notes: {
-              order_id: data.order_id
-            },
-            handler: function() {
-              startPolling(activeOrderID);
-            }
-          });
-          rzp.open();
-        } catch (rzpErr) {
-          console.warn('Razorpay checkout initialization notice:', rzpErr);
+      // Populate Checkout View
+      for (let i = 0; i < 4; i++) {
+        if (pinBoxes[i]) {
+          pinBoxes[i].textContent = activeDisplayCode[i] || '-';
         }
       }
 
-      // Start live order status polling
-      startPolling(activeOrderID);
-
-      statusSection.scrollIntoView({ behavior: 'smooth' });
-    } catch (err) {
-      console.error('Order submission error:', err);
-      if (reviewAlert) {
-        reviewAlert.textContent = err.message || 'Submission failed. Please try again.';
-        reviewAlert.classList.remove('hidden');
-      } else {
-        alert(err.message || 'Submission failed');
+      if (checkoutDocsCount) {
+        checkoutDocsCount.textContent = `${cartItems.length} file${cartItems.length > 1 ? 's' : ''}`;
       }
+      if (checkoutTotalAmount) {
+        const totalPaise = data.total_price_paise || cartItems.reduce((acc, it) => acc + it.pricePaise, 0);
+        checkoutTotalAmount.textContent = formatRupees(totalPaise);
+      }
+
+      startExpiryCountdown();
+      startOrderStatusPolling(activeOrderId);
+
+      switchView('checkout');
+    } catch (orderErr) {
+      console.error('Order submission error:', orderErr);
+      showCartError(`Could not create order: ${orderErr.message || orderErr}`);
     } finally {
-      if (btnPayUpi) btnPayUpi.disabled = false;
-      if (uploadProgressCard) uploadProgressCard.classList.add('hidden');
+      btnReviewOrder.disabled = false;
+      btnReviewOrder.innerHTML = originalText;
     }
   }
 
-  if (btnPayUpi) {
-    btnPayUpi.addEventListener('click', handleOrderSubmission);
+  function startExpiryCountdown() {
+    if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+    let secondsLeft = 15 * 60;
+
+    function tick() {
+      const minutes = Math.floor(secondsLeft / 60);
+      const seconds = secondsLeft % 60;
+      if (pinExpiryText) {
+        pinExpiryText.textContent = `Expires in ${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+      }
+      if (secondsLeft <= 0) {
+        clearInterval(expiryCountdownTimer);
+        if (pinExpiryText) pinExpiryText.textContent = 'PIN expired. Please create a new order.';
+      }
+      secondsLeft--;
+    }
+
+    tick();
+    expiryCountdownTimer = setInterval(tick, 1000);
   }
 
-  // --- Live Status Polling ---
-  function updateStatusDisplay(status, pagesPrinted, totalPages, sheetsPrinted, totalSheets, errReason) {
-    if (statusBadge) {
-      statusBadge.textContent = status;
-      statusBadge.className = `status-pill status-${status}`;
-    }
+  function startOrderStatusPolling(orderId) {
+    if (orderPollTimer) clearInterval(orderPollTimer);
 
-    if (totalPages > 0) {
-      const pct = Math.min(100, Math.round((pagesPrinted / totalPages) * 100));
-      if (statusProgressFill) statusProgressFill.style.width = pct + '%';
-      if (statusPagesText) statusPagesText.textContent = `${pagesPrinted} / ${totalPages}`;
-    }
-
-    if (totalSheets > 0 && statusSheetsText) {
-      statusSheetsText.textContent = `${sheetsPrinted} / ${totalSheets}`;
-    }
-
-    if (errReason && statusErrorAlert) {
-      statusErrorAlert.textContent = errReason;
-      statusErrorAlert.classList.remove('hidden');
-    } else if (statusErrorAlert) {
-      statusErrorAlert.classList.add('hidden');
-    }
-
-    if (status === 'COMPLETED' && statusSuccessAlert) {
-      statusSuccessAlert.classList.remove('hidden');
-      if (devSimulatePaymentBtn) devSimulatePaymentBtn.classList.add('hidden');
-    }
-  }
-
-  function startPolling(orderID) {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(async () => {
+    orderPollTimer = setInterval(async () => {
       try {
-        const resp = await fetch(`/api/orders/${encodeURIComponent(orderID)}/status`);
+        const resp = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`);
         if (!resp.ok) return;
-        const data = await resp.json();
-
-        updateStatusDisplay(
-          data.status,
-          data.pages_printed,
-          data.total_pages,
-          data.sheets_printed,
-          data.total_sheets,
-          data.error_reason
-        );
-
-        if (data.status === 'COMPLETED' || data.status === 'PAUSED_ERROR' || data.status === 'FAILED_REFUNDABLE') {
-          if (data.status === 'COMPLETED') {
-            clearInterval(pollTimer);
-          }
-        }
+        const statusData = await resp.json();
+        updateCheckoutStatus(statusData);
       } catch (_) {}
-    }, 1200);
+    }, 2500);
+  }
+
+  function updateCheckoutStatus(statusData) {
+    if (!statusData || !checkoutLiveStatusBox) return;
+    const st = statusData.status || '';
+
+    if (st && st !== 'PENDING_PAYMENT') {
+      checkoutLiveStatusBox.classList.remove('hidden');
+    }
+
+    if (checkoutStatusPill) {
+      checkoutStatusPill.className = `status-pill status-${st}`;
+      checkoutStatusPill.textContent = st;
+    }
+
+    if (checkoutProgressBar) {
+      let pct = 0;
+      if (st === 'PAID_WAITING') pct = 25;
+      else if (st === 'SPOOLING') pct = 50;
+      else if (st === 'PRINTING') {
+        const pagesPrinted = statusData.pages_printed || 0;
+        const totalPages = statusData.total_pages || 1;
+        pct = Math.min(95, Math.max(60, Math.round((pagesPrinted / totalPages) * 100)));
+      } else if (st === 'COMPLETED') {
+        pct = 100;
+        if (orderPollTimer) clearInterval(orderPollTimer);
+      }
+      checkoutProgressBar.style.width = pct + '%';
+    }
+
+    if (checkoutStatusMsg) {
+      if (st === 'PRINTING') {
+        checkoutStatusMsg.textContent = `Printing page ${statusData.pages_printed || 1} of ${statusData.total_pages || 1}...`;
+      } else if (st === 'COMPLETED') {
+        checkoutStatusMsg.textContent = 'Your documents have finished printing!';
+      } else {
+        checkoutStatusMsg.textContent = '';
+      }
+    }
+  }
+
+  function setupCheckoutEventListeners() {
+    btnCopyPin.addEventListener('click', async () => {
+      if (!activeDisplayCode) return;
+      try {
+        await navigator.clipboard.writeText(activeDisplayCode);
+        if (btnCopyPinLabel) {
+          const original = btnCopyPinLabel.textContent;
+          btnCopyPinLabel.textContent = 'Copied!';
+          setTimeout(() => {
+            btnCopyPinLabel.textContent = original;
+          }, 2000);
+        }
+      } catch (_) {
+        alert(`PIN: ${activeDisplayCode}`);
+      }
+    });
+
+    btnStartNewOrder.addEventListener('click', () => {
+      if (orderPollTimer) clearInterval(orderPollTimer);
+      if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+      cartItems = [];
+      activeOrderId = null;
+      activeDisplayCode = '';
+      switchView('cart');
+    });
+  }
+
+  // --- Pricing Fetch ---
+  async function fetchPricing() {
+    try {
+      const resp = await fetch(`/api/pricing?kiosk_id=${encodeURIComponent(kioskID)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (typeof data.bw_simplex_price_paise === 'number') bwSimplexPricePaise = data.bw_simplex_price_paise;
+        if (typeof data.bw_duplex_price_paise === 'number') bwDuplexPricePaise = data.bw_duplex_price_paise;
+        if (typeof data.color_simplex_price_paise === 'number') colorSimplexPricePaise = data.color_simplex_price_paise;
+        if (typeof data.color_duplex_price_paise === 'number') colorDuplexPricePaise = data.color_duplex_price_paise;
+        colorHardwareEnabled = !!data.color_hardware_enabled;
+
+        // Update settings labels
+        if (settingsBwPriceLabel) settingsBwPriceLabel.textContent = `${formatRupees(bwSimplexPricePaise)}/side`;
+        if (settingsColorPriceLabel) settingsColorPriceLabel.textContent = `${formatRupees(colorSimplexPricePaise)}/side`;
+      }
+    } catch (err) {
+      console.warn('Could not load remote pricing tiers:', err);
+    }
+  }
+
+  // --- Banner & PWA Setup ---
+  function setupBanner() {
+    if (!bannerTrack || !bannerDots) return;
+    let currentSlide = 0;
+    const slides = bannerTrack.children;
+    const dots = bannerDots.children;
+    if (slides.length === 0) return;
+
+    function setSlide(idx) {
+      currentSlide = idx % slides.length;
+      bannerTrack.style.transform = `translateX(-${currentSlide * 100}%)`;
+      Array.from(dots).forEach((dot, i) => {
+        dot.classList.toggle('active', i === currentSlide);
+      });
+    }
+
+    Array.from(dots).forEach((dot, idx) => {
+      dot.addEventListener('click', () => setSlide(idx));
+    });
+
+    setInterval(() => {
+      setSlide(currentSlide + 1);
+    }, 5000);
+
+    if (bannerCloseBtn && promoBanner) {
+      bannerCloseBtn.addEventListener('click', () => {
+        promoBanner.style.display = 'none';
+      });
+    }
+  }
+
+  function setupPwa() {
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPwaPrompt = e;
+      if (pwaInstallBanner) pwaInstallBanner.classList.remove('hidden');
+    });
+
+    if (pwaDismissBtn && pwaInstallBanner) {
+      pwaDismissBtn.addEventListener('click', () => {
+        pwaInstallBanner.classList.add('hidden');
+        if (pwaMiniPill) pwaMiniPill.classList.remove('hidden');
+      });
+    }
+
+    if (pwaInstallBtn) {
+      pwaInstallBtn.addEventListener('click', async () => {
+        if (deferredPwaPrompt) {
+          deferredPwaPrompt.prompt();
+          deferredPwaPrompt = null;
+        } else if (pwaGuideModal) {
+          pwaGuideModal.classList.remove('hidden');
+        }
+      });
+    }
+
+    if (pwaModalCloseBtn && pwaGuideModal) {
+      pwaModalCloseBtn.addEventListener('click', () => pwaGuideModal.classList.add('hidden'));
+    }
+    if (pwaModalGotItBtn && pwaGuideModal) {
+      pwaModalGotItBtn.addEventListener('click', () => pwaGuideModal.classList.add('hidden'));
+    }
+  }
+
+  // --- Drag & Drop / File Input Setup ---
+  function setupUploadInputs() {
+    if (btnChooseFiles && fileInput) {
+      btnChooseFiles.addEventListener('click', () => fileInput.click());
+    }
+
+    if (fileInput) {
+      fileInput.addEventListener('change', (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          handleFiles(Array.from(e.target.files));
+          fileInput.value = '';
+        }
+      });
+    }
+
+    if (cartUploadCard) {
+      cartUploadCard.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        cartUploadCard.classList.add('dragover');
+      });
+      cartUploadCard.addEventListener('dragleave', () => {
+        cartUploadCard.classList.remove('dragover');
+      });
+      cartUploadCard.addEventListener('drop', (e) => {
+        e.preventDefault();
+        cartUploadCard.classList.remove('dragover');
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          handleFiles(Array.from(e.dataTransfer.files));
+        }
+      });
+    }
+
+    if (btnReviewOrder) {
+      btnReviewOrder.addEventListener('click', submitOrder);
+    }
+  }
+
+  // --- Initialization ---
+  function init() {
+    setupBanner();
+    setupPwa();
+    setupUploadInputs();
+    setupSettingsEventListeners();
+    setupPreviewEventListeners();
+    setupCheckoutEventListeners();
+    fetchPricing();
+    renderCart();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
   }
 })();

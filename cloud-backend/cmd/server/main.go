@@ -14,8 +14,10 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -87,23 +89,21 @@ const portalHTML = `<!DOCTYPE html>
     window.dispatchEvent(new CustomEvent('pdfjs-ready', { detail: pdfjsLib }));
   </script>
   <script src="/static/js/portal.js" defer></script>
+  <script>
+    (function() {
+      var match = window.location.pathname.match(/\/k\/([^/]+)/);
+      var params = new URLSearchParams(window.location.search);
+      var kiosk = (match && match[1]) || params.get('kiosk_id') || 'kiosk-demo';
+      window.XEROXGO_KIOSK_ID = kiosk;
+      document.addEventListener('DOMContentLoaded', function() {
+        var el = document.getElementById('app-container');
+        if (el) el.dataset.kioskId = kiosk;
+      });
+    })();
+  </script>
 </head>
 <body>
-  <div class="app-container" data-kiosk-id="{{.KioskID}}" data-dev-mode="{{.DevMode}}" data-price-per-sheet-paise="{{.PricePerSheetPaise}}">
-    <!-- Header -->
-    <header class="header" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.25rem 1rem 0.75rem;">
-      <div class="logo-container" style="display:flex; align-items:center; justify-content:center; margin-bottom:0.35rem;">
-        <img
-          src="/static/assets/xeroxgo-full-logo-transparent.png"
-          alt="XeroxGO"
-          class="logo-img"
-          style="height:34px; width:min(100%, 340px); object-fit:contain;"
-        />
-      </div>
-      <p class="header-subtitle" style="margin:0; color:var(--text-secondary); font-size:0.95rem;">
-        Upload, Print, Collect - It's that simple!
-      </p>
-    </header>
+  <div class="app-container" id="app-container" data-kiosk-id="{{.KioskID}}" data-dev-mode="{{.DevMode}}" data-price-per-sheet-paise="{{.PricePerSheetPaise}}">
 
     <!-- Top Floating PWA Install Banner -->
     <div id="pwa-install-banner" class="pwa-install-banner animate-slide-down hidden">
@@ -135,310 +135,352 @@ const portalHTML = `<!DOCTYPE html>
       </button>
     </div>
 
-    <!-- Promo Banner Carousel -->
-    <div id="promo-banner" class="banner-container">
-      <div id="banner-track" class="banner-track">
-        <div class="banner-slide" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
-          <div class="banner-title">Quick &amp; Easy</div>
-          <div class="banner-desc">Direct UPI payment. No coins, no cash needed.</div>
-        </div>
-        <div class="banner-slide" style="background: linear-gradient(135deg, #065F46 0%, #10B981 50%, #059669 100%);">
-          <div class="banner-title">High Quality Prints</div>
-          <div class="banner-desc">Crisp laser documents ready in seconds.</div>
-        </div>
-        <div class="banner-slide" style="background: linear-gradient(135deg, #581C87 0%, #7C3AED 50%, #D97706 100%);">
-          <div class="banner-title">Skip The Queue</div>
-          <div class="banner-desc">Pick up your print job with your 4-digit code.</div>
-        </div>
-      </div>
-      <button id="banner-close-btn" class="banner-close" type="button" aria-label="Close banner">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-      <div id="banner-dots" class="banner-indicators">
-        <div class="indicator active"></div>
-        <div class="indicator"></div>
-        <div class="indicator"></div>
-      </div>
-    </div>
-
-    <!-- 1. Upload Document Section -->
-    <div id="upload-section" style="margin-top:1.25rem;">
-      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">1. Upload Document</h2>
-      <div class="card" style="margin-top:0;">
-        <input type="file" id="file-input" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.ods,.odp,.rtf,.txt,.jpg,.jpeg,.png,.webp,.bmp" style="display:none;" />
-        <div id="upload-area" class="upload-area">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="upload-icon" style="margin:0 auto 0.5rem; display:block;">
-            <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
-          </svg>
-          <div class="upload-text">Click to upload or drag and drop</div>
-          <div class="upload-subtext">Supported formats: PDF, DOCX, PPTX, XLSX, PNG, JPEG</div>
-          <div class="upload-subtext">Max size: 25 MB</div>
-        </div>
-
-        <div id="file-preview-card" class="file-preview animate-slide-up hidden" style="flex-direction:column; align-items:stretch; gap:0.75rem;">
-          <div style="display:flex; align-items:center; justify-content:space-between;">
-            <div class="file-info">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-              <div>
-                <div id="file-name-display" class="file-name" style="font-weight:700; font-size:1rem;">-</div>
-                <div id="file-meta-display" class="file-meta">-</div>
-              </div>
-            </div>
-            <button id="remove-file-btn" class="remove-btn" type="button" title="Remove file">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-            </button>
-          </div>
-          <!-- Live Print-Ready Sheet Preview -->
-          <div id="live-sheet-container" class="live-sheet-container">
-            <!-- Sheet Header / Status Badges -->
-            <div class="sheet-badges-bar">
-              <span id="preview-color-badge" class="sheet-badge badge-bw">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 0 20z" fill="currentColor"/></svg>
-                B&amp;W Preview
-              </span>
-              <span id="preview-sheet-badge" class="sheet-badge badge-sheet">Sheet 1 of 1</span>
-            </div>
-
-            <!-- Authentic Paper Sheet -->
-            <div id="paper-sheet" class="paper-sheet">
-              <div id="sheet-loading-spinner" class="sheet-spinner hidden">
-                <svg class="spin" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                <span id="sheet-spinner-text">Rendering preview...</span>
-              </div>
-              <div id="sheet-fallback" class="sheet-fallback hidden">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.75" style="margin-bottom:0.75rem;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                <div id="sheet-fallback-title" class="sheet-fallback-title">Preview Unavailable</div>
-                <div id="sheet-fallback-desc" class="sheet-fallback-desc">Document is ready to print</div>
-              </div>
-              <canvas id="live-preview-canvas" class="live-preview-canvas preview-bw"></canvas>
-            </div>
-
-            <!-- Sheet Footer Controls -->
-            <div class="sheet-controls-bar">
-              <div class="sheet-pager">
-                <button id="btn-sheet-prev" type="button" class="sheet-nav-btn" title="Previous Page" disabled>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
-                </button>
-                <span id="sheet-page-indicator" class="sheet-page-text">Page 1 of 1</span>
-                <button id="btn-sheet-next" type="button" class="sheet-nav-btn" title="Next Page" disabled>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
-                </button>
-              </div>
-              <button id="btn-sheet-flip" type="button" class="sheet-flip-btn hidden" title="Flip double-sided sheet">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><polyline points="21 3 21 8 16 8"/></svg>
-                <span id="sheet-flip-text">Flip to Back</span>
-              </button>
-            </div>
-          </div>
-        </div>
-        <div id="upload-alert" class="alert alert-error hidden"></div>
-      </div>
-    </div>
-
-    <!-- 2. Select Print Options Section -->
-    <div id="print-options-section" style="margin-top:2rem;">
-      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">2. Select Print Options</h2>
-      <div class="card" style="margin-top:0;">
-        <h3 style="font-size:1.25rem; font-weight:700; margin-bottom:1.75rem; color:var(--text-primary);">Print Options</h3>
-
-        <!-- Page Selection -->
-        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-          Page Selection
-        </div>
-        <div class="option-group" style="margin-bottom:1.25rem;">
-          <button id="btn-page-selection-all" type="button" class="option-btn active" style="padding:0.75rem;">
-            <div style="color:var(--text-primary); font-weight:600;">All Pages</div>
-          </button>
-          <button id="btn-page-selection-custom" type="button" class="option-btn" style="padding:0.75rem;">
-            <div style="color:var(--text-primary); font-weight:600;">Custom Range</div>
-          </button>
-        </div>
-
-        <div id="custom-range-box" class="hidden" style="margin-bottom:1.75rem;">
-          <input
-            id="custom-range-input"
-            type="text"
-            placeholder="e.g. 1-3, 5"
-            style="width:100%; padding:0.75rem; border-radius:var(--radius-md); border:1px solid var(--border-color); font-size:1rem; font-family:inherit;"
+    <!-- ================================================================= -->
+    <!-- VIEW 1: FILES CART SCREEN                                         -->
+    <!-- ================================================================= -->
+    <main id="view-cart" class="portal-view active-view">
+      <!-- Header -->
+      <header class="portal-header">
+        <div class="logo-box">
+          <img
+            src="/static/assets/xeroxgo-full-logo-transparent.png"
+            alt="XeroxGO"
+            class="header-logo-img"
           />
-          <div id="custom-range-feedback" style="color:var(--text-secondary); font-size:0.875rem; margin-top:0.4rem;">
-            Enter pages to print
+        </div>
+        <p class="header-tagline">Upload, Print, Collect - It's that simple!</p>
+      </header>
+
+      <!-- Promo Banner Carousel -->
+      <div id="promo-banner" class="banner-container">
+        <div id="banner-track" class="banner-track">
+          <div class="banner-slide" style="background: linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #4F46E5 100%);">
+            <div class="banner-title">Quick &amp; Easy</div>
+            <div class="banner-desc">Direct UPI payment. No coins, no cash needed.</div>
+          </div>
+          <div class="banner-slide" style="background: linear-gradient(135deg, #065F46 0%, #10B981 50%, #059669 100%);">
+            <div class="banner-title">High Quality Prints</div>
+            <div class="banner-desc">Crisp laser documents ready in seconds.</div>
+          </div>
+          <div class="banner-slide" style="background: linear-gradient(135deg, #581C87 0%, #7C3AED 50%, #D97706 100%);">
+            <div class="banner-title">Skip The Queue</div>
+            <div class="banner-desc">Pick up your print job with your 4-digit code.</div>
           </div>
         </div>
-
-        <!-- Number of Copies -->
-        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-          Number of Copies
-        </div>
-        <div class="counter" style="justify-content:flex-start; margin-bottom:1.75rem;">
-          <button id="copies-dec" class="counter-btn" type="button" style="border-radius:8px;">-</button>
-          <div id="copies-val" class="counter-value" style="width:40px; font-weight:800;">1</div>
-          <button id="copies-inc" class="counter-btn" type="button" style="border-radius:8px;">+</button>
-        </div>
-
-        <!-- Print Mode -->
-        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>
-          Print Mode
-        </div>
-        <div class="option-group" style="margin-bottom:1.75rem;">
-          <button id="btn-mode-bw" type="button" class="option-btn active" style="flex-direction:row; justify-content:center; padding:1rem;">
-            <div style="display:flex; align-items:center; gap:0.75rem;">
-              <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #64748B, #334155);"></div>
-              <div style="text-align:left;">
-                <div style="color:var(--text-primary); font-weight:600;">B&amp;W</div>
-                <div id="price-bw-label" style="font-size:0.875rem; color:var(--text-secondary);">₹2.00/side</div>
-              </div>
-            </div>
-          </button>
-          <button id="btn-mode-color" type="button" class="option-btn" style="flex-direction:row; justify-content:center; padding:1rem;">
-            <div style="display:flex; align-items:center; gap:0.75rem;">
-              <div style="width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, #F59E0B, #3B82F6);"></div>
-              <div style="text-align:left;">
-                <div style="color:var(--text-primary); font-weight:600;">Color</div>
-                <div id="price-color-label" style="font-size:0.875rem; color:var(--text-secondary);">₹10.00/side</div>
-              </div>
-            </div>
-          </button>
-        </div>
-
-        <!-- Print Sides -->
-        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
-          Print Sides
-        </div>
-        <div class="option-group" style="margin-bottom:1.75rem;">
-          <button id="btn-side-single" type="button" class="option-btn active" style="padding:1rem;">
-            <div style="border:2px solid var(--text-primary); width:32px; height:42px; border-radius:8px; margin-bottom:0.75rem;"></div>
-            <div style="color:var(--text-primary); font-weight:600;">Single Side</div>
-          </button>
-          <button id="btn-side-double" type="button" class="option-btn" style="padding:1rem;">
-            <div style="position:relative; width:38px; height:42px; margin-bottom:0.75rem;">
-              <div style="position:absolute; top:0; left:0; border:2px solid var(--text-primary); width:32px; height:42px; border-radius:8px; opacity:0.25;"></div>
-              <div style="position:absolute; top:4px; left:4px; border:2px solid var(--text-primary); width:32px; height:42px; border-radius:8px; background-color:white;"></div>
-            </div>
-            <div style="color:var(--text-primary); font-weight:600;">Double Side</div>
-            <div style="font-size:0.75rem; color:var(--secondary-color); font-weight:700; margin-top:0.25rem;">Save paper!</div>
-          </button>
-        </div>
-
-        <!-- Pages Per Sheet -->
-        <div style="margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem; color:var(--text-primary); font-weight:600;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
-          Pages Per Sheet
-        </div>
-        <div class="option-group" style="margin-bottom:0.5rem; display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); gap:0.5rem;">
-          <button id="btn-nup-1" type="button" class="option-btn active" style="padding:0.75rem 0.5rem; text-align:center;">
-            <div style="color:var(--text-primary); font-weight:600; font-size:0.9rem;">1 page/sheet</div>
-            <div style="font-size:0.75rem; color:var(--text-secondary); margin-top:0.15rem;">Standard A4 layout</div>
-          </button>
-          <button id="btn-nup-2" type="button" class="option-btn" disabled style="padding:0.75rem 0.5rem; text-align:center; opacity:0.5; cursor:not-allowed;" title="2-up layout handled via standard document formatting">
-            <div style="color:var(--text-primary); font-weight:600; font-size:0.9rem;">2 pages/sheet</div>
-            <div style="font-size:0.75rem; color:var(--text-secondary); margin-top:0.15rem;">1-Up Only</div>
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 3. Review & Pay Section -->
-    <div id="review-section" style="margin-top:2rem; margin-bottom:2rem;">
-      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">3. Review &amp; Pay</h2>
-      <div id="review-card" class="card" style="margin-top:0; padding:1.25rem;">
-        <div style="background-color:#F8FAFC; border-radius:var(--radius-md); padding:1.15rem; border:1px solid var(--border-color); margin-bottom:1.25rem;">
-          <div style="margin-bottom:0.75rem;">
-            <div id="summary-file-name" style="font-weight:700; font-size:1.05rem; color:var(--text-primary); word-break:break-all;">-</div>
-            <div id="summary-pages" style="font-size:0.875rem; color:var(--text-secondary); margin-top:0.2rem;">-</div>
-          </div>
-          <div style="height:1px; background-color:var(--border-color); margin:0.75rem 0;"></div>
-          <div style="display:flex; flex-direction:column; gap:0.35rem; margin-bottom:1.1rem;">
-            <div id="summary-options" style="font-weight:600; font-size:0.95rem; color:var(--text-primary);">B&amp;W · Single Side · 1 page/sheet</div>
-            <div id="summary-copies" style="font-size:0.875rem; color:var(--text-secondary);">1 copy</div>
-          </div>
-          <button id="btn-edit-settings" type="button" style="display:inline-flex; align-items:center; gap:0.4rem; padding:0.45rem 0.85rem; border-radius:var(--radius-md); border:1px solid var(--primary-color); background:rgba(37,99,235,0.06); color:var(--primary-color); font-weight:600; font-size:0.85rem; cursor:pointer;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-            Edit Settings
-          </button>
-          <div style="height:1px; background-color:var(--border-color); margin:1rem 0;"></div>
-          <div style="display:flex; align-items:center; justify-content:space-between;">
-            <span style="font-size:1rem; font-weight:600; color:var(--text-secondary);">Total Price</span>
-            <span id="summary-price" style="font-size:1.6rem; font-weight:800; color:var(--primary-color);">₹0</span>
-          </div>
-        </div>
-
-        <div style="display:flex; flex-direction:column; gap:1.25rem;">
-          <div>
-            <label for="user-name-input" style="display:block; margin-bottom:0.4rem; font-weight:600; font-size:0.9rem; color:var(--text-primary);">
-              Your Name (Optional)
-            </label>
-            <input
-              id="user-name-input"
-              type="text"
-              placeholder="Enter your name"
-              style="width:100%; padding:0.75rem; border-radius:var(--radius-md); border:1px solid var(--border-color); font-size:1rem; font-family:inherit;"
-            />
-          </div>
-
-          <div id="upload-progress-card" class="hidden" style="background:#FFFFFF; border-radius:var(--radius-lg); border:1px solid var(--border-color); padding:1.25rem 1rem; text-align:center;">
-            <div class="progress-bar-bg" style="margin-bottom:0.75rem;">
-              <div id="upload-progress-bar" class="progress-bar-fill" style="width:40%;"></div>
-            </div>
-            <p style="font-weight:600; color:var(--text-primary); margin:0; font-size:0.9rem;">Sending your document...</p>
-          </div>
-
-          <button id="btn-pay-upi" type="button" class="btn btn-primary" style="padding:0.85rem; font-size:0.95rem; font-weight:700; gap:0.5rem;">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-            Pay with UPI &amp; Print
-          </button>
-        </div>
-        <div id="review-alert" class="alert alert-error hidden"></div>
-      </div>
-    </div>
-
-    <!-- 4. Live Print Status & Order Tracking Section -->
-    <div id="status-section" class="hidden" style="margin-top:1.5rem; margin-bottom:2rem;">
-      <h2 class="section-title" style="padding-left:1rem; margin-bottom:0.5rem;">Print Order Status</h2>
-      <div class="card" style="margin-top:0; padding:1.25rem; display:flex; flex-direction:column; gap:1.25rem;">
-        <div>
-          <label style="display:block; margin-bottom:0.4rem; font-weight:600; font-size:0.85rem; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.5px;">
-            Your Kiosk Pickup Code
-          </label>
-          <div id="status-display-code" class="code-display">----</div>
-          <div style="font-size:0.8rem; color:var(--text-secondary); text-align:center; margin-top:0.35rem;">
-            Enter this 4-digit code on the kiosk screen if prompted.
-          </div>
-        </div>
-
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-weight:600; color:var(--text-secondary); font-size:0.95rem;">Current Status</span>
-          <span id="status-badge" class="status-pill status-PENDING_PAYMENT">PENDING_PAYMENT</span>
-        </div>
-
-        <div>
-          <div class="progress-bar-bg">
-            <div id="status-progress-fill" class="progress-bar-fill" style="width:0%;"></div>
-          </div>
-          <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-secondary); margin-top:0.5rem;">
-            <span>Pages: <strong id="status-pages-text" style="color:var(--text-primary);">0 / 0</strong></span>
-            <span>Sheets: <strong id="status-sheets-text" style="color:var(--text-primary);">0 / 0</strong></span>
-          </div>
-        </div>
-
-        {{if .DevMode}}
-        <button id="dev-simulate-payment-btn" type="button" class="btn btn-primary" style="background:#10B981; border:none; padding:0.75rem; font-weight:700;">
-          Simulate Payment (Dev Mode)
+        <button id="banner-close-btn" class="banner-close" type="button" aria-label="Close banner">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
-        {{end}}
-
-        <div id="status-success-alert" class="alert alert-success hidden" style="font-weight:600; text-align:center;">
-          🎉 Print job completed! Please collect your document from the printer tray.
+        <div id="banner-dots" class="banner-indicators">
+          <div class="indicator active"></div>
+          <div class="indicator"></div>
+          <div class="indicator"></div>
         </div>
-        <div id="status-error-alert" class="alert alert-error hidden"></div>
       </div>
-    </div>
 
-    <!-- PWA Install Guide Modal (for iOS and non-native browsers) -->
+      <!-- Add Documents Dropzone Card -->
+      <div class="cart-upload-card" id="cart-upload-card">
+        <div class="upload-cloud-icon">
+          <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>
+            <polyline points="16 13 12 9 8 13"/>
+            <line x1="12" y1="9" x2="12" y2="21"/>
+          </svg>
+        </div>
+        <h3 class="upload-heading">Add documents</h3>
+        <p class="upload-subheading">Select multiple PDFs, Office files or images</p>
+        <button type="button" class="btn-choose-files" id="btn-choose-files">+ Choose files</button>
+        <input type="file" id="file-input" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.ods,.odp,.rtf,.txt,.jpg,.jpeg,.png,.webp,.bmp" style="display:none;" />
+        
+        <!-- Upload Processing Spinner -->
+        <div id="upload-processing-indicator" class="upload-processing-box hidden">
+          <div class="spinner-icon"></div>
+          <span id="upload-processing-text" class="processing-text">Processing document...</span>
+        </div>
+
+        <!-- Cart Alert -->
+        <div id="cart-alert" class="alert alert-error hidden"></div>
+      </div>
+
+      <!-- Document Cards List -->
+      <div id="cart-doc-list" class="cart-doc-list">
+        <!-- Rendered dynamically via JavaScript -->
+      </div>
+
+      <!-- Empty Cart Message (when no documents added yet) -->
+      <div id="cart-empty-placeholder" class="cart-empty-state">
+        <p>No documents added yet. Select one or more files to start printing.</p>
+      </div>
+
+      <!-- Sticky Bottom Total Bar -->
+      <div id="cart-bottom-bar" class="cart-bottom-bar hidden">
+        <div class="cart-total-info">
+          <span class="cart-total-label">Estimated total &middot; <span id="cart-docs-count">0 documents</span></span>
+          <span class="cart-total-amount" id="cart-total-amount">&#8377;0.00</span>
+        </div>
+        <button type="button" id="btn-review-order" class="btn-review-order">
+          <span>Review Order</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </button>
+      </div>
+    </main>
+
+    <!-- ================================================================= -->
+    <!-- VIEW 2: DOCUMENT SETTINGS SCREEN                                  -->
+    <!-- ================================================================= -->
+    <section id="view-settings" class="portal-view hidden">
+      <!-- Navigation Bar -->
+      <div class="view-nav-bar">
+        <button type="button" id="btn-settings-back" class="btn-nav-back" aria-label="Back to Cart">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <div class="view-nav-title-box">
+          <h2 class="view-nav-title" id="settings-filename">Document.pdf</h2>
+          <p class="view-nav-subtitle">Document settings</p>
+        </div>
+        <div class="view-nav-actions">
+          <button type="button" id="btn-settings-menu" class="btn-nav-menu" aria-label="Document options">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.5"/><circle cx="6" cy="12" r="1.5"/><circle cx="18" cy="12" r="1.5"/></svg>
+          </button>
+          <div id="settings-menu-dropdown" class="nav-dropdown-menu hidden">
+            <button type="button" id="menu-opt-reset" class="dropdown-item">Reset to default</button>
+            <button type="button" id="menu-opt-delete" class="dropdown-item dropdown-item-danger">Delete document</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings Form Card -->
+      <div class="settings-card">
+        <!-- 1. Page Selection -->
+        <div class="settings-field-group">
+          <label class="settings-field-label">Page Selection</label>
+          <div class="segmented-control">
+            <button type="button" class="segmented-opt active" id="btn-opt-all-pages">All Pages</button>
+            <button type="button" class="segmented-opt" id="btn-opt-custom-range">Custom Range</button>
+          </div>
+          <div id="settings-custom-range-wrapper" class="custom-range-wrapper hidden">
+            <input type="text" id="input-custom-range" class="custom-range-input" placeholder="e.g. 1-3, 5" autocomplete="off" />
+            <p class="custom-range-hint" id="custom-range-hint">Enter pages to print (e.g. 1-3, 5)</p>
+            <p class="custom-range-error hidden" id="custom-range-error"></p>
+          </div>
+        </div>
+
+        <!-- 2. Number of Copies -->
+        <div class="settings-field-group">
+          <label class="settings-field-label">Number of Copies</label>
+          <div class="copies-stepper">
+            <button type="button" id="btn-copies-minus" class="stepper-btn" aria-label="Decrease copies">&minus;</button>
+            <span id="copies-count-display" class="stepper-value">1</span>
+            <button type="button" id="btn-copies-plus" class="stepper-btn" aria-label="Increase copies">&plus;</button>
+          </div>
+        </div>
+
+        <!-- 3. Print Mode -->
+        <div class="settings-field-group">
+          <label class="settings-field-label">Print Mode</label>
+          <div class="choice-cards-row">
+            <div class="choice-card active" id="card-mode-bw">
+              <div class="choice-icon-circle bw-circle"></div>
+              <div class="choice-card-title">B&amp;W</div>
+              <div class="choice-card-sub" id="settings-bw-price-label">&#8377;2.00/side</div>
+            </div>
+            <div class="choice-card" id="card-mode-color">
+              <div class="choice-icon-circle color-circle"></div>
+              <div class="choice-card-title">Color</div>
+              <div class="choice-card-sub" id="settings-color-price-label">&#8377;10.00/side</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4. Print Sides -->
+        <div class="settings-field-group">
+          <label class="settings-field-label">Print Sides</label>
+          <div class="choice-cards-row">
+            <div class="choice-card active" id="card-side-single">
+              <div class="sheet-icon-single"></div>
+              <div class="choice-card-title">Single Side</div>
+            </div>
+            <div class="choice-card" id="card-side-double">
+              <div class="sheet-icon-double">
+                <div class="sheet-under"></div>
+                <div class="sheet-over"></div>
+              </div>
+              <div class="choice-card-title">Double Side</div>
+              <div class="save-paper-badge">Save paper!</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 5. Orientation -->
+        <div class="settings-field-group">
+          <label class="settings-field-label">Orientation</label>
+          <div class="segmented-control three-segment">
+            <button type="button" class="segmented-opt active" id="btn-orient-auto">Auto</button>
+            <button type="button" class="segmented-opt" id="btn-orient-portrait">Portrait</button>
+            <button type="button" class="segmented-opt" id="btn-orient-landscape">Landscape</button>
+          </div>
+        </div>
+
+        <!-- 6. Pages Per Sheet -->
+        <div class="settings-field-group">
+          <label class="settings-field-label">Pages Per Sheet</label>
+          <div class="choice-cards-row">
+            <div class="choice-card active" id="card-nup-1">
+              <div class="choice-card-title">1 page/sheet</div>
+              <div class="choice-card-sub">Standard A4 layout</div>
+            </div>
+            <div class="choice-card disabled" id="card-nup-2" title="2 pages per sheet is not yet available">
+              <div class="choice-card-title">2 pages/sheet</div>
+              <div class="choice-card-sub">Not yet available</div>
+            </div>
+          </div>
+        </div>
+
+        <p class="settings-footnote">Selected settings apply to this document only.</p>
+      </div>
+
+      <!-- Save Settings Sticky Button -->
+      <div class="settings-bottom-bar">
+        <button type="button" id="btn-save-doc-settings" class="btn-save-settings">
+          Save Settings &middot; <span id="save-settings-price">&#8377;0.00</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ================================================================= -->
+    <!-- VIEW 3: PRINT PREVIEW SCREEN                                      -->
+    <!-- ================================================================= -->
+    <section id="view-preview" class="portal-view hidden">
+      <!-- Navigation Bar -->
+      <div class="view-nav-bar">
+        <button type="button" id="btn-preview-back" class="btn-nav-back" aria-label="Back to Cart">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <div class="view-nav-title-box">
+          <h2 class="view-nav-title" id="preview-filename">Document.pdf</h2>
+          <p class="view-nav-subtitle">Print Preview</p>
+        </div>
+        <div class="view-nav-actions">
+          <button type="button" id="btn-preview-menu" class="btn-nav-menu" aria-label="Options">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.5"/><circle cx="6" cy="12" r="1.5"/><circle cx="18" cy="12" r="1.5"/></svg>
+          </button>
+          <div id="preview-menu-dropdown" class="nav-dropdown-menu hidden">
+            <button type="button" id="preview-menu-settings" class="dropdown-item">Edit settings</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Preview Frame -->
+      <div class="preview-frame-card">
+        <div class="preview-paper-stage">
+          <div id="preview-loading-spinner" class="preview-spinner hidden">
+            <div class="spinner-icon"></div>
+            <span>Rendering preview...</span>
+          </div>
+          <div id="preview-error-box" class="preview-error-box hidden">
+            <p>Preview unavailable</p>
+          </div>
+          <canvas id="preview-canvas" class="preview-canvas"></canvas>
+        </div>
+
+        <!-- Sheet Pager -->
+        <div class="preview-sheet-pager">
+          <button type="button" id="btn-sheet-left" class="sheet-arrow-btn" aria-label="Previous sheet" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <span id="preview-sheet-indicator" class="preview-sheet-indicator">Sheet 1 of 1 (Front)</span>
+          <button type="button" id="btn-sheet-right" class="sheet-arrow-btn" aria-label="Next sheet" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Flip Sheet Action -->
+      <div class="preview-action-row">
+        <button type="button" id="btn-sheet-flip" class="btn-flip-sheet">Flip Sheet</button>
+      </div>
+    </section>
+
+    <!-- ================================================================= -->
+    <!-- VIEW 4: CHECKOUT / PIN SCREEN                                     -->
+    <!-- ================================================================= -->
+    <section id="view-checkout" class="portal-view hidden">
+      <!-- Header -->
+      <header class="portal-header">
+        <div class="logo-box">
+          <img
+            src="/static/assets/xeroxgo-full-logo-transparent.png"
+            alt="XeroxGO"
+            class="header-logo-img"
+          />
+        </div>
+        <p class="header-tagline">Upload, Print, Collect - It's that simple!</p>
+      </header>
+
+      <!-- Ready Card -->
+      <div class="checkout-ready-card">
+        <div class="checkout-check-circle">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+        </div>
+        <h2 class="checkout-ready-title">Your order is ready!</h2>
+        <p class="checkout-ready-subtitle">Enter this PIN at the XeroxGo kiosk to continue.</p>
+
+        <!-- 4 Large PIN Digit Boxes -->
+        <div class="pin-digit-boxes" id="pin-digit-boxes">
+          <div class="pin-digit-box" id="pin-box-0">-</div>
+          <div class="pin-digit-box" id="pin-box-1">-</div>
+          <div class="pin-digit-box" id="pin-box-2">-</div>
+          <div class="pin-digit-box" id="pin-box-3">-</div>
+        </div>
+
+        <div class="pin-expiry-text" id="pin-expiry-text">Expires in 15 minutes</div>
+
+        <button type="button" id="btn-copy-pin" class="btn-copy-pin">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+          <span id="btn-copy-pin-label">Copy PIN</span>
+        </button>
+      </div>
+
+      <!-- Order Summary Card -->
+      <div class="checkout-summary-card">
+        <div class="checkout-summary-row">
+          <span class="summary-label">Documents</span>
+          <span class="summary-value" id="checkout-docs-count">0 files</span>
+        </div>
+        <div class="checkout-summary-row total-row">
+          <span class="summary-label">Total</span>
+          <span class="summary-value total-price" id="checkout-total-amount">&#8377;0.00</span>
+        </div>
+      </div>
+
+      <!-- Kiosk Notice -->
+      <p class="checkout-footer-notice">
+        Payment will be completed at the kiosk. Keep this page open or copy your PIN.
+      </p>
+
+      <!-- Live Job Progress / Status (Spooling, Printing, Completed) -->
+      <div id="checkout-live-status-box" class="checkout-live-status hidden">
+        <div class="live-status-header">
+          <span class="live-status-label">Kiosk Progress</span>
+          <span id="checkout-status-pill" class="status-pill status-PENDING_PAYMENT">PENDING_PAYMENT</span>
+        </div>
+        <div class="progress-bar-bg" style="margin-top:0.5rem;">
+          <div id="checkout-progress-bar" class="progress-bar-fill" style="width:0%;"></div>
+        </div>
+        <div id="checkout-status-msg" class="checkout-status-msg"></div>
+      </div>
+
+      <!-- Action to Start New Order -->
+      <div style="text-align:center; margin-top:1.5rem; margin-bottom:2rem;">
+        <button type="button" id="btn-start-new-order" class="btn-new-order">Print More Documents</button>
+      </div>
+    </section>
+
+    <!-- PWA Install Guide Modal (iOS/Android manual) -->
     <div id="pwa-guide-modal" class="modal-overlay hidden">
       <div class="pwa-ios-modal animate-scale-up" onclick="event.stopPropagation();">
         <div class="pwa-ios-modal-header">
@@ -457,7 +499,7 @@ const portalHTML = `<!DOCTYPE html>
           <div class="pwa-ios-step">
             <div class="pwa-step-number">1</div>
             <div class="pwa-step-content">
-              <span>Tap the browser <strong>Share</strong> icon (iOS) or <strong>Menu (⋮)</strong> (Android)</span>
+              <span>Tap the browser <strong>Share</strong> icon (iOS) or <strong>Menu (&vellip;)</strong> (Android)</span>
             </div>
           </div>
           <div class="pwa-ios-step">
@@ -483,7 +525,8 @@ const portalHTML = `<!DOCTYPE html>
 
   </div>
 </body>
-</html>`
+</html>
+`
 
 func randomHex(bytesLen int) (string, error) {
 	b := make([]byte, bytesLen)
@@ -591,16 +634,340 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	const maxUploadSize = 25 * 1024 * 1024 // 25 MiB
+	const maxUploadSize = 50 * 1024 * 1024 // 50 MiB
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
-		http.Error(w, "request exceeds 25 MiB limit or malformed", http.StatusRequestEntityTooLarge)
+		http.Error(w, "request exceeds 50 MiB limit or malformed", http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	file, fileHeader, err := r.FormFile("file")
-	if err != nil {
+	var fileHeaders []*multipart.FileHeader
+	if r.MultipartForm != nil {
+		if files, ok := r.MultipartForm.File["files"]; ok && len(files) > 0 {
+			fileHeaders = files
+		} else if fileList, ok := r.MultipartForm.File["file"]; ok && len(fileList) > 0 {
+			fileHeaders = fileList
+		}
+	}
+	if len(fileHeaders) == 0 {
 		http.Error(w, "missing file field", http.StatusBadRequest)
+		return
+	}
+
+	if len(fileHeaders) > 1 {
+		type docItemMeta struct {
+			Copies    int    `json:"copies"`
+			Duplex    string `json:"duplex"`
+			ColorMode string `json:"color_mode"`
+			PageRange string `json:"page_range"`
+		}
+		var metaItems []docItemMeta
+		if mStr := r.FormValue("metadata"); strings.TrimSpace(mStr) != "" {
+			_ = json.Unmarshal([]byte(mStr), &metaItems)
+		}
+
+		pricing, err := s.db.GetPricing(r.Context())
+		if err != nil {
+			pricing = store.PricingConfig{
+				BWSimplexPricePaise:    200,
+				BWDuplexPricePaise:     150,
+				ColorSimplexPricePaise: 1000,
+				ColorDuplexPricePaise:  750,
+				ColorEnabled:           false,
+			}
+		}
+
+		orderHex, err := randomHex(12)
+		if err != nil {
+			http.Error(w, "failed to generate order id", http.StatusInternalServerError)
+			return
+		}
+		orderID := "ord_" + orderHex
+
+		jobHex, err := randomHex(12)
+		if err != nil {
+			http.Error(w, "failed to generate job id", http.StatusInternalServerError)
+			return
+		}
+		jobID := "job_" + jobHex
+
+		displayCode, err := randomDisplayCode()
+		if err != nil {
+			http.Error(w, "failed to generate display code", http.StatusInternalServerError)
+			return
+		}
+
+		h := sha256.Sum256([]byte(orderID))
+		outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
+
+		var intermediateNormPDFs []string
+		defer func() {
+			for _, p := range intermediateNormPDFs {
+				_ = os.Remove(p)
+			}
+		}()
+
+		var totalOrderPricePaise int64
+		var totalPrintedPages int
+		var totalSheets int
+		anyDuplex := false
+		anyColor := false
+
+		for idx, fh := range fileHeaders {
+			originalFilename := fh.Filename
+			if !pdf.IsSupportedFormat(originalFilename) {
+				_ = os.Remove(outputPath)
+				http.Error(w, fmt.Sprintf("unsupported file format %q in document %d", filepath.Ext(originalFilename), idx+1), http.StatusBadRequest)
+				return
+			}
+
+			f, err := fh.Open()
+			if err != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, fmt.Sprintf("failed to open uploaded file %q: %v", originalFilename, err), http.StatusBadRequest)
+				return
+			}
+
+			ext := strings.ToLower(filepath.Ext(originalFilename))
+			if ext == "" {
+				ext = ".pdf"
+			}
+			tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "upload_in_*"+ext)
+			if err != nil {
+				_ = f.Close()
+				_ = os.Remove(outputPath)
+				http.Error(w, "failed to create temp file", http.StatusInternalServerError)
+				return
+			}
+			tmpInputName := tmpInput.Name()
+			_, copyErr := io.Copy(tmpInput, f)
+			_ = f.Close()
+			_ = tmpInput.Close()
+			if copyErr != nil {
+				_ = os.Remove(tmpInputName)
+				_ = os.Remove(outputPath)
+				http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
+				return
+			}
+
+			normalizedInputPath := tmpInputName
+			if ext != ".pdf" {
+				tmpConverted, err := os.CreateTemp(s.cfg.jobsDir, "upload_conv_*.pdf")
+				if err != nil {
+					_ = os.Remove(tmpInputName)
+					_ = os.Remove(outputPath)
+					http.Error(w, "failed to create temp file for conversion", http.StatusInternalServerError)
+					return
+				}
+				tmpConvertedName := tmpConverted.Name()
+				_ = tmpConverted.Close()
+
+				if err := pdf.ConvertToPDF(r.Context(), tmpInputName, originalFilename, tmpConvertedName); err != nil {
+					_ = os.Remove(tmpInputName)
+					_ = os.Remove(tmpConvertedName)
+					_ = os.Remove(outputPath)
+					http.Error(w, fmt.Sprintf("conversion failed for %q: %v", originalFilename, err), http.StatusBadRequest)
+					return
+				}
+				_ = os.Remove(tmpInputName)
+				normalizedInputPath = tmpConvertedName
+			}
+			defer func(path string) { _ = os.Remove(path) }(normalizedInputPath)
+
+			docCopies := 1
+			docDuplexMode := contracts.DuplexSimplex
+			docColorMode := "BW"
+			docPageRange := ""
+
+			if idx < len(metaItems) {
+				if metaItems[idx].Copies >= 1 && metaItems[idx].Copies <= 999 {
+					docCopies = metaItems[idx].Copies
+				}
+				switch metaItems[idx].Duplex {
+				case string(contracts.DuplexLongEdge):
+					docDuplexMode = contracts.DuplexLongEdge
+				case string(contracts.DuplexShortEdge):
+					docDuplexMode = contracts.DuplexShortEdge
+				default:
+					docDuplexMode = contracts.DuplexSimplex
+				}
+				if strings.EqualFold(metaItems[idx].ColorMode, "COLOR") && pricing.ColorEnabled {
+					docColorMode = "COLOR"
+				}
+				docPageRange = strings.TrimSpace(metaItems[idx].PageRange)
+			} else {
+				if c, err := strconv.Atoi(r.FormValue("copies")); err == nil && c >= 1 && c <= 999 {
+					docCopies = c
+				}
+				switch r.FormValue("duplex") {
+				case string(contracts.DuplexLongEdge):
+					docDuplexMode = contracts.DuplexLongEdge
+				case string(contracts.DuplexShortEdge):
+					docDuplexMode = contracts.DuplexShortEdge
+				default:
+					docDuplexMode = contracts.DuplexSimplex
+				}
+				if strings.EqualFold(r.FormValue("color_mode"), "COLOR") && pricing.ColorEnabled {
+					docColorMode = "COLOR"
+				}
+				docPageRange = strings.TrimSpace(r.FormValue("page_range"))
+			}
+
+			if docDuplexMode != contracts.DuplexSimplex {
+				anyDuplex = true
+			}
+			if docColorMode == "COLOR" {
+				anyColor = true
+			}
+
+			tmpNorm, err := os.CreateTemp(s.cfg.jobsDir, "upload_norm_*.pdf")
+			if err != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, "failed to create intermediate file", http.StatusInternalServerError)
+				return
+			}
+			tmpNormPath := tmpNorm.Name()
+			_ = tmpNorm.Close()
+			intermediateNormPDFs = append(intermediateNormPDFs, tmpNormPath)
+
+			normRes, err := pdf.NormalizeAndCountWithOptions(r.Context(), normalizedInputPath, tmpNormPath, pdf.NormalizeOptions{
+				Copies:    docCopies,
+				Duplex:    docDuplexMode,
+				ColorMode: docColorMode,
+				PageRange: docPageRange,
+			})
+			if err != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
+				return
+			}
+
+			var unitPrice int64
+			isDuplex := docDuplexMode != contracts.DuplexSimplex
+			if docColorMode == "COLOR" {
+				if isDuplex {
+					unitPrice = pricing.ColorDuplexPricePaise
+				} else {
+					unitPrice = pricing.ColorSimplexPricePaise
+				}
+			} else {
+				if isDuplex {
+					unitPrice = pricing.BWDuplexPricePaise
+				} else {
+					unitPrice = pricing.BWSimplexPricePaise
+				}
+			}
+			if unitPrice <= 0 {
+				unitPrice = s.cfg.pricePerSheetPaise
+			}
+			if unitPrice <= 0 {
+				unitPrice = 200
+			}
+
+			docPrintedSides := normRes.TotalPages * docCopies
+			docPrice, err := payments.CalculatePricePaise(docPrintedSides, unitPrice)
+			if err != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, "failed to calculate price", http.StatusInternalServerError)
+				return
+			}
+
+			totalOrderPricePaise += docPrice
+			totalPrintedPages += docPrintedSides
+			totalSheets += normRes.TotalSheets
+		}
+
+		qpdfArgs := []string{"--empty", "--pages"}
+		for _, p := range intermediateNormPDFs {
+			qpdfArgs = append(qpdfArgs, p, "1-z")
+		}
+		qpdfArgs = append(qpdfArgs, "--", outputPath)
+
+		cmdMerge := exec.CommandContext(r.Context(), "qpdf", qpdfArgs...)
+		outMerge, errMerge := cmdMerge.CombinedOutput()
+		if errMerge != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, fmt.Sprintf("failed to merge documents: %s: %v", strings.TrimSpace(string(outMerge)), errMerge), http.StatusInternalServerError)
+			return
+		}
+
+		finalBytes, err := os.ReadFile(outputPath)
+		if err != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, "failed to read merged document", http.StatusInternalServerError)
+			return
+		}
+		checksumBytes := sha256.Sum256(finalBytes)
+		sha256Checksum := hex.EncodeToString(checksumBytes[:])
+
+		baseURL := os.Getenv("XEROXGO_PUBLIC_URL")
+		if baseURL == "" {
+			scheme := "http"
+			if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+				scheme = "https"
+			}
+			baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+		}
+		baseURL = strings.TrimRight(baseURL, "/")
+		downloadURL := generateSignedDownloadURL(baseURL, orderID, s.cfg.downloadSecret, 24*time.Hour)
+
+		overallDuplex := contracts.DuplexSimplex
+		if anyDuplex {
+			overallDuplex = contracts.DuplexLongEdge
+		}
+		overallColor := "BW"
+		if anyColor {
+			overallColor = "COLOR"
+		}
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          jobID,
+			KioskID:        kioskID,
+			DisplayCode:    displayCode,
+			DownloadURL:    downloadURL,
+			SHA256Checksum: sha256Checksum,
+			TotalPages:     totalPrintedPages,
+			TotalSheets:    totalSheets,
+			Copies:         1,
+			Duplex:         overallDuplex,
+			StartFromPage:  1,
+		}
+
+		order := store.Order{
+			OrderID:    orderID,
+			Command:    cmd,
+			Status:     contracts.JobStatusPendingPayment,
+			PricePaise: totalOrderPricePaise,
+			ColorMode:  overallColor,
+		}
+
+		if err := s.db.CreateOrder(r.Context(), order); err != nil {
+			_ = os.Remove(outputPath)
+			http.Error(w, "failed to persist order", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"order_id":              orderID,
+			"job_id":                jobID,
+			"display_code":          displayCode,
+			"color_mode":            overallColor,
+			"total_pages":           totalPrintedPages,
+			"total_sheets":          totalSheets,
+			"copies":                1,
+			"duplex":                string(overallDuplex),
+			"documents_count":       len(fileHeaders),
+			"total_price_paise":     totalOrderPricePaise,
+			"status":                string(contracts.JobStatusPendingPayment),
+		})
+		return
+	}
+
+	fileHeader := fileHeaders[0]
+	file, err := fileHeader.Open()
+	if err != nil {
+		http.Error(w, "failed to open file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
