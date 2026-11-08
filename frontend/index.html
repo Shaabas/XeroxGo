@@ -20,7 +20,7 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png" />
   <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
 
-  <link rel="stylesheet" href="/css/portal.css" />
+  <link rel="stylesheet" href="/css/portal.css?v=2.0.0" />
   <script src="/vendor/pdf-lib.min.js"></script>
   <script type="module">
     import * as pdfjsLib from '/vendor/pdf.min.mjs';
@@ -33,7 +33,7 @@
     }
     window.dispatchEvent(new CustomEvent('pdfjs-ready', { detail: pdfjsLib }));
   </script>
-  <script src="/js/portal.js" defer></script>
+  <script src="/js/portal.js?v=2.0.0" defer></script>
   <script>
     (function() {
       var match = window.location.pathname.match(/\/k\/([^/]+)/);

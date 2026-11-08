@@ -75,7 +75,7 @@ const portalHTML = `<!DOCTYPE html>
   <link rel="icon" type="image/png" sizes="32x32" href="/static/assets/favicon-32x32.png" />
   <link rel="apple-touch-icon" href="/static/assets/apple-touch-icon.png" />
 
-  <link rel="stylesheet" href="/static/css/portal.css" />
+  <link rel="stylesheet" href="/static/css/portal.css?v=2.0.0" />
   <script src="/static/vendor/pdf-lib.min.js"></script>
   <script type="module">
     import * as pdfjsLib from '/static/vendor/pdf.min.mjs';
@@ -88,7 +88,7 @@ const portalHTML = `<!DOCTYPE html>
     }
     window.dispatchEvent(new CustomEvent('pdfjs-ready', { detail: pdfjsLib }));
   </script>
-  <script src="/static/js/portal.js" defer></script>
+  <script src="/static/js/portal.js?v=2.0.0" defer></script>
   <script>
     (function() {
       var match = window.location.pathname.match(/\/k\/([^/]+)/);
