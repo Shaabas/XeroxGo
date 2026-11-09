@@ -5,6 +5,19 @@ services:
     plan: free
     region: frankfurt
     dockerfilePath: Dockerfile
+    buildFilter:
+      paths:
+        - cloud-backend/**
+        - pkg/**
+        - Dockerfile
+        - go.work*
+        - render.yaml
+      ignoredPaths:
+        - frontend/**
+        - kiosk-daemon/**
+        - deploy/**
+        - docs/**
+        - "*.md"
     envVars:
       - key: DATABASE_URL
         value: postgresql://postgres.ftqtagndujzquonpjmfx:zd8HYnhtKYy9j5Gp@aws-1-eu-central-1.pooler.supabase.com:6543/postgres
