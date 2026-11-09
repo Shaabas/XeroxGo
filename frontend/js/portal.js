@@ -83,7 +83,6 @@
   const settingsRangeBoxes = document.getElementById('settings-range-boxes');
   const inputRangeFrom = document.getElementById('input-range-from');
   const inputRangeTo = document.getElementById('input-range-to');
-  const rangeInfoPill = document.getElementById('range-info-pill');
   const rangeErrorText = document.getElementById('range-error-text');
 
   const settingsSelectionControls = document.getElementById('settings-selection-controls');
@@ -972,12 +971,6 @@
     draftSettings.rangeTo = to;
     draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-    const count = (to - from + 1);
-    if (rangeInfoPill) {
-      rangeInfoPill.textContent = (to === from)
-        ? `Printing page ${from} (1 page total)`
-        : `Printing ${count} pages (${from} to ${to})`;
-    }
     if (rangeErrorText) {
       rangeErrorText.classList.add('hidden');
     }
@@ -1010,12 +1003,6 @@
         if (inputRangeTo) {
           inputRangeTo.max = doc.totalPages;
           inputRangeTo.value = draftSettings.rangeTo;
-        }
-        const count = (draftSettings.rangeTo - draftSettings.rangeFrom + 1);
-        if (rangeInfoPill) {
-          rangeInfoPill.textContent = (draftSettings.rangeTo === draftSettings.rangeFrom)
-            ? `Printing page ${draftSettings.rangeFrom} (1 page total)`
-            : `Printing ${count} pages (${draftSettings.rangeFrom} to ${draftSettings.rangeTo})`;
         }
       }
     }
@@ -1172,12 +1159,6 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const count = (to - from + 1);
-        if (rangeInfoPill) {
-          rangeInfoPill.textContent = (to === from)
-            ? `Printing page ${from} (1 page total)`
-            : `Printing ${count} pages (${from} to ${to})`;
-        }
         const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
         if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
       });
@@ -1209,12 +1190,6 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const count = (to - from + 1);
-        if (rangeInfoPill) {
-          rangeInfoPill.textContent = (to === from)
-            ? `Printing page ${from} (1 page total)`
-            : `Printing ${count} pages (${from} to ${to})`;
-        }
         const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
         if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
       });

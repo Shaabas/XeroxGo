@@ -2245,27 +2245,6 @@ body {
   flex-shrink: 0;
 }
 
-.range-card-summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: #eff6ff;
-  color: var(--primary-blue);
-  font-size: 12px;
-  font-weight: 600;
-  padding: 4px 12px;
-  border-radius: 20px;
-  border: 1px solid #bfdbfe;
-}
-
-.range-info-pill {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--primary-blue);
-  text-align: center;
-  margin: 0;
-}
-
 /* Selection Mode Singular Card Header & Body */
 .selection-card-header {
   display: flex;
