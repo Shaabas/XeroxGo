@@ -32,12 +32,17 @@ jobs:
 
   deploy-frontend:
     name: Deploy Frontend to Vercel
-    needs: verify
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Cache Busting Asset Tagging
+        run: |
+          BUILD_TAG="${GITHUB_SHA::8}"
+          sed -i "s|portal\.css?v=[^\"]*|portal.css?v=${BUILD_TAG}|g" frontend/index.html
+          sed -i "s|portal\.js?v=[^\"]*|portal.js?v=${BUILD_TAG}|g" frontend/index.html
 
       - name: Deploy to Vercel Production
         env:
