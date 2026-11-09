@@ -933,12 +933,18 @@
           btn.setAttribute('aria-pressed', 'true');
         }
 
-        // Navigate preview canvas to this page
-        if (!isDuplex) {
-          currentPreviewSheet = pageNum;
-        } else {
-          currentPreviewSheet = Math.ceil(pageNum / 2);
-          currentPreviewSide = (pageNum % 2 === 1) ? 'front' : 'back';
+        // Navigate preview canvas to this page if selected
+        const sortedPages = draftSettings.selectedPages.slice().sort((a, b) => a - b);
+        if (!alreadySelected) {
+          const idx = sortedPages.indexOf(pageNum);
+          if (idx !== -1) {
+            if (!isDuplex) {
+              currentPreviewSheet = idx + 1;
+            } else {
+              currentPreviewSheet = Math.floor(idx / 2) + 1;
+              currentPreviewSide = (idx % 2 === 0) ? 'front' : 'back';
+            }
+          }
         }
 
         syncSelectionState(doc);
@@ -1380,13 +1386,48 @@
       const from = Math.max(1, Math.min(draftSettings.rangeFrom || 1, doc.totalPages));
       const to = Math.max(from, Math.min(draftSettings.rangeTo || doc.totalPages, doc.totalPages));
       for (let p = from; p <= to; p++) pages.push(p);
+    } else if (draftSettings && draftSettings.pageSelection === 'Selection') {
+      // In Selection mode: ONLY the selected pages appear in the preview!
+      pages = Array.isArray(draftSettings.selectedPages)
+        ? draftSettings.selectedPages.slice().sort((a, b) => a - b)
+        : [];
     } else {
-      // In 'All' and 'Selection', the user can browse all document pages (1..totalPages)
-      // so in Selection mode they can inspect and check/uncheck any page!
+      // In 'All' (default):
       pages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
     }
+
     if (pages.length === 0) {
-      pages = [1];
+      if (btnSheetLeft) btnSheetLeft.disabled = true;
+      if (btnSheetRight) btnSheetRight.disabled = true;
+      if (previewSideToggle) previewSideToggle.classList.add('hidden');
+      if (previewSheetIndicator) previewSheetIndicator.textContent = '0 of 0 sheets';
+
+      if (selectionSeatsGrid) {
+        const seatBtns = selectionSeatsGrid.querySelectorAll('.seat-btn');
+        seatBtns.forEach(btn => btn.classList.remove('current-view'));
+      }
+
+      const canvas = previewCanvas;
+      if (canvas) {
+        canvas.width = 160;
+        canvas.height = 226;
+        canvas.style.width = '160px';
+        canvas.style.height = '226px';
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '600 13px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('No Pages Selected', canvas.width / 2, canvas.height / 2 - 8);
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.fillText('Select pages below', canvas.width / 2, canvas.height / 2 + 10);
+      }
+      if (previewLoadingSpinner) previewLoadingSpinner.classList.add('hidden');
+      return;
     }
 
     const totalSheets = isDuplex ? Math.ceil(pages.length / 2) : pages.length;
@@ -1429,24 +1470,17 @@
       }
     }
 
-    // Synchronize Selection state (canvas dimming and active seat focus ring)
-    if (draftSettings && draftSettings.pageSelection === 'Selection') {
-      if (pageNumToRender !== null) {
-        const isSelected = Array.isArray(draftSettings.selectedPages) && draftSettings.selectedPages.includes(pageNumToRender);
-        if (previewCanvas) previewCanvas.classList.toggle('page-excluded', !isSelected);
-      } else {
-        if (previewCanvas) previewCanvas.classList.remove('page-excluded');
-      }
-    } else {
-      if (previewCanvas) previewCanvas.classList.remove('page-excluded');
-    }
-
+    // Synchronize active seat focus ring with currently displayed page
     if (selectionSeatsGrid && pageNumToRender !== null) {
       const seatBtns = selectionSeatsGrid.querySelectorAll('.seat-btn');
       seatBtns.forEach(btn => {
         const p = parseInt(btn.dataset.page, 10);
         btn.classList.toggle('current-view', p === pageNumToRender);
       });
+    }
+
+    if (previewCanvas) {
+      previewCanvas.classList.remove('page-excluded');
     }
 
     if (previewLoadingSpinner) previewLoadingSpinner.classList.remove('hidden');
