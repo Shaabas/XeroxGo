@@ -1203,15 +1203,17 @@ body {
    ========================================================================== */
 
 .cart-upload-card {
+  display: block;
   background: #f8fbff;
   border: 2px dashed #93c5fd;
   border-radius: 18px;
-  padding: 26px 16px;
+  padding: 24px 16px;
   text-align: center;
   margin-top: 12px;
   margin-bottom: 16px;
   cursor: pointer;
   transition: all 0.2s ease;
+  user-select: none;
 }
 
 .cart-upload-card:hover, .cart-upload-card.dragover {
@@ -1219,41 +1221,45 @@ body {
   background: #eff6ff;
 }
 
+.cart-upload-card:focus-visible {
+  outline: 2px solid var(--primary-blue);
+  outline-offset: 2px;
+}
+
 .upload-cloud-icon {
   display: flex;
   justify-content: center;
   align-items: center;
   margin-bottom: 8px;
+  color: var(--primary-blue);
+}
+
+.upload-cloud-icon .upload-icon {
+  color: var(--primary-blue);
+  transition: transform 0.2s ease;
+}
+
+.cart-upload-card:hover .upload-cloud-icon .upload-icon,
+.cart-upload-card.dragover .upload-cloud-icon .upload-icon {
+  transform: translateY(-2px);
 }
 
 .upload-heading {
   font-size: 18px;
   font-weight: 700;
   color: var(--text-main);
-  margin: 0 0 4px;
+  margin: 0 0 6px;
 }
 
 .upload-subheading {
   font-size: 13px;
   color: var(--text-muted);
-  margin: 0 0 16px;
+  margin: 0 0 4px;
+  line-height: 1.4;
 }
 
-.btn-choose-files {
-  background: var(--primary-blue-light);
-  color: var(--primary-blue);
-  font-size: 14px;
-  font-weight: 600;
-  padding: 9px 24px;
-  border-radius: 9999px;
-  border: 1px solid var(--primary-blue-border);
-  cursor: pointer;
-  display: inline-block;
-  transition: all 0.15s ease;
-}
-
-.btn-choose-files:hover {
-  background: #dbeafe;
+.upload-subheading:last-of-type {
+  margin-bottom: 0;
 }
 
 .upload-processing-box {

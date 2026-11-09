@@ -38,7 +38,6 @@
 
   // View 1 (Cart) DOM
   const cartUploadCard = document.getElementById('cart-upload-card');
-  const btnChooseFiles = document.getElementById('btn-choose-files');
   const fileInput = document.getElementById('file-input');
   const uploadProcessingIndicator = document.getElementById('upload-processing-indicator');
   const uploadProcessingText = document.getElementById('upload-processing-text');
@@ -1432,10 +1431,6 @@
 
   // --- Drag & Drop / File Input Setup ---
   function setupUploadInputs() {
-    if (btnChooseFiles && fileInput) {
-      btnChooseFiles.addEventListener('click', () => fileInput.click());
-    }
-
     if (fileInput) {
       fileInput.addEventListener('change', (e) => {
         if (e.target.files && e.target.files.length > 0) {
@@ -1446,6 +1441,21 @@
     }
 
     if (cartUploadCard) {
+      // Prevent opening file picker if clicking on an alert inside the card
+      cartUploadCard.addEventListener('click', (e) => {
+        if (e.target.closest('#cart-alert')) {
+          e.preventDefault();
+        }
+      });
+
+      // Keyboard accessibility (Enter or Space triggers file picker)
+      cartUploadCard.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          if (fileInput) fileInput.click();
+        }
+      });
+
       cartUploadCard.addEventListener('dragover', (e) => {
         e.preventDefault();
         cartUploadCard.classList.add('dragover');

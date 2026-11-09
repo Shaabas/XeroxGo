@@ -123,22 +123,22 @@
       </div>
 
       <!-- Add Documents Dropzone Card -->
-      <div class="cart-upload-card" id="cart-upload-card">
+      <label for="file-input" class="cart-upload-card" id="cart-upload-card" tabindex="0" role="button" aria-label="Click to upload files">
         <div class="upload-cloud-icon">
-          <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="upload-icon" style="margin:0 auto; display:block;">
             <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>
-            <polyline points="16 13 12 9 8 13"/>
-            <line x1="12" y1="9" x2="12" y2="21"/>
+            <polyline points="16 16 12 12 8 16"/>
+            <line x1="12" y1="12" x2="12" y2="21"/>
           </svg>
         </div>
-        <h3 class="upload-heading">Add documents</h3>
-        <p class="upload-subheading">Select multiple PDFs, Office files or images</p>
-        <button type="button" class="btn-choose-files" id="btn-choose-files">+ Choose files</button>
-        <input type="file" id="file-input" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.ods,.odp,.rtf,.txt,.jpg,.jpeg,.png,.webp,.bmp" style="display:none;" />
+        <h3 class="upload-heading">Click to upload files</h3>
+        <p class="upload-subheading">Supported formats: PDF, DOCX, PPTX, XLSX, PNG, JPEG</p>
+        <p class="upload-subheading">Max size: 25 MB</p>
         
         <!-- Cart Alert -->
         <div id="cart-alert" class="alert alert-error hidden"></div>
-      </div>
+      </label>
+      <input type="file" id="file-input" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.ods,.odp,.rtf,.txt,.jpg,.jpeg,.png,.webp,.bmp" style="display:none;" />
 
       <!-- Document Cards List -->
       <div id="cart-doc-list" class="cart-doc-list">
