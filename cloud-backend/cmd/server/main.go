@@ -1179,6 +1179,12 @@ func main() {
 	}
 
 	hub := ws.NewHub(storeDB)
+	kioskSecretStr := os.Getenv("XEROXGO_KIOSK_SECRET")
+	if kioskSecretStr != "" {
+		hub.SetKioskSecret([]byte(kioskSecretStr))
+	} else if !devMode {
+		log.Fatalf("XEROXGO_KIOSK_SECRET required in production mode")
+	}
 
 	cfg := &serverConfig{
 		addr:               addr,
@@ -1245,29 +1251,12 @@ func main() {
 	mux.HandleFunc("/api/admin/orders", app.handleAdminOrders)
 	mux.HandleFunc("/api/admin/orders/export", app.handleAdminOrdersExport)
 
-	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && isAllowedOrigin(origin) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Vary", "Origin")
-		}
-		if r.Method == http.MethodOptions {
-			if origin != "" && !isAllowedOrigin(origin) {
-				http.Error(w, "Forbidden origin", http.StatusForbidden)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		mux.ServeHTTP(w, r)
-	})
+	proxySecret := strings.TrimSpace(os.Getenv("XEROXGO_PROXY_SECRET"))
+	handler := createIngressHandler(mux, proxySecret, devMode)
 
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: corsHandler,
+		Handler: handler,
 	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1294,6 +1283,50 @@ func main() {
 			log.Printf("graceful shutdown error: %v", err)
 		}
 	}
+}
+
+// createIngressHandler wraps the root HTTP mux with CORS headers and proxy secret validation.
+func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Ingress proxy secret verification for frontend-facing API routes:
+		// When XEROXGO_PROXY_SECRET is configured, requests to frontend API routes
+		// must carry the secret header injected by Vercel Edge.
+		// Excluded routes: /healthz, /ws (has kiosk auth), /api/webhooks/razorpay (has HMAC),
+		// and /api/orders/:id/pdf (has HMAC download signature).
+		if proxySecret != "" && !devMode {
+			path := r.URL.Path
+			isExempt := path == "/healthz" ||
+				path == "/ws" ||
+				path == "/api/webhooks/razorpay" ||
+				(strings.HasPrefix(path, "/api/orders/") && strings.HasSuffix(path, "/pdf"))
+
+			if !isExempt && strings.HasPrefix(path, "/api/") {
+				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))
+				if !hmac.Equal([]byte(reqSecret), []byte(proxySecret)) {
+					http.NotFound(w, r)
+					return
+				}
+			}
+		}
+
+		origin := r.Header.Get("Origin")
+		if origin != "" && isAllowedOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-XeroxGo-Proxy-Secret")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Vary", "Origin")
+		}
+		if r.Method == http.MethodOptions {
+			if origin != "" && !isAllowedOrigin(origin) {
+				http.Error(w, "Forbidden origin", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // isAllowedOrigin checks if an incoming Origin header is permitted for CORS requests.

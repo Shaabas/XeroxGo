@@ -28,6 +28,7 @@ mkdir -p "${CLOUD_JOBS}" "${KIOSK_JOBS}"
 # 4. Generate random development secrets & configuration
 DOWNLOAD_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 WEBHOOK_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+KIOSK_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 
 export XEROXGO_CLOUD_ADDR="127.0.0.1:${PORT}"
@@ -37,6 +38,7 @@ export XEROXGO_DEV_MODE=1
 export XEROXGO_PRICE_PER_SHEET_PAISE="${XEROXGO_PRICE_PER_SHEET_PAISE:-500}"
 export XEROXGO_DOWNLOAD_SECRET="${DOWNLOAD_SECRET}"
 export XEROXGO_WEBHOOK_SECRET="${WEBHOOK_SECRET}"
+export XEROXGO_KIOSK_SECRET="${KIOSK_SECRET}"
 
 KIOSK_ID="kiosk-demo"
 CLOUD_URL="ws://127.0.0.1:${PORT}/ws"
@@ -118,6 +120,7 @@ fi
   --preview-png="${PREVIEW_PNG}" \
   --cloud-url="${CLOUD_URL}" \
   --kiosk-id="${KIOSK_ID}" \
+  --kiosk-secret="${KIOSK_SECRET}" \
   --state-db="${KIOSK_DB}" \
   --download-dir="${KIOSK_JOBS}" \
   --idle-qr-content="${PORTAL_URL}" \

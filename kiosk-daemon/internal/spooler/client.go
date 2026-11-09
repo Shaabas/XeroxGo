@@ -40,6 +40,7 @@ type wireMessage struct {
 type ClientConfig struct {
 	CloudURL                 string
 	KioskID                  string
+	KioskSecret              string
 	StateStore               *state.Store
 	PrinterAddr              string
 	SNMPTarget               string
@@ -134,6 +135,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	q := u.Query()
 	q.Set("kiosk_id", cfg.KioskID)
+	if strings.TrimSpace(cfg.KioskSecret) != "" {
+		q.Set("token", strings.TrimSpace(cfg.KioskSecret))
+	}
 	u.RawQuery = q.Encode()
 	normalizedURL := u.String()
 
@@ -263,7 +267,16 @@ func (c *Client) Run(ctx context.Context) error {
 		default:
 		}
 
-		conn, _, err := websocket.Dial(ctx, c.normalizedURL, nil)
+		var dialOpts *websocket.DialOptions
+		if strings.TrimSpace(c.cfg.KioskSecret) != "" {
+			dialOpts = &websocket.DialOptions{
+				HTTPHeader: http.Header{
+					"Authorization": []string{"Bearer " + strings.TrimSpace(c.cfg.KioskSecret)},
+				},
+			}
+		}
+
+		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
 			select {
 			case <-ctx.Done():

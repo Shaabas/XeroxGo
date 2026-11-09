@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"crypto/hmac"
 	"fmt"
 	"log"
 	"net/http"
@@ -33,9 +34,10 @@ type kioskSession struct {
 // Hub manages active WebSocket connections from kiosks and relays jobs,
 // progress events, and printer health observations.
 type Hub struct {
-	db       *store.Store
-	mu       sync.RWMutex
-	sessions map[string]*kioskSession
+	db          *store.Store
+	mu          sync.RWMutex
+	sessions    map[string]*kioskSession
+	kioskSecret []byte
 
 	healthMu sync.RWMutex
 	health   map[string]contracts.PrinterHealth
@@ -50,6 +52,13 @@ func NewHub(db *store.Store) *Hub {
 	}
 }
 
+// SetKioskSecret sets the pre-shared secret used to authenticate kiosk connections.
+func (h *Hub) SetKioskSecret(secret []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.kioskSecret = secret
+}
+
 // ServeHTTP handles incoming WebSocket connection upgrades at /ws?kiosk_id=<id>.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -61,6 +70,27 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if kioskID == "" {
 		http.Error(w, "kiosk_id required", http.StatusBadRequest)
 		return
+	}
+
+	h.mu.RLock()
+	expectedSecret := h.kioskSecret
+	h.mu.RUnlock()
+
+	if len(expectedSecret) > 0 {
+		var token string
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		}
+		if token == "" {
+			token = strings.TrimSpace(r.URL.Query().Get("token"))
+		}
+		if token == "" {
+			token = strings.TrimSpace(r.URL.Query().Get("secret"))
+		}
+		if !hmac.Equal([]byte(token), expectedSecret) {
+			http.Error(w, "unauthorized kiosk", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	conn, err := websocket.Accept(w, r, nil)

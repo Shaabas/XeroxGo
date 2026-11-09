@@ -225,6 +225,7 @@ func main() {
 	previewPNG := flag.String("preview-png", "", "Path to write preview PNG instead of writing to framebuffer")
 	cloudURL := flag.String("cloud-url", "ws://127.0.0.1:8080/ws", "Cloud WebSocket hub endpoint")
 	kioskID := flag.String("kiosk-id", "kiosk-001", "Kiosk identifier")
+	kioskSecret := flag.String("kiosk-secret", os.Getenv("XEROXGO_KIOSK_SECRET"), "Secret key for authenticating with cloud WebSocket hub")
 	stateDB := flag.String("state-db", "/var/kiosk/state.db", "SQLite state database path")
 	downloadDir := flag.String("download-dir", "/var/kiosk/jobs", "Directory for downloaded PDF jobs")
 	printerAddr := flag.String("printer-addr", "192.168.99.2:9100", "Physical printer TCP address")
@@ -369,6 +370,7 @@ func main() {
 	clientCfg := spooler.ClientConfig{
 		CloudURL:                 *cloudURL,
 		KioskID:                  *kioskID,
+		KioskSecret:              strings.TrimSpace(*kioskSecret),
 		StateStore:               stateStore,
 		PrinterAddr:              actualPrinterAddr,
 		SNMPTarget:               *snmpTarget,

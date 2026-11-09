@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
@@ -447,4 +448,95 @@ func TestHubConcurrentConnections(t *testing.T) {
 	if msgB.Job == nil || msgB.Job.JobID != "job-B" {
 		t.Fatalf("conn2 received wrong message: %+v", msgB)
 	}
+}
+
+func TestHubKioskAuthentication(t *testing.T) {
+	hub := NewHub(nil)
+	secret := []byte("super-secret-kiosk-token-1234")
+	hub.SetKioskSecret(secret)
+
+	server := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("invalid server url: %v", err)
+	}
+	u.Scheme = "ws"
+	u.Path = "/ws"
+
+	t.Run("Authorized via Bearer header", func(t *testing.T) {
+		q := u.Query()
+		q.Set("kiosk_id", "kiosk-auth-header")
+		targetURL := *u
+		targetURL.RawQuery = q.Encode()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		opts := &websocket.DialOptions{
+			HTTPHeader: http.Header{
+				"Authorization": []string{"Bearer super-secret-kiosk-token-1234"},
+			},
+		}
+		conn, _, err := websocket.Dial(ctx, targetURL.String(), opts)
+		if err != nil {
+			t.Fatalf("expected successful connection with valid bearer token, got: %v", err)
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "done")
+	})
+
+	t.Run("Authorized via query param token", func(t *testing.T) {
+		q := u.Query()
+		q.Set("kiosk_id", "kiosk-auth-query")
+		q.Set("token", "super-secret-kiosk-token-1234")
+		targetURL := *u
+		targetURL.RawQuery = q.Encode()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		conn, _, err := websocket.Dial(ctx, targetURL.String(), nil)
+		if err != nil {
+			t.Fatalf("expected successful connection with valid query token, got: %v", err)
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "done")
+	})
+
+	t.Run("Rejected with invalid secret", func(t *testing.T) {
+		q := u.Query()
+		q.Set("kiosk_id", "kiosk-invalid")
+		q.Set("token", "wrong-token")
+		targetURL := *u
+		targetURL.RawQuery = q.Encode()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		_, resp, err := websocket.Dial(ctx, targetURL.String(), nil)
+		if err == nil {
+			t.Fatalf("expected error for invalid token, but dial succeeded")
+		}
+		if resp != nil && resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Rejected when secret omitted", func(t *testing.T) {
+		q := u.Query()
+		q.Set("kiosk_id", "kiosk-missing-secret")
+		targetURL := *u
+		targetURL.RawQuery = q.Encode()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		_, resp, err := websocket.Dial(ctx, targetURL.String(), nil)
+		if err == nil {
+			t.Fatalf("expected error for missing token, but dial succeeded")
+		}
+		if resp != nil && resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", resp.StatusCode)
+		}
+	})
 }
