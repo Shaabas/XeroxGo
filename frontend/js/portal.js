@@ -289,6 +289,13 @@
   }
 
   // --- View 1: Cart Implementation ---
+  function formatFileSize(bytes) {
+    if (!bytes || bytes <= 0) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
   function renderCart() {
     if (!cartDocList) return;
 
@@ -303,81 +310,199 @@
     if (cartBottomBar) cartBottomBar.classList.remove('hidden');
 
     let totalCartPaise = 0;
+    let readyCount = 0;
+    let processingCount = 0;
+
     cartDocList.innerHTML = '';
 
-    cartItems.forEach((item, index) => {
-      const itemPrice = calculateDocPrice(item.totalPages, item.settings);
-      item.pricePaise = itemPrice;
-      totalCartPaise += itemPrice;
-
+    cartItems.forEach((item) => {
       const card = document.createElement('div');
       card.className = 'doc-card';
       card.dataset.id = item.id;
 
-      const pageCountText = item.settings.pageSelection === 'Custom Range' && item.settings.customPageRange
-        ? `${item.selectedPages.length} pages`
-        : `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
-
-      const sidesText = item.settings.sides === 'Double-sided' ? 'Double-sided' : 'Single-sided';
-      const metaText = `${pageCountText} · ${item.settings.mode} · ${sidesText}`;
-
-      const iconSvg = item.isImage
+      const isImage = item.isImage;
+      const iconSvg = isImage
         ? `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>`
         : `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>`;
 
-      card.innerHTML = `
-        <div class="doc-card-top">
-          <div class="doc-icon-box">${iconSvg}</div>
-          <div class="doc-info">
-            <h4 class="doc-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h4>
-            <div class="doc-meta">${metaText}</div>
+      if (item.status === 'processing') {
+        processingCount++;
+        card.innerHTML = `
+          <div class="doc-card-top">
+            <div class="doc-icon-box">${iconSvg}</div>
+            <div class="doc-info">
+              <h4 class="doc-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h4>
+              <div class="doc-meta">
+                <span>${formatFileSize(item.size)}</span>
+              </div>
+              <div class="doc-status-badge badge-processing">
+                <div class="spinner-icon-sm"></div>
+                <span class="doc-status-text">${escapeHtml(item.statusText || 'Processing document...')}</span>
+              </div>
+              <div class="doc-progress-track">
+                <div class="doc-progress-bar-indeterminate"></div>
+              </div>
+            </div>
+            <div class="doc-price doc-price-calculating">--</div>
           </div>
-          <div class="doc-price">${formatRupees(itemPrice)}</div>
-        </div>
-        <div class="doc-card-bottom">
-          <button type="button" class="btn-doc-delete" data-id="${item.id}">Delete</button>
-          <div class="doc-actions-right">
-            <button type="button" class="btn-doc-preview" data-id="${item.id}">Preview</button>
-            <button type="button" class="btn-doc-edit" data-id="${item.id}">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>
-              </svg>
-              Edit print settings
-            </button>
+          <div class="doc-card-bottom">
+            <button type="button" class="btn-doc-delete" data-id="${item.id}">Cancel</button>
+            <span class="doc-processing-hint">Preparing document...</span>
           </div>
-        </div>
-      `;
+        `;
 
-      // Event listeners
-      card.querySelector('.btn-doc-delete').addEventListener('click', (e) => {
-        e.stopPropagation();
-        removeDoc(item.id);
-      });
+        card.querySelector('.btn-doc-delete').addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeDoc(item.id);
+        });
+      } else if (item.status === 'error') {
+        card.classList.add('doc-card-error');
+        card.innerHTML = `
+          <div class="doc-card-top">
+            <div class="doc-icon-box" style="background:#fee2e2; color:#dc2626;">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            </div>
+            <div class="doc-info">
+              <h4 class="doc-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h4>
+              <div class="doc-status-badge badge-error">
+                <span>${escapeHtml(item.errorMessage || 'Failed to process file')}</span>
+              </div>
+            </div>
+            <div class="doc-price" style="color:#dc2626; font-size:14px; font-weight:600;">Error</div>
+          </div>
+          <div class="doc-card-bottom">
+            <button type="button" class="btn-doc-delete" data-id="${item.id}">Remove</button>
+            <button type="button" class="btn-doc-retry" data-id="${item.id}">Retry</button>
+          </div>
+        `;
 
-      card.querySelector('.btn-doc-preview').addEventListener('click', (e) => {
-        e.stopPropagation();
-        switchView('preview', item.id);
-      });
+        card.querySelector('.btn-doc-delete').addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeDoc(item.id);
+        });
+        card.querySelector('.btn-doc-retry').addEventListener('click', (e) => {
+          e.stopPropagation();
+          retryDoc(item.id);
+        });
+      } else {
+        // ready
+        readyCount++;
+        const itemPrice = calculateDocPrice(item.totalPages, item.settings);
+        item.pricePaise = itemPrice;
+        totalCartPaise += itemPrice;
 
-      card.querySelector('.btn-doc-edit').addEventListener('click', (e) => {
-        e.stopPropagation();
-        switchView('settings', item.id);
-      });
+        const pageCountText = item.settings.pageSelection === 'Custom Range' && item.settings.customPageRange
+          ? `${item.selectedPages.length} pages`
+          : `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
+
+        const sidesText = item.settings.sides === 'Double-sided' ? 'Double-sided' : 'Single-sided';
+        const metaText = `${pageCountText} · ${item.settings.mode} · ${sidesText}`;
+
+        card.innerHTML = `
+          <div class="doc-card-top">
+            <div class="doc-icon-box">${iconSvg}</div>
+            <div class="doc-info">
+              <h4 class="doc-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h4>
+              <div class="doc-meta">${metaText}</div>
+            </div>
+            <div class="doc-price">${formatRupees(itemPrice)}</div>
+          </div>
+          <div class="doc-card-bottom">
+            <button type="button" class="btn-doc-delete" data-id="${item.id}">Delete</button>
+            <div class="doc-actions-right">
+              <button type="button" class="btn-doc-preview" data-id="${item.id}">Preview</button>
+              <button type="button" class="btn-doc-edit" data-id="${item.id}">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>
+                </svg>
+                Edit print settings
+              </button>
+            </div>
+          </div>
+        `;
+
+        card.querySelector('.btn-doc-delete').addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeDoc(item.id);
+        });
+
+        card.querySelector('.btn-doc-preview').addEventListener('click', (e) => {
+          e.stopPropagation();
+          switchView('preview', item.id);
+        });
+
+        card.querySelector('.btn-doc-edit').addEventListener('click', (e) => {
+          e.stopPropagation();
+          switchView('settings', item.id);
+        });
+      }
 
       cartDocList.appendChild(card);
     });
 
     if (cartDocsCount) {
-      cartDocsCount.textContent = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
+      let countText = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
+      if (processingCount > 0) {
+        countText += ` (${processingCount} preparing...)`;
+      }
+      cartDocsCount.textContent = countText;
     }
     if (cartTotalAmount) {
       cartTotalAmount.textContent = formatRupees(totalCartPaise);
     }
+
+    if (btnReviewOrder) {
+      if (processingCount > 0) {
+        btnReviewOrder.disabled = true;
+        btnReviewOrder.innerHTML = `<span>Preparing documents (${readyCount}/${cartItems.length})...</span>`;
+      } else if (readyCount === 0) {
+        btnReviewOrder.disabled = true;
+        btnReviewOrder.innerHTML = `
+          <span>Review Order</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        `;
+      } else {
+        btnReviewOrder.disabled = false;
+        btnReviewOrder.innerHTML = `
+          <span>Review Order</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        `;
+      }
+    }
+  }
+
+  function updateCardDOM(docId) {
+    const item = cartItems.find(it => it.id === docId);
+    if (!item) return;
+    const card = cartDocList ? cartDocList.querySelector(`.doc-card[data-id="${docId}"]`) : null;
+    if (!card) return;
+
+    const statusTextSpan = card.querySelector('.doc-status-text');
+    if (statusTextSpan && item.statusText) {
+      statusTextSpan.textContent = item.statusText;
+    }
   }
 
   function removeDoc(docId) {
+    const item = cartItems.find(it => it.id === docId);
+    if (item && item.abortController) {
+      try {
+        item.abortController.abort();
+      } catch (_) {}
+    }
     cartItems = cartItems.filter(item => item.id !== docId);
     renderCart();
+  }
+
+  function retryDoc(docId) {
+    const item = cartItems.find(it => it.id === docId);
+    if (!item) return;
+    item.status = 'processing';
+    item.statusText = item.isOffice ? 'Preparing conversion...' : item.isImage ? 'Processing image...' : 'Reading PDF...';
+    item.errorMessage = '';
+    item.abortController = new AbortController();
+    renderCart();
+    processDocItem(item);
   }
 
   // --- Document Ingestion & Conversion ---
@@ -440,21 +565,25 @@
     return await pdfDoc.save();
   }
 
-  async function convertDocumentOnServer(selectedFile) {
+  async function convertDocumentOnServer(selectedFile, signal, onStatusUpdate) {
     const formData = new FormData();
     formData.append('file', selectedFile);
 
     let resp;
     try {
-      resp = await fetch('/api/conversions', { method: 'POST', body: formData });
-    } catch (_) {
-      resp = await fetch('/api/convert', { method: 'POST', body: formData });
+      if (onStatusUpdate) onStatusUpdate('Uploading for conversion...');
+      resp = await fetch('/api/conversions', { method: 'POST', body: formData, signal });
+    } catch (err) {
+      if (signal && signal.aborted) throw err;
+      if (onStatusUpdate) onStatusUpdate('Converting document on server...');
+      resp = await fetch('/api/convert', { method: 'POST', body: formData, signal });
       if (!resp.ok) throw new Error('Document conversion failed');
       return await resp.arrayBuffer();
     }
 
     if (resp.status === 404) {
-      const fallbackResp = await fetch('/api/convert', { method: 'POST', body: formData });
+      if (onStatusUpdate) onStatusUpdate('Converting document on server...');
+      const fallbackResp = await fetch('/api/convert', { method: 'POST', body: formData, signal });
       if (!fallbackResp.ok) throw new Error('Document conversion failed');
       return await fallbackResp.arrayBuffer();
     }
@@ -471,13 +600,20 @@
     let status = createData.status;
     let downloadUrl = null;
 
+    if (onStatusUpdate) onStatusUpdate('Waiting in conversion queue...');
+
     const startTime = Date.now();
     while (status === 'queued' || status === 'processing') {
+      if (signal && signal.aborted) throw new Error('Cancelled');
       if (Date.now() - startTime > 90000) {
         throw new Error('Document conversion timed out');
       }
+      if (onStatusUpdate) {
+        onStatusUpdate(status === 'processing' ? 'Converting pages on server...' : 'Waiting in conversion queue...');
+      }
       await new Promise(r => setTimeout(r, 1200));
-      const pollResp = await fetch(pollUrl);
+      if (signal && signal.aborted) throw new Error('Cancelled');
+      const pollResp = await fetch(pollUrl, { signal });
       if (!pollResp.ok) throw new Error('Failed to query conversion progress');
       const pollData = await pollResp.json();
       status = pollData.status;
@@ -490,15 +626,92 @@
     }
 
     if (!downloadUrl) throw new Error('Conversion result URL missing');
-    const pdfResp = await fetch(downloadUrl);
+    if (onStatusUpdate) onStatusUpdate('Downloading converted PDF...');
+    const pdfResp = await fetch(downloadUrl, { signal });
     if (!pdfResp.ok) throw new Error('Failed to download converted PDF');
     return await pdfResp.arrayBuffer();
+  }
+
+  async function processDocItem(item) {
+    const file = item.file;
+    const nameLower = file.name.toLowerCase();
+    const isOffice = officeExtensions.some(ext => nameLower.endsWith(ext));
+    const isImage = imageExtensions.some(ext => nameLower.endsWith(ext)) || file.type.startsWith('image/');
+    const isPdf = nameLower.endsWith('.pdf') || file.type === 'application/pdf';
+
+    try {
+      let pdfBytes = null;
+      if (isPdf) {
+        item.statusText = 'Reading PDF...';
+        updateCardDOM(item.id);
+        pdfBytes = await file.arrayBuffer();
+      } else if (isImage) {
+        item.statusText = 'Optimizing image...';
+        updateCardDOM(item.id);
+        pdfBytes = await convertImageToPdf(file);
+      } else if (isOffice) {
+        pdfBytes = await convertDocumentOnServer(file, item.abortController?.signal, (statusMsg) => {
+          item.statusText = statusMsg;
+          updateCardDOM(item.id);
+        });
+      }
+
+      // Check if user removed the item while it was processing
+      if (!cartItems.some(it => it.id === item.id)) {
+        return;
+      }
+
+      item.statusText = 'Reading pages...';
+      updateCardDOM(item.id);
+
+      if (!window.pdfjsLib) {
+        throw new Error('PDF viewing engine not initialized');
+      }
+
+      const loadingTask = window.pdfjsLib.getDocument({ data: pdfBytes.slice(0) });
+      const pdfDoc = await loadingTask.promise;
+      const totalPages = pdfDoc.numPages;
+
+      if (!cartItems.some(it => it.id === item.id)) {
+        return;
+      }
+
+      const defaultSides = totalPages > 1 ? 'Double-sided' : 'Single-sided';
+      item.pdfBytes = pdfBytes;
+      item.pdfDoc = pdfDoc;
+      item.totalPages = totalPages;
+      item.isImage = isImage;
+      item.isOffice = isOffice;
+      item.settings = {
+        pageSelection: 'All Pages',
+        customPageRange: '',
+        copies: 1,
+        mode: 'B&W',
+        sides: defaultSides,
+        orientation: 'Auto',
+        pagesPerSheet: '1'
+      };
+      item.selectedPages = Array.from({ length: totalPages }, (_, idx) => idx + 1);
+      item.status = 'ready';
+      item.statusText = '';
+      item.pricePaise = calculateDocPrice(totalPages, item.settings);
+    } catch (err) {
+      if (item.abortController?.signal?.aborted) {
+        return;
+      }
+      console.error('File processing error for', file.name, err);
+      item.status = 'error';
+      item.errorMessage = err.message || 'Processing failed';
+    }
+
+    renderCart();
   }
 
   async function handleFiles(files) {
     if (!files || files.length === 0) return;
     if (cartAlert) cartAlert.classList.add('hidden');
 
+    const newItems = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const nameLower = file.name.toLowerCase();
@@ -511,66 +724,45 @@
         continue;
       }
 
-      if (uploadProcessingIndicator && uploadProcessingText) {
-        uploadProcessingIndicator.classList.remove('hidden');
-        uploadProcessingText.textContent = isOffice
-          ? `Converting ${file.name}...`
-          : `Processing ${file.name}...`;
-      }
+      const docId = 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7) + '_' + i;
+      const item = {
+        id: docId,
+        file: file,
+        name: file.name,
+        size: file.size,
+        status: 'processing',
+        statusText: isOffice ? 'Preparing conversion...' : isImage ? 'Optimizing image...' : 'Reading PDF...',
+        errorMessage: '',
+        abortController: new AbortController(),
+        pdfBytes: null,
+        pdfDoc: null,
+        totalPages: 0,
+        isImage: isImage,
+        isOffice: isOffice,
+        settings: {
+          pageSelection: 'All Pages',
+          customPageRange: '',
+          copies: 1,
+          mode: 'B&W',
+          sides: 'Single-sided',
+          orientation: 'Auto',
+          pagesPerSheet: '1'
+        },
+        selectedPages: [],
+        pricePaise: 0
+      };
 
-      try {
-        let pdfBytes = null;
-        if (isPdf) {
-          pdfBytes = await file.arrayBuffer();
-        } else if (isImage) {
-          pdfBytes = await convertImageToPdf(file);
-        } else if (isOffice) {
-          pdfBytes = await convertDocumentOnServer(file);
-        }
-
-        if (!window.pdfjsLib) {
-          throw new Error('PDF viewing engine not initialized');
-        }
-
-        const loadingTask = window.pdfjsLib.getDocument({ data: pdfBytes.slice(0) });
-        const pdfDoc = await loadingTask.promise;
-        const totalPages = pdfDoc.numPages;
-
-        const defaultSides = totalPages > 1 ? 'Double-sided' : 'Single-sided';
-        const item = {
-          id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-          file: file,
-          name: file.name,
-          pdfBytes: pdfBytes,
-          pdfDoc: pdfDoc,
-          totalPages: totalPages,
-          isImage: isImage,
-          isOffice: isOffice,
-          settings: {
-            pageSelection: 'All Pages',
-            customPageRange: '',
-            copies: 1,
-            mode: 'B&W',
-            sides: defaultSides,
-            orientation: 'Auto',
-            pagesPerSheet: '1'
-          },
-          selectedPages: Array.from({ length: totalPages }, (_, idx) => idx + 1),
-          pricePaise: 0
-        };
-
-        item.pricePaise = calculateDocPrice(totalPages, item.settings);
-        cartItems.push(item);
-      } catch (err) {
-        console.error('File processing error:', err);
-        showCartError(`Failed to process ${file.name}: ${err.message || err}`);
-      }
+      cartItems.push(item);
+      newItems.push(item);
     }
 
-    if (uploadProcessingIndicator) {
-      uploadProcessingIndicator.classList.add('hidden');
-    }
+    // Immediately render all new cards into the DOM
     renderCart();
+
+    // Process all newly added items concurrently
+    newItems.forEach(item => {
+      processDocItem(item);
+    });
   }
 
   function showCartError(msg) {
@@ -959,8 +1151,9 @@
 
   // --- View 4: Checkout & Order Submission Implementation ---
   async function submitOrder() {
-    if (cartItems.length === 0) {
-      showCartError('Please add at least one document to print.');
+    const readyItems = cartItems.filter(it => it.status === 'ready');
+    if (readyItems.length === 0) {
+      showCartError('Please wait for at least one document to finish preparing.');
       return;
     }
 
@@ -972,8 +1165,8 @@
       const formData = new FormData();
       const metadata = [];
 
-      for (let i = 0; i < cartItems.length; i++) {
-        const item = cartItems[i];
+      for (let i = 0; i < readyItems.length; i++) {
+        const item = readyItems[i];
         let filePayload = item.file;
         if (item.pdfBytes && (item.isImage || item.isOffice)) {
           const pdfBlob = new Blob([item.pdfBytes], { type: 'application/pdf' });
@@ -995,8 +1188,8 @@
 
       formData.append('metadata', JSON.stringify(metadata));
 
-      if (cartItems.length > 0) {
-        const first = cartItems[0];
+      if (readyItems.length > 0) {
+        const first = readyItems[0];
         const isDouble = first.settings.sides === 'Double-sided';
         formData.append('copies', String(first.settings.copies || 1));
         formData.append('duplex', isDouble ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
@@ -1026,10 +1219,10 @@
       }
 
       if (checkoutDocsCount) {
-        checkoutDocsCount.textContent = `${cartItems.length} file${cartItems.length > 1 ? 's' : ''}`;
+        checkoutDocsCount.textContent = `${readyItems.length} file${readyItems.length > 1 ? 's' : ''}`;
       }
       if (checkoutTotalAmount) {
-        const totalPaise = data.total_price_paise || cartItems.reduce((acc, it) => acc + it.pricePaise, 0);
+        const totalPaise = data.total_price_paise || readyItems.reduce((acc, it) => acc + it.pricePaise, 0);
         checkoutTotalAmount.textContent = formatRupees(totalPaise);
       }
 
@@ -1139,10 +1332,16 @@
     btnStartNewOrder.addEventListener('click', () => {
       if (orderPollTimer) clearInterval(orderPollTimer);
       if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+      cartItems.forEach(it => {
+        if (it.abortController) {
+          try { it.abortController.abort(); } catch (_) {}
+        }
+      });
       cartItems = [];
       activeOrderId = null;
       activeDisplayCode = '';
       switchView('cart');
+      renderCart();
     });
   }
 
