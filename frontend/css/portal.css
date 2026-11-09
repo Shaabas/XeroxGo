@@ -1859,6 +1859,7 @@ body {
   border-radius: 50%;
   flex-shrink: 0;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  box-sizing: border-box;
 }
 
 .bw-circle {
@@ -1866,7 +1867,20 @@ body {
 }
 
 .color-circle {
-  background: linear-gradient(135deg, #F59E0B, #3B82F6);
+  background: conic-gradient(
+    from 90deg,
+    #ef4444 0deg,
+    #f97316 45deg,
+    #facc15 90deg,
+    #22c55e 135deg,
+    #06b6d4 180deg,
+    #3b82f6 225deg,
+    #a855f7 270deg,
+    #ec4899 315deg,
+    #ef4444 360deg
+  );
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), inset 0 0 0 1px rgba(255, 255, 255, 0.25);
 }
 
 .sheet-icon-single {
