@@ -20,7 +20,7 @@ services:
         - "*.md"
     envVars:
       - key: DATABASE_URL
-        value: postgresql://postgres.ftqtagndujzquonpjmfx:zd8HYnhtKYy9j5Gp@aws-1-eu-central-1.pooler.supabase.com:6543/postgres
+        sync: false
       - key: PORT
         value: 10000
       - key: XEROXGO_DEV_MODE
