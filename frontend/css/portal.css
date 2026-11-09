@@ -1852,7 +1852,7 @@ body {
   color: var(--primary-blue);
 }
 
-/* Classic Restored Button Icons */
+/* Classic Restored Button Icons & CMY Triad */
 .choice-icon-circle {
   width: 26px;
   height: 26px;
@@ -1860,6 +1860,32 @@ body {
   flex-shrink: 0;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
   box-sizing: border-box;
+}
+
+.choice-icon-triad {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.triad-svg {
+  width: 26px;
+  height: 26px;
+  overflow: visible;
+  isolation: isolate;
+  display: block;
+}
+
+.triad-svg circle {
+  mix-blend-mode: multiply;
+}
+
+.triad-cmy-smudge,
+.triad-bw-smudge {
+  filter: blur(0.5px);
 }
 
 .bw-circle {
