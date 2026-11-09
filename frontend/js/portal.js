@@ -115,6 +115,9 @@
   const btnSheetLeft = document.getElementById('btn-sheet-left');
   const btnSheetRight = document.getElementById('btn-sheet-right');
   const previewSheetIndicator = document.getElementById('preview-sheet-indicator');
+  const previewSideToggle = document.getElementById('preview-side-toggle');
+  const toggleSideFront = document.getElementById('toggle-side-front');
+  const toggleSideBack = document.getElementById('toggle-side-back');
   const btnSheetFlip = document.getElementById('btn-sheet-flip');
 
   // View 4 (Checkout) DOM
@@ -836,6 +839,9 @@
     if (previewCanvas) {
       previewCanvas.style.filter = (draftSettings.mode === 'B&W') ? 'grayscale(100%) contrast(105%)' : 'none';
     }
+    if (previewSideToggle) {
+      previewSideToggle.classList.toggle('hidden', draftSettings.sides !== 'Double-sided');
+    }
     if (btnSheetFlip) {
       btnSheetFlip.classList.toggle('hidden', draftSettings.sides !== 'Double-sided');
     }
@@ -1079,17 +1085,21 @@
     if (btnSheetLeft) btnSheetLeft.disabled = (currentPreviewSheet <= 1);
     if (btnSheetRight) btnSheetRight.disabled = (currentPreviewSheet >= totalSheets);
 
+    if (previewSideToggle) {
+      previewSideToggle.classList.toggle('hidden', !isDuplex);
+    }
+    if (toggleSideFront && toggleSideBack) {
+      toggleSideFront.classList.toggle('active', currentPreviewSide === 'front');
+      toggleSideFront.setAttribute('aria-pressed', currentPreviewSide === 'front');
+      toggleSideBack.classList.toggle('active', currentPreviewSide === 'back');
+      toggleSideBack.setAttribute('aria-pressed', currentPreviewSide === 'back');
+    }
     if (btnSheetFlip) {
       btnSheetFlip.classList.toggle('hidden', !isDuplex);
     }
 
     if (previewSheetIndicator) {
-      if (isDuplex) {
-        const sideLabel = currentPreviewSide === 'front' ? 'Front' : 'Back';
-        previewSheetIndicator.textContent = `Sheet ${currentPreviewSheet} of ${totalSheets} (${sideLabel})`;
-      } else {
-        previewSheetIndicator.textContent = `Sheet ${currentPreviewSheet} of ${totalSheets}`;
-      }
+      previewSheetIndicator.textContent = `Sheet ${currentPreviewSheet} of ${totalSheets}`;
     }
 
     // Determine 1-based PDF page index
@@ -1206,7 +1216,6 @@
       btnSheetLeft.addEventListener('click', () => {
         if (currentPreviewSheet > 1) {
           currentPreviewSheet--;
-          currentPreviewSide = 'front';
           renderPreviewSheet();
         }
       });
@@ -1223,10 +1232,32 @@
         const totalSheets = isDuplex ? Math.ceil(pages.length / 2) : pages.length;
         if (currentPreviewSheet < totalSheets) {
           currentPreviewSheet++;
-          currentPreviewSide = 'front';
           renderPreviewSheet();
         }
       });
+    }
+
+    const setPreviewSide = (targetSide, triggerAnim = true) => {
+      const doc = cartItems.find(d => d.id === (activeSettingsDocId || activePreviewDocId));
+      if (!doc) return;
+      const isDuplex = (draftSettings ? draftSettings.sides : doc.settings.sides) === 'Double-sided';
+      if (!isDuplex) return;
+      if (currentPreviewSide === targetSide) return;
+      currentPreviewSide = targetSide;
+      if (triggerAnim && previewCanvas) {
+        previewCanvas.classList.remove('flipping');
+        void previewCanvas.offsetWidth; // trigger reflow
+        previewCanvas.classList.add('flipping');
+        setTimeout(() => previewCanvas.classList.remove('flipping'), 300);
+      }
+      renderPreviewSheet();
+    };
+
+    if (toggleSideFront) {
+      toggleSideFront.addEventListener('click', () => setPreviewSide('front', true));
+    }
+    if (toggleSideBack) {
+      toggleSideBack.addEventListener('click', () => setPreviewSide('back', true));
     }
 
     const triggerFlip = () => {
@@ -1234,14 +1265,7 @@
       if (!doc) return;
       const isDuplex = (draftSettings ? draftSettings.sides : doc.settings.sides) === 'Double-sided';
       if (isDuplex) {
-        currentPreviewSide = currentPreviewSide === 'front' ? 'back' : 'front';
-        if (previewCanvas) {
-          previewCanvas.classList.remove('flipping');
-          void previewCanvas.offsetWidth; // trigger reflow
-          previewCanvas.classList.add('flipping');
-          setTimeout(() => previewCanvas.classList.remove('flipping'), 300);
-        }
-        renderPreviewSheet();
+        setPreviewSide(currentPreviewSide === 'front' ? 'back' : 'front', true);
       } else {
         // Simplex - advance to next sheet if available
         if (btnSheetRight && !btnSheetRight.disabled) {

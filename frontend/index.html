@@ -200,19 +200,22 @@
           <canvas id="preview-canvas" class="preview-canvas" title="Tap sheet to flip"></canvas>
         </div>
 
-        <!-- Sheet Pager & Flip Controls -->
+        <!-- Sheet Pager & Side Toggle Controls -->
         <div class="preview-sheet-pager">
-          <button type="button" id="btn-sheet-left" class="sheet-arrow-btn" aria-label="Previous sheet" disabled>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-          </button>
-          <span id="preview-sheet-indicator" class="preview-sheet-indicator">Sheet 1 of 1</span>
-          <button type="button" id="btn-sheet-right" class="sheet-arrow-btn" aria-label="Next sheet" disabled>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-          </button>
-          <button type="button" id="btn-sheet-flip" class="btn-flip-sheet-pill hidden" aria-label="Flip sheet">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6"/><path d="M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
-            <span>Flip</span>
-          </button>
+          <div class="pager-spacer" aria-hidden="true"></div>
+          <div class="pager-nav-group">
+            <button type="button" id="btn-sheet-left" class="sheet-arrow-btn" aria-label="Previous sheet" disabled>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+            <span id="preview-sheet-indicator" class="preview-sheet-indicator">Sheet 1 of 1</span>
+            <button type="button" id="btn-sheet-right" class="sheet-arrow-btn" aria-label="Next sheet" disabled>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+          </div>
+          <div id="preview-side-toggle" class="preview-side-toggle hidden" role="group" aria-label="Sheet side selection">
+            <button type="button" id="toggle-side-front" class="side-toggle-btn active" aria-pressed="true">FRONT</button>
+            <button type="button" id="toggle-side-back" class="side-toggle-btn" aria-pressed="false">BACK</button>
+          </div>
         </div>
       </div>
 
