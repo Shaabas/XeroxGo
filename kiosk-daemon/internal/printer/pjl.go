@@ -289,22 +289,20 @@ func StreamPDFWithPJL(
 		return fmt.Errorf("failed to write PJL trailer: %w", err)
 	}
 
-	// Signal write completion via CloseWrite
-	if cw, ok := conn.(closeWriter); ok {
-		if err := cw.CloseWrite(); err != nil {
-			_ = conn.Close()
-			<-readErrCh
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("failed to close write side of connection: %w", err)
-		}
-	}
+	// All data (header, PDF, trailer) has been successfully transmitted
 	writeCompleted.Store(true)
+
+	// Signal write completion via CloseWrite if supported
+	if cw, ok := conn.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
 
 	// Wait for status reader to finish
 	err = <-readErrCh
 	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) && writeCompleted.Load() {
+			return nil
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
