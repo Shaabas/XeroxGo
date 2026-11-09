@@ -2129,6 +2129,13 @@ body {
   text-align: center;
   white-space: nowrap;
   transition: all 0.15s ease;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.split-btn-card:focus,
+.split-btn-card:focus-visible {
+  outline: none;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -2290,6 +2297,13 @@ body {
   cursor: pointer;
   transition: all 0.15s ease;
   white-space: nowrap;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.btn-select-pill:focus,
+.btn-select-pill:focus-visible {
+  outline: none;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -2358,6 +2372,13 @@ body {
   user-select: none;
   font-variant-numeric: tabular-nums;
   padding: 0;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.seat-btn:focus,
+.seat-btn:focus-visible {
+  outline: none;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -2380,12 +2401,11 @@ body {
 }
 
 .seat-btn.current-view {
-  box-shadow: 0 0 0 2px #0f172a, 0 2px 6px rgba(0, 0, 0, 0.15);
   font-weight: 700;
 }
 
 .seat-btn.active.current-view {
-  box-shadow: 0 0 0 2px #0f172a, 0 2px 8px rgba(37, 99, 235, 0.35);
+  font-weight: 700;
 }
 
 /* Custom Range Input (legacy support) */
