@@ -1254,10 +1254,10 @@
     };
 
     if (toggleSideFront) {
-      toggleSideFront.addEventListener('click', () => setPreviewSide('front', true));
+      toggleSideFront.addEventListener('click', () => setPreviewSide('front', false));
     }
     if (toggleSideBack) {
-      toggleSideBack.addEventListener('click', () => setPreviewSide('back', true));
+      toggleSideBack.addEventListener('click', () => setPreviewSide('back', false));
     }
 
     const triggerFlip = () => {
