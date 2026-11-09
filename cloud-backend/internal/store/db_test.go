@@ -847,3 +847,67 @@ func TestRejectsInvalidInput(t *testing.T) {
 		})
 	}
 }
+
+func TestGetExpiredOrderIDs(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+
+	// 1. Completed order older than 24h
+	ord1 := sampleOrder("ord-exp-comp", "job-exp-comp")
+	ord1.Status = contracts.JobStatusCompleted
+	ord1.CreatedAt = now.Add(-30 * time.Hour)
+	ord1.UpdatedAt = now.Add(-25 * time.Hour)
+	if err := s.CreateOrder(ctx, ord1); err != nil {
+		t.Fatalf("create ord1 failed: %v", err)
+	}
+
+	// 2. Completed order recently (1h ago) -> should NOT be expired
+	ord2 := sampleOrder("ord-fresh-comp", "job-fresh-comp")
+	ord2.Status = contracts.JobStatusCompleted
+	ord2.CreatedAt = now.Add(-2 * time.Hour)
+	ord2.UpdatedAt = now.Add(-1 * time.Hour)
+	if err := s.CreateOrder(ctx, ord2); err != nil {
+		t.Fatalf("create ord2 failed: %v", err)
+	}
+
+	// 3. Unpaid pending order older than 4h -> should be expired
+	ord3 := sampleOrder("ord-exp-pending", "job-exp-pending")
+	ord3.Status = contracts.JobStatusPendingPayment
+	ord3.CreatedAt = now.Add(-5 * time.Hour)
+	ord3.UpdatedAt = now.Add(-5 * time.Hour)
+	if err := s.CreateOrder(ctx, ord3); err != nil {
+		t.Fatalf("create ord3 failed: %v", err)
+	}
+
+	// 4. Fresh pending order (30m ago) -> should NOT be expired
+	ord4 := sampleOrder("ord-fresh-pending", "job-fresh-pending")
+	ord4.Status = contracts.JobStatusPendingPayment
+	ord4.CreatedAt = now.Add(-30 * time.Minute)
+	ord4.UpdatedAt = now.Add(-30 * time.Minute)
+	if err := s.CreateOrder(ctx, ord4); err != nil {
+		t.Fatalf("create ord4 failed: %v", err)
+	}
+
+	completedThreshold := now.Add(-24 * time.Hour)
+	pendingThreshold := now.Add(-4 * time.Hour)
+
+	expiredIDs, err := s.GetExpiredOrderIDs(ctx, completedThreshold, pendingThreshold)
+	if err != nil {
+		t.Fatalf("GetExpiredOrderIDs failed: %v", err)
+	}
+
+	if len(expiredIDs) != 2 {
+		t.Fatalf("expected 2 expired orders, got %d: %v", len(expiredIDs), expiredIDs)
+	}
+
+	idMap := make(map[string]bool)
+	for _, id := range expiredIDs {
+		idMap[id] = true
+	}
+
+	if !idMap["ord-exp-comp"] || !idMap["ord-exp-pending"] {
+		t.Fatalf("expected ord-exp-comp and ord-exp-pending in expired set, got: %v", expiredIDs)
+	}
+}

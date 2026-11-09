@@ -546,6 +546,12 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 	if !hubSawCompleted {
 		t.Fatalf("cloud WS hub did not receive final COMPLETED progress event: %+v", receivedProgress)
 	}
+
+	// 5. Verify local PDF payload was shredded immediately after printing (ETSI EN 303 645 / GDPR compliance)
+	shreddedPath := filepath.Join(tmpDir, jobCmd.JobID+".pdf")
+	if _, err := os.Stat(shreddedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected printed document payload to be deleted from disk, but file still exists at %s", shreddedPath)
+	}
 }
 
 // Test E — TestClientPersistsStateWhenCloudDisconnects

@@ -960,6 +960,45 @@ WHERE job_id = ?;
 	return event, nil
 }
 
+// GetExpiredOrderIDs returns order IDs whose stored PDF artifacts have exceeded retention.
+// - completedThreshold applies to orders in terminal states (COMPLETED, PAUSED_ERROR, FAILED_REFUNDABLE).
+// - pendingThreshold applies to unpaid orders still in PENDING_PAYMENT.
+func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pendingThreshold time.Time) ([]string, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("get expired orders: store is closed or nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("get expired orders: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("get expired orders: %w", err)
+	}
+
+	query := `
+SELECT order_id FROM orders
+WHERE (status IN ('COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE') AND updated_at_ns <= ?)
+   OR (status = 'PENDING_PAYMENT' AND created_at_ns <= ?);
+`
+	rows, err := s.db.QueryContext(ctx, s.rebind(query), completedThreshold.UnixNano(), pendingThreshold.UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("query expired order ids: %w", err)
+	}
+	defer rows.Close()
+
+	var orderIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan expired order id: %w", err)
+		}
+		orderIDs = append(orderIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows expired order ids: %w", err)
+	}
+	return orderIDs, nil
+}
+
 func isValidJobStatus(s contracts.JobStatus) bool {
 	switch s {
 	case contracts.JobStatusUploaded,

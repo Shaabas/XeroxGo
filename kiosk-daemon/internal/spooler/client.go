@@ -695,6 +695,14 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) {
 	log.Printf("[SPOOLER] Job %s successfully printed (%d pages, %d sheets)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets)
+
+	// Post-print document shredder: immediately delete the downloaded PDF payload from local disk
+	// to enforce ETSI EN 303 645 (Provision 5.4), NIST SP 800-213, and GDPR/DPDP storage limitation.
+	finalPath := filepath.Join(c.cfg.DownloadDir, cmd.JobID+".pdf")
+	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("[WARN] Failed to shred local printed payload %s: %v", finalPath, err)
+	}
+
 	evt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,

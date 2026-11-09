@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -285,6 +287,7 @@ func (s *appServer) startConversionWorker(ctx context.Context) {
 			return
 		case <-cleanupTicker.C:
 			s.cleanupExpiredConversions(ctx)
+			s.cleanupExpiredOrderArtifacts(ctx)
 		case <-s.convWake:
 			s.processQueuedConversions(ctx)
 		case <-pollTicker.C:
@@ -352,5 +355,34 @@ func (s *appServer) cleanupExpiredConversions(ctx context.Context) {
 	}
 	if len(paths) > 0 {
 		log.Printf("[CONVERSION] cleaned up %d expired file artifacts", len(paths))
+	}
+}
+
+// cleanupExpiredOrderArtifacts shreds stored PDF artifacts for orders that exceed retention limits,
+// in compliance with GDPR Article 5(1)(e) (Storage Limitation) and India DPDP Act 2023 Section 8(7).
+func (s *appServer) cleanupExpiredOrderArtifacts(ctx context.Context) {
+	now := time.Now()
+	completedCutoff := now.Add(-24 * time.Hour)
+	pendingCutoff := now.Add(-4 * time.Hour)
+
+	orderIDs, err := s.db.GetExpiredOrderIDs(ctx, completedCutoff, pendingCutoff)
+	if err != nil {
+		log.Printf("[RETENTION] failed to query expired order IDs: %v", err)
+		return
+	}
+
+	shreddedCount := 0
+	for _, orderID := range orderIDs {
+		h := sha256.Sum256([]byte(orderID))
+		pdfPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
+		if fi, err := os.Stat(pdfPath); err == nil && !fi.IsDir() {
+			if err := os.Remove(pdfPath); err == nil {
+				shreddedCount++
+			}
+		}
+	}
+
+	if shreddedCount > 0 {
+		log.Printf("[RETENTION] Shredded %d expired student document payloads for privacy compliance", shreddedCount)
 	}
 }

@@ -11,18 +11,17 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
 	"xeroxgo/pkg/contracts"
 )
 
-// hashPassword produces a salted SHA-256 hash using 100,000 iterations: $sha256$iterations$salt$hash
+// hashPassword produces a standard bcrypt hash with cost 12 (NIST SP 800-63B / OWASP compliant).
 func hashPassword(password string) (string, error) {
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return "", fmt.Errorf("generate salt: %w", err)
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		return "", fmt.Errorf("bcrypt hash password: %w", err)
 	}
-	saltHex := hex.EncodeToString(salt)
-	hash := computeIteratedHash(password, saltHex, 100000)
-	return fmt.Sprintf("$sha256$100000$%s$%s", saltHex, hash), nil
+	return string(bytes), nil
 }
 
 func computeIteratedHash(password, salt string, iterations int) string {
@@ -38,18 +37,25 @@ func computeIteratedHash(password, salt string, iterations int) string {
 }
 
 func verifyPassword(password, storedHash string) bool {
+	// Standard bcrypt hash verification ($2a$, $2b$, $2y$)
+	if strings.HasPrefix(storedHash, "$2") {
+		return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
+	}
+
+	// Backward-compatible fallback for legacy $sha256$ hashes
 	parts := strings.Split(storedHash, "$")
-	if len(parts) != 5 || parts[1] != "sha256" {
-		return false
+	if len(parts) == 5 && parts[1] == "sha256" {
+		var iterations int
+		if _, err := fmt.Sscanf(parts[2], "%d", &iterations); err != nil || iterations < 1 {
+			return false
+		}
+		salt := parts[3]
+		expectedHash := parts[4]
+		actualHash := computeIteratedHash(password, salt, iterations)
+		return subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) == 1
 	}
-	var iterations int
-	if _, err := fmt.Sscanf(parts[2], "%d", &iterations); err != nil || iterations < 1 {
-		return false
-	}
-	salt := parts[3]
-	expectedHash := parts[4]
-	actualHash := computeIteratedHash(password, salt, iterations)
-	return subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) == 1
+
+	return false
 }
 
 func hashToken(token string) string {

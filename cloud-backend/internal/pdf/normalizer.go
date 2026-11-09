@@ -336,6 +336,7 @@ func NormalizeAndCountWithOptions(
 	}
 
 	gsArgs := []string{
+		"-dSAFER",
 		"-sDEVICE=pdfwrite",
 		"-dCompatibilityLevel=1.7",
 		"-dPDFSETTINGS=/prepress",
