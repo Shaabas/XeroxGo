@@ -92,9 +92,7 @@
   const selectionCountSummary = document.getElementById('selection-count-summary');
   const selectionErrorText = document.getElementById('selection-error-text');
 
-  const previewSelectionBadge = document.getElementById('preview-selection-badge');
-  const previewPageCheckbox = document.getElementById('preview-page-checkbox');
-  const previewCheckboxText = document.getElementById('preview-checkbox-text');
+  const selectionSeatsGrid = document.getElementById('selection-seats-grid');
 
   const settingsCustomRangeWrapper = document.getElementById('settings-custom-range-wrapper');
   const inputCustomRange = document.getElementById('input-custom-range');
@@ -864,9 +862,90 @@
     if (selectionErrorText) {
       selectionErrorText.classList.toggle('hidden', selCount > 0);
     }
+
+    // Sync seat button active classes
+    if (selectionSeatsGrid) {
+      const seatBtns = selectionSeatsGrid.querySelectorAll('.seat-btn');
+      seatBtns.forEach(btn => {
+        const p = parseInt(btn.dataset.page, 10);
+        const isSel = Array.isArray(draftSettings.selectedPages) && draftSettings.selectedPages.includes(p);
+        btn.classList.toggle('active', isSel);
+        btn.setAttribute('aria-pressed', isSel ? 'true' : 'false');
+      });
+    }
+
     const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
     if (saveSettingsPrice) {
       saveSettingsPrice.textContent = formatRupees(livePrice);
+    }
+  }
+
+  function renderSelectionSeats(doc) {
+    if (!selectionSeatsGrid || !doc || !draftSettings) return;
+    selectionSeatsGrid.innerHTML = '';
+
+    if (!Array.isArray(draftSettings.selectedPages)) {
+      draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
+    }
+
+    const isDuplex = (draftSettings.sides === 'Double-sided');
+    let currentViewPage = null;
+    if (!isDuplex) {
+      currentViewPage = currentPreviewSheet;
+    } else {
+      currentViewPage = (currentPreviewSide === 'front')
+        ? (currentPreviewSheet - 1) * 2 + 1
+        : (currentPreviewSheet - 1) * 2 + 2;
+    }
+
+    for (let p = 1; p <= doc.totalPages; p++) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'seat-btn';
+      btn.dataset.page = String(p);
+      btn.textContent = String(p);
+      btn.title = `Page ${p}`;
+
+      const isSelected = draftSettings.selectedPages.includes(p);
+      if (isSelected) {
+        btn.classList.add('active');
+        btn.setAttribute('aria-pressed', 'true');
+      } else {
+        btn.setAttribute('aria-pressed', 'false');
+      }
+
+      if (p === currentViewPage) {
+        btn.classList.add('current-view');
+      }
+
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const pageNum = parseInt(btn.dataset.page, 10);
+        const alreadySelected = draftSettings.selectedPages.includes(pageNum);
+        if (alreadySelected) {
+          draftSettings.selectedPages = draftSettings.selectedPages.filter(it => it !== pageNum);
+          btn.classList.remove('active');
+          btn.setAttribute('aria-pressed', 'false');
+        } else {
+          draftSettings.selectedPages.push(pageNum);
+          draftSettings.selectedPages.sort((a, b) => a - b);
+          btn.classList.add('active');
+          btn.setAttribute('aria-pressed', 'true');
+        }
+
+        // Navigate preview canvas to this page
+        if (!isDuplex) {
+          currentPreviewSheet = pageNum;
+        } else {
+          currentPreviewSheet = Math.ceil(pageNum / 2);
+          currentPreviewSide = (pageNum % 2 === 1) ? 'front' : 'back';
+        }
+
+        syncSelectionState(doc);
+        renderPreviewSheet();
+      });
+
+      selectionSeatsGrid.appendChild(btn);
     }
   }
 
@@ -941,12 +1020,9 @@
         if (!Array.isArray(draftSettings.selectedPages)) {
           draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
         }
+        renderSelectionSeats(doc);
         syncSelectionState(doc);
       }
-    }
-
-    if (previewSelectionBadge) {
-      previewSelectionBadge.classList.toggle('hidden', !isSelection);
     }
 
     // 2. Copies
@@ -1153,7 +1229,7 @@
         const doc = cartItems.find(d => d.id === activeSettingsDocId);
         if (!doc || !draftSettings) return;
         draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
-        syncSettingsUI(doc);
+        syncSelectionState(doc);
         renderPreviewSheet();
       });
     }
@@ -1163,47 +1239,8 @@
         const doc = cartItems.find(d => d.id === activeSettingsDocId);
         if (!doc || !draftSettings) return;
         draftSettings.selectedPages = [];
-        syncSettingsUI(doc);
-        renderPreviewSheet();
-      });
-    }
-
-    // Top-Right Preview Checkbox Listener
-    if (previewPageCheckbox) {
-      previewPageCheckbox.addEventListener('change', (e) => {
-        const doc = cartItems.find(d => d.id === activeSettingsDocId);
-        if (!doc || !draftSettings || draftSettings.pageSelection !== 'Selection') return;
-
-        const isDuplex = (draftSettings.sides === 'Double-sided');
-        let targetPage = null;
-        if (!isDuplex) {
-          targetPage = currentPreviewSheet;
-        } else {
-          targetPage = (currentPreviewSide === 'front')
-            ? (currentPreviewSheet - 1) * 2 + 1
-            : (currentPreviewSheet - 1) * 2 + 2;
-        }
-        if (!targetPage || targetPage > doc.totalPages) return;
-
-        if (!Array.isArray(draftSettings.selectedPages)) {
-          draftSettings.selectedPages = [];
-        }
-
-        const isChecked = e.target.checked;
-        if (isChecked) {
-          if (!draftSettings.selectedPages.includes(targetPage)) {
-            draftSettings.selectedPages.push(targetPage);
-            draftSettings.selectedPages.sort((a, b) => a - b);
-          }
-        } else {
-          draftSettings.selectedPages = draftSettings.selectedPages.filter(p => p !== targetPage);
-        }
-
-        if (previewCanvas) {
-          previewCanvas.classList.toggle('page-excluded', !isChecked);
-        }
-
         syncSelectionState(doc);
+        renderPreviewSheet();
       });
     }
 
@@ -1392,21 +1429,24 @@
       }
     }
 
-    // Synchronize Selection Checkbox in Preview Stage
+    // Synchronize Selection state (canvas dimming and active seat focus ring)
     if (draftSettings && draftSettings.pageSelection === 'Selection') {
       if (pageNumToRender !== null) {
-        if (previewSelectionBadge) previewSelectionBadge.classList.remove('hidden');
         const isSelected = Array.isArray(draftSettings.selectedPages) && draftSettings.selectedPages.includes(pageNumToRender);
-        if (previewPageCheckbox) previewPageCheckbox.checked = isSelected;
-        if (previewCheckboxText) previewCheckboxText.textContent = `Print Page ${pageNumToRender}`;
         if (previewCanvas) previewCanvas.classList.toggle('page-excluded', !isSelected);
       } else {
-        if (previewSelectionBadge) previewSelectionBadge.classList.add('hidden');
         if (previewCanvas) previewCanvas.classList.remove('page-excluded');
       }
     } else {
-      if (previewSelectionBadge) previewSelectionBadge.classList.add('hidden');
       if (previewCanvas) previewCanvas.classList.remove('page-excluded');
+    }
+
+    if (selectionSeatsGrid && pageNumToRender !== null) {
+      const seatBtns = selectionSeatsGrid.querySelectorAll('.seat-btn');
+      seatBtns.forEach(btn => {
+        const p = parseInt(btn.dataset.page, 10);
+        btn.classList.toggle('current-view', p === pageNumToRender);
+      });
     }
 
     if (previewLoadingSpinner) previewLoadingSpinner.classList.remove('hidden');

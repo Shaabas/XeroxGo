@@ -190,19 +190,6 @@
       <!-- Integrated Print Preview Stage -->
       <div class="preview-frame-card preview-frame-unified">
         <div class="preview-paper-stage">
-          <!-- Selection Checkbox (Appears when Selection mode is active) -->
-          <div id="preview-selection-badge" class="preview-selection-badge hidden">
-            <label class="preview-page-checkbox-label" for="preview-page-checkbox">
-              <input type="checkbox" id="preview-page-checkbox" class="preview-page-checkbox" checked />
-              <span class="preview-checkbox-custom">
-                <svg class="preview-checkbox-icon" viewBox="0 0 12 10" fill="none">
-                  <polyline points="1.5 5 4.5 8 10.5 1.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-              <span id="preview-checkbox-text" class="preview-checkbox-text">Print this page</span>
-            </label>
-          </div>
-
           <div id="preview-loading-spinner" class="preview-spinner hidden">
             <div class="spinner-icon"></div>
             <span>Rendering preview...</span>
@@ -251,7 +238,6 @@
                 <label for="input-range-from" class="range-label">From</label>
                 <input type="number" id="input-range-from" class="range-input" min="1" value="1" inputmode="numeric" />
               </div>
-              <span class="range-separator">to</span>
               <div class="range-field">
                 <label for="input-range-to" class="range-label">To</label>
                 <input type="number" id="input-range-to" class="range-input" min="1" value="1" inputmode="numeric" />
@@ -261,7 +247,7 @@
             <p id="range-error-text" class="custom-range-error-layout hidden"></p>
           </div>
 
-          <!-- Selection Controls Bar (Shown when Selection is active) -->
+          <!-- Selection Controls Bar & Theatre Seat Grid (Shown when Selection is active) -->
           <div id="settings-selection-controls" class="selection-controls-wrapper hidden">
             <div class="selection-actions-bar">
               <div class="selection-quick-btns">
@@ -275,6 +261,9 @@
                 </button>
               </div>
               <span id="selection-count-summary" class="selection-count-summary">1 of 1 pages selected</span>
+            </div>
+            <div id="selection-seats-grid" class="selection-seats-grid" role="group" aria-label="Page seat selector">
+              <!-- Dynamically populated theatre-seat style page buttons -->
             </div>
             <p id="selection-error-text" class="custom-range-error-layout hidden">Please select at least 1 page to print</p>
           </div>
