@@ -74,8 +74,28 @@
   const menuOptReset = document.getElementById('menu-opt-reset');
   const menuOptDelete = document.getElementById('menu-opt-delete');
 
-  const btnOptAllPages = document.getElementById('btn-opt-all-pages');
-  const btnOptCustomRange = document.getElementById('btn-opt-custom-range');
+  const btnOptAll = document.getElementById('btn-opt-all') || document.getElementById('btn-opt-all-pages');
+  const btnOptRange = document.getElementById('btn-opt-range') || document.getElementById('btn-opt-custom-range');
+  const btnOptSelection = document.getElementById('btn-opt-selection');
+  const btnOptAllPages = btnOptAll;
+  const btnOptCustomRange = btnOptRange;
+
+  const settingsRangeBoxes = document.getElementById('settings-range-boxes');
+  const inputRangeFrom = document.getElementById('input-range-from');
+  const inputRangeTo = document.getElementById('input-range-to');
+  const rangeInfoPill = document.getElementById('range-info-pill');
+  const rangeErrorText = document.getElementById('range-error-text');
+
+  const settingsSelectionControls = document.getElementById('settings-selection-controls');
+  const btnSelectCheckAll = document.getElementById('btn-select-check-all');
+  const btnSelectUncheckAll = document.getElementById('btn-select-uncheck-all');
+  const selectionCountSummary = document.getElementById('selection-count-summary');
+  const selectionErrorText = document.getElementById('selection-error-text');
+
+  const previewSelectionBadge = document.getElementById('preview-selection-badge');
+  const previewPageCheckbox = document.getElementById('preview-page-checkbox');
+  const previewCheckboxText = document.getElementById('preview-checkbox-text');
+
   const settingsCustomRangeWrapper = document.getElementById('settings-custom-range-wrapper');
   const inputCustomRange = document.getElementById('input-custom-range');
   const customRangeError = document.getElementById('custom-range-error');
@@ -225,8 +245,16 @@
 
   // Authoritative per-document price calculation in integer paise
   function calculateDocPrice(totalPages, settings) {
+    if (!settings) return 0;
     let pagesCount = totalPages;
-    if (settings.pageSelection === 'Custom Range' && settings.customPageRange) {
+    if (settings.pageSelection === 'Custom Range') {
+      const from = Math.max(1, Math.min(settings.rangeFrom || 1, totalPages));
+      const to = Math.max(from, Math.min(settings.rangeTo || totalPages, totalPages));
+      pagesCount = Math.max(1, to - from + 1);
+    } else if (settings.pageSelection === 'Selection') {
+      const sel = Array.isArray(settings.selectedPages) ? settings.selectedPages : [];
+      pagesCount = sel.length;
+    } else if (settings.customPageRange) {
       const parsed = parseCustomPages(settings.customPageRange, totalPages);
       if (parsed.valid && parsed.pages.length > 0) {
         pagesCount = parsed.pages.length;
@@ -240,11 +268,21 @@
       ratePaise = (settings.sides === 'Double-sided') ? bwDuplexPricePaise : bwSimplexPricePaise;
     }
 
-    return pagesCount * settings.copies * ratePaise;
+    return pagesCount * (settings.copies || 1) * ratePaise;
   }
 
   function getDocSelectedPages(totalPages, settings) {
-    if (settings.pageSelection === 'Custom Range' && settings.customPageRange) {
+    if (!settings) return Array.from({ length: totalPages }, (_, i) => i + 1);
+    if (settings.pageSelection === 'Custom Range') {
+      const from = Math.max(1, Math.min(settings.rangeFrom || 1, totalPages));
+      const to = Math.max(from, Math.min(settings.rangeTo || totalPages, totalPages));
+      const pages = [];
+      for (let p = from; p <= to; p++) pages.push(p);
+      return pages;
+    } else if (settings.pageSelection === 'Selection') {
+      const sel = Array.isArray(settings.selectedPages) ? settings.selectedPages : [];
+      return sel.slice().sort((a, b) => a - b);
+    } else if (settings.customPageRange) {
       const parsed = parseCustomPages(settings.customPageRange, totalPages);
       if (parsed.valid && parsed.pages.length > 0) {
         return parsed.pages;
@@ -387,9 +425,16 @@
         item.pricePaise = itemPrice;
         totalCartPaise += itemPrice;
 
-        const pageCountText = item.settings.pageSelection === 'Custom Range' && item.settings.customPageRange
-          ? `${item.selectedPages.length} pages`
-          : `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
+        let pageCountText = `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
+        if (item.settings.pageSelection === 'Custom Range') {
+          const from = item.settings.rangeFrom || 1;
+          const to = item.settings.rangeTo || item.totalPages;
+          const count = Math.max(1, to - from + 1);
+          pageCountText = `${count} page${count > 1 ? 's' : ''} (${from}-${to})`;
+        } else if (item.settings.pageSelection === 'Selection') {
+          const count = (item.settings.selectedPages || []).length;
+          pageCountText = `${count} of ${item.totalPages} pages`;
+        }
 
         const sidesText = item.settings.sides === 'Double-sided' ? 'Double Side' : 'Single Side';
         const metaText = `${pageCountText} · ${item.settings.mode} · ${sidesText}`;
@@ -679,7 +724,10 @@
       item.isImage = isImage;
       item.isOffice = isOffice;
       item.settings = {
-        pageSelection: 'All Pages',
+        pageSelection: 'All',
+        rangeFrom: 1,
+        rangeTo: totalPages,
+        selectedPages: Array.from({ length: totalPages }, (_, idx) => idx + 1),
         customPageRange: '',
         copies: 1,
         mode: 'B&W',
@@ -736,7 +784,10 @@
         isImage: isImage,
         isOffice: isOffice,
         settings: {
-          pageSelection: 'All Pages',
+          pageSelection: 'All',
+          rangeFrom: 1,
+          rangeTo: 1,
+          selectedPages: [1],
           customPageRange: '',
           copies: 1,
           mode: 'B&W',
@@ -781,6 +832,15 @@
     }
 
     draftSettings = JSON.parse(JSON.stringify(doc.settings));
+    if (!draftSettings.pageSelection || draftSettings.pageSelection === 'All Pages') {
+      draftSettings.pageSelection = 'All';
+    }
+    if (!draftSettings.rangeFrom) draftSettings.rangeFrom = 1;
+    if (!draftSettings.rangeTo) draftSettings.rangeTo = doc.totalPages;
+    if (!Array.isArray(draftSettings.selectedPages)) {
+      draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, idx) => idx + 1);
+    }
+
     if (settingsFilename) settingsFilename.textContent = doc.name;
     if (previewFilename) previewFilename.textContent = doc.name;
 
@@ -795,19 +855,99 @@
     renderPreviewSheet();
   }
 
-  function syncSettingsUI(doc) {
-    // 1. Page Selection
-    if (draftSettings.pageSelection === 'Custom Range') {
-      btnOptCustomRange.classList.add('active');
-      btnOptAllPages.classList.remove('active');
-      settingsCustomRangeWrapper.classList.remove('hidden');
-      inputCustomRange.value = draftSettings.customPageRange;
-    } else {
-      btnOptAllPages.classList.add('active');
-      btnOptCustomRange.classList.remove('active');
-      settingsCustomRangeWrapper.classList.add('hidden');
+  function syncSelectionState(doc) {
+    if (!doc || !draftSettings) return;
+    const selCount = Array.isArray(draftSettings.selectedPages) ? draftSettings.selectedPages.length : 0;
+    if (selectionCountSummary) {
+      selectionCountSummary.textContent = `${selCount} of ${doc.totalPages} pages selected`;
     }
-    if (customRangeError) customRangeError.classList.add('hidden');
+    if (selectionErrorText) {
+      selectionErrorText.classList.toggle('hidden', selCount > 0);
+    }
+    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+    if (saveSettingsPrice) {
+      saveSettingsPrice.textContent = formatRupees(livePrice);
+    }
+  }
+
+  function updateRangeBoxes(doc) {
+    if (!doc || !draftSettings) return;
+    let from = parseInt(inputRangeFrom?.value, 10);
+    let to = parseInt(inputRangeTo?.value, 10);
+
+    if (isNaN(from) || from < 1) from = 1;
+    if (from > doc.totalPages) from = doc.totalPages;
+    if (isNaN(to) || to < from) to = from;
+    if (to > doc.totalPages) to = doc.totalPages;
+
+    if (inputRangeFrom) inputRangeFrom.value = from;
+    if (inputRangeTo) inputRangeTo.value = to;
+
+    draftSettings.rangeFrom = from;
+    draftSettings.rangeTo = to;
+    draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
+
+    const count = (to - from + 1);
+    if (rangeInfoPill) {
+      rangeInfoPill.textContent = (to === from)
+        ? `Printing page ${from} (1 page total)`
+        : `Printing ${count} pages (${from} to ${to})`;
+    }
+    if (rangeErrorText) {
+      rangeErrorText.classList.add('hidden');
+    }
+
+    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+    if (saveSettingsPrice) {
+      saveSettingsPrice.textContent = formatRupees(livePrice);
+    }
+  }
+
+  function syncSettingsUI(doc) {
+    // 1. Page Selection (3 Options: All, Custom Range, Selection)
+    const isAll = (!draftSettings.pageSelection || draftSettings.pageSelection === 'All' || draftSettings.pageSelection === 'All Pages');
+    const isRange = (draftSettings.pageSelection === 'Custom Range');
+    const isSelection = (draftSettings.pageSelection === 'Selection');
+
+    if (btnOptAll) btnOptAll.classList.toggle('active', isAll);
+    if (btnOptRange) btnOptRange.classList.toggle('active', isRange);
+    if (btnOptSelection) btnOptSelection.classList.toggle('active', isSelection);
+
+    if (settingsRangeBoxes) {
+      settingsRangeBoxes.classList.toggle('hidden', !isRange);
+      if (isRange) {
+        if (!draftSettings.rangeFrom) draftSettings.rangeFrom = 1;
+        if (!draftSettings.rangeTo) draftSettings.rangeTo = doc.totalPages;
+        if (inputRangeFrom) {
+          inputRangeFrom.max = doc.totalPages;
+          inputRangeFrom.value = draftSettings.rangeFrom;
+        }
+        if (inputRangeTo) {
+          inputRangeTo.max = doc.totalPages;
+          inputRangeTo.value = draftSettings.rangeTo;
+        }
+        const count = (draftSettings.rangeTo - draftSettings.rangeFrom + 1);
+        if (rangeInfoPill) {
+          rangeInfoPill.textContent = (draftSettings.rangeTo === draftSettings.rangeFrom)
+            ? `Printing page ${draftSettings.rangeFrom} (1 page total)`
+            : `Printing ${count} pages (${draftSettings.rangeFrom} to ${draftSettings.rangeTo})`;
+        }
+      }
+    }
+
+    if (settingsSelectionControls) {
+      settingsSelectionControls.classList.toggle('hidden', !isSelection);
+      if (isSelection) {
+        if (!Array.isArray(draftSettings.selectedPages)) {
+          draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
+        }
+        syncSelectionState(doc);
+      }
+    }
+
+    if (previewSelectionBadge) {
+      previewSelectionBadge.classList.toggle('hidden', !isSelection);
+    }
 
     // 2. Copies
     if (copiesCountDisplay) copiesCountDisplay.textContent = draftSettings.copies;
@@ -863,7 +1003,10 @@
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (!doc) return;
       draftSettings = {
-        pageSelection: 'All Pages',
+        pageSelection: 'All',
+        rangeFrom: 1,
+        rangeTo: doc.totalPages,
+        selectedPages: Array.from({ length: doc.totalPages }, (_, idx) => idx + 1),
         customPageRange: '',
         copies: 1,
         mode: 'B&W',
@@ -884,62 +1027,185 @@
       }
     });
 
-    // Page Selection buttons
-    btnOptAllPages.addEventListener('click', () => {
-      draftSettings.pageSelection = 'All Pages';
-      draftSettings.customPageRange = '';
-      currentPreviewSheet = 1;
-      const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) {
-        syncSettingsUI(doc);
-        renderPreviewSheet();
-      }
-    });
-
-    btnOptCustomRange.addEventListener('click', () => {
-      draftSettings.pageSelection = 'Custom Range';
-      const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) {
-        syncSettingsUI(doc);
-        if (inputCustomRange) inputCustomRange.focus();
-        renderPreviewSheet();
-      }
-    });
-
-    let rangeInputTimer = null;
-    inputCustomRange.addEventListener('input', (e) => {
-      draftSettings.customPageRange = e.target.value.trim();
-      const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (!doc) return;
-
-      if (!draftSettings.customPageRange) {
-        if (customRangeError) customRangeError.classList.add('hidden');
-        if (saveSettingsPrice) {
-          saveSettingsPrice.textContent = formatRupees(calculateDocPrice(doc.totalPages, draftSettings));
-        }
-        clearTimeout(rangeInputTimer);
-        rangeInputTimer = setTimeout(() => {
-          currentPreviewSheet = 1;
+    // 3-Way Page Selection buttons
+    if (btnOptAll) {
+      btnOptAll.addEventListener('click', () => {
+        draftSettings.pageSelection = 'All';
+        draftSettings.customPageRange = '';
+        currentPreviewSheet = 1;
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) {
+          syncSettingsUI(doc);
           renderPreviewSheet();
-        }, 200);
-        return;
-      }
+        }
+      });
+    }
 
-      const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
-      if (!parsed.valid) {
-        customRangeError.textContent = parsed.error;
-        customRangeError.classList.remove('hidden');
-      } else {
-        customRangeError.classList.add('hidden');
+    if (btnOptRange) {
+      btnOptRange.addEventListener('click', () => {
+        draftSettings.pageSelection = 'Custom Range';
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) {
+          if (!draftSettings.rangeFrom) draftSettings.rangeFrom = 1;
+          if (!draftSettings.rangeTo) draftSettings.rangeTo = doc.totalPages;
+          currentPreviewSheet = 1;
+          syncSettingsUI(doc);
+          if (inputRangeFrom) inputRangeFrom.focus();
+          renderPreviewSheet();
+        }
+      });
+    }
+
+    if (btnOptSelection) {
+      btnOptSelection.addEventListener('click', () => {
+        draftSettings.pageSelection = 'Selection';
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) {
+          if (!Array.isArray(draftSettings.selectedPages) || draftSettings.selectedPages.length === 0) {
+            draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
+          }
+          currentPreviewSheet = 1;
+          syncSettingsUI(doc);
+          renderPreviewSheet();
+        }
+      });
+    }
+
+    // Direct Range Numeric Input Boxes (From & To)
+    if (inputRangeFrom) {
+      inputRangeFrom.addEventListener('input', () => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (!doc) return;
+        let from = parseInt(inputRangeFrom.value, 10);
+        if (isNaN(from)) return;
+        if (from < 1) from = 1;
+        if (from > doc.totalPages) from = doc.totalPages;
+
+        let to = parseInt(inputRangeTo?.value, 10);
+        if (isNaN(to) || to < from) {
+          to = from;
+          if (inputRangeTo) inputRangeTo.value = to;
+        }
+        draftSettings.rangeFrom = from;
+        draftSettings.rangeTo = to;
+        draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
+
+        const count = (to - from + 1);
+        if (rangeInfoPill) {
+          rangeInfoPill.textContent = (to === from)
+            ? `Printing page ${from} (1 page total)`
+            : `Printing ${count} pages (${from} to ${to})`;
+        }
         const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
         if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
-        clearTimeout(rangeInputTimer);
-        rangeInputTimer = setTimeout(() => {
+      });
+
+      inputRangeFrom.addEventListener('change', () => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) {
+          updateRangeBoxes(doc);
           currentPreviewSheet = 1;
           renderPreviewSheet();
-        }, 250);
-      }
-    });
+        }
+      });
+    }
+
+    if (inputRangeTo) {
+      inputRangeTo.addEventListener('input', () => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (!doc) return;
+        let to = parseInt(inputRangeTo.value, 10);
+        if (isNaN(to)) return;
+        if (to > doc.totalPages) to = doc.totalPages;
+
+        let from = parseInt(inputRangeFrom?.value, 10);
+        if (isNaN(from) || from > to) {
+          from = Math.max(1, to);
+          if (inputRangeFrom) inputRangeFrom.value = from;
+        }
+        draftSettings.rangeFrom = from;
+        draftSettings.rangeTo = to;
+        draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
+
+        const count = (to - from + 1);
+        if (rangeInfoPill) {
+          rangeInfoPill.textContent = (to === from)
+            ? `Printing page ${from} (1 page total)`
+            : `Printing ${count} pages (${from} to ${to})`;
+        }
+        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+      });
+
+      inputRangeTo.addEventListener('change', () => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (doc) {
+          updateRangeBoxes(doc);
+          currentPreviewSheet = 1;
+          renderPreviewSheet();
+        }
+      });
+    }
+
+    // Selection Controls (Check All / Uncheck All)
+    if (btnSelectCheckAll) {
+      btnSelectCheckAll.addEventListener('click', () => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (!doc || !draftSettings) return;
+        draftSettings.selectedPages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      });
+    }
+
+    if (btnSelectUncheckAll) {
+      btnSelectUncheckAll.addEventListener('click', () => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (!doc || !draftSettings) return;
+        draftSettings.selectedPages = [];
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      });
+    }
+
+    // Top-Right Preview Checkbox Listener
+    if (previewPageCheckbox) {
+      previewPageCheckbox.addEventListener('change', (e) => {
+        const doc = cartItems.find(d => d.id === activeSettingsDocId);
+        if (!doc || !draftSettings || draftSettings.pageSelection !== 'Selection') return;
+
+        const isDuplex = (draftSettings.sides === 'Double-sided');
+        let targetPage = null;
+        if (!isDuplex) {
+          targetPage = currentPreviewSheet;
+        } else {
+          targetPage = (currentPreviewSide === 'front')
+            ? (currentPreviewSheet - 1) * 2 + 1
+            : (currentPreviewSheet - 1) * 2 + 2;
+        }
+        if (!targetPage || targetPage > doc.totalPages) return;
+
+        if (!Array.isArray(draftSettings.selectedPages)) {
+          draftSettings.selectedPages = [];
+        }
+
+        const isChecked = e.target.checked;
+        if (isChecked) {
+          if (!draftSettings.selectedPages.includes(targetPage)) {
+            draftSettings.selectedPages.push(targetPage);
+            draftSettings.selectedPages.sort((a, b) => a - b);
+          }
+        } else {
+          draftSettings.selectedPages = draftSettings.selectedPages.filter(p => p !== targetPage);
+        }
+
+        if (previewCanvas) {
+          previewCanvas.classList.toggle('page-excluded', !isChecked);
+        }
+
+        syncSelectionState(doc);
+      });
+    }
 
     // Copies Stepper
     btnCopiesMinus.addEventListener('click', () => {
@@ -1030,11 +1296,23 @@
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (!doc) return;
 
-      if (draftSettings.pageSelection === 'Custom Range' && draftSettings.customPageRange) {
+      if (draftSettings.pageSelection === 'Selection') {
+        const selCount = Array.isArray(draftSettings.selectedPages) ? draftSettings.selectedPages.length : 0;
+        if (selCount === 0) {
+          if (selectionErrorText) selectionErrorText.classList.remove('hidden');
+          return;
+        }
+      }
+
+      if (draftSettings.pageSelection === 'Custom Range') {
+        updateRangeBoxes(doc);
+      } else if (draftSettings.customPageRange) {
         const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
         if (!parsed.valid) {
-          customRangeError.textContent = parsed.error;
-          customRangeError.classList.remove('hidden');
+          if (customRangeError) {
+            customRangeError.textContent = parsed.error;
+            customRangeError.classList.remove('hidden');
+          }
           return;
         }
       }
@@ -1059,17 +1337,16 @@
 
     const isDuplex = draftSettings ? (draftSettings.sides === 'Double-sided') : (doc.settings.sides === 'Double-sided');
     
-    // Resolve pages reactively from draftSettings
-    let pages = doc.selectedPages || [];
-    if (draftSettings) {
-      if (draftSettings.pageSelection === 'Custom Range' && draftSettings.customPageRange) {
-        const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
-        if (parsed.valid && parsed.pages.length > 0) {
-          pages = parsed.pages;
-        }
-      } else {
-        pages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
-      }
+    // Resolve pages browsable in preview
+    let pages = [];
+    if (draftSettings && draftSettings.pageSelection === 'Custom Range') {
+      const from = Math.max(1, Math.min(draftSettings.rangeFrom || 1, doc.totalPages));
+      const to = Math.max(from, Math.min(draftSettings.rangeTo || doc.totalPages, doc.totalPages));
+      for (let p = from; p <= to; p++) pages.push(p);
+    } else {
+      // In 'All' and 'Selection', the user can browse all document pages (1..totalPages)
+      // so in Selection mode they can inspect and check/uncheck any page!
+      pages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
     }
     if (pages.length === 0) {
       pages = [1];
@@ -1105,14 +1382,31 @@
     // Determine 1-based PDF page index
     let pageNumToRender = null;
     if (!isDuplex) {
-      pageNumToRender = pages[currentPreviewSheet - 1];
+      pageNumToRender = pages[currentPreviewSheet - 1] || null;
     } else {
       if (currentPreviewSide === 'front') {
-        pageNumToRender = pages[(currentPreviewSheet - 1) * 2];
+        pageNumToRender = pages[(currentPreviewSheet - 1) * 2] || null;
       } else {
         const backIdx = (currentPreviewSheet - 1) * 2 + 1;
-        pageNumToRender = backIdx < pages.length ? pages[backIdx] : null;
+        pageNumToRender = (backIdx < pages.length) ? pages[backIdx] : null;
       }
+    }
+
+    // Synchronize Selection Checkbox in Preview Stage
+    if (draftSettings && draftSettings.pageSelection === 'Selection') {
+      if (pageNumToRender !== null) {
+        if (previewSelectionBadge) previewSelectionBadge.classList.remove('hidden');
+        const isSelected = Array.isArray(draftSettings.selectedPages) && draftSettings.selectedPages.includes(pageNumToRender);
+        if (previewPageCheckbox) previewPageCheckbox.checked = isSelected;
+        if (previewCheckboxText) previewCheckboxText.textContent = `Print Page ${pageNumToRender}`;
+        if (previewCanvas) previewCanvas.classList.toggle('page-excluded', !isSelected);
+      } else {
+        if (previewSelectionBadge) previewSelectionBadge.classList.add('hidden');
+        if (previewCanvas) previewCanvas.classList.remove('page-excluded');
+      }
+    } else {
+      if (previewSelectionBadge) previewSelectionBadge.classList.add('hidden');
+      if (previewCanvas) previewCanvas.classList.remove('page-excluded');
     }
 
     if (previewLoadingSpinner) previewLoadingSpinner.classList.remove('hidden');
@@ -1328,11 +1622,23 @@
         const isDoubleSided = item.settings.sides === 'Double-sided';
         const duplexModeStr = isDoubleSided ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX';
 
+        let pageRangeVal = '';
+        if (item.settings.pageSelection === 'Custom Range') {
+          const from = item.settings.rangeFrom || 1;
+          const to = item.settings.rangeTo || item.totalPages;
+          pageRangeVal = (from === to) ? String(from) : `${from}-${to}`;
+        } else if (item.settings.pageSelection === 'Selection') {
+          const sel = Array.isArray(item.settings.selectedPages) ? item.settings.selectedPages : [];
+          pageRangeVal = sel.slice().sort((a, b) => a - b).join(',');
+        } else if (item.settings.customPageRange) {
+          pageRangeVal = item.settings.customPageRange;
+        }
+
         metadata.push({
           copies: item.settings.copies || 1,
           duplex: duplexModeStr,
           color_mode: item.settings.mode === 'Color' ? 'COLOR' : 'BW',
-          page_range: item.settings.pageSelection === 'Custom Range' ? item.settings.customPageRange : ''
+          page_range: pageRangeVal
         });
       }
 
@@ -1344,8 +1650,19 @@
         formData.append('copies', String(first.settings.copies || 1));
         formData.append('duplex', isDouble ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
         formData.append('color_mode', first.settings.mode === 'Color' ? 'COLOR' : 'BW');
-        if (first.settings.pageSelection === 'Custom Range' && first.settings.customPageRange) {
-          formData.append('page_range', first.settings.customPageRange);
+        let firstPageRange = '';
+        if (first.settings.pageSelection === 'Custom Range') {
+          const from = first.settings.rangeFrom || 1;
+          const to = first.settings.rangeTo || first.totalPages;
+          firstPageRange = (from === to) ? String(from) : `${from}-${to}`;
+        } else if (first.settings.pageSelection === 'Selection') {
+          const sel = Array.isArray(first.settings.selectedPages) ? first.settings.selectedPages : [];
+          firstPageRange = sel.slice().sort((a, b) => a - b).join(',');
+        } else if (first.settings.customPageRange) {
+          firstPageRange = first.settings.customPageRange;
+        }
+        if (firstPageRange) {
+          formData.append('page_range', firstPageRange);
         }
       }
 

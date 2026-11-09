@@ -2053,19 +2053,22 @@ body {
   color: var(--primary-blue);
 }
 
-/* Pages Selection 2-Column Button Cards */
+/* Pages Selection 3-Column Button Cards */
 .split-btn-card {
   min-height: 42px;
   border: 1px solid var(--border-light);
   border-radius: 10px;
   background: #ffffff;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-muted);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 0 4px;
+  text-align: center;
+  white-space: nowrap;
   transition: all 0.15s ease;
 }
 
@@ -2081,7 +2084,136 @@ body {
   color: var(--primary-blue);
 }
 
-/* Custom Range Input */
+/* Custom Range Input Boxes */
+.range-boxes-wrapper {
+  margin-top: 10px;
+}
+
+.range-inputs-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+
+.range-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  max-width: 140px;
+}
+
+.range-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+  user-select: none;
+}
+
+.range-input {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
+  background: #ffffff;
+  text-align: center;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  -moz-appearance: textfield;
+}
+
+.range-input::-webkit-outer-spin-button,
+.range-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.range-input:focus {
+  border-color: var(--primary-blue);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.range-separator {
+  font-size: 13px;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: lowercase;
+}
+
+.range-info-pill {
+  font-size: 12px;
+  font-weight: 500;
+  color: #475569;
+  text-align: center;
+  margin: 8px 0 0 0;
+}
+
+/* Selection Controls Bar */
+.selection-controls-wrapper {
+  margin-top: 10px;
+}
+
+.selection-actions-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 8px 12px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.selection-quick-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-selection-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 6px 11px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .btn-selection-action:hover {
+    border-color: #93c5fd;
+    background: #eff6ff;
+    color: var(--primary-blue);
+  }
+}
+
+.btn-selection-action:active {
+  background: #e0f2fe;
+}
+
+.selection-count-summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: #2563eb;
+  white-space: nowrap;
+}
+
+/* Custom Range Input (legacy support) */
 .custom-range-wrapper-layout {
   margin-top: 8px;
 }
@@ -2107,7 +2239,7 @@ body {
 .custom-range-error-layout {
   font-size: 11px;
   color: var(--danger-red);
-  margin-top: 3px;
+  margin-top: 5px;
   font-weight: 500;
 }
 
@@ -2183,8 +2315,99 @@ body {
   max-height: 215px;
   object-fit: contain;
   cursor: pointer;
-  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), filter 0.15s ease;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), filter 0.15s ease, opacity 0.15s ease;
   user-select: none;
+}
+
+/* Excluded page state in Selection mode */
+.preview-canvas.page-excluded {
+  opacity: 0.38;
+  filter: grayscale(80%);
+}
+
+/* Floating Top-Right Selection Checkbox Pill */
+.preview-selection-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid #cbd5e1;
+  border-radius: 9999px;
+  padding: 4px 10px 4px 8px;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
+  user-select: none;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.preview-selection-badge:hover {
+  border-color: #93c5fd;
+  box-shadow: 0 3px 10px rgba(37, 99, 235, 0.15);
+}
+
+.preview-page-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  margin: 0;
+}
+
+.preview-page-checkbox {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.preview-checkbox-custom {
+  width: 17px;
+  height: 17px;
+  border-radius: 5px;
+  border: 1.5px solid #94a3b8;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.preview-checkbox-icon {
+  width: 10px;
+  height: 8px;
+  stroke: #ffffff;
+  stroke-width: 2.2;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: all 0.15s ease;
+}
+
+.preview-page-checkbox:checked + .preview-checkbox-custom {
+  background: var(--primary-blue);
+  border-color: var(--primary-blue);
+}
+
+.preview-page-checkbox:checked + .preview-checkbox-custom .preview-checkbox-icon {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.preview-checkbox-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+  white-space: nowrap;
+}
+
+.preview-page-checkbox:checked ~ .preview-checkbox-text {
+  color: #0f172a;
 }
 
 @media (min-width: 600px) {
