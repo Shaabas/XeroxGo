@@ -231,41 +231,56 @@
             <button type="button" class="split-btn-card" id="btn-opt-selection">Selection</button>
           </div>
 
-          <!-- Custom Range Input Boxes (Shown when Custom Range is active) -->
-          <div id="settings-range-boxes" class="range-boxes-wrapper hidden">
-            <div class="range-inputs-row">
-              <div class="range-field">
-                <label for="input-range-from" class="range-label">From</label>
-                <input type="number" id="input-range-from" class="range-input" min="1" value="1" inputmode="numeric" />
+          <!-- Custom Range Singular Card (Shown when Custom Range is active) -->
+          <div id="settings-range-boxes" class="pages-dropdown-card range-boxes-wrapper hidden">
+            <div class="range-card-body">
+              <div class="range-card-inputs">
+                <div class="range-box-unit">
+                  <label for="input-range-from" class="range-box-label">From</label>
+                  <input type="number" id="input-range-from" class="range-box-input range-input" min="1" value="1" inputmode="numeric" />
+                </div>
+                <div class="range-arrow-divider" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                    <polyline points="12 5 19 12 12 19"></polyline>
+                  </svg>
+                </div>
+                <div class="range-box-unit">
+                  <label for="input-range-to" class="range-box-label">To</label>
+                  <input type="number" id="input-range-to" class="range-box-input range-input" min="1" value="1" inputmode="numeric" />
+                </div>
               </div>
-              <div class="range-field">
-                <label for="input-range-to" class="range-label">To</label>
-                <input type="number" id="input-range-to" class="range-input" min="1" value="1" inputmode="numeric" />
+              <div class="range-card-summary">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="20 6 9 17 4 12"></polyline>
+                </svg>
+                <span id="range-info-pill" class="range-info-pill">Printing 1 page (1 to 1)</span>
               </div>
+              <p id="range-error-text" class="custom-range-error-layout hidden"></p>
             </div>
-            <p id="range-info-pill" class="range-info-pill">Printing 1 page (1 to 1)</p>
-            <p id="range-error-text" class="custom-range-error-layout hidden"></p>
           </div>
 
-          <!-- Selection Controls Bar & Theatre Seat Grid (Shown when Selection is active) -->
-          <div id="settings-selection-controls" class="selection-controls-wrapper hidden">
-            <div class="selection-actions-bar">
-              <div class="selection-quick-btns">
-                <button type="button" id="btn-select-check-all" class="btn-selection-action">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          <!-- Selection Singular Card (Shown when Selection is active) -->
+          <div id="settings-selection-controls" class="pages-dropdown-card selection-controls-wrapper hidden">
+            <div class="selection-card-header">
+              <div class="selection-header-actions">
+                <button type="button" id="btn-select-check-all" class="btn-select-pill btn-selection-action">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
                   <span>Check all</span>
                 </button>
-                <button type="button" id="btn-select-uncheck-all" class="btn-selection-action">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                <button type="button" id="btn-select-uncheck-all" class="btn-select-pill btn-selection-action">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                   <span>Uncheck all</span>
                 </button>
               </div>
-              <span id="selection-count-summary" class="selection-count-summary">1 of 1 pages selected</span>
+              <span id="selection-count-summary" class="selection-header-badge selection-count-summary">1 of 1 pages selected</span>
             </div>
-            <div id="selection-seats-grid" class="selection-seats-grid" role="group" aria-label="Page seat selector">
-              <!-- Dynamically populated theatre-seat style page buttons -->
+            <div class="selection-card-body">
+              <div id="selection-seats-grid" class="selection-seats-grid" role="group" aria-label="Page seat selector">
+                <!-- Dynamically populated theatre-seat style page buttons -->
+              </div>
+              <p id="selection-error-text" class="custom-range-error-layout hidden">Please select at least 1 page to print</p>
             </div>
-            <p id="selection-error-text" class="custom-range-error-layout hidden">Please select at least 1 page to print</p>
           </div>
         </div>
 
