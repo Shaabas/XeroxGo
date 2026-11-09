@@ -2272,11 +2272,13 @@ body {
 }
 
 .preview-sheet-pager {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   margin-top: 10px;
+  min-height: 28px;
 }
 
 .sheet-arrow-btn {
@@ -2312,6 +2314,8 @@ body {
 }
 
 .btn-flip-sheet-pill {
+  position: absolute;
+  right: 0;
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -2320,7 +2324,7 @@ body {
   color: var(--primary-blue);
   font-size: 11.5px;
   font-weight: 700;
-  padding: 3px 9px;
+  padding: 4px 10px;
   border-radius: 9999px;
   cursor: pointer;
   transition: all 0.15s ease;
