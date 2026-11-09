@@ -15,9 +15,11 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-// hashPassword produces a standard bcrypt hash with cost 12 (NIST SP 800-63B / OWASP compliant).
+var bcryptCost = 12
+
+// hashPassword produces a standard bcrypt hash with cost bcryptCost (NIST SP 800-63B / OWASP compliant).
 func hashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		return "", fmt.Errorf("bcrypt hash password: %w", err)
 	}

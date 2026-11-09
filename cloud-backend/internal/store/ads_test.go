@@ -6,11 +6,17 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
 	"xeroxgo/pkg/contracts"
 )
 
+func init() {
+	// Use minimum bcrypt cost in tests for speed and to avoid timing out in CI with -race
+	bcryptCost = bcrypt.MinCost
+}
+
 func TestAdsAndAdminAuth(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	tmpDir := t.TempDir()
@@ -180,7 +186,7 @@ func TestAdsAndAdminAuth(t *testing.T) {
 }
 
 func TestUpdateAdminPasswordRevokesSessions(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	tmpDir := t.TempDir()
