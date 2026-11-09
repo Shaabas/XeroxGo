@@ -1723,25 +1723,6 @@ body {
   flex-shrink: 0;
 }
 
-.settings-title-with-info {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.title-info-icon {
-  color: var(--text-muted);
-  cursor: help;
-  flex-shrink: 0;
-  opacity: 0.75;
-  transition: opacity 0.15s ease;
-}
-
-.title-info-icon:hover {
-  opacity: 1;
-  color: var(--primary-blue);
-}
-
 .settings-header-inline .settings-section-title {
   margin-bottom: 0;
 }
@@ -1972,19 +1953,6 @@ body {
 
 .color-chip {
   background: conic-gradient(from 180deg at 50% 50%, #ef4444 0deg, #f59e0b 90deg, #10b981 180deg, #3b82f6 270deg, #ef4444 360deg);
-}
-
-/* Save paper badge */
-.save-paper-badge-pill {
-  background: #dcfce7;
-  color: #15803d;
-  font-size: 10px;
-  font-weight: 700;
-  padding: 1px 6px;
-  border-radius: 9999px;
-  margin-top: 3px;
-  display: inline-block;
-  width: fit-content;
 }
 
 /* Orientation compact cards */
