@@ -5,14 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
-	"io/fs"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -32,10 +29,6 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-//go:embed static
-var staticEmbedFS embed.FS
-
-
 type serverConfig struct {
 	addr               string
 	dbPath             string
@@ -52,8 +45,6 @@ type appServer struct {
 	hub      *ws.Hub
 	convWake chan struct{}
 }
-
-var portalTmpl = template.Must(template.ParseFS(staticEmbedFS, "static/index.html"))
 
 func randomHex(bytesLen int) (string, error) {
 	b := make([]byte, bytesLen)
@@ -103,38 +94,6 @@ func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
-}
-
-func (s *appServer) handlePortal(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	prefix := "/k/"
-	if !strings.HasPrefix(r.URL.Path, prefix) {
-		http.NotFound(w, r)
-		return
-	}
-	kioskID := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, prefix))
-	if kioskID == "" {
-		http.Error(w, "kiosk id required", http.StatusBadRequest)
-		return
-	}
-
-
-
-	data := struct {
-		KioskID            string
-		DevMode            bool
-		PricePerSheetPaise int64
-	}{
-		KioskID:            kioskID,
-		DevMode:            s.cfg.devMode,
-		PricePerSheetPaise: s.cfg.pricePerSheetPaise,
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = portalTmpl.Execute(w, data)
 }
 
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -1240,26 +1199,6 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.handleHealthz)
-	mux.HandleFunc("/k/", app.handlePortal)
-
-	subFS, err := fs.Sub(staticEmbedFS, "static")
-	if err != nil {
-		log.Fatalf("failed to create sub fs: %v", err)
-	}
-	staticFileServer := http.FileServer(http.FS(subFS))
-	mux.Handle("/static/", http.StripPrefix("/static/", staticFileServer))
-	mux.Handle("/assets/", staticFileServer)
-	mux.Handle("/css/", staticFileServer)
-	mux.Handle("/js/", staticFileServer)
-	mux.Handle("/vendor/", staticFileServer)
-	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/static/assets/favicon.svg", http.StatusMovedPermanently)
-	})
-	mux.HandleFunc("/manifest.webmanifest", func(w http.ResponseWriter, r *http.Request) {
-		r.URL.Path = "/manifest.webmanifest"
-		staticFileServer.ServeHTTP(w, r)
-	})
-
 	mux.HandleFunc("/api/convert", app.handleConvert)
 	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
 	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)

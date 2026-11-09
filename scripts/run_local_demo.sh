@@ -40,7 +40,7 @@ export XEROXGO_WEBHOOK_SECRET="${WEBHOOK_SECRET}"
 
 KIOSK_ID="kiosk-demo"
 CLOUD_URL="ws://127.0.0.1:${PORT}/ws"
-PORTAL_URL="http://127.0.0.1:${PORT}/k/${KIOSK_ID}"
+PORTAL_URL="${PORTAL_URL:-https://xeroxgo.vercel.app/k/${KIOSK_ID}}"
 
 # Track background PIDs for cleanup
 CLOUD_PID=""
@@ -236,15 +236,17 @@ price_paise = upload_data.get("total_price_paise")
 # Verification of calculation:
 # 3 pages, duplex long edge = ceil(3/2) = 2 sheets per copy.
 # 2 copies = 4 sheets total.
-# 4 sheets * 500 paise = 2000 paise.
+# 3 pages * 2 copies = 6 printed pages.
+# Duplex rate = 75% of 500 paise = 375 paise/page.
+# 6 printed pages * 375 paise = 2250 paise.
 if total_pages != 3:
     print(f"Expected 3 total pages, got {total_pages}", file=sys.stderr)
     sys.exit(1)
 if total_sheets != 4:
     print(f"Expected 4 total sheets, got {total_sheets}", file=sys.stderr)
     sys.exit(1)
-if price_paise != 2000:
-    print(f"Expected price 2000 paise, got {price_paise}", file=sys.stderr)
+if price_paise != 2250:
+    print(f"Expected price 2250 paise, got {price_paise}", file=sys.stderr)
     sys.exit(1)
 
 # 3. Simulate payment
