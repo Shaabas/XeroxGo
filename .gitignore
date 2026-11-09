@@ -5,4 +5,5 @@
 *.pem
 *.key
 /previews/
+kiosk-daemon/previews/
 .vercel

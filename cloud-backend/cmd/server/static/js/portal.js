@@ -466,6 +466,8 @@
 
     const createData = await resp.json();
     const jobId = createData.job_id;
+    const token = createData.token;
+    const pollUrl = createData.poll_url || `/api/conversions/${encodeURIComponent(jobId)}?token=${encodeURIComponent(token)}`;
     let status = createData.status;
     let downloadUrl = null;
 
@@ -475,7 +477,7 @@
         throw new Error('Document conversion timed out');
       }
       await new Promise(r => setTimeout(r, 1200));
-      const pollResp = await fetch(`/api/conversions/${jobId}`);
+      const pollResp = await fetch(pollUrl);
       if (!pollResp.ok) throw new Error('Failed to query conversion progress');
       const pollData = await pollResp.json();
       status = pollData.status;
