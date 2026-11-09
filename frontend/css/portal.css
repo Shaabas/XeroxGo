@@ -130,7 +130,6 @@ body {
 
 .btn-primary:hover {
   background-color: var(--primary-hover);
-  transform: translateY(-1px);
 }
 
 .btn-primary:active {
@@ -529,7 +528,6 @@ th {
 
 .pwa-install-btn:hover {
   background-color: var(--primary-hover);
-  transform: translateY(-1px);
   box-shadow: 0 4px 8px rgba(37, 99, 235, 0.35);
 }
 
@@ -1212,13 +1210,19 @@ body {
   margin-top: 12px;
   margin-bottom: 16px;
   cursor: pointer;
-  transition: all 0.2s ease;
   user-select: none;
 }
 
-.cart-upload-card:hover, .cart-upload-card.dragover {
+.cart-upload-card.dragover {
   border-color: var(--primary-blue);
   background: #eff6ff;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .cart-upload-card:hover {
+    border-color: var(--primary-blue);
+    background: #eff6ff;
+  }
 }
 
 .cart-upload-card:focus-visible {
@@ -1236,12 +1240,6 @@ body {
 
 .upload-cloud-icon .upload-icon {
   color: var(--primary-blue);
-  transition: transform 0.2s ease;
-}
-
-.cart-upload-card:hover .upload-cloud-icon .upload-icon,
-.cart-upload-card.dragover .upload-cloud-icon .upload-icon {
-  transform: translateY(-2px);
 }
 
 .upload-heading {
@@ -1303,7 +1301,6 @@ body {
   flex-direction: column;
   gap: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
 
 .doc-card-top {
