@@ -75,7 +75,7 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(script_dir, ".."))
     
-    src_logo = os.path.join(repo_root, "frontend/assets/xeroxgo-logo.png")
+    src_logo = os.path.join(repo_root, "frontend/assets/xeroxgo-full-logo-transparent.png")
     dest_dir = os.path.join(repo_root, "kiosk-daemon/plymouth/xeroxgo")
     
     generate_shimmer_frames(src_logo, dest_dir, total_frames=36)
