@@ -267,18 +267,12 @@
         viewCart.classList.add('active-view');
       }
       renderCart();
-    } else if (viewName === 'settings') {
+    } else if (viewName === 'settings' || viewName === 'preview') {
       if (viewSettings) {
         viewSettings.classList.remove('hidden');
         viewSettings.classList.add('active-view');
       }
       openSettings(docId);
-    } else if (viewName === 'preview') {
-      if (viewPreview) {
-        viewPreview.classList.remove('hidden');
-        viewPreview.classList.add('active-view');
-      }
-      openPreview(docId);
     } else if (viewName === 'checkout') {
       if (viewCheckout) {
         viewCheckout.classList.remove('hidden');
@@ -409,7 +403,6 @@
           <div class="doc-card-bottom">
             <button type="button" class="btn-doc-delete" data-id="${item.id}">Delete</button>
             <div class="doc-actions-right">
-              <button type="button" class="btn-doc-preview" data-id="${item.id}">Preview</button>
               <button type="button" class="btn-doc-edit" data-id="${item.id}">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                   <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>
@@ -420,20 +413,21 @@
           </div>
         `;
 
-        card.querySelector('.btn-doc-delete').addEventListener('click', (e) => {
-          e.stopPropagation();
-          removeDoc(item.id);
-        });
+        const btnDelete = card.querySelector('.btn-doc-delete');
+        if (btnDelete) {
+          btnDelete.addEventListener('click', (e) => {
+            e.stopPropagation();
+            removeDoc(item.id);
+          });
+        }
 
-        card.querySelector('.btn-doc-preview').addEventListener('click', (e) => {
-          e.stopPropagation();
-          switchView('preview', item.id);
-        });
-
-        card.querySelector('.btn-doc-edit').addEventListener('click', (e) => {
-          e.stopPropagation();
-          switchView('settings', item.id);
-        });
+        const btnEdit = card.querySelector('.btn-doc-edit');
+        if (btnEdit) {
+          btnEdit.addEventListener('click', (e) => {
+            e.stopPropagation();
+            switchView('settings', item.id);
+          });
+        }
       }
 
       cartDocList.appendChild(card);
@@ -773,9 +767,10 @@
     }, 6000);
   }
 
-  // --- View 2: Document Settings Implementation ---
+  // --- View 2: Document Settings & Preview Implementation ---
   function openSettings(docId) {
     activeSettingsDocId = docId;
+    activePreviewDocId = docId;
     const doc = cartItems.find(d => d.id === docId);
     if (!doc) {
       switchView('cart');
@@ -784,12 +779,17 @@
 
     draftSettings = JSON.parse(JSON.stringify(doc.settings));
     if (settingsFilename) settingsFilename.textContent = doc.name;
+    if (previewFilename) previewFilename.textContent = doc.name;
+
+    currentPreviewSheet = 1;
+    currentPreviewSide = 'front';
 
     // Rate labels
     if (settingsBwPriceLabel) settingsBwPriceLabel.textContent = `${formatRupees(bwSimplexPricePaise)}/side`;
     if (settingsColorPriceLabel) settingsColorPriceLabel.textContent = `${formatRupees(colorSimplexPricePaise)}/side`;
 
     syncSettingsUI(doc);
+    renderPreviewSheet();
   }
 
   function syncSettingsUI(doc) {
@@ -831,6 +831,14 @@
     if (saveSettingsPrice) {
       saveSettingsPrice.textContent = formatRupees(livePrice);
     }
+
+    // Dynamic visual sync with preview
+    if (previewCanvas) {
+      previewCanvas.style.filter = (draftSettings.mode === 'B&W') ? 'grayscale(100%) contrast(105%)' : 'none';
+    }
+    if (btnSheetFlip) {
+      btnSheetFlip.classList.toggle('hidden', draftSettings.sides !== 'Double-sided');
+    }
   }
 
   function setupSettingsEventListeners() {
@@ -857,7 +865,10 @@
         orientation: 'Auto',
         pagesPerSheet: '1'
       };
+      currentPreviewSheet = 1;
+      currentPreviewSide = 'front';
       syncSettingsUI(doc);
+      renderPreviewSheet();
     });
 
     menuOptDelete.addEventListener('click', () => {
@@ -870,30 +881,58 @@
     // Page Selection buttons
     btnOptAllPages.addEventListener('click', () => {
       draftSettings.pageSelection = 'All Pages';
+      draftSettings.customPageRange = '';
+      currentPreviewSheet = 1;
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      }
     });
 
     btnOptCustomRange.addEventListener('click', () => {
       draftSettings.pageSelection = 'Custom Range';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
-      if (inputCustomRange) inputCustomRange.focus();
+      if (doc) {
+        syncSettingsUI(doc);
+        if (inputCustomRange) inputCustomRange.focus();
+        renderPreviewSheet();
+      }
     });
 
+    let rangeInputTimer = null;
     inputCustomRange.addEventListener('input', (e) => {
       draftSettings.customPageRange = e.target.value.trim();
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (!doc) return;
+
+      if (!draftSettings.customPageRange) {
+        if (customRangeError) customRangeError.classList.add('hidden');
+        if (saveSettingsPrice) {
+          saveSettingsPrice.textContent = formatRupees(calculateDocPrice(doc.totalPages, draftSettings));
+        }
+        clearTimeout(rangeInputTimer);
+        rangeInputTimer = setTimeout(() => {
+          currentPreviewSheet = 1;
+          renderPreviewSheet();
+        }, 200);
+        return;
+      }
+
       const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
-      if (!parsed.valid && draftSettings.customPageRange.length > 0) {
+      if (!parsed.valid) {
         customRangeError.textContent = parsed.error;
         customRangeError.classList.remove('hidden');
       } else {
         customRangeError.classList.add('hidden');
+        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        clearTimeout(rangeInputTimer);
+        rangeInputTimer = setTimeout(() => {
+          currentPreviewSheet = 1;
+          renderPreviewSheet();
+        }, 250);
       }
-      const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-      if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
     });
 
     // Copies Stepper
@@ -913,47 +952,71 @@
       }
     });
 
-    // Print Mode Cards
+    // Print Mode Cards (Instant visual toggle on preview canvas)
     cardModeBw.addEventListener('click', () => {
       draftSettings.mode = 'B&W';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        if (previewCanvas) previewCanvas.style.filter = 'grayscale(100%) contrast(105%)';
+      }
     });
 
     cardModeColor.addEventListener('click', () => {
       draftSettings.mode = 'Color';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        if (previewCanvas) previewCanvas.style.filter = 'none';
+      }
     });
 
-    // Print Sides Cards
+    // Print Sides Cards (Instant duplex update)
     cardSideSingle.addEventListener('click', () => {
       draftSettings.sides = 'Single-sided';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        currentPreviewSide = 'front';
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      }
     });
 
     cardSideDouble.addEventListener('click', () => {
       draftSettings.sides = 'Double-sided';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      }
     });
 
-    // Orientation
+    // Orientation Controls (Instant rotation update)
     btnOrientAuto.addEventListener('click', () => {
       draftSettings.orientation = 'Auto';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      }
     });
+
     btnOrientPortrait.addEventListener('click', () => {
       draftSettings.orientation = 'Portrait';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      }
     });
+
     btnOrientLandscape.addEventListener('click', () => {
       draftSettings.orientation = 'Landscape';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
-      if (doc) syncSettingsUI(doc);
+      if (doc) {
+        syncSettingsUI(doc);
+        renderPreviewSheet();
+      }
     });
 
     // Save Settings Button
@@ -961,7 +1024,7 @@
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (!doc) return;
 
-      if (draftSettings.pageSelection === 'Custom Range') {
+      if (draftSettings.pageSelection === 'Custom Range' && draftSettings.customPageRange) {
         const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
         if (!parsed.valid) {
           customRangeError.textContent = parsed.error;
@@ -978,28 +1041,34 @@
     });
   }
 
-  // --- View 3: Print Preview Implementation ---
+  // --- View 3: Print Preview Engine (Unified inside View 2) ---
   function openPreview(docId) {
-    activePreviewDocId = docId;
-    const doc = cartItems.find(d => d.id === docId);
-    if (!doc) {
-      switchView('cart');
-      return;
-    }
-
-    if (previewFilename) previewFilename.textContent = doc.name;
-    currentPreviewSheet = 1;
-    currentPreviewSide = 'front';
-
-    renderPreviewSheet();
+    // Kept for backward compatibility: redirects directly to unified settings
+    openSettings(docId);
   }
 
   async function renderPreviewSheet() {
-    const doc = cartItems.find(d => d.id === activePreviewDocId);
+    const doc = cartItems.find(d => d.id === (activeSettingsDocId || activePreviewDocId));
     if (!doc || !doc.pdfDoc) return;
 
-    const isDuplex = doc.settings.sides === 'Double-sided';
-    const pages = doc.selectedPages;
+    const isDuplex = draftSettings ? (draftSettings.sides === 'Double-sided') : (doc.settings.sides === 'Double-sided');
+    
+    // Resolve pages reactively from draftSettings
+    let pages = doc.selectedPages || [];
+    if (draftSettings) {
+      if (draftSettings.pageSelection === 'Custom Range' && draftSettings.customPageRange) {
+        const parsed = parseCustomPages(draftSettings.customPageRange, doc.totalPages);
+        if (parsed.valid && parsed.pages.length > 0) {
+          pages = parsed.pages;
+        }
+      } else {
+        pages = Array.from({ length: doc.totalPages }, (_, i) => i + 1);
+      }
+    }
+    if (pages.length === 0) {
+      pages = [1];
+    }
+
     const totalSheets = isDuplex ? Math.ceil(pages.length / 2) : pages.length;
 
     // Bounds check
@@ -1009,6 +1078,10 @@
     // Pager indicators
     if (btnSheetLeft) btnSheetLeft.disabled = (currentPreviewSheet <= 1);
     if (btnSheetRight) btnSheetRight.disabled = (currentPreviewSheet >= totalSheets);
+
+    if (btnSheetFlip) {
+      btnSheetFlip.classList.toggle('hidden', !isDuplex);
+    }
 
     if (previewSheetIndicator) {
       if (isDuplex) {
@@ -1042,37 +1115,56 @@
       }
 
       const canvas = previewCanvas;
+      if (!canvas) return;
       const ctx = canvas.getContext('2d');
 
       if (pageNumToRender === null) {
         // Blank back sheet for odd duplex
-        canvas.width = 300;
-        canvas.height = 424;
+        canvas.width = 160;
+        canvas.height = 226;
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.strokeStyle = '#e2e8f0';
         ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
 
         ctx.fillStyle = '#94a3b8';
-        ctx.font = '600 15px system-ui, sans-serif';
+        ctx.font = '600 13px system-ui, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('Blank Page', canvas.width / 2, canvas.height / 2 - 10);
-        ctx.font = '12px system-ui, sans-serif';
-        ctx.fillText('(Duplex padding sheet)', canvas.width / 2, canvas.height / 2 + 12);
+        ctx.fillText('Blank Page', canvas.width / 2, canvas.height / 2 - 8);
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.fillText('(Duplex back sheet)', canvas.width / 2, canvas.height / 2 + 10);
         if (previewLoadingSpinner) previewLoadingSpinner.classList.add('hidden');
         return;
       }
 
       const page = await doc.pdfDoc.getPage(pageNumToRender);
-      const viewport = page.getViewport({ scale: 1.0 });
+      
+      // Determine orientation rotation
+      let renderRotation = page.rotate || 0;
+      if (draftSettings) {
+        if (draftSettings.orientation === 'Landscape' && page.view[2] < page.view[3]) {
+          renderRotation = (renderRotation + 90) % 360;
+        } else if (draftSettings.orientation === 'Portrait' && page.view[2] > page.view[3]) {
+          renderRotation = (renderRotation + 90) % 360;
+        }
+      }
 
-      // Scale to fit ~300px width
-      const targetWidth = 300;
-      const scale = targetWidth / viewport.width;
-      const scaledViewport = page.getViewport({ scale: scale });
+      const rawViewport = page.getViewport({ scale: 1.0, rotation: renderRotation });
 
-      canvas.width = scaledViewport.width;
-      canvas.height = scaledViewport.height;
+      // Responsive stage scale: target max dimensions 260px width x 215px height (245px on desktop)
+      const maxStageW = (window.innerWidth >= 600) ? 260 : 210;
+      const maxStageH = (window.innerWidth >= 600) ? 245 : 210;
+      const scale = Math.min(maxStageW / rawViewport.width, maxStageH / rawViewport.height, 1.5);
+      const scaledViewport = page.getViewport({ scale: scale, rotation: renderRotation });
+
+      // Crisp rendering support
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(scaledViewport.width * dpr);
+      canvas.height = Math.round(scaledViewport.height * dpr);
+      canvas.style.width = `${Math.round(scaledViewport.width)}px`;
+      canvas.style.height = `${Math.round(scaledViewport.height)}px`;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
       const renderContext = {
         canvasContext: ctx,
@@ -1084,10 +1176,18 @@
       activeRenderTask = null;
 
       // Apply grayscale filter if B&W
-      if (doc.settings.mode === 'B&W') {
+      const currentMode = draftSettings ? draftSettings.mode : doc.settings.mode;
+      if (currentMode === 'B&W') {
         canvas.style.filter = 'grayscale(100%) contrast(105%)';
       } else {
         canvas.style.filter = 'none';
+      }
+
+      // Update canvas title tooltip
+      if (isDuplex) {
+        canvas.title = `Double-sided (${currentPreviewSide === 'front' ? 'Front' : 'Back'}) - Tap sheet to flip`;
+      } else {
+        canvas.title = 'Single-sided sheet';
       }
     } catch (renderErr) {
       if (renderErr.name !== 'RenderingCancelledException') {
@@ -1100,52 +1200,79 @@
   }
 
   function setupPreviewEventListeners() {
-    btnPreviewBack.addEventListener('click', () => switchView('cart'));
+    if (btnPreviewBack) btnPreviewBack.addEventListener('click', () => switchView('cart'));
 
-    btnSheetLeft.addEventListener('click', () => {
-      if (currentPreviewSheet > 1) {
-        currentPreviewSheet--;
-        currentPreviewSide = 'front';
-        renderPreviewSheet();
-      }
-    });
+    if (btnSheetLeft) {
+      btnSheetLeft.addEventListener('click', () => {
+        if (currentPreviewSheet > 1) {
+          currentPreviewSheet--;
+          currentPreviewSide = 'front';
+          renderPreviewSheet();
+        }
+      });
+    }
 
-    btnSheetRight.addEventListener('click', () => {
-      const doc = cartItems.find(d => d.id === activePreviewDocId);
+    if (btnSheetRight) {
+      btnSheetRight.addEventListener('click', () => {
+        const doc = cartItems.find(d => d.id === (activeSettingsDocId || activePreviewDocId));
+        if (!doc) return;
+        const isDuplex = (draftSettings ? draftSettings.sides : doc.settings.sides) === 'Double-sided';
+        const pages = (draftSettings && draftSettings.pageSelection === 'Custom Range')
+          ? getDocSelectedPages(doc.totalPages, draftSettings)
+          : Array.from({ length: doc.totalPages }, (_, i) => i + 1);
+        const totalSheets = isDuplex ? Math.ceil(pages.length / 2) : pages.length;
+        if (currentPreviewSheet < totalSheets) {
+          currentPreviewSheet++;
+          currentPreviewSide = 'front';
+          renderPreviewSheet();
+        }
+      });
+    }
+
+    const triggerFlip = () => {
+      const doc = cartItems.find(d => d.id === (activeSettingsDocId || activePreviewDocId));
       if (!doc) return;
-      const isDuplex = doc.settings.sides === 'Double-sided';
-      const totalSheets = isDuplex ? Math.ceil(doc.selectedPages.length / 2) : doc.selectedPages.length;
-      if (currentPreviewSheet < totalSheets) {
-        currentPreviewSheet++;
-        currentPreviewSide = 'front';
-        renderPreviewSheet();
-      }
-    });
-
-    btnSheetFlip.addEventListener('click', () => {
-      const doc = cartItems.find(d => d.id === activePreviewDocId);
-      if (!doc) return;
-      if (doc.settings.sides === 'Double-sided') {
+      const isDuplex = (draftSettings ? draftSettings.sides : doc.settings.sides) === 'Double-sided';
+      if (isDuplex) {
         currentPreviewSide = currentPreviewSide === 'front' ? 'back' : 'front';
+        if (previewCanvas) {
+          previewCanvas.classList.remove('flipping');
+          void previewCanvas.offsetWidth; // trigger reflow
+          previewCanvas.classList.add('flipping');
+          setTimeout(() => previewCanvas.classList.remove('flipping'), 300);
+        }
         renderPreviewSheet();
       } else {
-        // Simplex - navigate to next sheet if available
+        // Simplex - advance to next sheet if available
         if (btnSheetRight && !btnSheetRight.disabled) {
           btnSheetRight.click();
         }
       }
-    });
+    };
 
-    btnPreviewMenu.addEventListener('click', (e) => {
-      e.stopPropagation();
-      previewMenuDropdown.classList.toggle('hidden');
-    });
+    if (btnSheetFlip) {
+      btnSheetFlip.addEventListener('click', triggerFlip);
+    }
 
-    previewMenuSettings.addEventListener('click', () => {
-      if (activePreviewDocId) {
-        switchView('settings', activePreviewDocId);
-      }
-    });
+    // Direct flip gesture when tapping or clicking on the canvas
+    if (previewCanvas) {
+      previewCanvas.addEventListener('click', triggerFlip);
+    }
+
+    if (btnPreviewMenu) {
+      btnPreviewMenu.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (previewMenuDropdown) previewMenuDropdown.classList.toggle('hidden');
+      });
+    }
+
+    if (previewMenuSettings) {
+      previewMenuSettings.addEventListener('click', () => {
+        if (activePreviewDocId) {
+          switchView('settings', activePreviewDocId);
+        }
+      });
+    }
   }
 
   // --- View 4: Checkout & Order Submission Implementation ---
