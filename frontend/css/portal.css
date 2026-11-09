@@ -1852,7 +1852,26 @@ body {
   color: var(--primary-blue);
 }
 
-/* Classic Restored Button Icons & CMY Triad */
+/* Classic Restored Button Icons & Stippled Spheres */
+.choice-icon-sphere {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  box-sizing: border-box;
+}
+
+.bw-sphere {
+  background-image: url('/assets/mode-bw-sphere.webp');
+}
+
+.color-sphere {
+  background-image: url('/assets/mode-color-sphere.webp');
+}
+
 .choice-icon-circle {
   width: 26px;
   height: 26px;
