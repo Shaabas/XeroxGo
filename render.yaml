@@ -32,6 +32,6 @@ services:
       - key: XEROXGO_WEBHOOK_SECRET
         generateValue: true
       - key: XEROXGO_KIOSK_SECRET
-        generateValue: true
+        sync: false
       - key: XEROXGO_PROXY_SECRET
-        generateValue: true
+        sync: false
