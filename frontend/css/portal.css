@@ -321,7 +321,7 @@ body {
 .banner-container {
   overflow: hidden;
   position: relative;
-  margin: 1rem;
+  margin: 0 0 16px;
   border-radius: var(--radius-lg);
 }
 
@@ -443,7 +443,7 @@ th {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  margin: 0.75rem 1rem 0;
+  margin: 0 0 0.75rem;
   padding: 0.75rem 1rem;
   background: linear-gradient(135deg, #EFF6FF 0%, #FFFFFF 100%);
   border: 1px solid #BFDBFE;
@@ -1143,7 +1143,7 @@ body {
 }
 
 .app-container {
-  max-width: 440px;
+  max-width: 600px;
   margin: 0 auto;
   min-height: 100vh;
   background-color: var(--app-bg);
