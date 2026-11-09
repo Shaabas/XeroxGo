@@ -1712,6 +1712,15 @@ body {
   color: var(--text-main);
   margin: 0 0 9px 0;
   line-height: 1.2;
+  display: flex;
+  align-items: center;
+}
+
+.section-title-svg {
+  display: inline-block;
+  margin-right: 7px;
+  color: #64748b;
+  flex-shrink: 0;
 }
 
 .settings-title-with-info {
@@ -1869,6 +1878,76 @@ body {
 
 .split-option-card.active .split-card-icon {
   color: var(--primary-blue);
+}
+
+/* Classic Restored Button Icons */
+.choice-icon-circle {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.bw-circle {
+  background: linear-gradient(135deg, #64748B, #334155);
+}
+
+.color-circle {
+  background: linear-gradient(135deg, #F59E0B, #3B82F6);
+}
+
+.sheet-icon-single {
+  width: 20px;
+  height: 26px;
+  border: 1.75px solid #475569;
+  border-radius: 4px;
+  background: #ffffff;
+  flex-shrink: 0;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.split-option-card.active .sheet-icon-single {
+  border-color: var(--primary-blue);
+}
+
+.sheet-icon-double {
+  position: relative;
+  width: 25px;
+  height: 27px;
+  flex-shrink: 0;
+}
+
+.sheet-under {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1.75px solid #475569;
+  width: 20px;
+  height: 26px;
+  border-radius: 4px;
+  opacity: 0.35;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+
+.sheet-over {
+  position: absolute;
+  top: 3px;
+  left: 4px;
+  border: 1.75px solid #475569;
+  width: 20px;
+  height: 26px;
+  border-radius: 4px;
+  background-color: #ffffff;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+
+.split-option-card.active .sheet-under,
+.split-option-card.active .sheet-over {
+  border-color: var(--primary-blue);
 }
 
 /* Color Mode Chips & Venn SVG */

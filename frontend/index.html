@@ -219,10 +219,40 @@
       <!-- Settings Form Card (Reference Layout Architecture) -->
       <div class="settings-card settings-card-layout">
         
-        <!-- 1. Number of Copies -->
+        <!-- 1. Pages Selection -->
+        <div class="settings-section">
+          <h3 class="settings-section-title settings-title-with-info">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="section-title-svg"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            <span>Pages Selection</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="title-info-icon" title="Select All or specify page numbers (e.g. 1-3, 5)">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="16" x2="12" y2="12"/>
+              <line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+          </h3>
+          <div class="settings-grid-2">
+            <button type="button" class="split-btn-card active" id="btn-opt-all-pages">All</button>
+            <button type="button" class="split-btn-card" id="btn-opt-custom-range">Range</button>
+          </div>
+          <div id="settings-custom-range-wrapper" class="custom-range-wrapper-layout hidden">
+            <input
+              type="text"
+              id="input-custom-range"
+              class="custom-range-input-layout"
+              placeholder="e.g. 1-3, 5"
+              autocomplete="off"
+            />
+            <p class="custom-range-error-layout hidden" id="custom-range-error"></p>
+          </div>
+        </div>
+
+        <!-- 2. Number of Copies -->
         <div class="settings-section">
           <div class="settings-section-header settings-header-inline">
-            <h3 class="settings-section-title">Number of Copies</h3>
+            <h3 class="settings-section-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="section-title-svg"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+              <span>Number of Copies</span>
+            </h3>
             <div class="copies-stepper-pill">
               <button type="button" id="btn-copies-minus" class="stepper-pill-btn" aria-label="Decrease copies">&minus;</button>
               <span id="copies-count-display" class="stepper-pill-value">1</span>
@@ -231,95 +261,84 @@
           </div>
         </div>
 
-        <!-- 2. Color Mode -->
+        <!-- 3. Print Mode -->
         <div class="settings-section">
-          <h3 class="settings-section-title">Color Mode</h3>
+          <h3 class="settings-section-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="section-title-svg"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>
+            <span>Print Mode</span>
+          </h3>
           <div class="settings-grid-2">
             <button type="button" class="split-option-card active" id="card-mode-bw">
               <div class="split-card-text">
                 <span class="split-card-title">B/W</span>
                 <span class="split-card-sub" id="settings-bw-price-label">&#8377;2.00/side</span>
               </div>
-              <div class="split-card-icon">
-                <svg width="24" height="22" viewBox="0 0 24 22" fill="none" class="color-venn-svg">
-                  <circle cx="8.5" cy="8" r="5.5" fill="#64748B" fill-opacity="0.85"/>
-                  <circle cx="15.5" cy="8" r="5.5" fill="#475569" fill-opacity="0.85"/>
-                  <circle cx="12" cy="14" r="5.5" fill="#1E293B" fill-opacity="0.9"/>
-                </svg>
-              </div>
+              <div class="choice-icon-circle bw-circle"></div>
             </button>
             <button type="button" class="split-option-card" id="card-mode-color">
               <div class="split-card-text">
                 <span class="split-card-title">Color</span>
                 <span class="split-card-sub" id="settings-color-price-label">&#8377;10.00/side</span>
               </div>
-              <div class="split-card-icon">
-                <svg width="24" height="22" viewBox="0 0 24 22" fill="none" class="color-venn-svg">
-                  <circle cx="8.5" cy="8" r="5.5" fill="#3B82F6" fill-opacity="0.85"/>
-                  <circle cx="15.5" cy="8" r="5.5" fill="#EC4899" fill-opacity="0.85"/>
-                  <circle cx="12" cy="14" r="5.5" fill="#EAB308" fill-opacity="0.85"/>
-                </svg>
-              </div>
+              <div class="choice-icon-circle color-circle"></div>
             </button>
           </div>
         </div>
 
-        <!-- 3. Print Sides -->
+        <!-- 4. Print Sides -->
         <div class="settings-section">
-          <h3 class="settings-section-title">Print Sides</h3>
+          <h3 class="settings-section-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="section-title-svg"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+            <span>Print Sides</span>
+          </h3>
           <div class="settings-grid-2">
             <button type="button" class="split-option-card active" id="card-side-single">
               <div class="split-card-text">
-                <span class="split-card-title">1-sided</span>
+                <span class="split-card-title">Single Side</span>
               </div>
-              <div class="split-card-icon">
-                <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                  <polyline points="14 2 14 8 20 8"/>
-                  <line x1="8.5" y1="13" x2="14.5" y2="13"/>
-                  <line x1="8.5" y1="17" x2="12.5" y2="17"/>
-                </svg>
-              </div>
+              <div class="sheet-icon-single"></div>
             </button>
             <button type="button" class="split-option-card" id="card-side-double">
               <div class="split-card-text">
-                <span class="split-card-title">2-sided</span>
+                <span class="split-card-title">Double Side</span>
                 <span class="save-paper-badge-pill">Save &#127811;</span>
               </div>
-              <div class="split-card-icon">
-                <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M7 17H5a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                  <path d="M17 6H9a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V10z"/>
-                  <polyline points="17 6 17 11 22 11"/>
-                  <line x1="11" y1="15" x2="16" y2="15"/>
-                </svg>
+              <div class="sheet-icon-double">
+                <div class="sheet-under"></div>
+                <div class="sheet-over"></div>
               </div>
             </button>
           </div>
         </div>
 
-        <!-- 4. Orientation -->
+        <!-- 5. Orientation -->
         <div class="settings-section">
-          <h3 class="settings-section-title">Orientation</h3>
+          <h3 class="settings-section-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="section-title-svg"><path d="M21.5 2v6h-6"/><path d="M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+            <span>Orientation</span>
+          </h3>
           <div class="settings-grid-3">
             <button type="button" class="split-option-card split-option-card-compact active" id="btn-orient-auto">
               <span class="split-card-title">Auto</span>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6"/><path d="M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6"/><path d="M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
             </button>
             <button type="button" class="split-option-card split-option-card-compact" id="btn-orient-portrait">
               <span class="split-card-title">Portrait</span>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="18" x="5" y="3" rx="2.5"/><line x1="8.5" y1="8" x2="15.5" y2="8"/><line x1="8.5" y1="12" x2="15.5" y2="12"/><line x1="8.5" y1="15.5" x2="13.5" y2="15.5"/></svg>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="13" height="18" x="5.5" y="3" rx="2.5"/></svg>
             </button>
             <button type="button" class="split-option-card split-option-card-compact" id="btn-orient-landscape">
               <span class="split-card-title">Landscape</span>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="14" x="3" y="5" rx="2.5"/><line x1="6.5" y1="9.5" x2="17.5" y2="9.5"/><line x1="6.5" y1="13.5" x2="17.5" y2="13.5"/></svg>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="13" x="3" y="5.5" rx="2.5"/></svg>
             </button>
           </div>
         </div>
 
-        <!-- 5. Pages Per Sheet -->
-        <div class="settings-section">
-          <h3 class="settings-section-title">Pages Per Sheet</h3>
+        <!-- 6. Pages Per Sheet -->
+        <div class="settings-section settings-section-last">
+          <h3 class="settings-section-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="section-title-svg"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
+            <span>Pages Per Sheet</span>
+          </h3>
           <div class="settings-grid-4">
             <button type="button" class="nup-sheet-card active" id="card-nup-1">
               <div class="nup-sheet-preview preview-1up">
@@ -357,31 +376,7 @@
           </div>
         </div>
 
-        <!-- 6. Pages Selection -->
-        <div class="settings-section settings-section-last">
-          <h3 class="settings-section-title settings-title-with-info">
-            <span>Pages Selection</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="title-info-icon" title="Select All or specify page numbers (e.g. 1-3, 5)">
-              <circle cx="12" cy="12" r="10"/>
-              <line x1="12" y1="16" x2="12" y2="12"/>
-              <line x1="12" y1="8" x2="12.01" y2="8"/>
-            </svg>
-          </h3>
-          <div class="settings-grid-2">
-            <button type="button" class="split-btn-card active" id="btn-opt-all-pages">All</button>
-            <button type="button" class="split-btn-card" id="btn-opt-custom-range">Range</button>
-          </div>
-          <div id="settings-custom-range-wrapper" class="custom-range-wrapper-layout hidden">
-            <input
-              type="text"
-              id="input-custom-range"
-              class="custom-range-input-layout"
-              placeholder="e.g. 1-3, 5"
-              autocomplete="off"
-            />
-            <p class="custom-range-error-layout hidden" id="custom-range-error"></p>
-          </div>
-        </div>
+      </div>
 
       </div>
 

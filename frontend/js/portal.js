@@ -388,7 +388,7 @@
           ? `${item.selectedPages.length} pages`
           : `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
 
-        const sidesText = item.settings.sides === 'Double-sided' ? 'Double-sided' : 'Single-sided';
+        const sidesText = item.settings.sides === 'Double-sided' ? 'Double Side' : 'Single Side';
         const metaText = `${pageCountText} · ${item.settings.mode} · ${sidesText}`;
 
         card.innerHTML = `
