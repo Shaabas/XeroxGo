@@ -153,3 +153,109 @@ func sha256ChecksumString(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
+
+func TestSingleFileUploadWithMetadataAndDuplexFormats(t *testing.T) {
+	_, mux := setupUploadTestServer(t)
+	tmpDir := t.TempDir()
+	docPath := createTestPDFWithPages(t, tmpDir, 2)
+	docBytes, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("failed to read test pdf: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		metaJSON     string
+		formDuplex   string
+		formCopies   string
+		wantDuplex   string
+		wantStatus   int
+		expectReject bool
+	}{
+		{
+			name:       "single_file_metadata_string_duplex_long_edge",
+			metaJSON:   `[{"copies": 1, "duplex": "DUPLEX_LONG_EDGE", "color_mode": "BW", "page_range": ""}]`,
+			wantDuplex: "DUPLEX_LONG_EDGE",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "single_file_metadata_boolean_duplex_true",
+			metaJSON:   `[{"copies": 1, "duplex": true, "color_mode": "BW", "page_range": ""}]`,
+			wantDuplex: "DUPLEX_LONG_EDGE",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "single_file_metadata_boolean_duplex_false",
+			metaJSON:   `[{"copies": 1, "duplex": false, "color_mode": "BW", "page_range": ""}]`,
+			wantDuplex: "SIMPLEX",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "single_file_metadata_string_simplex",
+			metaJSON:   `[{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW", "page_range": ""}]`,
+			wantDuplex: "SIMPLEX",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "single_file_no_metadata_omitted_duplex_defaults_to_simplex",
+			metaJSON:   "",
+			formCopies: "1",
+			wantDuplex: "SIMPLEX",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:         "single_file_invalid_duplex_rejected",
+			metaJSON:     "",
+			formDuplex:   "NOT_A_VALID_DUPLEX_MODE",
+			wantStatus:   http.StatusBadRequest,
+			expectReject: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &bytes.Buffer{}
+			writer := multipart.NewWriter(body)
+
+			p, err := writer.CreateFormFile("files", "SingleDoc.pdf")
+			if err != nil {
+				t.Fatalf("CreateFormFile failed: %v", err)
+			}
+			if _, err := p.Write(docBytes); err != nil {
+				t.Fatalf("failed to write doc bytes: %v", err)
+			}
+
+			if tc.metaJSON != "" {
+				_ = writer.WriteField("metadata", tc.metaJSON)
+			}
+			if tc.formDuplex != "" {
+				_ = writer.WriteField("duplex", tc.formDuplex)
+			}
+			if tc.formCopies != "" {
+				_ = writer.WriteField("copies", tc.formCopies)
+			}
+			_ = writer.Close()
+
+			req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-duplex-test/upload", body)
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("expected HTTP status %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+
+			if !tc.expectReject {
+				var resp map[string]interface{}
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("failed to parse JSON: %v", err)
+				}
+				gotDuplex, _ := resp["duplex"].(string)
+				if gotDuplex != tc.wantDuplex {
+					t.Errorf("expected duplex %q, got %q", tc.wantDuplex, gotDuplex)
+				}
+			}
+		})
+	}
+}

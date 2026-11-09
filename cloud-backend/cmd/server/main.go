@@ -96,6 +96,31 @@ func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
+func parseDuplex(val interface{}) contracts.DuplexMode {
+	if val == nil {
+		return contracts.DuplexSimplex
+	}
+	switch v := val.(type) {
+	case bool:
+		if v {
+			return contracts.DuplexLongEdge
+		}
+		return contracts.DuplexSimplex
+	case string:
+		upper := strings.ToUpper(strings.TrimSpace(v))
+		switch upper {
+		case string(contracts.DuplexLongEdge), "TRUE", "DUPLEX", "DOUBLE", "DOUBLE-SIDED", "LONG_EDGE":
+			return contracts.DuplexLongEdge
+		case string(contracts.DuplexShortEdge), "SHORT_EDGE":
+			return contracts.DuplexShortEdge
+		default:
+			return contracts.DuplexSimplex
+		}
+	default:
+		return contracts.DuplexSimplex
+	}
+}
+
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -136,16 +161,17 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(fileHeaders) > 1 {
+	metadataRaw := strings.TrimSpace(r.FormValue("metadata"))
+	if len(fileHeaders) > 1 || metadataRaw != "" {
 		type docItemMeta struct {
-			Copies    int    `json:"copies"`
-			Duplex    string `json:"duplex"`
-			ColorMode string `json:"color_mode"`
-			PageRange string `json:"page_range"`
+			Copies    int         `json:"copies"`
+			Duplex    interface{} `json:"duplex"`
+			ColorMode string      `json:"color_mode"`
+			PageRange string      `json:"page_range"`
 		}
 		var metaItems []docItemMeta
-		if mStr := r.FormValue("metadata"); strings.TrimSpace(mStr) != "" {
-			_ = json.Unmarshal([]byte(mStr), &metaItems)
+		if metadataRaw != "" {
+			_ = json.Unmarshal([]byte(metadataRaw), &metaItems)
 		}
 
 		pricing, err := s.db.GetPricing(r.Context())
@@ -265,14 +291,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				if metaItems[idx].Copies >= 1 && metaItems[idx].Copies <= 999 {
 					docCopies = metaItems[idx].Copies
 				}
-				switch metaItems[idx].Duplex {
-				case string(contracts.DuplexLongEdge):
-					docDuplexMode = contracts.DuplexLongEdge
-				case string(contracts.DuplexShortEdge):
-					docDuplexMode = contracts.DuplexShortEdge
-				default:
-					docDuplexMode = contracts.DuplexSimplex
-				}
+				docDuplexMode = parseDuplex(metaItems[idx].Duplex)
 				if strings.EqualFold(metaItems[idx].ColorMode, "COLOR") && pricing.ColorEnabled {
 					docColorMode = "COLOR"
 				}
@@ -281,14 +300,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				if c, err := strconv.Atoi(r.FormValue("copies")); err == nil && c >= 1 && c <= 999 {
 					docCopies = c
 				}
-				switch r.FormValue("duplex") {
-				case string(contracts.DuplexLongEdge):
-					docDuplexMode = contracts.DuplexLongEdge
-				case string(contracts.DuplexShortEdge):
-					docDuplexMode = contracts.DuplexShortEdge
-				default:
-					docDuplexMode = contracts.DuplexSimplex
-				}
+				docDuplexMode = parseDuplex(r.FormValue("duplex"))
 				if strings.EqualFold(r.FormValue("color_mode"), "COLOR") && pricing.ColorEnabled {
 					docColorMode = "COLOR"
 				}
@@ -359,18 +371,32 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			totalSheets += normRes.TotalSheets
 		}
 
-		qpdfArgs := []string{"--empty", "--pages"}
-		for _, p := range intermediateNormPDFs {
-			qpdfArgs = append(qpdfArgs, p, "1-z")
-		}
-		qpdfArgs = append(qpdfArgs, "--", outputPath)
+		if len(intermediateNormPDFs) == 1 {
+			data, err := os.ReadFile(intermediateNormPDFs[0])
+			if err != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, "failed to read normalized document", http.StatusInternalServerError)
+				return
+			}
+			if err := os.WriteFile(outputPath, data, 0600); err != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, "failed to save output document", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			qpdfArgs := []string{"--empty", "--pages"}
+			for _, p := range intermediateNormPDFs {
+				qpdfArgs = append(qpdfArgs, p, "1-z")
+			}
+			qpdfArgs = append(qpdfArgs, "--", outputPath)
 
-		cmdMerge := exec.CommandContext(r.Context(), "qpdf", qpdfArgs...)
-		outMerge, errMerge := cmdMerge.CombinedOutput()
-		if errMerge != nil {
-			_ = os.Remove(outputPath)
-			http.Error(w, fmt.Sprintf("failed to merge documents: %s: %v", strings.TrimSpace(string(outMerge)), errMerge), http.StatusInternalServerError)
-			return
+			cmdMerge := exec.CommandContext(r.Context(), "qpdf", qpdfArgs...)
+			outMerge, errMerge := cmdMerge.CombinedOutput()
+			if errMerge != nil {
+				_ = os.Remove(outputPath)
+				http.Error(w, fmt.Sprintf("failed to merge documents: %s: %v", strings.TrimSpace(string(outMerge)), errMerge), http.StatusInternalServerError)
+				return
+			}
 		}
 
 		finalBytes, err := os.ReadFile(outputPath)
@@ -471,18 +497,22 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		copies = c
 	}
 
-	duplexStr := r.FormValue("duplex")
+	duplexStr := strings.TrimSpace(r.FormValue("duplex"))
 	var duplexMode contracts.DuplexMode
-	switch duplexStr {
-	case string(contracts.DuplexSimplex):
+	if duplexStr == "" {
 		duplexMode = contracts.DuplexSimplex
-	case string(contracts.DuplexLongEdge):
-		duplexMode = contracts.DuplexLongEdge
-	case string(contracts.DuplexShortEdge):
-		duplexMode = contracts.DuplexShortEdge
-	default:
-		http.Error(w, "invalid duplex mode", http.StatusBadRequest)
-		return
+	} else {
+		switch strings.ToUpper(duplexStr) {
+		case string(contracts.DuplexSimplex), "SINGLE", "SINGLE-SIDED", "FALSE":
+			duplexMode = contracts.DuplexSimplex
+		case string(contracts.DuplexLongEdge), "LONG_EDGE", "DUPLEX", "DOUBLE", "DOUBLE-SIDED", "TRUE":
+			duplexMode = contracts.DuplexLongEdge
+		case string(contracts.DuplexShortEdge), "SHORT_EDGE":
+			duplexMode = contracts.DuplexShortEdge
+		default:
+			http.Error(w, "invalid duplex mode", http.StatusBadRequest)
+			return
+		}
 	}
 
 	ext := strings.ToLower(filepath.Ext(originalFilename))

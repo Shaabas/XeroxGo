@@ -982,15 +982,29 @@
         }
         formData.append('files', filePayload);
 
+        const isDoubleSided = item.settings.sides === 'Double-sided';
+        const duplexModeStr = isDoubleSided ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX';
+
         metadata.push({
-          copies: item.settings.copies,
-          duplex: item.settings.sides === 'Double-sided',
-          color_mode: item.settings.mode === 'Color' ? 'color' : 'bw',
+          copies: item.settings.copies || 1,
+          duplex: duplexModeStr,
+          color_mode: item.settings.mode === 'Color' ? 'COLOR' : 'BW',
           page_range: item.settings.pageSelection === 'Custom Range' ? item.settings.customPageRange : ''
         });
       }
 
       formData.append('metadata', JSON.stringify(metadata));
+
+      if (cartItems.length > 0) {
+        const first = cartItems[0];
+        const isDouble = first.settings.sides === 'Double-sided';
+        formData.append('copies', String(first.settings.copies || 1));
+        formData.append('duplex', isDouble ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
+        formData.append('color_mode', first.settings.mode === 'Color' ? 'COLOR' : 'BW');
+        if (first.settings.pageSelection === 'Custom Range' && first.settings.customPageRange) {
+          formData.append('page_range', first.settings.customPageRange);
+        }
+      }
 
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;
       const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
