@@ -385,6 +385,7 @@ func main() {
 		ScreenSink:               screenSink,
 		HTTPClient:               nil,
 		MockHealth:               mockHealthPoller,
+		EnableCloudRecovery:      true,
 	}
 
 	client, err := spooler.NewClient(clientCfg)

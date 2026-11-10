@@ -46,6 +46,21 @@ type Order struct {
 	UpdatedAt  time.Time
 }
 
+type RecoveryRecord struct {
+	RecoveryID             string
+	JobID                  string
+	KioskID                string
+	SequenceID             int
+	ConfirmedSheetsPrinted int
+	RemainingPages         int
+	RemainingSheets        int
+	DownloadURL            string
+	SHA256Checksum         string
+	Status                 string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
 // Open opens a database at dbPath. If dbPath starts with "postgres://" or "postgresql://",
 // it connects to a PostgreSQL instance (e.g. Supabase). Otherwise it connects to SQLite,
 // verifies durability pragmas, initializes schema tables, and returns a Store.
@@ -136,6 +151,23 @@ CREATE TABLE IF NOT EXISTS job_progress (
     timestamp_ns BIGINT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS recovery_records (
+    recovery_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    sequence_id INTEGER NOT NULL,
+    confirmed_sheets_printed INTEGER NOT NULL,
+    remaining_pages INTEGER NOT NULL,
+    remaining_sheets INTEGER NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(job_id, sequence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
+
 CREATE TABLE IF NOT EXISTS ads (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -199,6 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
+			"CREATE TABLE IF NOT EXISTS recovery_records (recovery_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, confirmed_sheets_printed INTEGER NOT NULL, remaining_pages INTEGER NOT NULL, remaining_sheets INTEGER NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(job_id, sequence_id));",
+			"CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);",
 		}
 		for _, mig := range pgMigrations {
 			if _, err := db.Exec(mig); err != nil {
@@ -322,6 +356,23 @@ CREATE TABLE IF NOT EXISTS job_progress (
     error_reason TEXT NOT NULL DEFAULT '',
     timestamp_ns BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS recovery_records (
+    recovery_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    sequence_id INTEGER NOT NULL,
+    confirmed_sheets_printed INTEGER NOT NULL,
+    remaining_pages INTEGER NOT NULL,
+    remaining_sheets INTEGER NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(job_id, sequence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS ads (
     id TEXT PRIMARY KEY,
@@ -453,6 +504,23 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS recovery_records (
+    recovery_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    sequence_id INTEGER NOT NULL,
+    confirmed_sheets_printed INTEGER NOT NULL,
+    remaining_pages INTEGER NOT NULL,
+    remaining_sheets INTEGER NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(job_id, sequence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 `)
 	return nil
 }
@@ -679,6 +747,258 @@ WHERE o.order_id = ?;
 	}
 
 	return result, nil
+}
+
+// GetOrderByJobID retrieves an order and its print configuration by jobID.
+func (s *Store) GetOrderByJobID(ctx context.Context, jobID string) (*Order, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("get order by job id: store is closed or nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("get order by job id: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("get order by job id: %w", err)
+	}
+	if strings.TrimSpace(jobID) == "" {
+		return nil, fmt.Errorf("get order by job id: jobID cannot be empty")
+	}
+
+	query := `
+SELECT
+    o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise, o.created_at_ns, o.updated_at_ns,
+    p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page,
+    COALESCE(p.color_mode, 'BW')
+FROM orders o
+JOIN print_configs p ON o.order_id = p.order_id
+WHERE o.job_id = ?;
+`
+
+	row := s.db.QueryRowContext(ctx, s.rebind(query), jobID)
+
+	var (
+		resOrderID    string
+		resJobID      string
+		kioskID       string
+		displayCode   string
+		statusStr     string
+		pricePaise    int64
+		createdNS     int64
+		updatedNS     int64
+		downloadURL   string
+		sha256Check   string
+		totalPages    int
+		totalSheets   int
+		copies        int
+		duplexStr     string
+		startFromPage int
+		colorMode     string
+	)
+
+	err := row.Scan(
+		&resOrderID,
+		&resJobID,
+		&kioskID,
+		&displayCode,
+		&statusStr,
+		&pricePaise,
+		&createdNS,
+		&updatedNS,
+		&downloadURL,
+		&sha256Check,
+		&totalPages,
+		&totalSheets,
+		&copies,
+		&duplexStr,
+		&startFromPage,
+		&colorMode,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get order by job id: scan: %w", err)
+	}
+
+	result := &Order{
+		OrderID: resOrderID,
+		Command: contracts.PrintJobCommand{
+			JobID:          resJobID,
+			KioskID:        kioskID,
+			DisplayCode:    displayCode,
+			DownloadURL:    downloadURL,
+			SHA256Checksum: sha256Check,
+			TotalPages:     totalPages,
+			TotalSheets:    totalSheets,
+			Copies:         copies,
+			Duplex:         contracts.DuplexMode(duplexStr),
+			StartFromPage:  startFromPage,
+		},
+		Status:     contracts.JobStatus(statusStr),
+		PricePaise: pricePaise,
+		ColorMode:  colorMode,
+		CreatedAt:  time.Unix(0, createdNS).UTC(),
+		UpdatedAt:  time.Unix(0, updatedNS).UTC(),
+	}
+
+	return result, nil
+}
+
+// CreateRecoveryRecord persists an immutable recovery attempt record.
+func (s *Store) CreateRecoveryRecord(ctx context.Context, rec RecoveryRecord) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("create recovery record: store is closed or nil")
+	}
+	if ctx == nil {
+		return fmt.Errorf("create recovery record: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("create recovery record: %w", err)
+	}
+	if strings.TrimSpace(rec.RecoveryID) == "" {
+		return fmt.Errorf("create recovery record: recovery_id cannot be empty")
+	}
+	if strings.TrimSpace(rec.JobID) == "" {
+		return fmt.Errorf("create recovery record: job_id cannot be empty")
+	}
+	if strings.TrimSpace(rec.KioskID) == "" {
+		return fmt.Errorf("create recovery record: kiosk_id cannot be empty")
+	}
+	if rec.SequenceID < 1 {
+		return fmt.Errorf("create recovery record: sequence_id must be >= 1, got %d", rec.SequenceID)
+	}
+	if rec.ConfirmedSheetsPrinted < 0 {
+		return fmt.Errorf("create recovery record: confirmed_sheets_printed must be >= 0, got %d", rec.ConfirmedSheetsPrinted)
+	}
+	if rec.RemainingPages < 1 {
+		return fmt.Errorf("create recovery record: remaining_pages must be >= 1, got %d", rec.RemainingPages)
+	}
+	if rec.RemainingSheets < 1 {
+		return fmt.Errorf("create recovery record: remaining_sheets must be >= 1, got %d", rec.RemainingSheets)
+	}
+	if strings.TrimSpace(rec.DownloadURL) == "" {
+		return fmt.Errorf("create recovery record: download_url cannot be empty")
+	}
+	if strings.TrimSpace(rec.SHA256Checksum) == "" {
+		return fmt.Errorf("create recovery record: sha256_checksum cannot be empty")
+	}
+
+	createdAt := rec.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := rec.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+
+	query := `
+INSERT INTO recovery_records (
+    recovery_id, job_id, kiosk_id, sequence_id, confirmed_sheets_printed,
+    remaining_pages, remaining_sheets, download_url, sha256_checksum, status,
+    created_at_ns, updated_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+`
+	_, err := s.db.ExecContext(ctx, s.rebind(query),
+		rec.RecoveryID, rec.JobID, rec.KioskID, rec.SequenceID, rec.ConfirmedSheetsPrinted,
+		rec.RemainingPages, rec.RemainingSheets, rec.DownloadURL, rec.SHA256Checksum, rec.Status,
+		createdAt.UnixNano(), updatedAt.UnixNano(),
+	)
+	if err != nil {
+		return fmt.Errorf("create recovery record: %w", err)
+	}
+	return nil
+}
+
+// GetRecoveryRecord retrieves a recovery record by recoveryID.
+func (s *Store) GetRecoveryRecord(ctx context.Context, recoveryID string) (*RecoveryRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("get recovery record: store is closed or nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("get recovery record: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("get recovery record: %w", err)
+	}
+	if strings.TrimSpace(recoveryID) == "" {
+		return nil, fmt.Errorf("get recovery record: recoveryID cannot be empty")
+	}
+
+	query := `
+SELECT
+    recovery_id, job_id, kiosk_id, sequence_id, confirmed_sheets_printed,
+    remaining_pages, remaining_sheets, download_url, sha256_checksum, status,
+    created_at_ns, updated_at_ns
+FROM recovery_records
+WHERE recovery_id = ?;
+`
+	row := s.db.QueryRowContext(ctx, s.rebind(query), recoveryID)
+
+	var (
+		recID       string
+		jobID       string
+		kioskID     string
+		seqID       int
+		confSheets  int
+		remPages    int
+		remSheets   int
+		downloadURL string
+		sha256Check string
+		status      string
+		createdNS   int64
+		updatedNS   int64
+	)
+	err := row.Scan(
+		&recID, &jobID, &kioskID, &seqID, &confSheets,
+		&remPages, &remSheets, &downloadURL, &sha256Check, &status,
+		&createdNS, &updatedNS,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get recovery record: scan: %w", err)
+	}
+
+	return &RecoveryRecord{
+		RecoveryID:             recID,
+		JobID:                  jobID,
+		KioskID:                kioskID,
+		SequenceID:             seqID,
+		ConfirmedSheetsPrinted: confSheets,
+		RemainingPages:         remPages,
+		RemainingSheets:        remSheets,
+		DownloadURL:            downloadURL,
+		SHA256Checksum:         sha256Check,
+		Status:                 status,
+		CreatedAt:              time.Unix(0, createdNS).UTC(),
+		UpdatedAt:              time.Unix(0, updatedNS).UTC(),
+	}, nil
+}
+
+// GetLatestRecoverySequence returns the maximum sequence_id for the given jobID (0 if none exist).
+func (s *Store) GetLatestRecoverySequence(ctx context.Context, jobID string) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("get latest recovery sequence: store is closed or nil")
+	}
+	if ctx == nil {
+		return 0, fmt.Errorf("get latest recovery sequence: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("get latest recovery sequence: %w", err)
+	}
+	if strings.TrimSpace(jobID) == "" {
+		return 0, fmt.Errorf("get latest recovery sequence: jobID cannot be empty")
+	}
+
+	query := `SELECT COALESCE(MAX(sequence_id), 0) FROM recovery_records WHERE job_id = ?;`
+	row := s.db.QueryRowContext(ctx, s.rebind(query), jobID)
+	var maxSeq int
+	if err := row.Scan(&maxSeq); err != nil {
+		return 0, fmt.Errorf("get latest recovery sequence: scan: %w", err)
+	}
+	return maxSeq, nil
 }
 
 // UpdateOrderStatus updates an existing order's status and updated_at_ns.

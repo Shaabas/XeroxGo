@@ -37,6 +37,7 @@ type serverConfig struct {
 	devMode            bool
 	downloadSecret     []byte
 	webhookSecret      []byte
+	kioskSecret        []byte
 }
 
 type appServer struct {
@@ -1514,8 +1515,10 @@ func main() {
 
 	hub := ws.NewHub(storeDB)
 	kioskSecretStr := os.Getenv("XEROXGO_KIOSK_SECRET")
+	var kioskSecretBytes []byte
 	if kioskSecretStr != "" {
-		hub.SetKioskSecret([]byte(kioskSecretStr))
+		kioskSecretBytes = []byte(kioskSecretStr)
+		hub.SetKioskSecret(kioskSecretBytes)
 	} else if !devMode {
 		log.Fatalf("XEROXGO_KIOSK_SECRET required in production mode")
 	}
@@ -1528,6 +1531,7 @@ func main() {
 		devMode:            devMode,
 		downloadSecret:     []byte(dlSecretStr),
 		webhookSecret:      []byte(whSecretStr),
+		kioskSecret:        kioskSecretBytes,
 	}
 
 	app := &appServer{
@@ -1543,7 +1547,24 @@ func main() {
 	mux.HandleFunc("/api/convert", app.handleConvert)
 	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
 	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
-	mux.HandleFunc("/api/k/", app.handleUpload)
+	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/upload"):
+			app.handleUpload(w, r)
+		case strings.HasSuffix(path, "/recover"):
+			app.handleRecoverJob(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	mux.HandleFunc("/api/recovery/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/pdf") {
+			app.handleDownloadRecoveryPDF(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
@@ -1633,7 +1654,9 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 			isExempt := path == "/healthz" ||
 				path == "/ws" ||
 				path == "/api/webhooks/razorpay" ||
-				(strings.HasPrefix(path, "/api/orders/") && strings.HasSuffix(path, "/pdf"))
+				(strings.HasPrefix(path, "/api/orders/") && strings.HasSuffix(path, "/pdf")) ||
+				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
+				(strings.HasPrefix(path, "/api/k/") && strings.HasSuffix(path, "/recover"))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))

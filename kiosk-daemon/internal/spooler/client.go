@@ -1,6 +1,7 @@
 package spooler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -58,6 +59,7 @@ type ClientConfig struct {
 	HTTPClient               *http.Client
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
+	EnableCloudRecovery      bool
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -228,12 +230,41 @@ func (c *Client) Run(ctx context.Context) error {
 	// 2. Startup recovery check
 	incomplete, err := c.cfg.StateStore.GetIncompleteJob(ctx)
 	if err == nil && incomplete != nil {
-		c.activeMu.Lock()
-		c.activeJobs[incomplete.Command.JobID] = true
-		c.activeMu.Unlock()
-		select {
-		case c.jobQueue <- incomplete.Command:
-		default:
+		if c.cfg.EnableCloudRecovery {
+			// When cloud recovery is active, never automatically resume if physical output is uncertain.
+			// If daemon crashed or restarted after sheets/pages were already dispatched to the printer,
+			// mark the job as PAUSED_ERROR requiring explicit operator/cloud reconciliation.
+			if incomplete.PagesPrinted > 0 || incomplete.SheetsPrinted > 0 {
+				evt := contracts.JobProgressEvent{
+					JobID:         incomplete.Command.JobID,
+					KioskID:       incomplete.Command.KioskID,
+					Status:        contracts.JobStatusPausedError,
+					PagesPrinted:  incomplete.PagesPrinted,
+					SheetsPrinted: incomplete.SheetsPrinted,
+					ErrorReason:   "interrupted by daemon restart; physical output uncertain, reconciliation required",
+					Timestamp:     time.Now().UTC(),
+				}
+				_ = c.cfg.StateStore.UpdateProgress(ctx, evt)
+				c.sendProgress(ctx, evt)
+			} else {
+				// Zero sheets were ever printed; safe to retry from beginning
+				c.activeMu.Lock()
+				c.activeJobs[incomplete.Command.JobID] = true
+				c.activeMu.Unlock()
+				select {
+				case c.jobQueue <- incomplete.Command:
+				default:
+				}
+			}
+		} else {
+			// Migration fallback: legacy Pi-side behavior
+			c.activeMu.Lock()
+			c.activeJobs[incomplete.Command.JobID] = true
+			c.activeMu.Unlock()
+			select {
+			case c.jobQueue <- incomplete.Command:
+			default:
+			}
 		}
 	}
 
@@ -1082,5 +1113,95 @@ func loadAdsCache(path string) ([]contracts.AdItem, error) {
 		return nil, err
 	}
 	return ads, nil
+}
+
+// RequestCloudRecovery contacts the cloud recovery endpoint to generate an immutable continuation
+// artifact and queues the continuation command for execution without any Pi-side PDF slicing.
+// If outputConfirmed is false, the cloud will reject the recovery per safety constraints.
+func (c *Client) RequestCloudRecovery(
+	ctx context.Context,
+	jobID string,
+	confirmedSheets int,
+	outputConfirmed bool,
+	reason string,
+) (*contracts.PrintJobCommand, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return nil, errors.New("request recovery: jobID cannot be empty")
+	}
+
+	u, err := url.Parse(c.cfg.CloudURL)
+	if err != nil {
+		return nil, fmt.Errorf("request recovery: parse cloud URL: %w", err)
+	}
+	httpScheme := "http"
+	if u.Scheme == "wss" {
+		httpScheme = "https"
+	}
+	baseURL := fmt.Sprintf("%s://%s", httpScheme, u.Host)
+	recoveryEndpoint := fmt.Sprintf("%s/api/k/%s/jobs/%s/recover", baseURL, c.cfg.KioskID, jobID)
+
+	recoveryID := fmt.Sprintf("rec_%s_%d", jobID, time.Now().UnixNano())
+
+	reqBody := map[string]interface{}{
+		"recovery_id":              recoveryID,
+		"confirmed_sheets_printed": confirmedSheets,
+		"output_confirmed":         outputConfirmed,
+		"reason":                   reason,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("request recovery: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, recoveryEndpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("request recovery: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(c.cfg.KioskSecret) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(c.cfg.KioskSecret))
+	}
+
+	client := c.cfg.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request recovery: HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("recovery failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+	}
+
+	var recResp struct {
+		Status  string                     `json:"status"`
+		Command *contracts.PrintJobCommand `json:"command"`
+	}
+	if err := json.Unmarshal(respBytes, &recResp); err != nil {
+		return nil, fmt.Errorf("request recovery: decode response: %w", err)
+	}
+
+	if recResp.Status == "COMPLETED" || recResp.Command == nil {
+		return nil, nil
+	}
+
+	cmd := *recResp.Command
+	c.activeMu.Lock()
+	c.activeJobs[cmd.JobID] = true
+	c.activeMu.Unlock()
+
+	select {
+	case c.jobQueue <- cmd:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	return &cmd, nil
 }
 
