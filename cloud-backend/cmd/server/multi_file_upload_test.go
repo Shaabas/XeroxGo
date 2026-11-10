@@ -259,3 +259,84 @@ func TestSingleFileUploadWithMetadataAndDuplexFormats(t *testing.T) {
 		})
 	}
 }
+
+func TestMultiFileUploadWithOrientationAndNUp(t *testing.T) {
+	app, mux := setupUploadTestServer(t)
+	tmpDir := t.TempDir()
+
+	doc1Path := createTestPDFWithPages(t, tmpDir, 4)
+	doc2Path := createTestPDFWithPages(t, tmpDir, 6)
+
+	doc1Bytes, _ := os.ReadFile(doc1Path)
+	doc2Bytes, _ := os.ReadFile(doc2Path)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	p1, _ := writer.CreateFormFile("files", "Doc1_4p.pdf")
+	_, _ = p1.Write(doc1Bytes)
+	p2, _ := writer.CreateFormFile("files", "Doc2_6p.pdf")
+	_, _ = p2.Write(doc2Bytes)
+
+	// Doc 1: 4 pages, 2-up, landscape, simplex -> 2 imposed sides, 2 sheets, 400 paise
+	// Doc 2: 6 pages, 4-up, auto, duplex -> 2 imposed sides, 1 sheet, 300 paise
+	metaJSON := `[
+		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW", "page_range": "", "orientation": "LANDSCAPE", "pages_per_sheet": 2},
+		{"copies": 1, "duplex": "DUPLEX_LONG_EDGE", "color_mode": "BW", "page_range": "", "orientation": "AUTO", "pages_per_sheet": 4}
+	]`
+	_ = writer.WriteField("metadata", metaJSON)
+	_ = writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-nup-test/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
+
+	totalPages := int(resp["total_pages"].(float64))
+	totalSheets := int(resp["total_sheets"].(float64))
+	totalPricePaise := int64(resp["total_price_paise"].(float64))
+	docsCount := int(resp["documents_count"].(float64))
+
+	if docsCount != 2 {
+		t.Errorf("documents_count = %d, want 2", docsCount)
+	}
+	if totalPages != 4 {
+		t.Errorf("total_pages = %d, want 4", totalPages)
+	}
+	if totalSheets != 3 {
+		t.Errorf("total_sheets = %d, want 3", totalSheets)
+	}
+	if totalPricePaise != 700 {
+		t.Errorf("total_price_paise = %d, want 700", totalPricePaise)
+	}
+
+	orderID, _ := resp["order_id"].(string)
+	h := sha256ChecksumString(orderID)
+	mergedPDFPath := filepath.Join(app.cfg.jobsDir, h+".pdf")
+
+	cmdCheck := exec.Command("qpdf", "--check", mergedPDFPath)
+	outCheck, errCheck := cmdCheck.CombinedOutput()
+	if errCheck != nil {
+		t.Fatalf("qpdf --check failed on merged PDF: %s: %v", strings.TrimSpace(string(outCheck)), errCheck)
+	}
+
+	cmdCount := exec.Command("qpdf", "--show-npages", mergedPDFPath)
+	outCount, errCount := cmdCount.CombinedOutput()
+	if errCount != nil {
+		t.Fatalf("qpdf --show-npages failed: %s: %v", strings.TrimSpace(string(outCount)), errCount)
+	}
+	pCount, _ := strconv.Atoi(strings.TrimSpace(string(outCount)))
+	if pCount != 4 {
+		t.Errorf("merged PDF pages = %d, want 4", pCount)
+	}
+}
