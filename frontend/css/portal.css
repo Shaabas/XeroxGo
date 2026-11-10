@@ -1303,7 +1303,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
 }
 
 /* Document Card */
@@ -1589,22 +1589,13 @@ body {
   font-size: 14px;
 }
 
-/* Scoped cart layout for bottom summary bar with 16px breathing room */
+/* Scoped cart layout for natural document flow */
 .app-container:has(#view-cart.active-view) {
-  padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
 }
 
-#view-cart.active-view {
-  display: flex;
-  flex-direction: column;
-  min-height: calc(100vh - 12px - 16px - env(safe-area-inset-bottom, 0px));
-  min-height: calc(100dvh - 12px - 16px - env(safe-area-inset-bottom, 0px));
-}
-
-/* Sticky Bottom Total Bar */
+/* Bottom Total Bar (normal document flow) */
 .cart-bottom-bar {
-  position: sticky;
-  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   background: #ffffff;
   border: 1px solid var(--border-light);
   border-radius: 20px;
@@ -1613,8 +1604,6 @@ body {
   justify-content: space-between;
   align-items: center;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
-  z-index: 40;
-  margin-top: auto;
 }
 
 .cart-total-info {
