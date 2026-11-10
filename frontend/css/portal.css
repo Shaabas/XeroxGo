@@ -54,7 +54,7 @@ body {
   min-height: 100vh;
   background-color: var(--background-color);
   position: relative;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 /* Admin Layout */
@@ -1369,7 +1369,6 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-top: 1px solid #f1f5f9;
   padding-top: 10px;
 }
 
@@ -1525,10 +1524,22 @@ body {
   font-size: 14px;
 }
 
+/* Scoped cart layout for flush bottom summary bar */
+.app-container:has(#view-cart.active-view) {
+  padding-bottom: max(0px, env(safe-area-inset-bottom, 0px));
+}
+
+#view-cart.active-view {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 12px - env(safe-area-inset-bottom, 0px));
+  min-height: calc(100dvh - 12px - env(safe-area-inset-bottom, 0px));
+}
+
 /* Sticky Bottom Total Bar */
 .cart-bottom-bar {
   position: sticky;
-  bottom: 16px;
+  bottom: max(0px, env(safe-area-inset-bottom, 0px));
   background: #ffffff;
   border: 1px solid var(--border-light);
   border-radius: 20px;
@@ -1538,7 +1549,7 @@ body {
   align-items: center;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
   z-index: 40;
-  margin-top: 20px;
+  margin-top: auto;
 }
 
 .cart-total-info {
