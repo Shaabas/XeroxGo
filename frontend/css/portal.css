@@ -1377,28 +1377,27 @@ body {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  background: #ffffff;
-  border: 1px solid var(--danger-red);
-  border-radius: 9999px;
-  padding: 5px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-left: -8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
-  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 
 .btn-doc-delete:hover {
   background-color: #fef2f2;
-  border-color: #dc2626;
   color: #dc2626;
 }
 
 .btn-doc-delete:active {
   background-color: #fee2e2;
-  border-color: #b91c1c;
   color: #b91c1c;
 }
 
@@ -1433,28 +1432,27 @@ body {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  background: #ffffff;
-  border: 1px solid var(--primary-blue);
-  border-radius: 9999px;
-  padding: 5px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-right: -8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
-  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 
 .btn-doc-edit:hover {
   background-color: var(--primary-blue-light);
-  border-color: var(--primary-blue-hover);
   color: var(--primary-blue-hover);
 }
 
 .btn-doc-edit:active {
   background-color: #dbeafe;
-  border-color: #1e40af;
   color: #1e40af;
 }
 
@@ -1544,28 +1542,27 @@ body {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  background: #ffffff;
-  border: 1px solid var(--primary-blue);
-  border-radius: 9999px;
-  padding: 5px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-right: -8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
-  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 
 .btn-doc-retry:hover {
   background-color: var(--primary-blue-light);
-  border-color: var(--primary-blue-hover);
   color: var(--primary-blue-hover);
 }
 
 .btn-doc-retry:active {
   background-color: #dbeafe;
-  border-color: #1e40af;
   color: #1e40af;
 }
 
