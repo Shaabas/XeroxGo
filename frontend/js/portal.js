@@ -21,7 +21,7 @@
   if (urlKiosk) {
     kioskID = urlKiosk;
   }
-  const devMode = container.dataset.devMode === 'true';
+  const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
   // Rates in paise (Authoritative defaults)
   let bwSimplexPricePaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
@@ -488,33 +488,27 @@
     });
 
     if (cartDocsCount) {
-      let countText = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
-      if (processingCount > 0) {
-        countText += ` (${processingCount} preparing...)`;
-      }
-      cartDocsCount.textContent = countText;
+      cartDocsCount.textContent = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
     }
     if (cartTotalAmount) {
-      cartTotalAmount.textContent = formatRupees(totalCartPaise);
+      if (processingCount > 0) {
+        cartTotalAmount.innerHTML = `<span class="price-loading-dots" role="status" aria-label="Calculating price"><span class="price-dot"></span><span class="price-dot"></span><span class="price-dot"></span></span>`;
+      } else if (readyCount > 0 && totalCartPaise > 0) {
+        cartTotalAmount.textContent = formatRupees(totalCartPaise);
+      } else if (readyCount === 0 && cartItems.length > 0) {
+        cartTotalAmount.textContent = '--';
+      } else {
+        cartTotalAmount.textContent = formatRupees(0);
+      }
     }
 
     if (btnReviewOrder) {
-      if (processingCount > 0) {
-        btnReviewOrder.disabled = true;
-        btnReviewOrder.innerHTML = `<span>Preparing documents (${readyCount}/${cartItems.length})...</span>`;
-      } else if (readyCount === 0) {
-        btnReviewOrder.disabled = true;
-        btnReviewOrder.innerHTML = `
-          <span>Review Order</span>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-        `;
-      } else {
-        btnReviewOrder.disabled = false;
-        btnReviewOrder.innerHTML = `
-          <span>Review Order</span>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-        `;
-      }
+      btnReviewOrder.innerHTML = `
+        <span>Review Order</span>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+      `;
+      const canProceed = processingCount === 0 && readyCount > 0 && totalCartPaise > 0;
+      btnReviewOrder.disabled = !canProceed;
     }
   }
 
@@ -1653,7 +1647,13 @@
 
   // --- View 4: Checkout & Order Submission Implementation ---
   async function submitOrder() {
+    if (btnReviewOrder && btnReviewOrder.disabled) return;
     const readyItems = cartItems.filter(it => it.status === 'ready');
+    const processingItems = cartItems.filter(it => it.status === 'processing');
+    if (processingItems.length > 0) {
+      showCartError('Please wait for all documents to finish preparing.');
+      return;
+    }
     if (readyItems.length === 0) {
       showCartError('Please wait for at least one document to finish preparing.');
       return;
@@ -1759,8 +1759,7 @@
       console.error('Order submission error:', orderErr);
       showCartError(`Could not create order: ${orderErr.message || orderErr}`);
     } finally {
-      btnReviewOrder.disabled = false;
-      btnReviewOrder.innerHTML = originalText;
+      renderCart();
     }
   }
 
@@ -2005,6 +2004,17 @@
 
   // --- Initialization ---
   function init() {
+    if (devMode) {
+      window.__portal = {
+        getCartItems: () => cartItems,
+        setCartItems: (items) => {
+          cartItems.length = 0;
+          items.forEach(it => cartItems.push(it));
+        },
+        renderCart,
+        submitOrder
+      };
+    }
     setupBanner();
     setupPwa();
     setupUploadInputs();

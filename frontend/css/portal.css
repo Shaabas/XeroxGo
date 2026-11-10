@@ -1625,6 +1625,56 @@ body {
   color: var(--text-main);
   line-height: 1.1;
   margin-top: 2px;
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+}
+
+.price-loading-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.price-loading-dots .price-dot {
+  width: 6px;
+  height: 6px;
+  background-color: var(--text-muted);
+  border-radius: 50%;
+  display: inline-block;
+  opacity: 0.25;
+  animation: priceDotPulse 1.2s infinite ease-in-out;
+}
+
+.price-loading-dots .price-dot:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.price-loading-dots .price-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.price-loading-dots .price-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes priceDotPulse {
+  0%, 100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .price-loading-dots .price-dot {
+    animation: none !important;
+    opacity: 0.6;
+  }
 }
 
 .btn-review-order {
@@ -1639,15 +1689,28 @@ body {
   align-items: center;
   gap: 6px;
   cursor: pointer;
-  transition: background-color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 
-.btn-review-order:hover {
+.btn-review-order:hover:not(:disabled) {
   background: var(--primary-blue-hover);
 }
 
-.btn-review-order:active {
+.btn-review-order:active:not(:disabled) {
   background-color: #1e40af;
+}
+
+.btn-review-order:focus-visible {
+  outline: 2px solid var(--primary-blue);
+  outline-offset: 2px;
+}
+
+.btn-review-order:disabled {
+  background-color: #e2e8f0;
+  color: #94a3b8;
+  cursor: not-allowed;
+  pointer-events: none;
+  box-shadow: none;
 }
 
 /* ==========================================================================
