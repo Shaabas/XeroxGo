@@ -1375,7 +1375,7 @@ body {
 .btn-doc-delete {
   color: var(--danger-red);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   background: #ffffff;
   border: 1px solid var(--danger-red);
@@ -1440,7 +1440,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
   transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
@@ -1551,6 +1551,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
   transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
@@ -1571,6 +1572,14 @@ body {
 .btn-doc-retry:focus-visible {
   outline: 2px solid var(--primary-blue);
   outline-offset: 2px;
+}
+
+.btn-doc-delete:disabled,
+.btn-doc-retry:disabled,
+.btn-doc-edit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 .cart-empty-state {
