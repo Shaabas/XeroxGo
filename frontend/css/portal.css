@@ -133,7 +133,7 @@ body {
 }
 
 .btn-primary:active {
-  transform: translateY(1px);
+  background-color: #1e40af;
 }
 
 .btn-outline {
@@ -759,6 +759,21 @@ th {
   .splash-logo {
     animation: none !important;
     transform: none !important;
+  }
+  .pages-dropdown-card,
+  .preview-canvas {
+    animation: none !important;
+    transition: none !important;
+  }
+  .split-option-card,
+  .split-btn-card,
+  .nup-sheet-card,
+  .seat-btn,
+  .btn-select-pill,
+  .btn-review-order,
+  .btn-save-settings,
+  .btn-primary {
+    transition: none !important;
   }
 }
 
@@ -1557,7 +1572,7 @@ body {
   align-items: center;
   gap: 6px;
   cursor: pointer;
-  transition: background-color 0.15s ease, transform 0.1s ease;
+  transition: background-color 0.12s ease;
 }
 
 .btn-review-order:hover {
@@ -1565,7 +1580,7 @@ body {
 }
 
 .btn-review-order:active {
-  transform: scale(0.98);
+  background-color: #1e40af;
 }
 
 /* ==========================================================================
@@ -1794,7 +1809,7 @@ body {
   align-items: center;
   justify-content: space-between;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
   text-align: left;
   box-sizing: border-box;
 }
@@ -1805,8 +1820,12 @@ body {
   }
 }
 
+.split-option-card:active {
+  background: #e0f2fe;
+}
+
 .split-option-card.active {
-  border: 1.5px solid var(--primary-blue);
+  border-color: var(--primary-blue);
   background: var(--primary-blue-light);
 }
 
@@ -2025,7 +2044,7 @@ body {
   cursor: pointer;
   min-height: 58px;
   box-sizing: border-box;
-  transition: all 0.15s ease;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -2034,8 +2053,12 @@ body {
   }
 }
 
+.nup-sheet-card:active {
+  background: #e0f2fe;
+}
+
 .nup-sheet-card.active {
-  border: 1.5px solid var(--primary-blue);
+  border-color: var(--primary-blue);
   background: var(--primary-blue-light);
 }
 
@@ -2128,7 +2151,7 @@ body {
   padding: 0 4px;
   text-align: center;
   white-space: nowrap;
-  transition: all 0.15s ease;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
   outline: none;
   -webkit-tap-highlight-color: transparent;
 }
@@ -2144,8 +2167,12 @@ body {
   }
 }
 
+.split-btn-card:active {
+  background: #e0f2fe;
+}
+
 .split-btn-card.active {
-  border: 1.5px solid var(--primary-blue);
+  border-color: var(--primary-blue);
   background: var(--primary-blue-light);
   color: var(--primary-blue);
 }
@@ -2156,21 +2183,19 @@ body {
 .pages-dropdown-card {
   margin-top: 10px;
   background: #f8fafc;
-  border: 1.5px solid #e2e8f0;
+  border: 1px solid #e2e8f0;
   border-radius: 14px;
   overflow: hidden;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
-  animation: panelSlideFade 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  animation: panelFadeIn 0.15s ease-out;
 }
 
-@keyframes panelSlideFade {
+@keyframes panelFadeIn {
   from {
     opacity: 0;
-    transform: translateY(-4px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
   }
 }
 
@@ -2274,7 +2299,7 @@ body {
   font-weight: 600;
   color: #334155;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
   white-space: nowrap;
   outline: none;
   -webkit-tap-highlight-color: transparent;
@@ -2338,7 +2363,7 @@ body {
   height: 38px;
   min-width: 38px;
   border-radius: 9px;
-  border: 1.5px solid #e2e8f0;
+  border: 1px solid #cbd5e1;
   background: #f8fafc;
   color: #475569;
   font-size: 13.5px;
@@ -2347,7 +2372,7 @@ body {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.12s ease;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
   user-select: none;
   font-variant-numeric: tabular-nums;
   padding: 0;
@@ -2369,7 +2394,7 @@ body {
 }
 
 .seat-btn:active {
-  transform: scale(0.95);
+  background: #e2e8f0;
 }
 
 .seat-btn.active {
@@ -2379,12 +2404,16 @@ body {
   box-shadow: 0 2px 6px rgba(37, 99, 235, 0.28);
 }
 
+.seat-btn.active:active {
+  background: #1d4ed8;
+}
+
 .seat-btn.current-view {
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .seat-btn.active.current-view {
-  font-weight: 700;
+  font-weight: 600;
 }
 
 /* Custom Range Input (legacy support) */
@@ -2441,7 +2470,7 @@ body {
   border: none;
   cursor: pointer;
   box-shadow: 0 4px 14px rgba(37, 99, 235, 0.2);
-  transition: background-color 0.15s ease, transform 0.1s ease;
+  transition: background-color 0.12s ease;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -2451,7 +2480,7 @@ body {
 }
 
 .btn-save-settings:active {
-  transform: scale(0.99);
+  background-color: #1e40af;
 }
 
 /* ==========================================================================
@@ -2633,8 +2662,15 @@ body {
 .side-toggle-btn.active {
   background: #ffffff;
   color: var(--primary-blue);
-  font-weight: 700;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.side-toggle-btn:active {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.side-toggle-btn.active:active {
+  background: #f1f5f9;
 }
 
 @media (min-width: 480px) {
