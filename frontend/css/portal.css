@@ -2696,6 +2696,23 @@ body {
   z-index: 10;
 }
 
+.btn-retry-preview {
+  padding: 6px 14px;
+  background: var(--primary-blue);
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 6px;
+  transition: background-color 0.15s ease;
+}
+
+.btn-retry-preview:hover {
+  background: var(--primary-blue-hover);
+}
+
 .preview-sheet-pager {
   display: flex;
   align-items: center;

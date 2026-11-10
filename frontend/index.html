@@ -195,7 +195,8 @@
             <span>Rendering preview...</span>
           </div>
           <div id="preview-error-box" class="preview-error-box hidden">
-            <p>Preview unavailable</p>
+            <p id="preview-error-msg">Preview unavailable</p>
+            <button type="button" id="btn-retry-preview" class="btn-retry-preview">Retry</button>
           </div>
           <canvas id="preview-canvas" class="preview-canvas" title="Tap sheet to flip"></canvas>
         </div>
@@ -356,20 +357,20 @@
         <div class="settings-section settings-section-last">
           <h3 class="settings-section-title">Pages Per Sheet</h3>
           <div class="settings-grid-4">
-            <button type="button" class="nup-sheet-card active" id="card-nup-1">
+            <button type="button" class="nup-sheet-card active" id="card-nup-1" aria-label="1 page per sheet">
               <div class="nup-sheet-preview preview-1up">
                 <div class="nup-pane-single"></div>
               </div>
               <span class="nup-sheet-label">1 on 1</span>
             </button>
-            <button type="button" class="nup-sheet-card disabled" id="card-nup-2" title="2 on 1 layout not yet available">
+            <button type="button" class="nup-sheet-card" id="card-nup-2" aria-label="2 pages per sheet">
               <div class="nup-sheet-preview preview-2up">
                 <div class="nup-pane"></div>
                 <div class="nup-pane"></div>
               </div>
               <span class="nup-sheet-label">2 on 1</span>
             </button>
-            <button type="button" class="nup-sheet-card disabled" title="4 on 1 layout not yet available">
+            <button type="button" class="nup-sheet-card" id="card-nup-4" aria-label="4 pages per sheet">
               <div class="nup-sheet-preview preview-4up">
                 <div class="nup-pane"></div>
                 <div class="nup-pane"></div>
@@ -378,7 +379,7 @@
               </div>
               <span class="nup-sheet-label">4 on 1</span>
             </button>
-            <button type="button" class="nup-sheet-card disabled" title="6 on 1 layout not yet available">
+            <button type="button" class="nup-sheet-card" id="card-nup-6" aria-label="6 pages per sheet">
               <div class="nup-sheet-preview preview-6up">
                 <div class="nup-pane"></div>
                 <div class="nup-pane"></div>
