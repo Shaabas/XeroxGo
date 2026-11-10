@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -530,5 +532,333 @@ func TestNormalizeAndCountWithOptions_CustomRangeSelection(t *testing.T) {
 	}
 	if !strings.Contains(errInvalid.Error(), "exceeds document page count") {
 		t.Errorf("expected out-of-bounds error message, got: %v", errInvalid)
+	}
+}
+
+func generateMultiPagePDF(t *testing.T, dir string, pageCount int, mixedOrientation bool) string {
+	t.Helper()
+
+	psPath := filepath.Join(dir, fmt.Sprintf("fixture_%d_pages.ps", pageCount))
+	pdfPath := filepath.Join(dir, fmt.Sprintf("fixture_%d_pages.pdf", pageCount))
+
+	var sb strings.Builder
+	sb.WriteString("%!PS\n")
+	for p := 1; p <= pageCount; p++ {
+		if mixedOrientation && p%2 == 0 {
+			sb.WriteString("<< /PageSize [842 595] >> setpagedevice\n")
+			sb.WriteString("/Helvetica findfont 36 scalefont setfont\n")
+			sb.WriteString("100 400 moveto\n")
+			fmt.Fprintf(&sb, "(Content of Page %d Landscape) show\n", p)
+		} else {
+			sb.WriteString("<< /PageSize [595 842] >> setpagedevice\n")
+			sb.WriteString("/Helvetica findfont 36 scalefont setfont\n")
+			sb.WriteString("100 700 moveto\n")
+			fmt.Fprintf(&sb, "(Content of Page %d Portrait) show\n", p)
+		}
+		sb.WriteString("showpage\n")
+	}
+
+	if err := os.WriteFile(psPath, []byte(sb.String()), 0600); err != nil {
+		t.Fatalf("failed to write PostScript fixture: %v", err)
+	}
+
+	cmd := exec.Command("gs",
+		"-sDEVICE=pdfwrite",
+		"-dNOPAUSE",
+		"-dBATCH",
+		"-dQUIET",
+		"-sOutputFile="+pdfPath,
+		psPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to generate %d-page fixture PDF: %s: %v", pageCount, strings.TrimSpace(string(out)), err)
+	}
+
+	return pdfPath
+}
+
+func extractPageText(t *testing.T, pdfPath string, pageNum int) string {
+	t.Helper()
+	cmd := exec.Command("pdftotext", "-f", fmt.Sprintf("%d", pageNum), "-l", fmt.Sprintf("%d", pageNum), pdfPath, "-")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pdftotext failed for page %d: %s: %v", pageNum, strings.TrimSpace(string(out)), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func extractPageDimensions(t *testing.T, pdfPath string, pageNum int) (float64, float64) {
+	t.Helper()
+	cmd := exec.Command("pdfinfo", "-f", fmt.Sprintf("%d", pageNum), "-l", fmt.Sprintf("%d", pageNum), pdfPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pdfinfo failed for page %d: %s: %v", pageNum, strings.TrimSpace(string(out)), err)
+	}
+	lines := strings.Split(string(out), "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "Page") && strings.Contains(l, "size:") {
+			parts := strings.Fields(l)
+			for i, p := range parts {
+				if p == "size:" && i+3 < len(parts) {
+					w, errW := strconv.ParseFloat(parts[i+1], 64)
+					h, errH := strconv.ParseFloat(parts[i+3], 64)
+					if errW == nil && errH == nil {
+						return w, h
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("unable to parse page dimensions from pdfinfo output for page %d:\n%s", pageNum, string(out))
+	return 0, 0
+}
+
+func TestNormalize_NUp1_Orientation(t *testing.T) {
+	tmpDir := t.TempDir()
+	inputPDF := generateMultiPagePDF(t, tmpDir, 2, false)
+	ctx := context.Background()
+
+	// 1. Explicit Portrait orientation
+	outPortrait := filepath.Join(tmpDir, "out_1up_portrait.pdf")
+	resPort, err := NormalizeAndCountWithOptions(ctx, inputPDF, outPortrait, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 1,
+		Orientation:   "PORTRAIT",
+	})
+	if err != nil {
+		t.Fatalf("1-up Portrait normalization failed: %v", err)
+	}
+	if resPort.TotalPages != 2 || resPort.TotalSheets != 2 {
+		t.Errorf("1-up Portrait: TotalPages=%d, TotalSheets=%d (want 2, 2)", resPort.TotalPages, resPort.TotalSheets)
+	}
+	wP, hP := extractPageDimensions(t, outPortrait, 1)
+	if wP > hP {
+		t.Errorf("expected portrait dimensions (width < height), got width=%.2f, height=%.2f", wP, hP)
+	}
+
+	// 2. Explicit Landscape orientation
+	outLandscape := filepath.Join(tmpDir, "out_1up_landscape.pdf")
+	resLand, err := NormalizeAndCountWithOptions(ctx, inputPDF, outLandscape, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 1,
+		Orientation:   "LANDSCAPE",
+	})
+	if err != nil {
+		t.Fatalf("1-up Landscape normalization failed: %v", err)
+	}
+	if resLand.TotalPages != 2 || resLand.TotalSheets != 2 {
+		t.Errorf("1-up Landscape: TotalPages=%d, TotalSheets=%d (want 2, 2)", resLand.TotalPages, resLand.TotalSheets)
+	}
+	wL, hL := extractPageDimensions(t, outLandscape, 1)
+	if wL < hL {
+		t.Errorf("expected landscape dimensions (width > height), got width=%.2f, height=%.2f", wL, hL)
+	}
+}
+
+func TestNormalize_NUp2_SimplexAndDuplex(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := context.Background()
+
+	// 8-page document in 2-up Simplex
+	// 8 content pages / 2-up = 4 output pages, 4 sheets
+	input8 := generateMultiPagePDF(t, tmpDir, 8, false)
+	out8Simplex := filepath.Join(tmpDir, "out_8p_2up_simplex.pdf")
+	res8Simp, err := NormalizeAndCountWithOptions(ctx, input8, out8Simplex, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 2,
+	})
+	if err != nil {
+		t.Fatalf("8-page 2-up simplex failed: %v", err)
+	}
+	if res8Simp.TotalPages != 4 {
+		t.Errorf("TotalPages = %d, want 4", res8Simp.TotalPages)
+	}
+	if res8Simp.TotalSheets != 4 {
+		t.Errorf("TotalSheets = %d, want 4", res8Simp.TotalSheets)
+	}
+
+	// Verify Sheet 1 contains Page 1 and Page 2
+	sheet1Text := extractPageText(t, out8Simplex, 1)
+	if !strings.Contains(sheet1Text, "Page 1") || !strings.Contains(sheet1Text, "Page 2") {
+		t.Errorf("Sheet 1 text missing Page 1 or Page 2, got: %q", sheet1Text)
+	}
+	// Verify Sheet 2 contains Page 3 and Page 4
+	sheet2Text := extractPageText(t, out8Simplex, 2)
+	if !strings.Contains(sheet2Text, "Page 3") || !strings.Contains(sheet2Text, "Page 4") {
+		t.Errorf("Sheet 2 text missing Page 3 or Page 4, got: %q", sheet2Text)
+	}
+
+	// 5-page document in 2-up Duplex
+	// 5 content pages / 2-up = 3 content sheet sides
+	// Duplex with odd content sides (3) requires 1 blank padding page -> 4 total pages in PDF, 2 physical sheets
+	input5 := generateMultiPagePDF(t, tmpDir, 5, false)
+	out5Duplex := filepath.Join(tmpDir, "out_5p_2up_duplex.pdf")
+	res5Dup, err := NormalizeAndCountWithOptions(ctx, input5, out5Duplex, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexLongEdge,
+		PagesPerSheet: 2,
+	})
+	if err != nil {
+		t.Fatalf("5-page 2-up duplex failed: %v", err)
+	}
+	if res5Dup.TotalPages != 3 {
+		t.Errorf("TotalPages = %d, want 3", res5Dup.TotalPages)
+	}
+	if res5Dup.TotalSheets != 2 {
+		t.Errorf("TotalSheets = %d, want 2 physical sheets", res5Dup.TotalSheets)
+	}
+	if res5Dup.PaddedPages != 4 {
+		t.Errorf("PaddedPages = %d, want 4 (3 content + 1 blank padding)", res5Dup.PaddedPages)
+	}
+
+	// Check Sheet 3 has Page 5
+	sheet3Text := extractPageText(t, out5Duplex, 3)
+	if !strings.Contains(sheet3Text, "Page 5") {
+		t.Errorf("Sheet 3 text missing Page 5, got: %q", sheet3Text)
+	}
+	// Check Sheet 4 is blank padding
+	sheet4Text := extractPageText(t, out5Duplex, 4)
+	if sheet4Text != "" {
+		t.Errorf("Sheet 4 should be blank duplex padding, got: %q", sheet4Text)
+	}
+}
+
+func TestNormalize_NUp4_SimplexAndDuplex(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := context.Background()
+
+	// 8-page document in 4-up Simplex
+	// 8 content pages / 4-up = 2 output pages, 2 sheets
+	input8 := generateMultiPagePDF(t, tmpDir, 8, false)
+	out8 := filepath.Join(tmpDir, "out_8p_4up.pdf")
+	res8, err := NormalizeAndCountWithOptions(ctx, input8, out8, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 4,
+	})
+	if err != nil {
+		t.Fatalf("8-page 4-up failed: %v", err)
+	}
+	if res8.TotalPages != 2 || res8.TotalSheets != 2 {
+		t.Errorf("TotalPages=%d, TotalSheets=%d, want 2, 2", res8.TotalPages, res8.TotalSheets)
+	}
+
+	// Sheet 1 must contain Page 1, 2, 3, 4
+	s1 := extractPageText(t, out8, 1)
+	for p := 1; p <= 4; p++ {
+		if !strings.Contains(s1, fmt.Sprintf("Page %d", p)) {
+			t.Errorf("Sheet 1 missing Page %d, got: %q", p, s1)
+		}
+	}
+	// Sheet 2 must contain Page 5, 6, 7, 8
+	s2 := extractPageText(t, out8, 2)
+	for p := 5; p <= 8; p++ {
+		if !strings.Contains(s2, fmt.Sprintf("Page %d", p)) {
+			t.Errorf("Sheet 2 missing Page %d, got: %q", p, s2)
+		}
+	}
+}
+
+func TestNormalize_NUp6_Simplex(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := context.Background()
+
+	// 12-page document in 6-up Simplex
+	// 12 content pages / 6-up = 2 output pages, 2 sheets
+	input12 := generateMultiPagePDF(t, tmpDir, 12, false)
+	out12 := filepath.Join(tmpDir, "out_12p_6up.pdf")
+	res12, err := NormalizeAndCountWithOptions(ctx, input12, out12, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 6,
+	})
+	if err != nil {
+		t.Fatalf("12-page 6-up failed: %v", err)
+	}
+	if res12.TotalPages != 2 || res12.TotalSheets != 2 {
+		t.Errorf("TotalPages=%d, TotalSheets=%d, want 2, 2", res12.TotalPages, res12.TotalSheets)
+	}
+
+	// Sheet 1 must contain Page 1..6
+	s1 := extractPageText(t, out12, 1)
+	for p := 1; p <= 6; p++ {
+		if !strings.Contains(s1, fmt.Sprintf("Page %d", p)) {
+			t.Errorf("Sheet 1 missing Page %d, got: %q", p, s1)
+		}
+	}
+	// Sheet 2 must contain Page 7..12
+	s2 := extractPageText(t, out12, 2)
+	for p := 7; p <= 12; p++ {
+		if !strings.Contains(s2, fmt.Sprintf("Page %d", p)) {
+			t.Errorf("Sheet 2 missing Page %d, got: %q", p, s2)
+		}
+	}
+}
+
+func TestNormalize_MixedOrientationInput(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := context.Background()
+
+	// 6-page document with alternating Portrait and Landscape pages
+	mixedPDF := generateMultiPagePDF(t, tmpDir, 6, true)
+	outMixed := filepath.Join(tmpDir, "out_mixed_2up.pdf")
+
+	resMixed, err := NormalizeAndCountWithOptions(ctx, mixedPDF, outMixed, NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 2,
+	})
+	if err != nil {
+		t.Fatalf("Mixed orientation 2-up failed: %v", err)
+	}
+	if resMixed.TotalPages != 3 || resMixed.TotalSheets != 3 {
+		t.Errorf("TotalPages=%d, TotalSheets=%d, want 3, 3", resMixed.TotalPages, resMixed.TotalSheets)
+	}
+
+	// Check text of Sheet 1: has Page 1 (portrait) and Page 2 (landscape)
+	s1 := extractPageText(t, outMixed, 1)
+	if !strings.Contains(s1, "Page 1") || !strings.Contains(s1, "Page 2") {
+		t.Errorf("Sheet 1 missing Page 1 or Page 2, got: %q", s1)
+	}
+}
+
+func TestNormalize_InvalidNUpAndOrientation(t *testing.T) {
+	tmpDir := t.TempDir()
+	inputPDF := generateMultiPagePDF(t, tmpDir, 4, false)
+	ctx := context.Background()
+
+	// Invalid N-up (3 on 1)
+	_, err3 := NormalizeAndCountWithOptions(ctx, inputPDF, filepath.Join(tmpDir, "out3.pdf"), NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 3,
+	})
+	if err3 == nil || !strings.Contains(err3.Error(), "invalid pages_per_sheet") {
+		t.Errorf("expected error for N-up=3, got: %v", err3)
+	}
+
+	// Invalid N-up (5 on 1)
+	_, err5 := NormalizeAndCountWithOptions(ctx, inputPDF, filepath.Join(tmpDir, "out5.pdf"), NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 5,
+	})
+	if err5 == nil || !strings.Contains(err5.Error(), "invalid pages_per_sheet") {
+		t.Errorf("expected error for N-up=5, got: %v", err5)
+	}
+
+	// Invalid orientation ("DIAGONAL")
+	_, errOrient := NormalizeAndCountWithOptions(ctx, inputPDF, filepath.Join(tmpDir, "out_diag.pdf"), NormalizeOptions{
+		Copies:        1,
+		Duplex:        contracts.DuplexSimplex,
+		PagesPerSheet: 1,
+		Orientation:   "DIAGONAL",
+	})
+	if errOrient == nil || !strings.Contains(errOrient.Error(), "invalid orientation") {
+		t.Errorf("expected error for Orientation=DIAGONAL, got: %v", errOrient)
 	}
 }

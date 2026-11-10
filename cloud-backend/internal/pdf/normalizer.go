@@ -26,10 +26,121 @@ type NormalizedResult struct {
 
 // NormalizeOptions specifies the parameters for normalizing a PDF print job.
 type NormalizeOptions struct {
-	Copies    int
-	Duplex    contracts.DuplexMode
-	ColorMode string
-	PageRange string
+	Copies        int
+	Duplex        contracts.DuplexMode
+	ColorMode     string
+	PageRange     string
+	Orientation   string // "AUTO", "PORTRAIT", "LANDSCAPE" (defaults to "AUTO")
+	PagesPerSheet int    // 1, 2, 4, 6 (defaults to 1 if <= 0)
+}
+
+var pdfToPDFCandidates = []string{
+	"/usr/lib/cups/filter/pdftopdf",
+	"/usr/libexec/cups/filter/pdftopdf",
+	"pdftopdf",
+}
+
+// FindPDFToPDF locates the pdftopdf filter executable on the host system.
+func FindPDFToPDF() (string, error) {
+	for _, c := range pdfToPDFCandidates {
+		if filepath.IsAbs(c) {
+			if info, err := os.Stat(c); err == nil && !info.IsDir() {
+				return c, nil
+			}
+		} else {
+			if p, err := exec.LookPath(c); err == nil {
+				return p, nil
+			}
+		}
+	}
+	return "", errors.New("pdftopdf executable not found in standard CUPS filter locations")
+}
+
+// isPDFLandscape inspects the first page of the PDF to determine if its orientation is landscape (width > height).
+func isPDFLandscape(ctx context.Context, pdfPath string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "pdfinfo", "-f", "1", "-l", "1", pdfPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("pdfinfo failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	lines := strings.Split(string(out), "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "Page") && strings.Contains(l, "size:") {
+			parts := strings.Fields(l)
+			for i, p := range parts {
+				if p == "size:" && i+3 < len(parts) {
+					w, errW := strconv.ParseFloat(parts[i+1], 64)
+					h, errH := strconv.ParseFloat(parts[i+3], 64)
+					if errW == nil && errH == nil {
+						return w > h, nil
+					}
+				}
+			}
+		}
+	}
+	return false, errors.New("unable to determine page size from pdfinfo")
+}
+
+// ImposePDF executes N-up imposition and orientation normalization on an input PDF using pdftopdf.
+// Supported N-up values: 1, 2, 4, 6.
+// Supported orientations: "AUTO", "PORTRAIT", "LANDSCAPE".
+func ImposePDF(ctx context.Context, inputPath, outputPath string, nup int, orientation string) error {
+	if ctx == nil {
+		return errors.New("context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if nup <= 0 {
+		nup = 1
+	}
+	if nup != 1 && nup != 2 && nup != 4 && nup != 6 {
+		return fmt.Errorf("invalid pages_per_sheet %d: only 1, 2, 4, and 6 are supported", nup)
+	}
+
+	orientation = strings.ToUpper(strings.TrimSpace(orientation))
+	if orientation == "" {
+		orientation = "AUTO"
+	}
+	if orientation != "AUTO" && orientation != "PORTRAIT" && orientation != "LANDSCAPE" {
+		return fmt.Errorf("invalid orientation %q: only AUTO, PORTRAIT, and LANDSCAPE are supported", orientation)
+	}
+
+	bin, err := FindPDFToPDF()
+	if err != nil {
+		return fmt.Errorf("pdftopdf required for imposition: %w", err)
+	}
+
+	optsSlice := []string{"media=A4", fmt.Sprintf("number-up=%d", nup)}
+	switch orientation {
+	case "LANDSCAPE":
+		optsSlice = append(optsSlice, "orientation-requested=4")
+	case "PORTRAIT":
+		optsSlice = append(optsSlice, "orientation-requested=3")
+	}
+	optionsStr := strings.Join(optsSlice, " ")
+
+	outFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create imposition output file: %w", err)
+	}
+	defer outFile.Close()
+
+	// pdftopdf <job-id> <user> <title> <copies> "<options>" [filename]
+	cmd := exec.CommandContext(ctx, bin, "1", "xeroxgo", "imposition", "1", optionsStr, inputPath)
+	cmd.Stdout = outFile
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("pdftopdf imposition failed: %s: %w", strings.TrimSpace(errBuf.String()), err)
+	}
+
+	return nil
 }
 
 // ParsePageRange parses and validates custom page ranges like "1-5", "1,3,5", "1-3,7"
@@ -200,6 +311,22 @@ func NormalizeAndCountWithOptions(
 		return nil, fmt.Errorf("copies must be at least 1, got %d", opts.Copies)
 	}
 
+	nup := opts.PagesPerSheet
+	if nup <= 0 {
+		nup = 1
+	}
+	if nup != 1 && nup != 2 && nup != 4 && nup != 6 {
+		return nil, fmt.Errorf("invalid pages_per_sheet %d: only 1, 2, 4, and 6 are supported", nup)
+	}
+
+	orientation := strings.ToUpper(strings.TrimSpace(opts.Orientation))
+	if orientation == "" {
+		orientation = "AUTO"
+	}
+	if orientation != "AUTO" && orientation != "PORTRAIT" && orientation != "LANDSCAPE" {
+		return nil, fmt.Errorf("invalid orientation %q: only AUTO, PORTRAIT, and LANDSCAPE are supported", opts.Orientation)
+	}
+
 	switch opts.Duplex {
 	case contracts.DuplexSimplex, contracts.DuplexLongEdge, contracts.DuplexShortEdge:
 	default:
@@ -322,12 +449,50 @@ func NormalizeAndCountWithOptions(
 		contentPages = len(selectedPages)
 	}
 
-	// Step 5: Determine duplex blank padding requirement
-	// In duplex mode, odd-page documents must end on an even boundary so that
-	// subsequent copies begin on a fresh physical sheet and the last sheet has a blank back.
-	needsDuplexPadding := (opts.Duplex != contracts.DuplexSimplex) && (contentPages%2 != 0)
+	// Step 5: Apply N-Up imposition and explicit orientation if requested
+	imposedSides := contentPages
+	if nup > 1 || orientation != "AUTO" {
+		tmpImposed, err := os.CreateTemp("", "xeroxgo_imposed_*.pdf")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp file for imposition: %w", err)
+		}
+		tmpImposedName := tmpImposed.Name()
+		_ = tmpImposed.Close()
+		defer os.Remove(tmpImposedName)
 
-	// Step 6: Normalize the PDF with Ghostscript
+		if err := ImposePDF(ctx, workingInputPath, tmpImposedName, nup, orientation); err != nil {
+			return nil, fmt.Errorf("imposition failed: %w", err)
+		}
+
+		// Count pages of imposed PDF
+		cmdImposedPages := exec.CommandContext(ctx, "qpdf", "--show-npages", tmpImposedName)
+		outImposedPages, errImposedPages := cmdImposedPages.CombinedOutput()
+		if errImposedPages != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("failed to count pages of imposed PDF: %s: %w", strings.TrimSpace(string(outImposedPages)), errImposedPages)
+		}
+		actualImposedPages, err := strconv.Atoi(strings.TrimSpace(string(outImposedPages)))
+		if err != nil || actualImposedPages <= 0 {
+			return nil, fmt.Errorf("invalid imposed page count %q: %w", strings.TrimSpace(string(outImposedPages)), err)
+		}
+
+		expectedImposedPages := int(math.Ceil(float64(contentPages) / float64(nup)))
+		if actualImposedPages != expectedImposedPages {
+			return nil, fmt.Errorf("imposed page count mismatch: expected %d (from %d content pages / %d-up), got %d", expectedImposedPages, contentPages, nup, actualImposedPages)
+		}
+
+		workingInputPath = tmpImposedName
+		imposedSides = actualImposedPages
+	}
+
+	// Step 6: Determine duplex blank padding requirement
+	// In duplex mode, odd-page imposed sheets must end on an even boundary so that
+	// subsequent copies begin on a fresh physical sheet and the last sheet has a blank back.
+	needsDuplexPadding := (opts.Duplex != contracts.DuplexSimplex) && (imposedSides%2 != 0)
+
+	// Step 7: Normalize the PDF with Ghostscript
 	colorStrategy := "-sColorConversionStrategy=Gray"
 	processModel := "-dProcessColorModel=/DeviceGray"
 	if strings.ToUpper(strings.TrimSpace(opts.ColorMode)) == "COLOR" {
@@ -342,15 +507,37 @@ func NormalizeAndCountWithOptions(
 		"-dPDFSETTINGS=/prepress",
 		colorStrategy,
 		processModel,
-		"-sPAPERSIZE=a4",
-		"-dFIXEDMEDIA",
-		"-dPDFFitPage",
+	}
+
+	isLandscape := false
+	if nup > 1 || orientation != "AUTO" {
+		if land, err := isPDFLandscape(ctx, workingInputPath); err == nil {
+			isLandscape = land
+		}
+	}
+
+	if isLandscape {
+		gsArgs = append(gsArgs,
+			"-dDEVICEWIDTHPOINTS=842",
+			"-dDEVICEHEIGHTPOINTS=595",
+			"-dFIXEDMEDIA",
+			"-dPDFFitPage",
+		)
+	} else {
+		gsArgs = append(gsArgs,
+			"-sPAPERSIZE=a4",
+			"-dFIXEDMEDIA",
+			"-dPDFFitPage",
+		)
+	}
+
+	gsArgs = append(gsArgs,
 		"-dNOPAUSE",
 		"-dQUIET",
 		"-dBATCH",
-		"-sOutputFile=" + outputPath,
+		"-sOutputFile="+outputPath,
 		workingInputPath,
-	}
+	)
 	if needsDuplexPadding {
 		gsArgs = append(gsArgs, "-c", "showpage")
 	}
@@ -364,7 +551,7 @@ func NormalizeAndCountWithOptions(
 		return nil, fmt.Errorf("ghostscript normalization failed: %s: %w", strings.TrimSpace(string(outGS)), errGS)
 	}
 
-	// Step 7: Verify output page count
+	// Step 8: Verify output page count
 	cmdPages := exec.CommandContext(ctx, "qpdf", "--show-npages", outputPath)
 	var stdoutPages, stderrPages strings.Builder
 	cmdPages.Stdout = &stdoutPages
@@ -381,7 +568,7 @@ func NormalizeAndCountWithOptions(
 		return nil, fmt.Errorf("failed to parse normalized page count %q: %w", stdoutPages.String(), err)
 	}
 
-	expectedOutputPages := contentPages
+	expectedOutputPages := imposedSides
 	if needsDuplexPadding {
 		expectedOutputPages++
 	}
@@ -389,13 +576,13 @@ func NormalizeAndCountWithOptions(
 		return nil, fmt.Errorf("normalized page count mismatch: expected %d, got %d", expectedOutputPages, actualOutputPages)
 	}
 
-	// Step 8: Calculate physical sheets
+	// Step 9: Calculate physical sheets
 	var sheetsPerCopy int
 	switch opts.Duplex {
 	case contracts.DuplexSimplex:
-		sheetsPerCopy = contentPages
+		sheetsPerCopy = imposedSides
 	case contracts.DuplexLongEdge, contracts.DuplexShortEdge:
-		sheetsPerCopy = contentPages/2 + contentPages%2
+		sheetsPerCopy = imposedSides/2 + imposedSides%2
 	}
 
 	if opts.Copies > 0 && sheetsPerCopy > math.MaxInt/opts.Copies {
@@ -403,7 +590,7 @@ func NormalizeAndCountWithOptions(
 	}
 	totalSheets := sheetsPerCopy * opts.Copies
 
-	// Step 9: Compute the SHA-256 checksum of the normalized output file
+	// Step 10: Compute the SHA-256 checksum of the normalized output file
 	f, err := os.Open(outputPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open normalized output file for checksum: %w", err)
@@ -420,9 +607,9 @@ func NormalizeAndCountWithOptions(
 
 	checksum := hex.EncodeToString(h.Sum(nil))
 
-	// Step 10: Return the authoritative result
+	// Step 11: Return the authoritative result
 	return &NormalizedResult{
-		TotalPages:     contentPages,
+		TotalPages:     imposedSides,
 		TotalSheets:    totalSheets,
 		PaddedPages:    actualOutputPages,
 		SHA256Checksum: checksum,

@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/xeroxgo-cloud ./c
 # Minimal runtime image
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata qpdf ghostscript libreoffice ttf-dejavu font-noto
+RUN apk add --no-cache ca-certificates tzdata qpdf ghostscript libreoffice ttf-dejavu font-noto cups-filters poppler-utils
 
 WORKDIR /app
 
