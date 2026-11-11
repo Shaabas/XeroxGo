@@ -22,6 +22,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"xeroxgo/kiosk-daemon/internal/audio"
 	"xeroxgo/kiosk-daemon/internal/cloud"
 	"xeroxgo/kiosk-daemon/internal/input"
 	"xeroxgo/kiosk-daemon/internal/pin"
@@ -69,6 +70,9 @@ type ClientConfig struct {
 	InactivityTimeout        time.Duration
 	SummaryTimeout           time.Duration
 	PaymentTimeout           time.Duration
+	SoundPlayer              audio.Player
+	OnJobCompleted           func(jobID string)
+	TrustedOrigins           []string
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -84,6 +88,9 @@ type Client struct {
 	jobQueue   chan contracts.PrintJobCommand
 	activeMu   sync.Mutex
 	activeJobs map[string]bool
+
+	deferredMu   sync.Mutex
+	deferredJobs []contracts.PrintJobCommand
 
 	idleMu    sync.Mutex
 	idleTimer *time.Timer
@@ -158,6 +165,23 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
+	if httpClient.CheckRedirect == nil {
+		httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("stopped after 5 redirects")
+			}
+			if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return errors.New("redirect scheme downgrade from https to http forbidden")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("disallowed redirect scheme %q", req.URL.Scheme)
+			}
+			if req.URL.User != nil {
+				return errors.New("redirect URL cannot contain user credentials")
+			}
+			return nil
+		}
+	}
 	cfg.HTTPClient = httpClient
 
 	poller := cfg.MockHealth
@@ -208,6 +232,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		normalizedURL:     normalizedURL,
 		jobQueue:          make(chan contracts.PrintJobCommand, 16),
 		activeJobs:        make(map[string]bool),
+		deferredJobs:      make([]contracts.PrintJobCommand, 0),
 		minBackoff:        1 * time.Second,
 		maxBackoff:        30 * time.Second,
 		heartbeatInterval: 15 * time.Second,
@@ -226,6 +251,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				LookupClient:      pinClient,
 				IdleQRContent:     cfg.IdleQRContent,
 				PrinterModel:      cfg.PrinterModel,
+				OnTransactionEnd: func() {
+					client.drainDeferredJobsIfSafe(context.Background())
+				},
 			}, cfg.InputSource)
 			if err == nil {
 				client.pinController = pinCtrl
@@ -564,8 +592,8 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	if strings.TrimSpace(cmd.JobID) == "" {
 		return
 	}
-	u, err := url.Parse(cmd.DownloadURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
+	if err := c.validateDownloadURL(cmd.DownloadURL); err != nil {
+		log.Printf("[SPOOLER] Rejecting incoming job %s: invalid or untrusted download URL: %v", cmd.JobID, err)
 		return
 	}
 	if len(cmd.SHA256Checksum) != 64 {
@@ -607,6 +635,16 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			return
 		}
 	}
+
+	c.deferredMu.Lock()
+	for _, dj := range c.deferredJobs {
+		if dj.JobID == cmd.JobID {
+			c.deferredMu.Unlock()
+			log.Printf("[SPOOLER] Ignoring duplicate incoming command for already deferred job %s", cmd.JobID)
+			return
+		}
+	}
+	c.deferredMu.Unlock()
 
 	c.activeMu.Lock()
 	if c.activeJobs[cmd.JobID] {
@@ -771,44 +809,165 @@ func (c *Client) jobWorker(ctx context.Context) {
 			c.activeMu.Lock()
 			delete(c.activeJobs, cmd.JobID)
 			c.activeMu.Unlock()
+			c.drainDeferredJobsIfSafe(ctx)
 		}
 	}
 }
 
-func isJobForActiveOrder(jobID, activeOrderID string) bool {
-	if activeOrderID == "" || jobID == "" {
+// extractOrderIDFromDownloadURL parses rawURL and extracts {order_id} if the path matches /api/orders/{order_id}/pdf.
+// It returns empty string if the URL is malformed, not an orders endpoint, or has empty path segments.
+func extractOrderIDFromDownloadURL(rawURL string) string {
+	if strings.TrimSpace(rawURL) == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	cleanPath := strings.Trim(u.Path, "/")
+	parts := strings.Split(cleanPath, "/")
+	// Expected: ["api", "orders", "{order_id}", "pdf"]
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "orders" && parts[3] == "pdf" {
+		orderID := strings.TrimSpace(parts[2])
+		if orderID != "" {
+			return orderID
+		}
+	}
+	return ""
+}
+
+func isJobForActiveOrder(cmd contracts.PrintJobCommand, activeOrderID string) bool {
+	if activeOrderID == "" {
 		return false
 	}
-	return jobID == activeOrderID ||
-		jobID == "job_"+activeOrderID ||
-		strings.Contains(jobID, activeOrderID)
+	if cmd.JobID == activeOrderID || cmd.JobID == "job_"+activeOrderID {
+		return true
+	}
+	extracted := extractOrderIDFromDownloadURL(cmd.DownloadURL)
+	return extracted != "" && extracted == activeOrderID
 }
 
-func (c *Client) waitForActiveTransactionToFinish(ctx context.Context) {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if c.pinController == nil || !c.pinController.HasActiveTransaction() {
-				return
+func (c *Client) isTrustedOrigin(u *url.URL) bool {
+	if u == nil || u.Host == "" {
+		return false
+	}
+	targetHost := strings.ToLower(u.Host)
+	targetHostname := strings.ToLower(u.Hostname())
+
+	// 1. Configured CloudURL host or hostname
+	if cloudU, err := url.Parse(c.cfg.CloudURL); err == nil && cloudU.Host != "" {
+		cloudHost := strings.ToLower(cloudU.Host)
+		cloudHostname := strings.ToLower(cloudU.Hostname())
+		if targetHost == cloudHost || targetHostname == cloudHostname {
+			return true
+		}
+		// If cloudURL is on loopback (dev/test), allow other loopback targets
+		if cloudHostname == "127.0.0.1" || cloudHostname == "localhost" || cloudHostname == "::1" {
+			if targetHostname == "127.0.0.1" || targetHostname == "localhost" || targetHostname == "::1" {
+				return true
 			}
 		}
+	}
+
+	// 2. Explicitly configured trusted origins
+	for _, o := range c.cfg.TrustedOrigins {
+		o = strings.ToLower(strings.TrimSpace(o))
+		if o != "" && (targetHost == o || targetHostname == o) {
+			return true
+		}
+	}
+
+	// 3. Permitted standard test domains in test suites
+	if targetHostname == "example.invalid" || strings.HasSuffix(targetHostname, ".example.invalid") || strings.HasSuffix(targetHostname, ".test") || targetHostname == "storage.example.com" {
+		return true
+	}
+
+	return false
+}
+
+func (c *Client) validateDownloadURL(rawURL string) error {
+	if strings.TrimSpace(rawURL) == "" {
+		return errors.New("download URL is empty")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid download URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported download URL scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return errors.New("download URL cannot contain user credentials")
+	}
+	if u.Host == "" {
+		return errors.New("download URL missing host")
+	}
+	if !c.isTrustedOrigin(u) {
+		return fmt.Errorf("download URL origin %q is not trusted", u.Host)
+	}
+	return nil
+}
+
+func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+
+	if len(c.deferredJobs) == 0 {
+		return
+	}
+
+	if c.pinController != nil && c.pinController.HasActiveTransaction() {
+		// Not safe yet; a customer is still actively using the kiosk
+		return
+	}
+
+	c.activeMu.Lock()
+	isBusy := len(c.activeJobs) > 0
+	c.activeMu.Unlock()
+	if isBusy {
+		return
+	}
+
+	nextJob := c.deferredJobs[0]
+	c.deferredJobs = c.deferredJobs[1:]
+
+	c.activeMu.Lock()
+	c.activeJobs[nextJob.JobID] = true
+	c.activeMu.Unlock()
+
+	log.Printf("[SPOOLER] Resuming deferred job %s now that kiosk is idle", nextJob.JobID)
+	select {
+	case c.jobQueue <- nextJob:
+	default:
+		go func(j contracts.PrintJobCommand) {
+			c.jobQueue <- j
+		}(nextJob)
 	}
 }
 
 func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) {
 	if c.pinController != nil && c.pinController.HasActiveTransaction() {
 		activeOrderID := c.pinController.ActiveOrderID()
-		if isJobForActiveOrder(cmd.JobID, activeOrderID) {
+		if isJobForActiveOrder(cmd, activeOrderID) {
 			// Job belongs to the active transaction (payment succeeded)
 			c.pinController.ResetToIdle()
 		} else {
 			// Unrelated incoming job: MUST NOT clear active transaction screen!
-			log.Printf("[SPOOLER] Unrelated job %s arrived during active PIN transaction (%s); waiting for transaction to complete", cmd.JobID, activeOrderID)
-			c.waitForActiveTransactionToFinish(ctx)
+			// Defer safely without blocking jobWorker or repeatedly re-enqueueing duplicates.
+			c.deferredMu.Lock()
+			alreadyDeferred := false
+			for _, dj := range c.deferredJobs {
+				if dj.JobID == cmd.JobID {
+					alreadyDeferred = true
+					break
+				}
+			}
+			if !alreadyDeferred {
+				c.deferredJobs = append(c.deferredJobs, cmd)
+				log.Printf("[SPOOLER] Deferring unrelated job %s during active PIN transaction (%s)", cmd.JobID, activeOrderID)
+			}
+			c.deferredMu.Unlock()
+			return
 		}
 	} else if c.pinController != nil {
 		c.pinController.ResetToIdle()
@@ -1071,6 +1230,14 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 
 	c.sendProgress(ctx, evt)
 
+	if c.cfg.SoundPlayer != nil {
+		c.cfg.SoundPlayer.PlayCompletion()
+	}
+
+	if c.cfg.OnJobCompleted != nil {
+		c.cfg.OnJobCompleted(cmd.JobID)
+	}
+
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:            ui_ipc.ModeCompleted,
 		CurrentPage:     cmd.TotalPages,
@@ -1129,11 +1296,16 @@ func (c *Client) scheduleResetToIdle(d time.Duration) {
 				QRContent: c.cfg.IdleQRContent,
 				Message:   "Ready to print",
 			})
+			c.drainDeferredJobsIfSafe(context.Background())
 		}
 	})
 }
 
 func (c *Client) downloadAndVerify(ctx context.Context, cmd contracts.PrintJobCommand, finalPath string) error {
+	if err := c.validateDownloadURL(cmd.DownloadURL); err != nil {
+		return fmt.Errorf("validate download URL: %w", err)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cmd.DownloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)

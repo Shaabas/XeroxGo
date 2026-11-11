@@ -36,6 +36,7 @@ type Config struct {
 	LookupClient      cloud.PINLookupClient
 	IdleQRContent     string
 	PrinterModel      string
+	OnTransactionEnd  func()
 }
 
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
@@ -46,9 +47,10 @@ type Controller struct {
 	state          State
 	pinBuffer      string
 	pinError       string
-	currentOrder   *cloud.OrderDetails
-	currentSession *cloud.SessionDetails
-	lookupSeq      uint64 // Monotonically increasing sequence to discard stale responses
+	currentOrder     *cloud.OrderDetails
+	currentSession   *cloud.SessionDetails
+	currentQRPayload string
+	lookupSeq        uint64 // Monotonically increasing sequence to discard stale responses
 
 	inactivityTimer *time.Timer
 	stopCountdown   chan struct{}
@@ -187,6 +189,7 @@ func (c *Controller) resetToIdleLocked() {
 	c.pinError = ""
 	c.currentOrder = nil
 	c.currentSession = nil
+	c.currentQRPayload = ""
 
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
 		Mode:         ui_ipc.ModeIdle,
@@ -194,6 +197,11 @@ func (c *Controller) resetToIdleLocked() {
 		Message:      "Ready to print",
 		PrinterModel: c.cfg.PrinterModel,
 	})
+
+	if c.cfg.OnTransactionEnd != nil {
+		onEnd := c.cfg.OnTransactionEnd
+		go onEnd()
+	}
 }
 
 func (c *Controller) eventLoop() {
@@ -309,7 +317,34 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 		}
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
-		log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
+		if c.pinError != "" && c.currentSession != nil {
+			log.Printf("[PIN-CONTROLLER] Retrying payment initiation for session %s", c.currentSession.SessionID)
+			c.pinError = ""
+			c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+			seq := atomic.AddUint64(&c.lookupSeq, 1)
+			sID := c.currentSession.SessionID
+			go func(targetSeq uint64, sessionID string) {
+				initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer initCancel()
+				attempt, pErr := c.cfg.LookupClient.InitiatePayment(initCtx, sessionID)
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
+					return
+				}
+				if pErr != nil {
+					log.Printf("[PIN-CONTROLLER] Retry initiate payment failed: %v", pErr)
+					c.pinError = "Failed to load payment QR. Press Confirm to retry."
+					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+					return
+				}
+				c.currentQRPayload = attempt.QRPayload
+				c.pinError = ""
+				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+			}(seq, sID)
+		} else {
+			log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
+		}
 	}
 }
 
@@ -387,6 +422,7 @@ func (c *Controller) startClaimLocked() {
 
 		c.state = StatePaymentPending
 		c.pinError = ""
+		c.currentQRPayload = ""
 
 		timeoutSec := int(c.cfg.PaymentTimeout.Seconds())
 		if session.SecondsRemaining > 0 && int(session.SecondsRemaining) < timeoutSec {
@@ -398,6 +434,32 @@ func (c *Controller) startClaimLocked() {
 
 		c.renderPaymentPendingLocked(timeoutSec)
 		c.startCountdownLocked(time.Duration(timeoutSec) * time.Second)
+
+		// Asynchronously initiate payment to obtain dynamic payment QR payload
+		sessID := session.SessionID
+		go func(targetSeq uint64, sID string, tSec int) {
+			initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer initCancel()
+
+			attempt, pErr := c.cfg.LookupClient.InitiatePayment(initCtx, sID)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+
+			if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
+				return
+			}
+
+			if pErr != nil {
+				log.Printf("[PIN-CONTROLLER] Failed to initiate payment for session %s: %v", sID, pErr)
+				c.pinError = "Failed to load payment QR. Press Confirm to retry."
+				c.renderPaymentPendingLocked(tSec)
+				return
+			}
+
+			c.currentQRPayload = attempt.QRPayload
+			c.pinError = ""
+			c.renderPaymentPendingLocked(tSec)
+		}(targetSeq, sessID, timeoutSec)
 	}(seq, orderID)
 }
 
@@ -527,6 +589,8 @@ func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
 		Mode:           ui_ipc.ModePaymentPending,
 		OrderSummary:   summary,
 		SessionID:      sessID,
+		QRContent:      c.currentQRPayload,
+		PINError:       c.pinError,
 		TimeoutSeconds: remainingSeconds,
 		PrinterModel:   c.cfg.PrinterModel,
 	})

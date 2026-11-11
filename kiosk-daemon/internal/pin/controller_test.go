@@ -3,6 +3,7 @@ package pin
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ type mockLookupClient struct {
 	releaseFn    func(ctx context.Context, orderID string) error
 	cancelFn     func(ctx context.Context, sessionID string) error
 	getFn        func(ctx context.Context, sessionID string) (*cloud.SessionDetails, error)
+	initiateFn   func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error)
 	calls        int
 	cancelCalls  int
 	releaseCalls int
@@ -99,6 +101,24 @@ func (m *mockLookupClient) GetSession(ctx context.Context, sessionID string) (*c
 		return fn(ctx, sessionID)
 	}
 	return nil, nil
+}
+
+func (m *mockLookupClient) InitiatePayment(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+	m.mu.Lock()
+	fn := m.initiateFn
+	m.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, sessionID)
+	}
+	return &cloud.PaymentAttemptDetails{
+		AttemptID:     "att_mock_001",
+		SessionID:     sessionID,
+		Status:        "PAYMENT_PENDING",
+		AttemptStatus: "CREATED",
+		QRPayload:     "https://test.local/pay/dmo_mock123",
+		AmountPaise:   1800,
+	}, nil
 }
 
 type mockRenderer struct {
@@ -693,6 +713,208 @@ func TestController_PaperShortageAndRetryAfterRefill(t *testing.T) {
 	}
 	if ctrl.GetPINError() != "" {
 		t.Errorf("pinError after success = %q, want empty", ctrl.GetPINError())
+	}
+}
+
+func TestController_InitiatePayment_DynamicQR(t *testing.T) {
+	sim := input.NewSimulatedSource(32)
+	rnd := &mockRenderer{}
+
+	expectedQR := "https://demo.local/pay/dmo_abc123xyz789"
+	client := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:          "ord_qr_test",
+				KioskID:          "kiosk-1",
+				Status:           "PENDING_PAYMENT",
+				TotalPricePaise:  1250,
+				TotalPages:       4,
+				TotalSheets:      2,
+				Copies:           1,
+				Duplex:           "simplex",
+				ColorMode:        "mono",
+				PINExpiresAt:     time.Now().Add(10 * time.Minute).Format(time.RFC3339),
+				SecondsRemaining: 600,
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_qr_123",
+				OrderID:          orderID,
+				KioskID:          "kiosk-1",
+				Status:           "PAYMENT_PENDING",
+				TotalPricePaise:  1250,
+				SecondsRemaining: 300,
+			}, nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID:     "att_qr_123",
+				SessionID:     sessionID,
+				OrderID:       "ord_qr_test",
+				KioskID:       "kiosk-1",
+				Status:        "PAYMENT_PENDING",
+				AttemptStatus: "CREATED",
+				QRPayload:     expectedQR,
+				AmountPaise:   1250,
+				Currency:      "INR",
+			}, nil
+		},
+	}
+
+	ctrl, err := NewController(Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    10 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      client,
+	}, sim)
+	if err != nil {
+		t.Fatalf("failed to create controller: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Enter PIN and submit
+	sim.EmitDigits("8888")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	}
+
+	// 2. Confirm order to transition to StatePaymentPending and initiate payment
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
+	}
+
+	// Wait for async InitiatePayment to deliver QRContent
+	var foundQR bool
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rnd.mu.Lock()
+		for _, s := range rnd.states {
+			if s.Mode == ui_ipc.ModePaymentPending && s.QRContent == expectedQR {
+				foundQR = true
+				break
+			}
+		}
+		rnd.mu.Unlock()
+		if foundQR {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !foundQR {
+		t.Errorf("renderer did not receive expected dynamic QRContent %q in ModePaymentPending", expectedQR)
+	}
+}
+
+func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+
+	readerSrc := input.NewReaderSource(pr)
+	defer readerSrc.Close()
+
+	rnd := &mockRenderer{}
+	mockClient := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			if pin == "4281" {
+				return &cloud.OrderDetails{
+					OrderID:         "ord_ssh_4281",
+					TotalPages:      4,
+					TotalSheets:     2,
+					Copies:          1,
+					Duplex:          "LONG_EDGE",
+					ColorMode:       "MONO",
+					TotalPricePaise: 200,
+				}, nil
+			}
+			return nil, cloud.ErrInvalidOrExpiredPIN
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_ssh_001",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				TotalPricePaise:  200,
+				SecondsRemaining: 300,
+			}, nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID: "att_ssh_001",
+				QRPayload: "https://xeroxgo.demo/pay/tok_ssh",
+			}, nil
+		},
+	}
+
+	cfg := Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		CountdownInterval: 100 * time.Millisecond,
+		PaymentTimeout:    300 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      mockClient,
+		IdleQRContent:     "https://xeroxgo.test/idle",
+		PrinterModel:      "Brother HL-L5210DN",
+	}
+
+	ctrl, err := NewController(cfg, readerSrc)
+	if err != nil {
+		t.Fatalf("NewController failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Simulate user typing "4281\n" over SSH in line-buffered canonical mode
+	go func() {
+		_, _ = pw.Write([]byte("4281\n"))
+	}()
+
+	// Wait for transition to StateOrderSummary
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected state %s after typing 4281\\n, got %s", StateOrderSummary, ctrl.GetState())
+	}
+	if ctrl.ActiveOrderID() != "ord_ssh_4281" {
+		t.Errorf("ActiveOrderID = %q, want ord_ssh_4281", ctrl.ActiveOrderID())
+	}
+
+	// 2. Simulate user pressing Enter (\n) to confirm order summary
+	go func() {
+		_, _ = pw.Write([]byte("\n"))
+	}()
+
+	// Wait for transition to StatePaymentPending
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s after Enter confirmation, got %s", StatePaymentPending, ctrl.GetState())
 	}
 }
 

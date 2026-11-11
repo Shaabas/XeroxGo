@@ -66,10 +66,10 @@ func setupTestAppWithOrder(t *testing.T, kioskID, orderID, pin string, status co
 			app.handleOrderClaim(w, r)
 		case stringsContains(path, "/sessions/") && stringsHasSuffix(path, "/cancel"), stringsHasSuffix(path, "/cancel-session"):
 			app.handleSessionCancel(w, r)
-		case stringsContains(path, "/sessions/"):
-			app.handleGetSession(w, r)
 		case stringsHasSuffix(path, "/initiate-payment"):
 			app.handleInitiatePayment(w, r)
+		case stringsContains(path, "/sessions/"):
+			app.handleGetSession(w, r)
 		default:
 			http.NotFound(w, r)
 		}

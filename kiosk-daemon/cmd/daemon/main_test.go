@@ -14,7 +14,7 @@ func TestMockPrinterShutdownUnblocksListener(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	addr, cleanup, err := startMockPrinter(ctx, tempDir, &wg)
+	addr, cleanup, err := startMockPrinter(ctx, tempDir, &wg, &mockPrinterState{})
 	if err != nil {
 		t.Fatalf("startMockPrinter failed: %v", err)
 	}

@@ -16,13 +16,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"xeroxgo/kiosk-daemon/internal/audio"
 	"xeroxgo/kiosk-daemon/internal/input"
 	"xeroxgo/kiosk-daemon/internal/spooler"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
+	"xeroxgo/kiosk-daemon/internal/viewer"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -78,7 +81,17 @@ func startSystemdWatchdog(ctx context.Context, wg *sync.WaitGroup) {
 	}()
 }
 
-func startMockPrinter(ctx context.Context, downloadDir string, wg *sync.WaitGroup) (string, func(), error) {
+type mockPrinterState struct {
+	failureType      string
+	failureSheet     int
+	failureTriggered atomic.Bool
+}
+
+func startMockPrinter(ctx context.Context, downloadDir string, wg *sync.WaitGroup, mockState *mockPrinterState) (string, func(), error) {
+	if mockState.failureSheet <= 0 && mockState.failureType != "" {
+		mockState.failureTriggered.Store(true)
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to bind mock printer: %w", err)
@@ -99,7 +112,7 @@ func startMockPrinter(ctx context.Context, downloadDir string, wg *sync.WaitGrou
 			if err != nil {
 				return
 			}
-			go handleMockPrinterConn(conn, downloadDir)
+			go handleMockPrinterConn(conn, downloadDir, mockState)
 		}
 	}()
 
@@ -107,8 +120,15 @@ func startMockPrinter(ctx context.Context, downloadDir string, wg *sync.WaitGrou
 }
 
 
-func handleMockPrinterConn(conn net.Conn, downloadDir string) {
+func handleMockPrinterConn(conn net.Conn, downloadDir string, mockState *mockPrinterState) {
 	defer conn.Close()
+
+	failTypeNorm := strings.ToLower(strings.TrimSpace(mockState.failureType))
+	if mockState.failureSheet <= 0 && failTypeNorm != "" {
+		mockState.failureTriggered.Store(true)
+		log.Printf("[MOCK-PRINTER] Immediate failure (%s); aborting connection immediately", failTypeNorm)
+		return
+	}
 
 	var buf bytes.Buffer
 	const maxRead = 300 * 1024 * 1024 // 300 MiB safety bound
@@ -141,34 +161,51 @@ func handleMockPrinterConn(conn net.Conn, downloadDir string) {
 		pdfBytes = streamBytes[pdfStart:]
 	}
 
-	pages := 1
-	rePages := regexp.MustCompile(`/Type\s*/Page[^s]`)
-	matches := rePages.FindAll(pdfBytes, -1)
-	if len(matches) > 0 {
-		pages = len(matches)
-	}
-
-	copies := 1
-	reCopies := regexp.MustCompile(`@PJL\s+SET\s+COPIES\s*=\s*(\d+)`)
-	if m := reCopies.FindSubmatch(streamBytes[:headerIdx]); len(m) > 1 {
-		if c, cerr := strconv.Atoi(string(m[1])); cerr == nil && c > 0 {
-			copies = c
+	// 1. Authoritative sheet count from PJL header
+	totalSheets := 0
+	reSheets := regexp.MustCompile(`@PJL\s+COMMENT\s+XEROXGO\s+TOTAL_SHEETS=(\d+)`)
+	if m := reSheets.FindSubmatch(streamBytes[:headerIdx]); len(m) > 1 {
+		if s, serr := strconv.Atoi(string(m[1])); serr == nil && s > 0 {
+			totalSheets = s
 		}
 	}
 
-	isDuplex := bytes.Contains(streamBytes[:headerIdx], []byte("@PJL SET DUPLEX=ON"))
+	// 2. Safe fallback if comment missing
+	if totalSheets <= 0 {
+		pages := 1
+		rePages := regexp.MustCompile(`/Type\s*/Page[^s]`)
+		matches := rePages.FindAll(pdfBytes, -1)
+		if len(matches) > 0 {
+			pages = len(matches)
+		}
 
-	totalSheets := 0
-	if !isDuplex {
-		totalSheets = pages * copies
-	} else {
-		totalSheets = ((pages + 1) / 2) * copies
-	}
-	if totalSheets < 1 {
-		totalSheets = 1
+		copies := 1
+		reCopies := regexp.MustCompile(`@PJL\s+SET\s+COPIES\s*=\s*(\d+)`)
+		if m := reCopies.FindSubmatch(streamBytes[:headerIdx]); len(m) > 1 {
+			if c, cerr := strconv.Atoi(string(m[1])); cerr == nil && c > 0 {
+				copies = c
+			}
+		}
+
+		isDuplex := bytes.Contains(streamBytes[:headerIdx], []byte("@PJL SET DUPLEX=ON"))
+		if !isDuplex {
+			totalSheets = pages * copies
+		} else {
+			totalSheets = ((pages + 1) / 2) * copies
+		}
+		if totalSheets < 1 {
+			totalSheets = 1
+		}
 	}
 
 	for sheet := 1; sheet <= totalSheets; sheet++ {
+		// Check for mid-job failure injection: trigger failure when sheet exceeds failureSheet
+		if mockState.failureSheet > 0 && sheet > mockState.failureSheet && failTypeNorm != "" {
+			mockState.failureTriggered.Store(true)
+			log.Printf("[MOCK-PRINTER] Injected failure (%s) triggered after sheet %d; aborting connection", failTypeNorm, mockState.failureSheet)
+			return
+		}
+
 		time.Sleep(80 * time.Millisecond)
 		msg := fmt.Sprintf("@PJL USTATUS PAGE\r\n%d\r\n", sheet)
 		if _, werr := conn.Write([]byte(msg)); werr != nil {
@@ -232,6 +269,10 @@ func main() {
 	paymentPendingTimeout := flag.Duration("payment-timeout", 300*time.Second, "Inactivity timeout for payment pending screen before returning to idle")
 	refill := flag.Int("refill", -1, "Reset and calibrate estimated paper tray stock to N sheets (0-250) and exit")
 	simulatedStock := flag.Int("simulated-stock", -1, "Initialize and calibrate estimated paper tray stock to N sheets (0-250) for testing/demo")
+	viewerAddr := flag.String("viewer-addr", "", "HTTP address to serve the live preview browser viewer (e.g. :8081 or 0.0.0.0:8081). If empty, viewer HTTP server is disabled.")
+	enableSound := flag.Bool("enable-sound", true, "Enable sound playback on job completion (degrades gracefully if hardware unavailable)")
+	simulatedFailure := flag.String("simulated-failure", "", "Simulated failure condition: none, paper-empty, jam, offline")
+	simulatedFailureSheet := flag.Int("simulated-failure-sheet", 0, "Sheet number after which to inject simulated failure (0 = fail at start/health)")
 	flag.Parse()
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
@@ -355,23 +396,77 @@ func main() {
 	var mockHealthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	var cleanupMock func()
 
+	soundPlayer := audio.NewPlayer(*enableSound)
+
+	var mockState *mockPrinterState
 	if *mockPrinter {
-		addr, cleanup, err := startMockPrinter(ctx, *downloadDir, &rootWg)
+		mockState = &mockPrinterState{
+			failureType:  *simulatedFailure,
+			failureSheet: *simulatedFailureSheet,
+		}
+		addr, cleanup, err := startMockPrinter(ctx, *downloadDir, &rootWg, mockState)
 		if err != nil {
 			log.Fatalf("Fatal: failed to start mock printer: %v", err)
 		}
 		cleanupMock = cleanup
 		actualPrinterAddr = addr
-		log.Printf("XeroxGo kiosk daemon: mock printer active on %s", actualPrinterAddr)
+		log.Printf("XeroxGo kiosk daemon: mock printer active on %s (simulated failure: %q, sheet: %d)", actualPrinterAddr, *simulatedFailure, *simulatedFailureSheet)
 
 		mockHealthPoller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
-				EstimatedSheets: estimatedSheets,
-				UpdatedAt:       time.Now().UTC(),
+			h := contracts.PrinterHealth{
+				Online:            true,
+				State:             "IDLE",
+				PaperTrayStatus:   "OK",
+				EstimatedSheets:   estimatedSheets,
+				TonerLevelPercent: 95,
+				DrumLifePercent:   98,
+				UpdatedAt:         time.Now().UTC(),
 			}
+
+			if estimatedSheets <= 0 {
+				h.PaperTrayStatus = "EMPTY"
+			} else if estimatedSheets <= 10 {
+				h.PaperTrayStatus = "LOW"
+			}
+
+			if mockState != nil && mockState.failureTriggered.Load() {
+				switch strings.ToLower(strings.TrimSpace(mockState.failureType)) {
+				case "paper-empty":
+					h.PaperTrayStatus = "EMPTY"
+					h.EstimatedSheets = 0
+					h.ErrorMessage = "printer paper tray empty"
+				case "jam":
+					h.State = "ERROR"
+					h.PaperJam = true
+					h.ErrorMessage = "printer has a paper jam"
+				case "offline":
+					h.Online = false
+					h.State = "OFFLINE"
+					h.ErrorMessage = "printer is offline or disconnected"
+				}
+			}
+
+			return h
+		}
+	}
+
+	var viewerServer *viewer.Server
+	if strings.TrimSpace(*viewerAddr) != "" {
+		vServer, vErr := viewer.NewServer(viewer.Config{
+			Addr:        *viewerAddr,
+			PreviewPNG:  *previewPNG,
+			SoundPlayer: soundPlayer,
+			KioskID:     *kioskID,
+		})
+		if vErr != nil {
+			log.Printf("[WARN] Failed to initialize live monitor viewer on %s: %v", *viewerAddr, vErr)
+		} else {
+			viewerServer = vServer
+			rootWg.Add(1)
+			go func() {
+				defer rootWg.Done()
+				vServer.Start(ctx)
+			}()
 		}
 	}
 
@@ -414,6 +509,12 @@ func main() {
 		InactivityTimeout:        *pinInactivityTimeout,
 		SummaryTimeout:           *orderSummaryTimeout,
 		PaymentTimeout:           *paymentPendingTimeout,
+		SoundPlayer:              soundPlayer,
+		OnJobCompleted: func(jobID string) {
+			if viewerServer != nil {
+				viewerServer.NotifyJobCompleted(jobID)
+			}
+		},
 	}
 
 	client, err := spooler.NewClient(clientCfg)

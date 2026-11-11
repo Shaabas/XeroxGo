@@ -131,7 +131,8 @@ func TestRenderOrderSummary(t *testing.T) {
 }
 
 func TestRenderPaymentPending(t *testing.T) {
-	state := ScreenState{
+	// Case 1: Loading state without QR content
+	stateLoading := ScreenState{
 		Mode: ModePaymentPending,
 		OrderSummary: &OrderSummary{
 			OrderID:         "ord_pay_pen_001",
@@ -144,17 +145,46 @@ func TestRenderPaymentPending(t *testing.T) {
 		},
 		SessionID:      "sess_abc123456",
 		TimeoutSeconds: 300,
+		QRContent:      "",
 	}
 
-	img, err := Render(state)
+	imgLoading, err := Render(stateLoading)
 	if err != nil {
-		t.Fatalf("Render(PaymentPending) failed: %v", err)
+		t.Fatalf("Render(PaymentPending, loading) failed: %v", err)
 	}
-	if img == nil {
-		t.Fatalf("Render(PaymentPending) returned nil image")
+	if imgLoading == nil {
+		t.Fatalf("Render(PaymentPending, loading) returned nil image")
 	}
-	if img.Bounds().Dx() != ScreenWidth || img.Bounds().Dy() != ScreenHeight {
-		t.Errorf("expected 1920x1080, got %dx%d", img.Bounds().Dx(), img.Bounds().Dy())
+	if imgLoading.Bounds().Dx() != ScreenWidth || imgLoading.Bounds().Dy() != ScreenHeight {
+		t.Errorf("expected 1920x1080, got %dx%d", imgLoading.Bounds().Dx(), imgLoading.Bounds().Dy())
+	}
+
+	// Case 2: Active state with dynamic checkout QR payload
+	stateQR := ScreenState{
+		Mode: ModePaymentPending,
+		OrderSummary: &OrderSummary{
+			OrderID:         "ord_pay_pen_001",
+			TotalPricePaise: 3500,
+			TotalPages:      10,
+			TotalSheets:     5,
+			Copies:          1,
+			Duplex:          "long_edge",
+			ColorMode:       "color",
+		},
+		SessionID:      "sess_abc123456",
+		TimeoutSeconds: 295,
+		QRContent:      "https://demo.xeroxgo.com/pay/dmo_9876543210fedcba",
+	}
+
+	imgQR, err := Render(stateQR)
+	if err != nil {
+		t.Fatalf("Render(PaymentPending, QR) failed: %v", err)
+	}
+	if imgQR == nil {
+		t.Fatalf("Render(PaymentPending, QR) returned nil image")
+	}
+	if imgQR.Bounds().Dx() != ScreenWidth || imgQR.Bounds().Dy() != ScreenHeight {
+		t.Errorf("expected 1920x1080, got %dx%d", imgQR.Bounds().Dx(), imgQR.Bounds().Dy())
 	}
 }
 

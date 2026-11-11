@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -37,6 +38,7 @@ type serverConfig struct {
 	jobsDir            string
 	pricePerSheetPaise int64
 	devMode            bool
+	demoMode           bool
 	downloadSecret     []byte
 	webhookSecret      []byte
 	kioskSecret        []byte
@@ -60,6 +62,26 @@ func (s *appServer) getPaymentProvider() payments.Provider {
 		secret = string(s.cfg.webhookSecret)
 	}
 	return payments.NewMockProvider(secret)
+}
+
+func (s *appServer) getBaseURL(r *http.Request) string {
+	baseURL := strings.TrimSpace(os.Getenv("XEROXGO_PUBLIC_URL"))
+	if baseURL != "" {
+		return strings.TrimRight(baseURL, "/")
+	}
+	scheme := "https"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS != nil {
+		scheme = "https"
+	} else if s.cfg != nil && s.cfg.devMode && (strings.HasPrefix(r.Host, "127.0.0.1") || strings.HasPrefix(r.Host, "localhost")) {
+		scheme = "http"
+	}
+	host := r.Host
+	if host == "" {
+		host = "127.0.0.1:8080"
+	}
+	return fmt.Sprintf("%s://%s", scheme, host)
 }
 
 func randomHex(bytesLen int) (string, error) {
@@ -1222,6 +1244,10 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		http.Error(w, "payment simulation only available in development mode", http.StatusForbidden)
 		return
 	}
+	if s.cfg.demoMode {
+		http.Error(w, "direct order simulation is disabled in demo mode; use secure /pay/{token} checkout", http.StatusForbidden)
+		return
+	}
 
 	prefix := "/api/orders/"
 	suffix := "/simulate-payment"
@@ -1674,7 +1700,16 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	addr := os.Getenv("XEROXGO_CLOUD_ADDR")
+	demoFlag := flag.Bool("demo-mode", false, "Enable demo mode with simulated QR payments")
+	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
+	flag.Parse()
+
+	demoMode := *demoFlag || os.Getenv("DEMO_MODE") == "1" || strings.ToLower(os.Getenv("DEMO_MODE")) == "true" || os.Getenv("XEROXGO_DEMO_MODE") == "1" || strings.ToLower(os.Getenv("XEROXGO_DEMO_MODE")) == "true"
+
+	addr := strings.TrimSpace(*addrFlag)
+	if addr == "" {
+		addr = os.Getenv("XEROXGO_CLOUD_ADDR")
+	}
 	if addr == "" {
 		if p := os.Getenv("PORT"); p != "" {
 			addr = ":" + p
@@ -1697,6 +1732,9 @@ func main() {
 	}
 
 	devMode := os.Getenv("XEROXGO_DEV_MODE") == "1"
+	if demoMode {
+		devMode = true
+	}
 
 	dlSecretStr := os.Getenv("XEROXGO_DOWNLOAD_SECRET")
 	whSecretStr := os.Getenv("XEROXGO_WEBHOOK_SECRET")
@@ -1774,6 +1812,9 @@ func main() {
 
 	hub := ws.NewHub(storeDB)
 	kioskSecretStr := os.Getenv("XEROXGO_KIOSK_SECRET")
+	if kioskSecretStr == "" && demoMode {
+		kioskSecretStr = "dev_kiosk_secret_32_bytes_long_1234"
+	}
 	var kioskSecretBytes []byte
 	if kioskSecretStr != "" {
 		kioskSecretBytes = []byte(kioskSecretStr)
@@ -1788,6 +1829,7 @@ func main() {
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: pricePaise,
 		devMode:            devMode,
+		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
 		webhookSecret:      []byte(whSecretStr),
 		kioskSecret:        kioskSecretBytes,
@@ -1848,12 +1890,12 @@ func main() {
 			app.handleOrderRelease(w, r)
 		case strings.HasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
-		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/cancel"), strings.HasSuffix(path, "/cancel-session"):
+		case strings.HasSuffix(path, "/initiate-payment"):
+			app.handleInitiatePayment(w, r)
+		case strings.Contains(path, "/sessions/") && (strings.HasSuffix(path, "/cancel") || strings.HasSuffix(path, "/cancel-session")):
 			app.handleSessionCancel(w, r)
 		case strings.Contains(path, "/sessions/"):
 			app.handleGetSession(w, r)
-		case strings.HasSuffix(path, "/initiate-payment"):
-			app.handleInitiatePayment(w, r)
 		case strings.HasSuffix(path, "/refill"):
 			app.handleKioskRefill(w, r)
 		default:
@@ -1884,6 +1926,7 @@ func main() {
 	})
 	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
 	mux.HandleFunc("/ws", hub.ServeHTTP)
+	mux.HandleFunc("/pay/", app.handleDemoPayRoutes)
 
 	// Public Ads API
 	mux.HandleFunc("/api/ads", app.handlePublicAds)
@@ -1960,7 +2003,7 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 				path == "/api/webhooks/razorpay" ||
 				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
 				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
-				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.Contains(path, "/sessions/")))
+				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))

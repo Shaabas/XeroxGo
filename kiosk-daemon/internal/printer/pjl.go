@@ -110,6 +110,13 @@ func buildPJLHeader(cmd contracts.PrintJobCommand) []byte {
 		b.WriteString("@PJL SET BINDING=SHORTEDGE\r\n")
 	}
 
+	if cmd.TotalSheets > 0 {
+		fmt.Fprintf(&b, "@PJL COMMENT XEROXGO TOTAL_SHEETS=%d\r\n", cmd.TotalSheets)
+	}
+	if cmd.TotalPages > 0 {
+		fmt.Fprintf(&b, "@PJL COMMENT XEROXGO TOTAL_PAGES=%d\r\n", cmd.TotalPages)
+	}
+
 	b.WriteString("@PJL ENTER LANGUAGE=PDF\r\n")
 	return []byte(b.String())
 }
@@ -184,7 +191,10 @@ func parsePJLStatus(
 			}
 
 			if err == io.EOF {
-				if writeCompleted.Load() || gotJobEnd {
+				if gotJobEnd {
+					return nil
+				}
+				if writeCompleted.Load() && lastPage == 0 {
 					return nil
 				}
 				return io.ErrUnexpectedEOF
@@ -300,9 +310,6 @@ func StreamPDFWithPJL(
 	// Wait for status reader to finish
 	err = <-readErrCh
 	if err != nil {
-		if errors.Is(err, io.ErrUnexpectedEOF) && writeCompleted.Load() {
-			return nil
-		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

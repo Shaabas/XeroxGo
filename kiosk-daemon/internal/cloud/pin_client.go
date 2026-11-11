@@ -91,6 +91,24 @@ type SessionDetails struct {
 	SecondsRemaining int64  `json:"seconds_remaining"`
 }
 
+// PaymentAttemptDetails represents the payment attempt and dynamic QR payload returned by initiate-payment.
+type PaymentAttemptDetails struct {
+	AttemptID         string `json:"attempt_id"`
+	SessionID         string `json:"session_id"`
+	OrderID           string `json:"order_id"`
+	KioskID           string `json:"kiosk_id"`
+	Provider          string `json:"provider"`
+	ProviderOrderID   string `json:"provider_order_id"`
+	AmountPaise       int64  `json:"amount_paise"`
+	Currency          string `json:"currency"`
+	Status            string `json:"status"`
+	AttemptStatus     string `json:"attempt_status"`
+	QRPayload         string `json:"qr_payload"`
+	QRImageURL        string `json:"qr_image_url"`
+	DemoToken         string `json:"demo_token"`
+	ExpiresAt         string `json:"expires_at"`
+}
+
 // PINLookupClient abstracts the retrieval and confirmation of orders and transaction sessions.
 type PINLookupClient interface {
 	LookupOrderByPIN(ctx context.Context, pin string) (*OrderDetails, error)
@@ -98,6 +116,7 @@ type PINLookupClient interface {
 	ReleaseOrder(ctx context.Context, orderID string) error
 	CancelSession(ctx context.Context, sessionID string) error
 	GetSession(ctx context.Context, sessionID string) (*SessionDetails, error)
+	InitiatePayment(ctx context.Context, sessionID string) (*PaymentAttemptDetails, error)
 }
 
 // HTTPPINClient implements PINLookupClient using HTTP REST against the cloud backend.
@@ -393,5 +412,57 @@ func (c *HTTPPINClient) ReleaseOrder(ctx context.Context, orderID string) error 
 		return fmt.Errorf("release error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 }
+
+// InitiatePayment requests payment attempt creation / dynamic QR payload for an active session.
+func (c *HTTPPINClient) InitiatePayment(ctx context.Context, sessionID string) (*PaymentAttemptDetails, error) {
+	initiateURL := fmt.Sprintf("%s/sessions/%s/initiate-payment", c.baseURL, url.PathEscape(sessionID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, initiateURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create initiate payment request: %w", err)
+	}
+
+	if c.kioskSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.kioskSecret)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, &NetworkError{Err: err}
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var att PaymentAttemptDetails
+		if err := json.Unmarshal(bodyBytes, &att); err != nil {
+			return nil, fmt.Errorf("unmarshal payment attempt details: %w", err)
+		}
+		return &att, nil
+	case http.StatusConflict:
+		var errResp struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		_ = json.Unmarshal(bodyBytes, &errResp)
+		switch errResp.Code {
+		case "INSUFFICIENT_PAPER", "PAPER_UNKNOWN":
+			return nil, ErrInsufficientPaper
+		case "PRINTER_OFFLINE":
+			return nil, ErrPrinterOffline
+		case "PRINTER_ERROR":
+			return nil, ErrPrinterError
+		default:
+			return nil, errors.New(errResp.Error)
+		}
+	case http.StatusUnauthorized:
+		return nil, ErrUnauthorized
+	case http.StatusNotFound:
+		return nil, ErrSessionNotFound
+	default:
+		return nil, fmt.Errorf("initiate payment error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+}
+
 
 

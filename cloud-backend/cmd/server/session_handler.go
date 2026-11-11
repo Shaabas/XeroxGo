@@ -458,6 +458,7 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 			"attempt_status":    activeAttempt.Status,
 			"qr_payload":        activeAttempt.QRPayload,
 			"qr_image_url":      activeAttempt.QRImageURL,
+			"demo_token":        activeAttempt.DemoToken,
 			"expires_at":        activeAttempt.ExpiresAt.Format(time.RFC3339),
 		})
 		return
@@ -495,6 +496,21 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	var demoToken string
+	if s.cfg != nil && s.cfg.demoMode {
+		tokenHex, err := randomHex(24)
+		if err != nil {
+			log.Printf("[DEMO-MODE] Failed to generate secure random token: %v", err)
+			http.Error(w, "internal server error generating demo token", http.StatusInternalServerError)
+			return
+		}
+		demoToken = "dmo_" + tokenHex
+
+		baseURL := s.getBaseURL(r)
+		checkoutURL := fmt.Sprintf("%s/pay/%s", baseURL, demoToken)
+		res.QRPayload = checkoutURL
+	}
+
 	attemptID := fmt.Sprintf("att_%s_%d", sess.OrderID, now.UnixNano())
 	newAttempt := store.PaymentAttempt{
 		AttemptID:         attemptID,
@@ -509,6 +525,7 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		Status:            "CREATED",
 		QRPayload:         res.QRPayload,
 		QRImageURL:        res.QRImageURL,
+		DemoToken:         demoToken,
 		ExpiresAt:         attemptExpiresAt,
 	}
 
@@ -537,6 +554,7 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		"attempt_status":    newAttempt.Status,
 		"qr_payload":        newAttempt.QRPayload,
 		"qr_image_url":      newAttempt.QRImageURL,
+		"demo_token":        newAttempt.DemoToken,
 		"expires_at":        newAttempt.ExpiresAt.Format(time.RFC3339),
 	})
 }

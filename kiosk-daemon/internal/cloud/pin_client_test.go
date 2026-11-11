@@ -222,3 +222,83 @@ func TestHTTPPINClient_ClaimAndSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestHTTPPINClient_InitiatePayment(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sec-init-1" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		switch r.URL.Path {
+		case "/api/k/kiosk-init/sessions/sess_ok/initiate-payment":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(PaymentAttemptDetails{
+				AttemptID:   "att_test_123",
+				SessionID:   "sess_ok",
+				OrderID:     "ord_test_01",
+				KioskID:     "kiosk-init",
+				Provider:    "mock",
+				AmountPaise: 1500,
+				Status:      "INITIATED",
+				QRPayload:   "https://demo.pay/pay/tok_123",
+				DemoToken:   "tok_123",
+				ExpiresAt:   time.Now().Add(5 * time.Minute).Format(time.RFC3339),
+			})
+		case "/api/k/kiosk-init/sessions/sess_insufficient_paper/initiate-payment":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "insufficient paper in kiosk tray",
+				"code":  "INSUFFICIENT_PAPER",
+			})
+		case "/api/k/kiosk-init/sessions/sess_printer_offline/initiate-payment":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "printer offline",
+				"code":  "PRINTER_OFFLINE",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := NewHTTPPINClient(ts.URL, "kiosk-init", "sec-init-1", nil)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	// 1. Success
+	attempt, err := client.InitiatePayment(context.Background(), "sess_ok")
+	if err != nil {
+		t.Fatalf("initiate payment failed: %v", err)
+	}
+	if attempt.AttemptID != "att_test_123" {
+		t.Errorf("attempt ID = %s, want att_test_123", attempt.AttemptID)
+	}
+	if attempt.QRPayload != "https://demo.pay/pay/tok_123" {
+		t.Errorf("qr payload = %s, want https://demo.pay/pay/tok_123", attempt.QRPayload)
+	}
+	if attempt.AmountPaise != 1500 {
+		t.Errorf("amount paise = %d, want 1500", attempt.AmountPaise)
+	}
+
+	// 2. Insufficient paper conflict
+	_, err = client.InitiatePayment(context.Background(), "sess_insufficient_paper")
+	if !errors.Is(err, ErrInsufficientPaper) {
+		t.Errorf("expected ErrInsufficientPaper, got %v", err)
+	}
+
+	// 3. Printer offline conflict
+	_, err = client.InitiatePayment(context.Background(), "sess_printer_offline")
+	if !errors.Is(err, ErrPrinterOffline) {
+		t.Errorf("expected ErrPrinterOffline, got %v", err)
+	}
+}
+

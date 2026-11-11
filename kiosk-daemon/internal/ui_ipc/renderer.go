@@ -1174,31 +1174,60 @@ func renderPaymentPending(dst *image.RGBA, state ScreenState) {
 		yRow += 65
 	}
 
-	// Right Card: Payment Required & Authoritative Price
+	// Right Card: Payment Required & Authoritative Price & Dynamic QR
 	rightCard := image.Rect(1100, 330, 1830, 780)
 	fillRoundedRect(dst, rightCard, 20, colorPillBlueBg)
 	strokeRoundedRect(dst, rightCard, 20, 2, colorPillBlueBorder)
 
 	// Status badge pill inside right card
-	statusBadge := image.Rect(1140, 360, 1480, 410)
+	statusBadge := image.Rect(1140, 355, 1370, 400)
 	drawPill(dst, statusBadge, colorPillGreenBg, colorPillGreenBorder)
-	drawText(dst, faceBold20, "Awaiting Payment", 1170, 375, colorSuccessGreen)
+	drawText(dst, faceBold20, "Awaiting Payment", 1160, 368, colorSuccessGreen)
 
-	drawText(dst, faceReg24, "Authoritative Amount Due", 1140, 445, colorTextSecondary)
+	drawText(dst, faceReg22, "Authoritative Amount Due", 1140, 430, colorTextSecondary)
 
 	rupees := float64(summary.TotalPricePaise) / 100.0
 	priceStr := fmt.Sprintf("Rs. %.2f", rupees)
-	drawText(dst, faceBold56, priceStr, 1140, 505, colorPrimaryBlue)
+	drawText(dst, faceBold56, priceStr, 1140, 485, colorPrimaryBlue)
 
-	drawText(dst, faceBold24, "Follow instructions on the kiosk or UPI terminal.", 1140, 610, colorTextPrimary)
-	drawText(dst, faceReg20, "Printing begins automatically once payment is verified.", 1140, 650, colorTextSecondary)
+	drawText(dst, faceReg20, "Printing begins automatically once payment is verified.", 1140, 535, colorTextSecondary)
 
 	if summary.OrderID != "" {
-		orderIdStr := fmt.Sprintf("Order ID: %s", summary.OrderID)
+		orderIdStr := fmt.Sprintf("Order: %s", summary.OrderID)
+		drawText(dst, faceBold20, orderIdStr, 1140, 580, colorTextMutedDark)
 		if state.SessionID != "" {
-			orderIdStr += fmt.Sprintf("  |  Session: %s", state.SessionID)
+			sessIdStr := fmt.Sprintf("Session: %s", state.SessionID)
+			drawText(dst, faceBold20, sessIdStr, 1140, 610, colorTextMutedDark)
 		}
-		drawText(dst, faceBold20, orderIdStr, 1140, 710, colorTextMutedDark)
+	}
+
+	if state.PINError != "" {
+		drawText(dst, faceBold20, state.PINError, 1140, 670, colorErrorRed)
+	} else {
+		drawText(dst, faceReg20, "Point phone camera at QR code to pay", 1140, 670, colorPrimaryBlue)
+	}
+
+	// QR Code Container Box on right side of Right Card (x: 1510 to 1780, y: 350 to 620 -> 270x270)
+	qrBox := image.Rect(1510, 350, 1780, 620)
+	fillRoundedRect(dst, qrBox, 16, colorCardBg)
+	strokeRoundedRect(dst, qrBox, 16, 1, colorBorder)
+
+	if strings.TrimSpace(state.QRContent) != "" {
+		qrImg, err := getQRCodeImage(state.QRContent)
+		if err == nil && qrImg != nil {
+			qrTarget := image.Rect(1520, 360, 1770, 610)
+			xdraw.NearestNeighbor.Scale(dst, qrTarget, qrImg, qrImg.Bounds(), xdraw.Over, nil)
+		}
+		scanLabel := "Scan to Pay with Phone"
+		sW := measureTextWidth(faceBold20, scanLabel)
+		drawText(dst, faceBold20, scanLabel, qrBox.Min.X+(qrBox.Dx()-sW)/2, 650, colorTextPrimary)
+	} else {
+		genLabel := "Generating QR..."
+		gW := measureTextWidth(faceBold20, genLabel)
+		drawText(dst, faceBold20, genLabel, qrBox.Min.X+(qrBox.Dx()-gW)/2, 475, colorTextSecondary)
+		waitLabel := "Please wait"
+		wW := measureTextWidth(faceReg20, waitLabel)
+		drawText(dst, faceReg20, waitLabel, qrBox.Min.X+(qrBox.Dx()-wW)/2, 510, colorTextSecondary)
 	}
 
 	// Action Bar: Cancel Transaction

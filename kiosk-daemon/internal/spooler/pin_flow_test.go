@@ -2,8 +2,12 @@ package spooler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"image"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -513,5 +517,427 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 	simInput.EmitCancel()
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "IDLE" }) {
 		t.Errorf("expected state IDLE after cancel, got %s", client.PINController().GetState())
+	}
+}
+
+func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
+	tempDir := t.TempDir()
+	st, _ := state.Open(filepath.Join(tempDir, "state.db"))
+	defer st.Close()
+
+	var initiateCalled bool
+	var initiateMu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/k/kiosk-qr/orders/lookup":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"order_id":          "ord_qr_01",
+				"kiosk_id":          "kiosk-qr",
+				"status":            "PENDING_PAYMENT",
+				"total_price_paise": 1500,
+				"total_pages":       2,
+				"total_sheets":      1,
+				"copies":            1,
+				"duplex":            "simplex",
+				"color_mode":        "mono",
+				"seconds_remaining": 600,
+			})
+		case r.URL.Path == "/api/k/kiosk-qr/orders/ord_qr_01/claim":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"session_id":        "sess_qr_789",
+				"order_id":          "ord_qr_01",
+				"kiosk_id":          "kiosk-qr",
+				"status":            "PAYMENT_PENDING",
+				"total_price_paise": 1500,
+				"seconds_remaining": 300,
+			})
+		case r.URL.Path == "/api/k/kiosk-qr/sessions/sess_qr_789/initiate-payment":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			initiateMu.Lock()
+			initiateCalled = true
+			initiateMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"attempt_id":   "att_qr_999",
+				"session_id":   "sess_qr_789",
+				"order_id":     "ord_qr_01",
+				"kiosk_id":     "kiosk-qr",
+				"provider":     "mock",
+				"amount_paise": 1500,
+				"status":       "INITIATED",
+				"qr_payload":   "https://xeroxgo.demo/pay/tok_dynamic_qr",
+				"demo_token":   "tok_dynamic_qr",
+			})
+		case strings.HasPrefix(r.URL.Path, "/api/k/kiosk-qr/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	simInput := input.NewSimulatedSource(16)
+	defer simInput.Close()
+
+	cfg := ClientConfig{
+		CloudURL:          "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws",
+		KioskID:           "kiosk-qr",
+		KioskSecret:       "qr-secret",
+		StateStore:        st,
+		PrinterAddr:       "127.0.0.1:9100",
+		DownloadDir:       filepath.Join(tempDir, "dl_qr"),
+		IdleQRContent:     "https://kiosk-qr",
+		ScreenSink:        func(img *image.RGBA) error { return nil },
+		InputSource:       simInput,
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    10 * time.Second,
+	}
+	_ = os.MkdirAll(cfg.DownloadDir, 0700)
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = client.Run(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Enter PIN & lookup -> ORDER_SUMMARY
+	simInput.EmitDigits("1122")
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "1122" }) {
+		t.Fatalf("expected buffer 1122, got %s", client.PINController().GetPINBuffer())
+	}
+	simInput.EmitSubmit()
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
+		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	}
+
+	// 2. Confirm order -> PAYMENT_PENDING with dynamic QR
+	simInput.EmitSubmit()
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	}
+
+	// 3. Verify that InitiatePayment was called via HTTPPINClient
+	if !waitCondition(5*time.Second, func() bool {
+		initiateMu.Lock()
+		defer initiateMu.Unlock()
+		return initiateCalled
+	}) {
+		t.Fatalf("InitiatePayment was not called on /sessions/sess_qr_789/initiate-payment")
+	}
+
+	// 4. Verify that dynamic QR content is delivered to the rendered screen state
+	if !waitCondition(5*time.Second, func() bool {
+		hist := client.RenderHistory()
+		if len(hist) == 0 {
+			return false
+		}
+		last := hist[len(hist)-1]
+		return last.Mode == ui_ipc.ModePaymentPending && last.QRContent == "https://xeroxgo.demo/pay/tok_dynamic_qr"
+	}) {
+		hist := client.RenderHistory()
+		last := hist[len(hist)-1]
+		t.Fatalf("expected rendered state with dynamic QR payload, got mode=%s qr=%s error=%s", last.Mode, last.QRContent, client.PINController().GetPINError())
+	}
+
+	if client.PINController().GetPINError() != "" {
+		t.Errorf("expected empty PIN error, got %q", client.PINController().GetPINError())
+	}
+}
+
+func TestSpooler_ExactURLPathCorrelation(t *testing.T) {
+	// 1. extractOrderIDFromDownloadURL exact matching tests
+	tests := []struct {
+		name     string
+		url      string
+		expected string
+	}{
+		{"valid standard order URL", "http://localhost:8080/api/orders/ord_123/pdf", "ord_123"},
+		{"valid https order URL", "https://cloud.xeroxgo.demo/api/orders/ord_abc-xyz_99/pdf", "ord_abc-xyz_99"},
+		{"prefix collision rejected", "http://localhost:8080/api/orders/ord_123_evil/pdf", "ord_123_evil"},
+		{"query collision rejected", "http://localhost:8080/api/orders/ord_123?ext=pdf", ""},
+		{"extra path segments rejected", "http://localhost:8080/api/orders/ord_123/pdf/extra", ""},
+		{"missing pdf segment rejected", "http://localhost:8080/api/orders/ord_123", ""},
+		{"query parameter containing path rejected", "http://localhost:8080/api/other?q=/api/orders/ord_123/pdf", ""},
+		{"recovery URL returns empty string", "http://localhost:8080/api/recovery/rec_456/pdf", ""},
+		{"malformed URL returns empty string", "http://[::1:invalid/api/orders/ord_123/pdf", ""},
+		{"empty string returns empty string", "", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractOrderIDFromDownloadURL(tc.url)
+			if got != tc.expected {
+				t.Errorf("extractOrderIDFromDownloadURL(%q) = %q, want %q", tc.url, got, tc.expected)
+			}
+		})
+	}
+
+	// 2. isJobForActiveOrder tests
+	activeOrder := "ord_active_target"
+
+	// Match by JobID
+	if !isJobForActiveOrder(contracts.PrintJobCommand{JobID: activeOrder}, activeOrder) {
+		t.Errorf("expected isJobForActiveOrder to match when JobID == activeOrderID")
+	}
+
+	// Match by exact download URL path segment
+	if !isJobForActiveOrder(contracts.PrintJobCommand{
+		JobID:       "job_unique_uuid_1",
+		DownloadURL: "http://127.0.0.1:8080/api/orders/ord_active_target/pdf",
+	}, activeOrder) {
+		t.Errorf("expected isJobForActiveOrder to match by exact parsed path segment")
+	}
+
+	// Reject substring / prefix false positives
+	if isJobForActiveOrder(contracts.PrintJobCommand{
+		JobID:       "job_unique_uuid_2",
+		DownloadURL: "http://127.0.0.1:8080/api/orders/ord_active_target_evil/pdf",
+	}, activeOrder) {
+		t.Errorf("expected isJobForActiveOrder to reject prefix false match")
+	}
+
+	// Reject recovery URLs pretending to be order IDs
+	if isJobForActiveOrder(contracts.PrintJobCommand{
+		JobID:       "job_unique_uuid_3",
+		DownloadURL: "http://127.0.0.1:8080/api/recovery/ord_active_target/pdf",
+	}, activeOrder) {
+		t.Errorf("expected isJobForActiveOrder to reject recovery URL false match")
+	}
+}
+
+func TestSpooler_TrustedOriginValidation(t *testing.T) {
+	client := &Client{
+		cfg: ClientConfig{
+			CloudURL:       "http://127.0.0.1:8080/ws",
+			TrustedOrigins: []string{"cdn.xeroxgo.demo", "storage.internal:8443"},
+		},
+	}
+
+	// Trusted origins
+	validURLs := []string{
+		"http://127.0.0.1:8080/api/orders/ord1/pdf",
+		"http://localhost:8080/api/orders/ord1/pdf",
+		"http://127.0.0.1:9090/api/orders/ord1/pdf",
+		"https://cdn.xeroxgo.demo/api/orders/ord1/pdf",
+		"https://storage.internal:8443/api/orders/ord1/pdf",
+		"https://storage.example.com/api/orders/ord1/pdf",
+		"https://test.example.invalid/api/orders/ord1/pdf",
+	}
+
+	for _, u := range validURLs {
+		if err := client.validateDownloadURL(u); err != nil {
+			t.Errorf("expected %q to be trusted, got error: %v", u, err)
+		}
+	}
+
+	// Untrusted / Malformed origins
+	invalidURLs := []struct {
+		url     string
+		wantErr string
+	}{
+		{"", "download URL is empty"},
+		{"http://evil-attacker.com/api/orders/ord1/pdf", "not trusted"},
+		{"ftp://127.0.0.1:8080/api/orders/ord1/pdf", "unsupported download URL scheme"},
+		{"http://user:pass@127.0.0.1:8080/api/orders/ord1/pdf", "cannot contain user credentials"},
+		{"://bad-url", "invalid download URL"},
+	}
+
+	for _, tc := range invalidURLs {
+		err := client.validateDownloadURL(tc.url)
+		if err == nil {
+			t.Errorf("expected error for URL %q, got nil", tc.url)
+		} else if !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("for URL %q expected error containing %q, got %q", tc.url, tc.wantErr, err.Error())
+		}
+	}
+}
+
+func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := state.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("failed to open state db: %v", err)
+	}
+	defer st.Close()
+
+	// 1. Create a dummy test PDF
+	pdfBytes := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n")
+	h := sha256.Sum256(pdfBytes)
+	checksum := hex.EncodeToString(h[:])
+
+	// 2. Setup mock HTTP server for PIN lookup and PDF downloads
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/k/kiosk-deadlock-test/orders/lookup":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"order_id":          "ord_active_deadlock",
+				"kiosk_id":          "kiosk-deadlock-test",
+				"status":            "PENDING_PAYMENT",
+				"total_price_paise": 2000,
+				"total_pages":       1,
+				"total_sheets":      1,
+				"copies":            1,
+				"duplex":            "simplex",
+				"color_mode":        "mono",
+				"seconds_remaining": 600,
+			})
+		case r.URL.Path == "/api/k/kiosk-deadlock-test/orders/ord_active_deadlock/claim":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"session_id":        "sess_deadlock_123",
+				"order_id":          "ord_active_deadlock",
+				"kiosk_id":          "kiosk-deadlock-test",
+				"status":            "PAYMENT_PENDING",
+				"total_price_paise": 2000,
+				"seconds_remaining": 300,
+			})
+		case strings.HasSuffix(r.URL.Path, "/pdf"):
+			w.Header().Set("Content-Type", "application/pdf")
+			_, _ = w.Write(pdfBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	// 3. Setup mock PJL printer
+	printerLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("printer listener failed: %v", err)
+	}
+	defer printerLn.Close()
+
+	go func() {
+		for {
+			conn, err := printerLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(io.Discard, c)
+				_, _ = c.Write([]byte("@PJL USTATUS PAGE\r\n1\r\n@PJL USTATUS JOB\r\nEND\r\n"))
+			}(conn)
+		}
+	}()
+
+	simInput := input.NewSimulatedSource(16)
+	defer simInput.Close()
+
+	completedJobs := make(chan string, 10)
+
+	cfg := ClientConfig{
+		CloudURL:                 "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws",
+		KioskID:                  "kiosk-deadlock-test",
+		KioskSecret:              "secret-deadlock",
+		StateStore:               st,
+		PrinterAddr:              printerLn.Addr().String(),
+		DownloadDir:              filepath.Join(tempDir, "downloads"),
+		IdleQRContent:            "https://kiosk-deadlock",
+		ScreenSink:               func(img *image.RGBA) error { return nil },
+		InputSource:              simInput,
+		InactivityTimeout:        10 * time.Second,
+		SummaryTimeout:           10 * time.Second,
+		PaymentTimeout:           10 * time.Second,
+		CompletedDisplayDuration: 100 * time.Millisecond,
+		OnJobCompleted: func(jobID string) {
+			completedJobs <- jobID
+		},
+	}
+	_ = os.MkdirAll(cfg.DownloadDir, 0700)
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = client.Run(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 4. Customer enters PIN "5555" -> claims order -> PAYMENT_PENDING
+	simInput.EmitDigits("5555")
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "5555" }) {
+		t.Fatalf("expected buffer 5555, got %s", client.PINController().GetPINBuffer())
+	}
+	simInput.EmitSubmit()
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
+		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	}
+	simInput.EmitSubmit()
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	}
+
+	// 5. Unrelated job arrives FIRST while customer is looking at QR payment screen
+	unrelatedCmd := contracts.PrintJobCommand{
+		JobID:          "job_unrelated_first",
+		KioskID:        "kiosk-deadlock-test",
+		DownloadURL:    ts.URL + "/api/orders/ord_unrelated_other/pdf",
+		SHA256Checksum: checksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	client.handleIncomingJob(unrelatedCmd)
+
+	// Wait briefly: customer transaction must NOT be interrupted
+	time.Sleep(100 * time.Millisecond)
+	if client.PINController().GetState() != "PAYMENT_PENDING" {
+		t.Fatalf("unrelated job interrupted active customer transaction! State is %s", client.PINController().GetState())
+	}
+	if !client.PINController().HasActiveTransaction() {
+		t.Fatalf("expected HasActiveTransaction to remain true")
+	}
+
+	// 6. Active customer's job arrives SECOND
+	activeCmd := contracts.PrintJobCommand{
+		JobID:          "job_active_customer",
+		KioskID:        "kiosk-deadlock-test",
+		DownloadURL:    ts.URL + "/api/orders/ord_active_deadlock/pdf",
+		SHA256Checksum: checksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	client.handleIncomingJob(activeCmd)
+
+	// 7. Verify active job completes immediately without deadlock!
+	select {
+	case jobID := <-completedJobs:
+		if jobID != "job_active_customer" {
+			t.Fatalf("expected active customer job to complete first, got %s", jobID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("DEADLOCK DETECTED: active job failed to complete within 5 seconds behind unrelated job")
+	}
+
+	// 8. Verify that after active job finishes, the deferred unrelated job is processed and completes
+	select {
+	case jobID := <-completedJobs:
+		if jobID != "job_unrelated_first" {
+			t.Fatalf("expected deferred unrelated job to complete, got %s", jobID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("TIMED OUT waiting for deferred unrelated job to be processed")
 	}
 }

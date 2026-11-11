@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/pkg/contracts"
@@ -355,5 +356,142 @@ func TestCloudRecoveryEndpoint_FullLifecycleAndIdempotency(t *testing.T) {
 	mux.ServeHTTP(wAfterDone, reqAfterDone)
 	if wAfterDone.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict for completed job, got %d", wAfterDone.Code)
+	}
+}
+
+func TestCloud_ContinuationJobProgressResolution(t *testing.T) {
+	app, mux, jobsDir, cleanup := setupRecoveryTestApp(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Create canonical 6-page duplex document (3 sheets total)
+	orderID := "ord_prog_res_01"
+	jobID := "job_prog_res_01"
+	kioskID := "kiosk-prog-1"
+
+	h := sha256.Sum256([]byte(orderID))
+	pdfPath := filepath.Join(jobsDir, hex.EncodeToString(h[:])+".pdf")
+	origChecksum := createServerTestCanonicalPDF(t, pdfPath, 6)
+
+	order := store.Order{
+		OrderID: orderID,
+		Command: contracts.PrintJobCommand{
+			JobID:          jobID,
+			KioskID:        kioskID,
+			DisplayCode:    "8888",
+			DownloadURL:    "http://example.com/pdf",
+			SHA256Checksum: origChecksum,
+			TotalPages:     6,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexLongEdge,
+			StartFromPage:  1,
+		},
+		Status:     contracts.JobStatusPausedError,
+		PricePaise: 450,
+		ColorMode:  "BW",
+	}
+	if err := app.db.CreateOrder(ctx, order); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// 2. Initiate recovery continuation job after 1 sheet printed (2 sheets = 4 pages remaining)
+	recReq := map[string]interface{}{
+		"recovery_id":              "rec_prog_001",
+		"confirmed_sheets_printed": 1, // 1 sheet confirmed, 2 remaining
+		"output_confirmed":         true,
+	}
+	recBytes, _ := json.Marshal(recReq)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/k/%s/jobs/%s/recover", kioskID, jobID), bytes.NewReader(recBytes))
+	req.Header.Set("Authorization", "Bearer kiosk-secret-xyz")
+	wRec := httptest.NewRecorder()
+	mux.ServeHTTP(wRec, req)
+
+	if wRec.Code != http.StatusOK {
+		t.Fatalf("recovery initiation failed: %d: %s", wRec.Code, wRec.Body.String())
+	}
+
+	var recResp struct {
+		JobID           string                    `json:"job_id"`
+		RemainingPages  int                       `json:"remaining_pages"`
+		RemainingSheets int                       `json:"remaining_sheets"`
+		Command         contracts.PrintJobCommand `json:"command"`
+	}
+	_ = json.Unmarshal(wRec.Body.Bytes(), &recResp)
+	expectedContJobID := fmt.Sprintf("%s-rec1", jobID)
+	if recResp.JobID != expectedContJobID {
+		t.Fatalf("expected continuation jobID %s, got %s", expectedContJobID, recResp.JobID)
+	}
+	if recResp.RemainingSheets != 2 {
+		t.Fatalf("expected 2 remaining sheets, got %d", recResp.RemainingSheets)
+	}
+
+	// 3. Send progress event for continuation job: PRINTING (1 sheet printed of continuation)
+	progEvt := contracts.JobProgressEvent{
+		JobID:         expectedContJobID,
+		KioskID:       kioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  2,
+		SheetsPrinted: 1,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := app.db.UpdateJobProgress(ctx, progEvt); err != nil {
+		t.Fatalf("UpdateJobProgress for continuation job failed: %v", err)
+	}
+
+	// Check cumulative progress on parent job
+	parentProg, err := app.db.GetJobProgress(ctx, jobID)
+	if err != nil {
+		t.Fatalf("failed to get parent job progress: %v", err)
+	}
+	if parentProg.SheetsPrinted != 2 { // 1 confirmed + 1 in continuation = 2
+		t.Fatalf("expected 2 cumulative sheets printed on parent, got %d", parentProg.SheetsPrinted)
+	}
+	if parentProg.Status != contracts.JobStatusPrinting {
+		t.Fatalf("expected parent job status PRINTING, got %s", parentProg.Status)
+	}
+
+	// 4. Send completion event for continuation job: COMPLETED (all 2 remaining sheets printed)
+	completeEvt := contracts.JobProgressEvent{
+		JobID:         expectedContJobID,
+		KioskID:       kioskID,
+		Status:        contracts.JobStatusCompleted,
+		PagesPrinted:  4,
+		SheetsPrinted: 2,
+		Timestamp:     time.Now().UTC().Add(time.Second),
+	}
+	if err := app.db.UpdateJobProgress(ctx, completeEvt); err != nil {
+		t.Fatalf("UpdateJobProgress for continuation completion failed: %v", err)
+	}
+
+	// 5. Verify parent order is now COMPLETED in DB
+	finalOrder, err := app.db.GetOrderByJobID(ctx, jobID)
+	if err != nil {
+		t.Fatalf("failed to get final order: %v", err)
+	}
+	if finalOrder.Status != contracts.JobStatusCompleted {
+		t.Fatalf("expected parent order status COMPLETED, got %s", finalOrder.Status)
+	}
+
+	// 6. Verify recovery record status is COMPLETED
+	recRecord, err := app.db.GetRecoveryRecord(ctx, "rec_prog_001")
+	if err != nil {
+		t.Fatalf("failed to get recovery record: %v", err)
+	}
+	if recRecord.Status != "COMPLETED" {
+		t.Fatalf("expected recovery record status COMPLETED, got %s", recRecord.Status)
+	}
+
+	// 7. Verify parent job progress cumulative totals
+	finalParentProg, err := app.db.GetJobProgress(ctx, jobID)
+	if err != nil {
+		t.Fatalf("failed to get final parent job progress: %v", err)
+	}
+	if finalParentProg.SheetsPrinted != 3 {
+		t.Fatalf("expected 3 total sheets printed on parent, got %d", finalParentProg.SheetsPrinted)
+	}
+	if finalParentProg.Status != contracts.JobStatusCompleted {
+		t.Fatalf("expected parent job progress status COMPLETED, got %s", finalParentProg.Status)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -345,6 +346,7 @@ CREATE TABLE IF NOT EXISTS payment_attempts (
     qr_payload TEXT NOT NULL DEFAULT '',
     qr_image_url TEXT NOT NULL DEFAULT '',
     idempotency_key TEXT NOT NULL DEFAULT '',
+    demo_token TEXT NOT NULL DEFAULT '',
     expires_at_ns BIGINT NOT NULL,
     created_at_ns BIGINT NOT NULL,
     updated_at_ns BIGINT NOT NULL
@@ -353,6 +355,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (session_id);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);
 `
 		if _, err := db.Exec(schema); err != nil {
 			_ = db.Close()
@@ -389,11 +392,13 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts
 			"CREATE TABLE IF NOT EXISTS dispatch_intents (order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE, job_id TEXT NOT NULL, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, dispatched_at_ns BIGINT NOT NULL DEFAULT 0, acknowledged_at_ns BIGINT NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');",
 			"ALTER TABLE dispatch_intents ADD COLUMN IF NOT EXISTS acknowledged_at_ns BIGINT NOT NULL DEFAULT 0;",
 			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);",
-			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
+			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', demo_token TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
+			"ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS demo_token TEXT NOT NULL DEFAULT '';",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order_id);",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (session_id);",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);",
+			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);",
 		}
 		for _, mig := range pgMigrations {
 			if _, err := db.Exec(mig); err != nil {
@@ -783,6 +788,7 @@ CREATE TABLE IF NOT EXISTS payment_attempts (
     qr_payload TEXT NOT NULL DEFAULT '',
     qr_image_url TEXT NOT NULL DEFAULT '',
     idempotency_key TEXT NOT NULL DEFAULT '',
+    demo_token TEXT NOT NULL DEFAULT '',
     expires_at_ns BIGINT NOT NULL,
     created_at_ns BIGINT NOT NULL,
     updated_at_ns BIGINT NOT NULL
@@ -791,6 +797,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (session_id);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);
 `)
 
 	colsDispatch := make(map[string]bool)
@@ -811,6 +818,25 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts
 		_, _ = db.Exec("ALTER TABLE dispatch_intents ADD COLUMN acknowledged_at_ns INTEGER NOT NULL DEFAULT 0;")
 	}
 	_, _ = db.Exec("UPDATE dispatch_intents SET status = 'PENDING' WHERE status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL);")
+
+	colsPayAttempts := make(map[string]bool)
+	rowsPay, err := db.Query("PRAGMA table_info(payment_attempts);")
+	if err == nil {
+		for rowsPay.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt *string
+			if err := rowsPay.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+				colsPayAttempts[name] = true
+			}
+		}
+		_ = rowsPay.Close()
+	}
+	if !colsPayAttempts["demo_token"] {
+		_, _ = db.Exec("ALTER TABLE payment_attempts ADD COLUMN demo_token TEXT NOT NULL DEFAULT '';")
+		_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);")
+	}
 
 	return nil
 }
@@ -1780,9 +1806,15 @@ func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgre
 
 	// 1. Check order exists and retrieve kiosk_id, total_pages, total_sheets
 	var (
-		orderKioskID string
-		totalPages   int
-		totalSheets  int
+		orderKioskID       string
+		totalPages         int
+		totalSheets        int
+		isRecovery         bool
+		parentJobID        string
+		recoveryID         string
+		recRemainingPages  int
+		recRemainingSheets int
+		recConfirmedSheets int
 	)
 	queryOrder := `
 SELECT o.kiosk_id, p.total_pages, p.total_sheets
@@ -1792,9 +1824,29 @@ WHERE o.job_id = ?;
 `
 	err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderKioskID, &totalPages, &totalSheets)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("update job progress: job %q not found in orders", event.JobID)
-	}
-	if err != nil {
+		if idx := strings.LastIndex(event.JobID, "-rec"); idx != -1 {
+			pJobID := event.JobID[:idx]
+			seqStr := event.JobID[idx+4:]
+			if seqID, parseErr := strconv.Atoi(seqStr); parseErr == nil && pJobID != "" {
+				queryRec := `
+SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed, r.remaining_pages, r.remaining_sheets, p.total_pages, p.total_sheets
+FROM recovery_records r
+JOIN orders o ON r.job_id = o.job_id
+JOIN print_configs p ON o.order_id = p.order_id
+WHERE r.job_id = ? AND r.sequence_id = ?;
+`
+				recErr := tx.QueryRowContext(ctx, s.rebind(queryRec), pJobID, seqID).Scan(
+					&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets, &recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets,
+				)
+				if recErr == nil {
+					isRecovery = true
+				}
+			}
+		}
+		if !isRecovery {
+			return fmt.Errorf("update job progress: job %q not found in orders", event.JobID)
+		}
+	} else if err != nil {
 		return fmt.Errorf("update job progress: query order: %w", err)
 	}
 
@@ -1804,16 +1856,41 @@ WHERE o.job_id = ?;
 	}
 
 	// 3. Verify progress bounds
-	if event.PagesPrinted > totalPages {
-		return fmt.Errorf("update job progress: pages_printed (%d) exceeds order total_pages (%d)", event.PagesPrinted, totalPages)
+	if isRecovery {
+		if event.PagesPrinted > recRemainingPages {
+			return fmt.Errorf("update job progress: pages_printed (%d) exceeds recovery remaining_pages (%d)", event.PagesPrinted, recRemainingPages)
+		}
+		if event.SheetsPrinted > recRemainingSheets {
+			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds recovery remaining_sheets (%d)", event.SheetsPrinted, recRemainingSheets)
+		}
+	} else {
+		if event.PagesPrinted > totalPages {
+			return fmt.Errorf("update job progress: pages_printed (%d) exceeds order total_pages (%d)", event.PagesPrinted, totalPages)
+		}
+		if event.SheetsPrinted > totalSheets {
+			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds order total_sheets (%d)", event.SheetsPrinted, totalSheets)
+		}
 	}
-	if event.SheetsPrinted > totalSheets {
-		return fmt.Errorf("update job progress: sheets_printed (%d) exceeds order total_sheets (%d)", event.SheetsPrinted, totalSheets)
+
+	targetJobID := event.JobID
+	pagesPrinted := event.PagesPrinted
+	sheetsPrinted := event.SheetsPrinted
+
+	if isRecovery {
+		targetJobID = parentJobID
+		sheetsPrinted = recConfirmedSheets + event.SheetsPrinted
+		if sheetsPrinted > totalSheets {
+			sheetsPrinted = totalSheets
+		}
+		pagesPrinted = (totalPages - recRemainingPages) + event.PagesPrinted
+		if pagesPrinted > totalPages {
+			pagesPrinted = totalPages
+		}
 	}
 
 	// 4. Check existing progress timestamp to reject older/stale events
 	var existingTimestampNS int64
-	err = tx.QueryRowContext(ctx, s.rebind("SELECT timestamp_ns FROM job_progress WHERE job_id = ?;"), event.JobID).Scan(&existingTimestampNS)
+	err = tx.QueryRowContext(ctx, s.rebind("SELECT timestamp_ns FROM job_progress WHERE job_id = ?;"), targetJobID).Scan(&existingTimestampNS)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("update job progress: query existing progress: %w", err)
 	}
@@ -1834,11 +1911,11 @@ ON CONFLICT(job_id) DO UPDATE SET
     timestamp_ns = excluded.timestamp_ns;
 `
 	_, err = tx.ExecContext(ctx, s.rebind(upsertProgress),
-		event.JobID,
+		targetJobID,
 		event.KioskID,
 		string(event.Status),
-		event.PagesPrinted,
-		event.SheetsPrinted,
+		pagesPrinted,
+		sheetsPrinted,
 		event.ErrorReason,
 		eventNS,
 	)
@@ -1846,19 +1923,31 @@ ON CONFLICT(job_id) DO UPDATE SET
 		return fmt.Errorf("update job progress: upsert progress: %w", err)
 	}
 
+	if isRecovery {
+		recStatus := string(event.Status)
+		if event.Status == contracts.JobStatusCompleted {
+			recStatus = "COMPLETED"
+		}
+		_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE recovery_records
+SET status = ?, updated_at_ns = ?
+WHERE recovery_id = ?;
+`), recStatus, eventNS, recoveryID)
+	}
+
 	// 6. Update associated order's status and updated_at_ns
 	_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE job_id = ?;
-`), string(event.Status), eventNS, event.JobID)
+`), string(event.Status), eventNS, targetJobID)
 	if err != nil {
 		return fmt.Errorf("update job progress: update order status: %w", err)
 	}
 
 	// Release PIN reservation upon terminal status
 	if event.Status == contracts.JobStatusCompleted || event.Status == contracts.JobStatusFailedRefundable {
-		_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = (SELECT order_id FROM orders WHERE job_id = ?);"), event.JobID)
+		_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = (SELECT order_id FROM orders WHERE job_id = ?);"), targetJobID)
 	}
 
 	// Synchronize dispatch intent status with authoritative progress
@@ -1867,13 +1956,13 @@ WHERE job_id = ?;
 UPDATE dispatch_intents
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE job_id = ?;
-`), eventNS, event.JobID)
+`), eventNS, targetJobID)
 	} else if event.Status == contracts.JobStatusSpooling || event.Status == contracts.JobStatusPrinting {
 		_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'ACKNOWLEDGED', acknowledged_at_ns = ?, updated_at_ns = ?
 WHERE job_id = ? AND status IN ('PENDING', 'SENT');
-`), eventNS, eventNS, event.JobID)
+`), eventNS, eventNS, targetJobID)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1903,6 +1992,14 @@ SELECT job_id, kiosk_id, status, pages_printed, sheets_printed, error_reason, ti
 FROM job_progress
 WHERE job_id = ?;
 `
+	targetJobID := jobID
+	if idx := strings.LastIndex(jobID, "-rec"); idx != -1 {
+		pJobID := jobID[:idx]
+		if pJobID != "" {
+			targetJobID = pJobID
+		}
+	}
+
 	var (
 		resJobID      string
 		kioskID       string
@@ -1913,7 +2010,7 @@ WHERE job_id = ?;
 		timestampNS   int64
 	)
 
-	err := s.db.QueryRowContext(ctx, s.rebind(query), jobID).Scan(
+	err := s.db.QueryRowContext(ctx, s.rebind(query), targetJobID).Scan(
 		&resJobID,
 		&kioskID,
 		&statusStr,
@@ -3022,6 +3119,7 @@ type PaymentAttempt struct {
 	QRPayload         string
 	QRImageURL        string
 	IdempotencyKey    string
+	DemoToken         string
 	ExpiresAt         time.Time
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
@@ -3066,14 +3164,14 @@ func (s *Store) CreatePaymentAttempt(ctx context.Context, att PaymentAttempt) er
 INSERT INTO payment_attempts (
     attempt_id, order_id, kiosk_id, session_id, provider,
     provider_order_id, provider_payment_id, amount_paise, currency,
-    status, qr_payload, qr_image_url, idempotency_key,
+    status, qr_payload, qr_image_url, idempotency_key, demo_token,
     expires_at_ns, created_at_ns, updated_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `)
 	_, err := s.db.ExecContext(ctx, query,
 		att.AttemptID, att.OrderID, att.KioskID, att.SessionID, att.Provider,
 		att.ProviderOrderID, att.ProviderPaymentID, att.AmountPaise, att.Currency,
-		att.Status, att.QRPayload, att.QRImageURL, att.IdempotencyKey,
+		att.Status, att.QRPayload, att.QRImageURL, att.IdempotencyKey, att.DemoToken,
 		expNS, createdNS, updatedNS,
 	)
 	if err != nil {
@@ -3096,7 +3194,7 @@ func (s *Store) GetActivePaymentAttempt(ctx context.Context, sessionID string, n
 	query := s.rebind(`
 SELECT attempt_id, order_id, kiosk_id, session_id, provider,
        provider_order_id, provider_payment_id, amount_paise, currency,
-       status, qr_payload, qr_image_url, idempotency_key,
+       status, qr_payload, qr_image_url, idempotency_key, demo_token,
        expires_at_ns, created_at_ns, updated_at_ns
 FROM payment_attempts
 WHERE session_id = ? AND status = 'CREATED' AND expires_at_ns > ?
@@ -3109,7 +3207,7 @@ LIMIT 1;
 	err := row.Scan(
 		&att.AttemptID, &att.OrderID, &att.KioskID, &att.SessionID, &att.Provider,
 		&att.ProviderOrderID, &att.ProviderPaymentID, &att.AmountPaise, &att.Currency,
-		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey,
+		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey, &att.DemoToken,
 		&expNS, &cNS, &uNS,
 	)
 	if err == sql.ErrNoRows {
@@ -3138,7 +3236,7 @@ func (s *Store) GetPaymentAttemptByProviderOrder(ctx context.Context, provider, 
 	query := s.rebind(`
 SELECT attempt_id, order_id, kiosk_id, session_id, provider,
        provider_order_id, provider_payment_id, amount_paise, currency,
-       status, qr_payload, qr_image_url, idempotency_key,
+       status, qr_payload, qr_image_url, idempotency_key, demo_token,
        expires_at_ns, created_at_ns, updated_at_ns
 FROM payment_attempts
 WHERE (provider = ? OR ? = '') AND provider_order_id = ?
@@ -3151,7 +3249,7 @@ LIMIT 1;
 	err := row.Scan(
 		&att.AttemptID, &att.OrderID, &att.KioskID, &att.SessionID, &att.Provider,
 		&att.ProviderOrderID, &att.ProviderPaymentID, &att.AmountPaise, &att.Currency,
-		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey,
+		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey, &att.DemoToken,
 		&expNS, &cNS, &uNS,
 	)
 	if err == sql.ErrNoRows {
@@ -3180,7 +3278,7 @@ func (s *Store) GetPaymentAttemptByOrderAndSession(ctx context.Context, orderID,
 	query := s.rebind(`
 SELECT attempt_id, order_id, kiosk_id, session_id, provider,
        provider_order_id, provider_payment_id, amount_paise, currency,
-       status, qr_payload, qr_image_url, idempotency_key,
+       status, qr_payload, qr_image_url, idempotency_key, demo_token,
        expires_at_ns, created_at_ns, updated_at_ns
 FROM payment_attempts
 WHERE order_id = ? AND (session_id = ? OR ? = '')
@@ -3193,7 +3291,7 @@ LIMIT 1;
 	err := row.Scan(
 		&att.AttemptID, &att.OrderID, &att.KioskID, &att.SessionID, &att.Provider,
 		&att.ProviderOrderID, &att.ProviderPaymentID, &att.AmountPaise, &att.Currency,
-		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey,
+		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey, &att.DemoToken,
 		&expNS, &cNS, &uNS,
 	)
 	if err == sql.ErrNoRows {
@@ -3201,6 +3299,47 @@ LIMIT 1;
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get payment attempt by order: %w", err)
+	}
+	att.ExpiresAt = time.Unix(0, expNS).UTC()
+	att.CreatedAt = time.Unix(0, cNS).UTC()
+	att.UpdatedAt = time.Unix(0, uNS).UTC()
+	return &att, nil
+}
+
+// GetPaymentAttemptByToken retrieves a payment attempt by its demo checkout token.
+func (s *Store) GetPaymentAttemptByToken(ctx context.Context, demoToken string) (*PaymentAttempt, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store not initialized")
+	}
+	demoToken = strings.TrimSpace(demoToken)
+	if demoToken == "" {
+		return nil, nil
+	}
+
+	query := s.rebind(`
+SELECT attempt_id, order_id, kiosk_id, session_id, provider,
+       provider_order_id, provider_payment_id, amount_paise, currency,
+       status, qr_payload, qr_image_url, idempotency_key, demo_token,
+       expires_at_ns, created_at_ns, updated_at_ns
+FROM payment_attempts
+WHERE demo_token = ?
+ORDER BY created_at_ns DESC
+LIMIT 1;
+`)
+	row := s.db.QueryRowContext(ctx, query, demoToken)
+	var att PaymentAttempt
+	var expNS, cNS, uNS int64
+	err := row.Scan(
+		&att.AttemptID, &att.OrderID, &att.KioskID, &att.SessionID, &att.Provider,
+		&att.ProviderOrderID, &att.ProviderPaymentID, &att.AmountPaise, &att.Currency,
+		&att.Status, &att.QRPayload, &att.QRImageURL, &att.IdempotencyKey, &att.DemoToken,
+		&expNS, &cNS, &uNS,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get payment attempt by demo token: %w", err)
 	}
 	att.ExpiresAt = time.Unix(0, expNS).UTC()
 	att.CreatedAt = time.Unix(0, cNS).UTC()
