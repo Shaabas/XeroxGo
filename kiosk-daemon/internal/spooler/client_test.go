@@ -846,6 +846,108 @@ func TestClientHeartbeat(t *testing.T) {
 	}
 }
 
+func TestClientRefill_OverWebSocket(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "kiosk_refill.db")
+	st, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer st.Close()
+
+	var gotInitialUnknown atomic.Bool
+	var gotRefilledHealth atomic.Bool
+	var refilledSheets atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+				break
+			}
+			if msg.Type == "health" && msg.Health != nil {
+				if msg.Health.PaperTrayStatus == "UNKNOWN" {
+					gotInitialUnknown.Store(true)
+					// Trigger operator refill of 215 sheets
+					_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 215})
+				} else if msg.Health.PaperTrayStatus == "OK" && msg.Health.EstimatedSheets == 215 {
+					gotRefilledHealth.Store(true)
+					refilledSheets.Store(int32(msg.Health.EstimatedSheets))
+				}
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      wsURL,
+		KioskID:       "kiosk-refill-ws",
+		StateStore:    st,
+		PrinterAddr:   "127.0.0.1:9999",
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/kiosk-refill",
+		ScreenSink:    noopSink,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	client.minBackoff = 20 * time.Millisecond
+	client.heartbeatInterval = 20 * time.Millisecond
+	client.healthPoller = func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		return contracts.PrinterHealth{
+			State:           "IDLE",
+			PaperTrayStatus: "OK",
+			EstimatedSheets: sheets,
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = client.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if gotInitialUnknown.Load() && gotRefilledHealth.Load() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !gotInitialUnknown.Load() {
+		t.Fatal("expected uncalibrated client to report PaperTrayStatus UNKNOWN initially")
+	}
+	if !gotRefilledHealth.Load() {
+		t.Fatal("expected client to report PaperTrayStatus OK with 215 sheets after refill")
+	}
+	if refilledSheets.Load() != 215 {
+		t.Fatalf("expected refilled sheets 215, got %d", refilledSheets.Load())
+	}
+
+	// Verify stateStore persisted the calibrated state
+	storedSheets, calib, err := st.GetPaperSupply(ctx)
+	if err != nil {
+		t.Fatalf("failed to query paper supply: %v", err)
+	}
+	if !calib {
+		t.Errorf("expected stateStore calibrated=true")
+	}
+	if storedSheets != 215 {
+		t.Errorf("expected stateStore sheets=215, got %d", storedSheets)
+	}
+}
+
 // Test H — TestClientRejectsWrongKioskJob
 func TestClientRejectsWrongKioskJob(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -1150,8 +1252,8 @@ func TestClientStartupRecovery(t *testing.T) {
 		}
 	})
 
-	// Case 2: Incomplete job with PagesPrinted = 1, slicing remaining pages 2-3
-	t.Run("recovery with page slicing for partial print", func(t *testing.T) {
+	// Case 2: Incomplete job with PagesPrinted = 1: zero Pi-side slicing, pause safely in PAUSED_ERROR
+	t.Run("recovery with partial print pauses safely without Pi slicing", func(t *testing.T) {
 		printerLn, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("printer listener failed: %v", err)
@@ -1166,12 +1268,10 @@ func TestClientStartupRecovery(t *testing.T) {
 			}
 			defer conn.Close()
 			_, _ = io.Copy(&receivedBytes, conn)
-			// Mock printer reports remaining 2 sheets
-			_, _ = conn.Write([]byte("@PJL USTATUS PAGE\r\n1\r\n@PJL USTATUS PAGE\r\n2\r\n@PJL USTATUS JOB\r\nEND\r\n"))
 		}()
 
 		jobSlice := contracts.PrintJobCommand{
-			JobID:          "job-rec-slice",
+			JobID:          "job-rec-partial",
 			KioskID:        "kiosk-j",
 			DisplayCode:    "3333",
 			DownloadURL:    pdfServer.URL + "/doc.pdf",
@@ -1183,7 +1283,7 @@ func TestClientStartupRecovery(t *testing.T) {
 			StartFromPage:  1,
 		}
 
-		if err := store.SaveJob(context.Background(), jobSlice, contracts.JobStatusPausedError); err != nil {
+		if err := store.SaveJob(context.Background(), jobSlice, contracts.JobStatusPrinting); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -1191,7 +1291,7 @@ func TestClientStartupRecovery(t *testing.T) {
 		evt := contracts.JobProgressEvent{
 			JobID:         jobSlice.JobID,
 			KioskID:       jobSlice.KioskID,
-			Status:        contracts.JobStatusPausedError,
+			Status:        contracts.JobStatusPrinting,
 			PagesPrinted:  1,
 			SheetsPrinted: 1,
 			Timestamp:     time.Now().UTC(),
@@ -1220,24 +1320,26 @@ func TestClientStartupRecovery(t *testing.T) {
 			_ = client.Run(ctx)
 		}()
 
-		deadline := time.Now().Add(5 * time.Second)
-		completed := false
+		deadline := time.Now().Add(2 * time.Second)
+		paused := false
 		for time.Now().Before(deadline) {
 			inc, err := store.GetIncompleteJob(ctx)
-			if err == nil && inc == nil {
-				completed = true
-				break
+			if err == nil && inc != nil && inc.Status == contracts.JobStatusPausedError {
+				if strings.Contains(inc.ErrorReason, "reconciliation required") {
+					paused = true
+					break
+				}
 			}
 			time.Sleep(30 * time.Millisecond)
 		}
 
-		if !completed {
-			t.Fatal("partially printed job was not sliced and recovered to COMPLETED")
+		if !paused {
+			t.Fatal("partially printed job was not paused in PAUSED_ERROR with reconciliation required")
 		}
 
-		// Verify that PJL command sent to printer had TotalPages=2 (remaining pages)
-		if !bytes.Contains(receivedBytes.Bytes(), []byte("@PJL ENTER LANGUAGE=PDF")) {
-			t.Fatal("printer stream missing PJL header")
+		// Verify zero bytes were submitted to the printer (no Pi slicing or duplicate reprint)
+		if receivedBytes.Len() > 0 {
+			t.Fatalf("expected 0 bytes sent to printer, got %d bytes", receivedBytes.Len())
 		}
 	})
 }

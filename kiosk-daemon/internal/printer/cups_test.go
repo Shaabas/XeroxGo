@@ -689,3 +689,93 @@ func TestPollCUPSHealth(t *testing.T) {
 		})
 	}
 }
+
+func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-hook-test",
+		Copies:      1,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	var submittingCalled bool
+	var submittedJobID string
+
+	hooks := &CUPSPrintHooks{
+		OnSubmitting: func() {
+			submittingCalled = true
+		},
+		OnSubmitted: func(cupsJobID string) {
+			submittedJobID = cupsJobID
+		},
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			return []byte("request id is DCPT310-777 (1 file(s))"), nil
+		}
+		if name == "lpstat" {
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("DCPT310-777 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, hooks)
+	if err != nil {
+		t.Fatalf("PrintPDFWithCUPSHooksCustom failed: %v", err)
+	}
+
+	if !submittingCalled {
+		t.Error("expected OnSubmitting hook to be called before lp submission")
+	}
+	if submittedJobID != "DCPT310-777" {
+		t.Errorf("expected OnSubmitted hook with DCPT310-777, got %q", submittedJobID)
+	}
+}
+
+func TestMonitorCUPSJobCustom_ActiveToCompleted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-mon-test",
+		Copies:      1,
+		TotalPages:  2,
+		TotalSheets: 2,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	pollCount := 0
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			pollCount++
+			if pollCount == 1 {
+				// First poll: job still in not-completed
+				return []byte("DCPT310-888 user 1024 Tue Nov 3 14:00:00 2026"), nil
+			}
+			// Second poll: job completed
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("DCPT310-888 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+
+	err := MonitorCUPSJobCustom(ctx, runner, "DCPT310", cmd, "DCPT310-888", nil, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("MonitorCUPSJobCustom failed: %v", err)
+	}
+	if pollCount < 2 {
+		t.Errorf("expected at least 2 polls, got %d", pollCount)
+	}
+}

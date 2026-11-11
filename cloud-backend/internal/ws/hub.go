@@ -3,6 +3,7 @@ package ws
 import (
 	"context"
 	"crypto/hmac"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -21,6 +22,7 @@ type wireMessage struct {
 	Progress *contracts.JobProgressEvent `json:"progress,omitempty"`
 	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
+	Sheets   int                         `json:"sheets,omitempty"`
 	Error    string                      `json:"error,omitempty"`
 }
 
@@ -123,6 +125,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 		close(sess.closed)
 		log.Printf("[HUB] Kiosk disconnected: %q", kioskID)
+		if h.db != nil {
+			_ = h.db.ResetUnacknowledgedDispatchIntents(context.Background(), kioskID)
+		}
 		_ = conn.Close(websocket.StatusNormalClosure, "session ended")
 	}()
 
@@ -133,6 +138,19 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.db != nil {
 		if activeAds, err := h.db.GetActiveAds(ctx); err == nil && len(activeAds) > 0 {
 			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: activeAds})
+		}
+		// Reconcile pending dispatch intents for this kiosk (crash/disconnect recovery)
+		_ = h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID)
+		if pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID); err == nil && len(pendingJobs) > 0 {
+			log.Printf("[HUB] Reconciling %d pending dispatch orders for kiosk %s", len(pendingJobs), kioskID)
+			for _, jobCmd := range pendingJobs {
+				if err := h.SendJob(ctx, jobCmd); err != nil {
+					log.Printf("[HUB] Failed to dispatch pending job %s to kiosk %s: %v", jobCmd.JobID, kioskID, err)
+					break
+				}
+				_ = h.db.MarkDispatchIntentSent(ctx, jobCmd.JobID)
+				log.Printf("[HUB] Reconciled and dispatched pending job %s to kiosk %s", jobCmd.JobID, kioskID)
+			}
 		}
 	}
 
@@ -146,6 +164,17 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "heartbeat":
 			// Maintain liveness
+		case "ack", "job_ack":
+			jobID := ""
+			if msg.Progress != nil {
+				jobID = msg.Progress.JobID
+			}
+			if jobID == "" && msg.Job != nil {
+				jobID = msg.Job.JobID
+			}
+			if jobID != "" && h.db != nil {
+				_ = h.db.MarkDispatchIntentAcknowledged(ctx, jobID)
+			}
 		case "progress":
 			if msg.Progress == nil {
 				continue
@@ -276,7 +305,7 @@ func isValidHealthState(state string) bool {
 
 func isValidTrayState(tray string) bool {
 	switch tray {
-	case "OK", "LOW", "EMPTY":
+	case "OK", "LOW", "EMPTY", "UNKNOWN", "CHECK_PRINTER":
 		return true
 	default:
 		return false
@@ -325,6 +354,27 @@ func (h *Hub) BroadcastSyncAds(ctx context.Context, ads []contracts.AdItem) {
 		_ = wsjson.Write(ctx, sess.conn, msg)
 		sess.sendMu.Unlock()
 	}
+}
+
+// SendRefill sends an authenticated operator paper refill command to the connected kiosk.
+func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error {
+	if h == nil {
+		return errors.New("hub is nil")
+	}
+	h.mu.RLock()
+	sess, ok := h.sessions[kioskID]
+	h.mu.RUnlock()
+	if !ok || sess == nil {
+		return errors.New("kiosk not connected")
+	}
+
+	msg := wireMessage{
+		Type:   "refill",
+		Sheets: sheets,
+	}
+	sess.sendMu.Lock()
+	defer sess.sendMu.Unlock()
+	return wsjson.Write(ctx, sess.conn, msg)
 }
 
 // ConnectedKiosksCount returns the number of currently connected kiosks.

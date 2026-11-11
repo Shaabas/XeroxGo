@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
@@ -327,6 +328,25 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
 	resp := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "")
 	orderID := resp["order_id"].(string)
+
+	sess, err := app.db.CreateOrGetKioskSession(ctx, "kiosk_test", orderID, 15*time.Minute, time.Now())
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	if err := app.db.CreatePaymentAttempt(ctx, store.PaymentAttempt{
+		AttemptID:       "att_" + orderID,
+		OrderID:         orderID,
+		KioskID:         "kiosk_test",
+		SessionID:       sess.SessionID,
+		Provider:        "razorpay",
+		ProviderOrderID: orderID,
+		AmountPaise:     600,
+		Currency:        "INR",
+		Status:          "CREATED",
+		ExpiresAt:       time.Now().Add(15 * time.Minute),
+	}); err != nil {
+		t.Fatalf("failed to seed payment attempt: %v", err)
+	}
 
 	// Scenario A: Razorpay webhook with TAMPERED amount (300 paise instead of 600 paise)
 	mismatchPayload := []byte(fmt.Sprintf(`{

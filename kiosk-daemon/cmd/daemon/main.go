@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -20,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"xeroxgo/kiosk-daemon/internal/input"
 	"xeroxgo/kiosk-daemon/internal/spooler"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
@@ -141,28 +141,11 @@ func handleMockPrinterConn(conn net.Conn, downloadDir string) {
 		pdfBytes = streamBytes[pdfStart:]
 	}
 
-	tmpFile, err := os.CreateTemp(downloadDir, "mock_printer_*.pdf")
-	if err != nil {
-		return
-	}
-	tmpName := tmpFile.Name()
-	defer func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpName)
-	}()
-
-	if _, err := tmpFile.Write(pdfBytes); err != nil {
-		return
-	}
-	_ = tmpFile.Close()
-
-	cmd := exec.Command("qpdf", "--show-npages", tmpName)
-	out, err := cmd.CombinedOutput()
 	pages := 1
-	if err == nil {
-		if p, perr := strconv.Atoi(strings.TrimSpace(string(out))); perr == nil && p > 0 {
-			pages = p
-		}
+	rePages := regexp.MustCompile(`/Type\s*/Page[^s]`)
+	matches := rePages.FindAll(pdfBytes, -1)
+	if len(matches) > 0 {
+		pages = len(matches)
 	}
 
 	copies := 1
@@ -242,6 +225,13 @@ func main() {
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
+	enableCloudRecovery := flag.Bool("enable-cloud-recovery", true, "Enable cloud-owned print recovery and continuation artifacts (disables Pi-side slicer)")
+	enableKeypad := flag.Bool("enable-keypad", false, "Enable keyboard/keypad input for PIN entry on stdin")
+	pinInactivityTimeout := flag.Duration("pin-timeout", 30*time.Second, "Inactivity timeout for PIN entry screen before returning to idle")
+	orderSummaryTimeout := flag.Duration("summary-timeout", 60*time.Second, "Inactivity timeout for order summary screen before returning to idle")
+	paymentPendingTimeout := flag.Duration("payment-timeout", 300*time.Second, "Inactivity timeout for payment pending screen before returning to idle")
+	refill := flag.Int("refill", -1, "Reset and calibrate estimated paper tray stock to N sheets (0-250) and exit")
+	simulatedStock := flag.Int("simulated-stock", -1, "Initialize and calibrate estimated paper tray stock to N sheets (0-250) for testing/demo")
 	flag.Parse()
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
@@ -280,6 +270,33 @@ func main() {
 		log.Fatalf("Fatal: failed to open state database at %s: %v", *stateDB, err)
 	}
 	defer stateStore.Close()
+
+	if *refill >= 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stateStore.ResetPaperTray(ctx, *refill); err != nil {
+			log.Fatalf("Fatal: failed to refill paper tray to %d sheets: %v", *refill, err)
+		}
+		log.Printf("Successfully refilled and calibrated paper tray to %d sheets", *refill)
+		return
+	}
+
+	if *simulatedStock >= 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stateStore.ResetPaperTray(ctx, *simulatedStock); err != nil {
+			log.Fatalf("Fatal: failed to set simulated paper stock: %v", err)
+		}
+		log.Printf("Initialized simulated paper tray to %d sheets", *simulatedStock)
+	} else if *mockPrinter {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, calib, err := stateStore.GetPaperSupply(ctx)
+		if err == nil && !calib {
+			_ = stateStore.ResetPaperTray(ctx, 250)
+			log.Printf("Mock printer mode: initialized calibrated paper stock to 250 sheets")
+		}
+	}
 
 	var screenSink ui_ipc.Sink
 	if *previewPNG != "" {
@@ -367,6 +384,13 @@ func main() {
 		}
 	}
 
+	var inputSource input.Source
+	if *enableKeypad {
+		inputSource = input.NewReaderSource(os.Stdin)
+		defer inputSource.Close()
+		log.Printf("XeroxGo kiosk daemon: stdin keypad reader enabled")
+	}
+
 	clientCfg := spooler.ClientConfig{
 		CloudURL:                 *cloudURL,
 		KioskID:                  *kioskID,
@@ -385,7 +409,11 @@ func main() {
 		ScreenSink:               screenSink,
 		HTTPClient:               nil,
 		MockHealth:               mockHealthPoller,
-		EnableCloudRecovery:      true,
+		EnableCloudRecovery:      *enableCloudRecovery,
+		InputSource:              inputSource,
+		InactivityTimeout:        *pinInactivityTimeout,
+		SummaryTimeout:           *orderSummaryTimeout,
+		PaymentTimeout:           *paymentPendingTimeout,
 	}
 
 	client, err := spooler.NewClient(clientCfg)

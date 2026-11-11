@@ -298,6 +298,12 @@ func extractJobBlock(output, jobID string) string {
 	return strings.Join(block, "\n")
 }
 
+// CUPSPrintHooks provides optional callbacks during CUPS submission and lifecycle.
+type CUPSPrintHooks struct {
+	OnSubmitting func()
+	OnSubmitted  func(cupsJobID string)
+}
+
 // PrintPDFWithCUPS submits a PDF file to the specified CUPS queue via the lp command
 // and monitors its progress until completion.
 func PrintPDFWithCUPS(
@@ -307,7 +313,7 @@ func PrintPDFWithCUPS(
 	pdfPath string,
 	onPage func(sheetsCompleted int),
 ) error {
-	return PrintPDFWithCUPSCustom(ctx, defaultCommandRunner, queue, cmd, pdfPath, onPage, 500*time.Millisecond)
+	return PrintPDFWithCUPSHooksCustom(ctx, defaultCommandRunner, queue, cmd, pdfPath, onPage, 500*time.Millisecond, nil)
 }
 
 // PrintPDFWithCUPSCustom allows injection of a custom command runner and polling interval for testing.
@@ -319,6 +325,20 @@ func PrintPDFWithCUPSCustom(
 	pdfPath string,
 	onPage func(sheetsCompleted int),
 	pollInterval time.Duration,
+) error {
+	return PrintPDFWithCUPSHooksCustom(ctx, runner, queue, cmd, pdfPath, onPage, pollInterval, nil)
+}
+
+// PrintPDFWithCUPSHooksCustom executes submission with optional pre- and post-submission hooks.
+func PrintPDFWithCUPSHooksCustom(
+	ctx context.Context,
+	runner CommandRunner,
+	queue string,
+	cmd contracts.PrintJobCommand,
+	pdfPath string,
+	onPage func(sheetsCompleted int),
+	pollInterval time.Duration,
+	hooks *CUPSPrintHooks,
 ) error {
 	if ctx == nil {
 		return errors.New("context cannot be nil")
@@ -363,6 +383,10 @@ func PrintPDFWithCUPSCustom(
 
 	log.Printf("[CUPS] Submitting print job %s to queue %q: lp %s", cmd.JobID, queue, strings.Join(lpArgs, " "))
 
+	if hooks != nil && hooks.OnSubmitting != nil {
+		hooks.OnSubmitting()
+	}
+
 	// 2. Submit print job via lp
 	out, err := runner(ctx, "lp", lpArgs...)
 	if err != nil {
@@ -377,7 +401,37 @@ func PrintPDFWithCUPSCustom(
 	cupsJobID := match[1]
 	log.Printf("[CUPS] Job %s assigned CUPS request ID: %s", cmd.JobID, cupsJobID)
 
+	if hooks != nil && hooks.OnSubmitted != nil {
+		hooks.OnSubmitted(cupsJobID)
+	}
+
 	// 3. Monitor CUPS job until completed, failed, or context canceled
+	return MonitorCUPSJobCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval)
+}
+
+// MonitorCUPSJobCustom monitors an active or queued CUPS job until completion, failure, or context cancellation.
+func MonitorCUPSJobCustom(
+	ctx context.Context,
+	runner CommandRunner,
+	queue string,
+	cmd contracts.PrintJobCommand,
+	cupsJobID string,
+	onPage func(sheetsCompleted int),
+	pollInterval time.Duration,
+) error {
+	if ctx == nil {
+		return errors.New("context cannot be nil")
+	}
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	if strings.TrimSpace(cupsJobID) == "" {
+		return errors.New("cupsJobID cannot be empty")
+	}
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -509,12 +563,19 @@ func PollCUPSHealthCustom(
 
 	raw := strings.ToLower(string(out))
 
-	if strings.Contains(raw, "disabled") {
+	if strings.Contains(raw, "disabled") || strings.Contains(raw, "stopped") || strings.Contains(raw, "error") || strings.Contains(raw, "jam") {
+		errMsg := "printer is stopped or disabled"
+		if strings.Contains(raw, "jam") {
+			errMsg = "paper jam"
+		} else if strings.Contains(raw, "out of paper") || strings.Contains(raw, "media-empty") {
+			errMsg = "out of paper"
+		}
 		return contracts.PrinterHealth{
 			Online:          false,
 			State:           "ERROR",
 			PaperTrayStatus: "CHECK_PRINTER",
 			EstimatedSheets: estimatedSheets,
+			ErrorMessage:    errMsg,
 			UpdatedAt:       now,
 		}
 	}

@@ -2890,20 +2890,21 @@ body {
 .pin-digit-boxes {
   display: flex;
   justify-content: center;
-  gap: 10px;
+  gap: 8px;
   margin-bottom: 16px;
+  max-width: 100%;
 }
 
 .pin-digit-box {
-  width: 58px;
-  height: 68px;
-  border-radius: 12px;
+  width: 46px;
+  height: 58px;
+  border-radius: 10px;
   border: 1.5px solid var(--primary-blue-border);
   background: var(--primary-blue-light);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 32px;
+  font-size: 26px;
   font-weight: 800;
   color: var(--primary-blue);
   letter-spacing: -0.02em;

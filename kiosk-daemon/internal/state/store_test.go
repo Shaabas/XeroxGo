@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -356,11 +357,29 @@ func TestResetPaperTray(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Reset to 250 succeeds
+	// Initial state before calibration
+	initSheets, calib, err := s.GetPaperSupply(ctx)
+	if err != nil {
+		t.Fatalf("GetPaperSupply failed: %v", err)
+	}
+	if calib {
+		t.Errorf("expected initial calibrated=false, got true")
+	}
+	if initSheets != 250 {
+		t.Errorf("initial sheets = %d, want 250", initSheets)
+	}
+
+	// Reset to 250 succeeds and calibrates tray
 	if err := s.ResetPaperTray(ctx, 250); err != nil {
 		t.Fatalf("ResetPaperTray(250) failed: %v", err)
 	}
-	sheets, _ := s.GetEstimatedSheets(ctx)
+	sheets, calib, err := s.GetPaperSupply(ctx)
+	if err != nil {
+		t.Fatalf("GetPaperSupply after reset failed: %v", err)
+	}
+	if !calib {
+		t.Errorf("expected calibrated=true after ResetPaperTray, got false")
+	}
 	if sheets != 250 {
 		t.Errorf("sheets = %d, want 250", sheets)
 	}
@@ -710,5 +729,363 @@ func TestRejectsInvalidInput(t *testing.T) {
 				t.Fatalf("expected error for %s, got nil", tt.name)
 			}
 		})
+	}
+}
+
+func TestJobSubmissionTrackingAndGetJob(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+	cmd := sampleCommand("job-sub-001")
+
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	// 1. Verify initial state before submission
+	job, err := s.GetJob(ctx, cmd.JobID)
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected job to be found")
+	}
+	if job.SubmittedToPrinter {
+		t.Errorf("expected SubmittedToPrinter=false initially, got true")
+	}
+	if job.CUPSJobID != "" {
+		t.Errorf("expected empty CUPSJobID, got %q", job.CUPSJobID)
+	}
+	if job.Status != contracts.JobStatusSpooling {
+		t.Errorf("expected status SPOOLING, got %v", job.Status)
+	}
+
+	// 2. Mark submission initiated
+	if err := s.MarkJobSubmitting(ctx, cmd.JobID); err != nil {
+		t.Fatalf("MarkJobSubmitting failed: %v", err)
+	}
+
+	job, err = s.GetJob(ctx, cmd.JobID)
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if !job.SubmittedToPrinter {
+		t.Errorf("expected SubmittedToPrinter=true after MarkJobSubmitting")
+	}
+	if job.Status != contracts.JobStatusPrinting {
+		t.Errorf("expected status PRINTING after MarkJobSubmitting, got %v", job.Status)
+	}
+	if job.CUPSJobID != "" {
+		t.Errorf("expected CUPSJobID to remain empty before lp returned, got %q", job.CUPSJobID)
+	}
+
+	// 3. Record successful CUPS submission
+	cupsID := "DCPT310-99"
+	if err := s.RecordJobSubmission(ctx, cmd.JobID, cupsID); err != nil {
+		t.Fatalf("RecordJobSubmission failed: %v", err)
+	}
+
+	job, err = s.GetJob(ctx, cmd.JobID)
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if !job.SubmittedToPrinter {
+		t.Errorf("expected SubmittedToPrinter=true")
+	}
+	if job.CUPSJobID != cupsID {
+		t.Errorf("expected CUPSJobID=%q, got %q", cupsID, job.CUPSJobID)
+	}
+	if job.Status != contracts.JobStatusPrinting {
+		t.Errorf("expected status PRINTING, got %v", job.Status)
+	}
+
+	// 4. Verify GetIncompleteJob reflects these fields
+	inc, err := s.GetIncompleteJob(ctx)
+	if err != nil {
+		t.Fatalf("GetIncompleteJob failed: %v", err)
+	}
+	if inc == nil || inc.Command.JobID != cmd.JobID {
+		t.Fatalf("expected incomplete job %s, got %v", cmd.JobID, inc)
+	}
+	if !inc.SubmittedToPrinter {
+		t.Errorf("expected inc.SubmittedToPrinter=true")
+	}
+	if inc.CUPSJobID != cupsID {
+		t.Errorf("expected inc.CUPSJobID=%q, got %q", cupsID, inc.CUPSJobID)
+	}
+
+	// 5. Test GetJob with non-existent ID
+	nonExistent, err := s.GetJob(ctx, "job-does-not-exist")
+	if err != nil {
+		t.Fatalf("GetJob for non-existent job returned error: %v", err)
+	}
+	if nonExistent != nil {
+		t.Errorf("expected nil for non-existent job, got %v", nonExistent)
+	}
+
+	// 6. Test invalid inputs
+	if err := s.MarkJobSubmitting(ctx, ""); err == nil {
+		t.Error("expected error for empty jobID in MarkJobSubmitting")
+	}
+	if err := s.RecordJobSubmission(ctx, "", cupsID); err == nil {
+		t.Error("expected error for empty jobID in RecordJobSubmission")
+	}
+	if _, err := s.GetJob(ctx, ""); err == nil {
+		t.Error("expected error for empty jobID in GetJob")
+	}
+}
+
+func TestRecordSheetProgress_AtomicityAndRollbackOnInsufficientSupply(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+	cmd := sampleCommand("job-atomicity-01")
+	cmd.TotalPages = 10
+	cmd.TotalSheets = 5
+
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	// Set tray stock to exactly 2 sheets
+	if err := s.ResetPaperTray(ctx, 2); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	// 1. Progress by 1 sheet (stock 2 -> 1, sheets_printed 0 -> 1)
+	evt1 := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  2,
+		SheetsPrinted: 1,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.RecordSheetProgress(ctx, evt1); err != nil {
+		t.Fatalf("RecordSheetProgress 1 failed: %v", err)
+	}
+
+	stock, _ := s.GetEstimatedSheets(ctx)
+	if stock != 1 {
+		t.Fatalf("expected stock 1, got %d", stock)
+	}
+	job, _ := s.GetJob(ctx, cmd.JobID)
+	if job.SheetsPrinted != 1 || job.PagesPrinted != 2 {
+		t.Fatalf("unexpected job progress: sheets=%d, pages=%d", job.SheetsPrinted, job.PagesPrinted)
+	}
+
+	// 2. Attempt to progress by 2 more sheets (requires 2 sheets, but only 1 available)
+	// Must fail atomically without modifying stock or job progress!
+	evt2 := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  6,
+		SheetsPrinted: 3,
+		Timestamp:     time.Now().UTC(),
+	}
+	err := s.RecordSheetProgress(ctx, evt2)
+	if err == nil || !strings.Contains(err.Error(), "insufficient sheets") {
+		t.Fatalf("expected insufficient sheets error, got: %v", err)
+	}
+
+	// Verify rollback: stock remains 1, sheets_printed remains 1
+	stockAfter, _ := s.GetEstimatedSheets(ctx)
+	if stockAfter != 1 {
+		t.Fatalf("stock was corrupted during failed transaction: got %d, want 1", stockAfter)
+	}
+	jobAfter, _ := s.GetJob(ctx, cmd.JobID)
+	if jobAfter.SheetsPrinted != 1 || jobAfter.PagesPrinted != 2 {
+		t.Fatalf("job state was corrupted during failed transaction: sheets=%d, pages=%d", jobAfter.SheetsPrinted, jobAfter.PagesPrinted)
+	}
+}
+
+func TestRecordSheetProgress_MonotonicityAndDuplicateIdempotency(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+	cmd := sampleCommand("job-mono-01")
+	cmd.TotalPages = 10
+	cmd.TotalSheets = 5
+
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	if err := s.ResetPaperTray(ctx, 20); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	// Initial progress: sheet 1
+	evt := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  2,
+		SheetsPrinted: 1,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.RecordSheetProgress(ctx, evt); err != nil {
+		t.Fatalf("initial progress failed: %v", err)
+	}
+	stock, _ := s.GetEstimatedSheets(ctx)
+	if stock != 19 {
+		t.Fatalf("expected stock 19, got %d", stock)
+	}
+
+	// Duplicate callback with same progress (sheet 1): must be idempotent no-op for stock
+	for i := 0; i < 3; i++ {
+		if err := s.RecordSheetProgress(ctx, evt); err != nil {
+			t.Fatalf("duplicate callback %d failed: %v", i, err)
+		}
+		stk, _ := s.GetEstimatedSheets(ctx)
+		if stk != 19 {
+			t.Fatalf("duplicate callback %d double-decremented stock to %d", i, stk)
+		}
+	}
+
+	// Out-of-order / regressive progress (sheet 0): must be clamped monotonically, no stock change
+	regressiveEvt := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  1,
+		SheetsPrinted: 0,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.RecordSheetProgress(ctx, regressiveEvt); err != nil {
+		t.Fatalf("regressive callback failed: %v", err)
+	}
+	stk, _ := s.GetEstimatedSheets(ctx)
+	if stk != 19 {
+		t.Fatalf("regressive callback changed stock to %d", stk)
+	}
+	jb, _ := s.GetJob(ctx, cmd.JobID)
+	if jb.SheetsPrinted != 1 || jb.PagesPrinted != 2 {
+		t.Fatalf("regressive callback regressed job progress: %+v", jb)
+	}
+
+	// Forward progress: sheet 3 (delta = 2, stock 19 -> 17)
+	evtForward := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  6,
+		SheetsPrinted: 3,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.RecordSheetProgress(ctx, evtForward); err != nil {
+		t.Fatalf("forward progress failed: %v", err)
+	}
+	stkForward, _ := s.GetEstimatedSheets(ctx)
+	if stkForward != 17 {
+		t.Fatalf("expected stock 17 after forward progress, got %d", stkForward)
+	}
+}
+
+func TestRecordSheetProgress_CompletionDeductionAndDuplicateCompletion(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+	cmd := sampleCommand("job-comp-01")
+	cmd.TotalPages = 10
+	cmd.TotalSheets = 5
+
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	if err := s.ResetPaperTray(ctx, 50); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	// 1. Partial print: 2 sheets
+	evtPartial := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  4,
+		SheetsPrinted: 2,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.RecordSheetProgress(ctx, evtPartial); err != nil {
+		t.Fatalf("partial progress failed: %v", err)
+	}
+	stock, _ := s.GetEstimatedSheets(ctx)
+	if stock != 48 {
+		t.Fatalf("expected stock 48, got %d", stock)
+	}
+
+	// 2. Complete job (should deduct remaining 3 sheets: 48 -> 45)
+	evtComplete := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusCompleted,
+		PagesPrinted:  10,
+		SheetsPrinted: 5,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := s.RecordSheetProgress(ctx, evtComplete); err != nil {
+		t.Fatalf("complete progress failed: %v", err)
+	}
+	stockAfterComp, _ := s.GetEstimatedSheets(ctx)
+	if stockAfterComp != 45 {
+		t.Fatalf("expected stock 45 after completion, got %d", stockAfterComp)
+	}
+	jb, _ := s.GetJob(ctx, cmd.JobID)
+	if jb.Status != contracts.JobStatusCompleted || jb.SheetsPrinted != 5 || jb.PagesPrinted != 10 {
+		t.Fatalf("unexpected completed job state: %+v", jb)
+	}
+
+	// 3. Duplicate completion: calling complete again must NOT double-decrement stock
+	for i := 0; i < 2; i++ {
+		if err := s.RecordSheetProgress(ctx, evtComplete); err != nil {
+			t.Fatalf("duplicate completion %d failed: %v", i, err)
+		}
+		stk, _ := s.GetEstimatedSheets(ctx)
+		if stk != 45 {
+			t.Fatalf("duplicate completion %d double-decremented stock to %d", i, stk)
+		}
+	}
+}
+
+func TestRecordSheetProgress_Validation(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+	cmd := sampleCommand("job-val-01")
+	_ = s.SaveJob(ctx, cmd, contracts.JobStatusPrinting)
+
+	// nil context
+	if err := s.RecordSheetProgress(nil, contracts.JobProgressEvent{JobID: cmd.JobID, Status: contracts.JobStatusPrinting}); err == nil {
+		t.Error("expected error for nil context")
+	}
+
+	// empty job ID
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{JobID: "", Status: contracts.JobStatusPrinting}); err == nil {
+		t.Error("expected error for empty job ID")
+	}
+
+	// invalid status
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{JobID: cmd.JobID, Status: contracts.JobStatus("INVALID_STATUS")}); err == nil {
+		t.Error("expected error for invalid status")
+	}
+
+	// negative pages
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{JobID: cmd.JobID, Status: contracts.JobStatusPrinting, PagesPrinted: -1}); err == nil {
+		t.Error("expected error for negative pages printed")
+	}
+
+	// negative sheets
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{JobID: cmd.JobID, Status: contracts.JobStatusPrinting, SheetsPrinted: -1}); err == nil {
+		t.Error("expected error for negative sheets printed")
+	}
+
+	// job not found
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{JobID: "non-existent-job", Status: contracts.JobStatusPrinting}); err == nil {
+		t.Error("expected error for non-existent job")
 	}
 }

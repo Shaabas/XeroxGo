@@ -22,6 +22,9 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"xeroxgo/kiosk-daemon/internal/cloud"
+	"xeroxgo/kiosk-daemon/internal/input"
+	"xeroxgo/kiosk-daemon/internal/pin"
 	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
@@ -33,6 +36,7 @@ type wireMessage struct {
 	Job      *contracts.PrintJobCommand  `json:"job,omitempty"`
 	Progress *contracts.JobProgressEvent `json:"progress,omitempty"`
 	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
+	Sheets   int                         `json:"sheets,omitempty"`
 	Error    string                      `json:"error,omitempty"`
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 }
@@ -59,7 +63,12 @@ type ClientConfig struct {
 	HTTPClient               *http.Client
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
+	CUPSRunner               printer.CommandRunner
 	EnableCloudRecovery      bool
+	InputSource              input.Source
+	InactivityTimeout        time.Duration
+	SummaryTimeout           time.Duration
+	PaymentTimeout           time.Duration
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -98,6 +107,8 @@ type Client struct {
 	canvas   *image.RGBA
 
 	healthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+
+	pinController *pin.Controller
 }
 
 // NewClient validates the configuration and initializes a new spooler client.
@@ -204,9 +215,45 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		healthPoller:      poller,
 	}
 
+	if cfg.InputSource != nil {
+		pinClient, err := cloud.NewHTTPPINClient(cfg.CloudURL, cfg.KioskID, cfg.KioskSecret, cfg.HTTPClient)
+		if err == nil {
+			pinCtrl, err := pin.NewController(pin.Config{
+				InactivityTimeout: cfg.InactivityTimeout,
+				SummaryTimeout:    cfg.SummaryTimeout,
+				PaymentTimeout:    cfg.PaymentTimeout,
+				RenderScreen:      client.renderScreen,
+				LookupClient:      pinClient,
+				IdleQRContent:     cfg.IdleQRContent,
+				PrinterModel:      cfg.PrinterModel,
+			}, cfg.InputSource)
+			if err == nil {
+				client.pinController = pinCtrl
+			} else {
+				log.Printf("[SPOOLER] Warning: failed to initialize PIN controller: %v", err)
+			}
+		} else {
+			log.Printf("[SPOOLER] Warning: failed to initialize PIN lookup client: %v", err)
+		}
+	}
+
 	go client.fetchInitialAds()
 
 	return client, nil
+}
+
+// PINController returns the active PIN controller instance, or nil if keypad input is not configured.
+func (c *Client) PINController() *pin.Controller {
+	return c.pinController
+}
+
+// RenderHistory returns a copy of the screen states recorded during client execution.
+func (c *Client) RenderHistory() []ui_ipc.ScreenState {
+	c.renderHistoryMu.Lock()
+	defer c.renderHistoryMu.Unlock()
+	historyCopy := make([]ui_ipc.ScreenState, len(c.renderHistory))
+	copy(historyCopy, c.renderHistory)
+	return historyCopy
 }
 
 // Run executes the spooler client loops until the context is canceled.
@@ -220,6 +267,11 @@ func (c *Client) Run(ctx context.Context) error {
 		c.idleMu.Unlock()
 	}()
 
+	if c.pinController != nil {
+		c.pinController.Start(ctx)
+		defer c.pinController.Stop()
+	}
+
 	// 1. Initial idle screen transition
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:      ui_ipc.ModeIdle,
@@ -230,40 +282,101 @@ func (c *Client) Run(ctx context.Context) error {
 	// 2. Startup recovery check
 	incomplete, err := c.cfg.StateStore.GetIncompleteJob(ctx)
 	if err == nil && incomplete != nil {
-		if c.cfg.EnableCloudRecovery {
-			// When cloud recovery is active, never automatically resume if physical output is uncertain.
-			// If daemon crashed or restarted after sheets/pages were already dispatched to the printer,
-			// mark the job as PAUSED_ERROR requiring explicit operator/cloud reconciliation.
-			if incomplete.PagesPrinted > 0 || incomplete.SheetsPrinted > 0 {
-				evt := contracts.JobProgressEvent{
-					JobID:         incomplete.Command.JobID,
-					KioskID:       incomplete.Command.KioskID,
-					Status:        contracts.JobStatusPausedError,
-					PagesPrinted:  incomplete.PagesPrinted,
-					SheetsPrinted: incomplete.SheetsPrinted,
-					ErrorReason:   "interrupted by daemon restart; physical output uncertain, reconciliation required",
-					Timestamp:     time.Now().UTC(),
-				}
-				_ = c.cfg.StateStore.UpdateProgress(ctx, evt)
-				c.sendProgress(ctx, evt)
-			} else {
-				// Zero sheets were ever printed; safe to retry from beginning
-				c.activeMu.Lock()
-				c.activeJobs[incomplete.Command.JobID] = true
-				c.activeMu.Unlock()
-				select {
-				case c.jobQueue <- incomplete.Command:
-				default:
-				}
-			}
-		} else {
-			// Migration fallback: legacy Pi-side behavior
+		isDefinitelyNotSubmitted := !incomplete.SubmittedToPrinter &&
+			incomplete.CUPSJobID == "" &&
+			incomplete.SheetsPrinted == 0 &&
+			incomplete.PagesPrinted == 0 &&
+			incomplete.ErrorReason == ""
+
+		if isDefinitelyNotSubmitted {
+			// Zero sheets were ever printed and submission was never initiated; safe to retry from beginning
 			c.activeMu.Lock()
 			c.activeJobs[incomplete.Command.JobID] = true
 			c.activeMu.Unlock()
 			select {
 			case c.jobQueue <- incomplete.Command:
 			default:
+			}
+		} else {
+			// Potentially submitted or already partially printed.
+			// Never automatically resubmit.
+			if strings.TrimSpace(c.cfg.CUPSQueue) != "" && incomplete.CUPSJobID != "" {
+				// Reconcile with CUPS using authoritative job status
+				cupsInfo, qErr := printer.QueryCUPSJobInfo(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, incomplete.CUPSJobID)
+				if qErr == nil && cupsInfo.State == printer.CUPSJobStateCompleted {
+					// Verify printer hardware health before assuming completed physical output
+					cupsHealth := printer.PollCUPSHealthCustom(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, 0)
+					if !cupsHealth.Online || cupsHealth.State == "ERROR" || cupsHealth.PaperTrayStatus == "CHECK_PRINTER" ||
+						strings.Contains(strings.ToLower(cupsHealth.ErrorMessage), "jam") ||
+						strings.Contains(strings.ToLower(cupsHealth.ErrorMessage), "out of paper") ||
+						strings.Contains(strings.ToLower(cupsHealth.ErrorMessage), "media-empty") {
+						reason := fmt.Sprintf("interrupted by daemon restart; printer in error (%s), physical output uncertain, manual reconciliation required", cupsHealth.ErrorMessage)
+						log.Printf("[SPOOLER] Startup reconciliation: pausing ambiguous job %s: %s", incomplete.Command.JobID, reason)
+						evt := contracts.JobProgressEvent{
+							JobID:         incomplete.Command.JobID,
+							KioskID:       incomplete.Command.KioskID,
+							Status:        contracts.JobStatusPausedError,
+							PagesPrinted:  incomplete.PagesPrinted,
+							SheetsPrinted: incomplete.SheetsPrinted,
+							ErrorReason:   reason,
+							Timestamp:     time.Now().UTC(),
+						}
+						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+						c.sendProgress(ctx, evt)
+					} else {
+						// Physical printing finished in CUPS while daemon was stopped/restarting and printer is healthy
+						log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) confirmed COMPLETED by CUPS and printer healthy", incomplete.Command.JobID, incomplete.CUPSJobID)
+						c.completeJob(ctx, incomplete.Command)
+					}
+				} else if qErr == nil && (cupsInfo.State == printer.CUPSJobStateProcessing ||
+					cupsInfo.State == printer.CUPSJobStatePending ||
+					cupsInfo.State == printer.CUPSJobStateHeld ||
+					cupsInfo.State == printer.CUPSJobStateProcessingStopped) {
+					// Job is actively processing or held/stopped in CUPS.
+					// Resume monitoring existing CUPS job without duplicate submission.
+					log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) is %s in CUPS; resuming monitoring", incomplete.Command.JobID, incomplete.CUPSJobID, cupsInfo.State)
+					c.activeMu.Lock()
+					c.activeJobs[incomplete.Command.JobID] = true
+					c.activeMu.Unlock()
+					go c.resumeCUPSMonitoring(ctx, incomplete)
+				} else {
+					// Reconciliation uncertain or job aborted/canceled in CUPS.
+					reason := "interrupted printer submission; manual reconciliation required"
+					if len(cupsInfo.Reasons) > 0 {
+						reason = fmt.Sprintf("CUPS job %s: %s", cupsInfo.State, strings.Join(cupsInfo.Reasons, ", "))
+					}
+					log.Printf("[SPOOLER] Startup reconciliation: pausing job %s: %s", incomplete.Command.JobID, reason)
+					evt := contracts.JobProgressEvent{
+						JobID:         incomplete.Command.JobID,
+						KioskID:       incomplete.Command.KioskID,
+						Status:        contracts.JobStatusPausedError,
+						PagesPrinted:  incomplete.PagesPrinted,
+						SheetsPrinted: incomplete.SheetsPrinted,
+						ErrorReason:   reason,
+						Timestamp:     time.Now().UTC(),
+					}
+					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+					c.sendProgress(ctx, evt)
+				}
+			} else {
+				// Ambiguous submission (crash during lp submission or PJL stream without CUPS ID)
+				// or partially printed without CUPS reconciliation available:
+				reason := "interrupted during printer submission; physical output uncertain, manual reconciliation required"
+				if incomplete.PagesPrinted > 0 || incomplete.SheetsPrinted > 0 {
+					reason = "interrupted by daemon restart; physical output uncertain, reconciliation required"
+				}
+				log.Printf("[SPOOLER] Startup recovery: job %s potentially submitted; pausing in PAUSED_ERROR (%s)", incomplete.Command.JobID, reason)
+				evt := contracts.JobProgressEvent{
+					JobID:         incomplete.Command.JobID,
+					KioskID:       incomplete.Command.KioskID,
+					Status:        contracts.JobStatusPausedError,
+					PagesPrinted:  incomplete.PagesPrinted,
+					SheetsPrinted: incomplete.SheetsPrinted,
+					ErrorReason:   reason,
+					Timestamp:     time.Now().UTC(),
+				}
+				_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+				c.sendProgress(ctx, evt)
 			}
 		}
 	}
@@ -366,6 +479,20 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 			c.handleIncomingJob(*msg.Job)
 		} else if msg.Type == "sync_ads" && len(msg.Ads) > 0 {
 			c.handleSyncAds(msg.Ads)
+		} else if msg.Type == "refill" {
+			sheets := msg.Sheets
+			if sheets <= 0 || sheets > 250 {
+				sheets = 250
+			}
+			if err := c.cfg.StateStore.ResetPaperTray(connCtx, sheets); err != nil {
+				log.Printf("[SPOOLER] Failed to reset paper tray on refill message: %v", err)
+			} else {
+				log.Printf("[SPOOLER] Successfully refilled paper tray to %d sheets", sheets)
+				h := c.healthPoller(connCtx, sheets)
+				h.PaperTrayStatus = "OK"
+				h.EstimatedSheets = sheets
+				_ = c.sendWire(connCtx, conn, wireMessage{Type: "health", Health: &h})
+			}
 		}
 	}
 
@@ -386,8 +513,15 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			_ = c.sendWire(ctx, conn, wireMessage{Type: "heartbeat"})
 
 			// Relay printer health
-			sheets, _ := c.cfg.StateStore.GetEstimatedSheets(ctx)
+			sheets, isCalibrated, err := c.cfg.StateStore.GetPaperSupply(ctx)
+			if err != nil {
+				sheets, _ = c.cfg.StateStore.GetEstimatedSheets(ctx)
+				isCalibrated = true
+			}
 			h := c.healthPoller(ctx, sheets)
+			if !isCalibrated {
+				h.PaperTrayStatus = "UNKNOWN"
+			}
 			_ = c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h})
 		}
 	}
@@ -444,6 +578,36 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		return
 	}
 
+	// Durable idempotency check: ignore if job is already marked COMPLETED or submitted to printer in local database
+	if existing, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID); err == nil && existing != nil {
+		if existing.Status == contracts.JobStatusCompleted {
+			log.Printf("[SPOOLER] Ignoring duplicate command for already completed job %s", cmd.JobID)
+			evt := contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       cmd.KioskID,
+				Status:        contracts.JobStatusCompleted,
+				PagesPrinted:  cmd.TotalPages,
+				SheetsPrinted: cmd.TotalSheets,
+				Timestamp:     time.Now().UTC(),
+			}
+			c.sendProgress(context.Background(), evt)
+			return
+		}
+		if existing.SubmittedToPrinter || existing.CUPSJobID != "" {
+			log.Printf("[SPOOLER] Ignoring duplicate command for job %s: already submitted to printer (CUPS ID %s, status %s)", cmd.JobID, existing.CUPSJobID, existing.Status)
+			evt := contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       cmd.KioskID,
+				Status:        existing.Status,
+				PagesPrinted:  existing.PagesPrinted,
+				SheetsPrinted: existing.SheetsPrinted,
+				Timestamp:     time.Now().UTC(),
+			}
+			c.sendProgress(context.Background(), evt)
+			return
+		}
+	}
+
 	c.activeMu.Lock()
 	if c.activeJobs[cmd.JobID] {
 		c.activeMu.Unlock()
@@ -466,6 +630,34 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	c.activeMu.Unlock()
 	log.Printf("[SPOOLER] Queued print job %s (pages=%d, sheets=%d, copies=%d, duplex=%s)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets, cmd.Copies, cmd.Duplex)
 
+	// Durably record incoming job acceptance in local state store before enqueueing
+	if c.cfg.StateStore != nil {
+		if err := c.cfg.StateStore.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			log.Printf("[SPOOLER] Warning: failed to persist initial job %s: %v", cmd.JobID, err)
+		}
+	}
+
+	// Send explicit acceptance / spooling acknowledgement back to cloud
+	ackEvt := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusSpooling,
+		PagesPrinted:  0,
+		SheetsPrinted: 0,
+		Timestamp:     time.Now().UTC(),
+	}
+	c.sendProgress(context.Background(), ackEvt)
+
+	c.connMu.Lock()
+	activeConn := c.conn
+	c.connMu.Unlock()
+	if activeConn != nil {
+		_ = c.sendWire(context.Background(), activeConn, wireMessage{
+			Type:     "job_ack",
+			Progress: &ackEvt,
+		})
+	}
+
 	select {
 	case c.jobQueue <- cmd:
 	default:
@@ -485,6 +677,90 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 }
 
+func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob) {
+	defer func() {
+		c.activeMu.Lock()
+		delete(c.activeJobs, job.Command.JobID)
+		c.activeMu.Unlock()
+	}()
+
+	cmd := job.Command
+	pagesPrinted := job.PagesPrinted
+	sheetsPrinted := job.SheetsPrinted
+
+	_ = c.renderScreen(ui_ipc.ScreenState{
+		Mode:            ui_ipc.ModePrinting,
+		CurrentPage:     pagesPrinted,
+		TotalPages:      cmd.TotalPages,
+		ProgressPercent: (pagesPrinted * 100) / cmd.TotalPages,
+		Message:         "Resuming print monitoring...",
+		Detail:          "Job ID: " + cmd.JobID,
+	})
+
+	onPage := func(streamSheetsCompleted int) {
+		targetSheets := streamSheetsCompleted
+		if targetSheets > cmd.TotalSheets {
+			targetSheets = cmd.TotalSheets
+		}
+		if targetSheets < sheetsPrinted {
+			targetSheets = sheetsPrinted
+		}
+
+		if cmd.Duplex == contracts.DuplexSimplex {
+			pagesPrinted = (cmd.StartFromPage - 1) + streamSheetsCompleted/cmd.Copies
+		} else {
+			pagesPrinted = (cmd.StartFromPage - 1) + (streamSheetsCompleted*2)/cmd.Copies
+		}
+		if pagesPrinted > cmd.TotalPages {
+			pagesPrinted = cmd.TotalPages
+		}
+
+		evt := contracts.JobProgressEvent{
+			JobID:         cmd.JobID,
+			KioskID:       cmd.KioskID,
+			Status:        contracts.JobStatusPrinting,
+			PagesPrinted:  pagesPrinted,
+			SheetsPrinted: targetSheets,
+			Timestamp:     time.Now().UTC(),
+		}
+		if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
+			log.Printf("[SPOOLER] RecordSheetProgress error during CUPS monitoring for job %s: %v", cmd.JobID, err)
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("inventory deduction error: %v", err))
+			return
+		}
+		sheetsPrinted = targetSheets
+		c.sendProgress(ctx, evt)
+
+		_ = c.renderScreen(ui_ipc.ScreenState{
+			Mode:            ui_ipc.ModePrinting,
+			CurrentPage:     pagesPrinted,
+			TotalPages:      cmd.TotalPages,
+			ProgressPercent: (pagesPrinted * 100) / cmd.TotalPages,
+			Message:         "Printing document...",
+			Detail:          "Job ID: " + cmd.JobID,
+		})
+	}
+
+	err := printer.MonitorCUPSJobCustom(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond)
+	if err != nil {
+		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("CUPS monitoring error: %v", err))
+		return
+	}
+
+	if strings.TrimSpace(c.cfg.CUPSQueue) != "" && c.cfg.CUPSRunner != nil {
+		health := printer.PollCUPSHealthCustom(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, 0)
+		if !health.Online || health.State == "ERROR" || health.PaperTrayStatus == "CHECK_PRINTER" ||
+			strings.Contains(strings.ToLower(health.ErrorMessage), "jam") ||
+			strings.Contains(strings.ToLower(health.ErrorMessage), "out of paper") ||
+			strings.Contains(strings.ToLower(health.ErrorMessage), "media-empty") {
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer reported hardware error on completion (%s); physical output uncertain, manual reconciliation required", health.ErrorMessage))
+			return
+		}
+	}
+
+	c.completeJob(ctx, cmd)
+}
+
 func (c *Client) jobWorker(ctx context.Context) {
 	for {
 		select {
@@ -499,7 +775,45 @@ func (c *Client) jobWorker(ctx context.Context) {
 	}
 }
 
+func isJobForActiveOrder(jobID, activeOrderID string) bool {
+	if activeOrderID == "" || jobID == "" {
+		return false
+	}
+	return jobID == activeOrderID ||
+		jobID == "job_"+activeOrderID ||
+		strings.Contains(jobID, activeOrderID)
+}
+
+func (c *Client) waitForActiveTransactionToFinish(ctx context.Context) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if c.pinController == nil || !c.pinController.HasActiveTransaction() {
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) {
+	if c.pinController != nil && c.pinController.HasActiveTransaction() {
+		activeOrderID := c.pinController.ActiveOrderID()
+		if isJobForActiveOrder(cmd.JobID, activeOrderID) {
+			// Job belongs to the active transaction (payment succeeded)
+			c.pinController.ResetToIdle()
+		} else {
+			// Unrelated incoming job: MUST NOT clear active transaction screen!
+			log.Printf("[SPOOLER] Unrelated job %s arrived during active PIN transaction (%s); waiting for transaction to complete", cmd.JobID, activeOrderID)
+			c.waitForActiveTransactionToFinish(ctx)
+		}
+	} else if c.pinController != nil {
+		c.pinController.ResetToIdle()
+	}
+
 	c.idleMu.Lock()
 	if c.idleTimer != nil {
 		c.idleTimer.Stop()
@@ -581,12 +895,9 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		return
 	}
 
-	remainingPages := cmd.TotalPages - startPage + 1
-	remainingSheets := 0
-	if cmd.Duplex == contracts.DuplexSimplex {
-		remainingSheets = remainingPages * cmd.Copies
-	} else {
-		remainingSheets = ((remainingPages + 1) / 2) * cmd.Copies
+	remainingSheets := cmd.TotalSheets - sheetsPrinted
+	if remainingSheets < 0 {
+		remainingSheets = 0
 	}
 
 	estimatedSheets, err := c.cfg.StateStore.GetEstimatedSheets(ctx)
@@ -595,22 +906,9 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		return
 	}
 
-	// 6. Page Slicing if resuming partway
+	// 6. Imposed print artifact (zero Pi-side slicing or transformation)
 	printPath := finalPath
 	streamCmd := cmd
-	if startPage > 1 {
-		slicedPath := filepath.Join(c.cfg.DownloadDir, fmt.Sprintf("slice_%s_%d.pdf", finalName, startPage))
-		if err := printer.SlicePDFForResume(ctx, finalPath, slicedPath, startPage); err != nil {
-			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("slicing failed: %v", err))
-			return
-		}
-		defer os.Remove(slicedPath)
-		printPath = slicedPath
-
-		streamCmd.StartFromPage = 1
-		streamCmd.TotalPages = remainingPages
-		streamCmd.TotalSheets = remainingSheets
-	}
 
 	// 7. Update progress: PRINTING
 	printEvt := contracts.JobProgressEvent{
@@ -621,7 +919,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		SheetsPrinted: sheetsPrinted,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = c.cfg.StateStore.UpdateProgress(ctx, printEvt)
+	_ = c.cfg.StateStore.RecordSheetProgress(ctx, printEvt)
 	c.sendProgress(ctx, printEvt)
 
 	_ = c.renderScreen(ui_ipc.ScreenState{
@@ -649,14 +947,17 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 	onPage := func(streamSheetsCompleted int) {
 		if streamSheetsCompleted > lastReportedStreamSheets {
-			delta := streamSheetsCompleted - lastReportedStreamSheets
 			lastReportedStreamSheets = streamSheetsCompleted
-
-			if err := c.cfg.StateStore.DecrementSheets(jobCtx, delta); err != nil {
-				cancelJob()
-				return
+			targetSheets := initialSheetsOffset + streamSheetsCompleted
+			if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+				targetSheets = streamSheetsCompleted
 			}
-			sheetsPrinted = initialSheetsOffset + streamSheetsCompleted
+			if targetSheets > cmd.TotalSheets {
+				targetSheets = cmd.TotalSheets
+			}
+			if targetSheets < sheetsPrinted {
+				targetSheets = sheetsPrinted
+			}
 
 			if cmd.Duplex == contracts.DuplexSimplex {
 				pagesPrinted = (startPage - 1) + streamSheetsCompleted/cmd.Copies
@@ -667,22 +968,21 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 			if pagesPrinted > cmd.TotalPages {
 				pagesPrinted = cmd.TotalPages
 			}
-			if sheetsPrinted > cmd.TotalSheets {
-				sheetsPrinted = cmd.TotalSheets
-			}
 
 			evt := contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       cmd.KioskID,
 				Status:        contracts.JobStatusPrinting,
 				PagesPrinted:  pagesPrinted,
-				SheetsPrinted: sheetsPrinted,
+				SheetsPrinted: targetSheets,
 				Timestamp:     time.Now().UTC(),
 			}
-			if err := c.cfg.StateStore.UpdateProgress(jobCtx, evt); err != nil {
+			if err := c.cfg.StateStore.RecordSheetProgress(jobCtx, evt); err != nil {
+				log.Printf("[SPOOLER] RecordSheetProgress error for job %s: %v", cmd.JobID, err)
 				cancelJob()
 				return
 			}
+			sheetsPrinted = targetSheets
 			c.sendProgress(jobCtx, evt)
 
 			_ = c.renderScreen(ui_ipc.ScreenState{
@@ -700,12 +1000,22 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 		log.Printf("[SPOOLER] Sending job %s to CUPS queue %s", cmd.JobID, c.cfg.CUPSQueue)
 		if c.cfg.MockCUPSPrint != nil {
+			_ = c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
 			printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
 		} else {
-			printErr = printer.PrintPDFWithCUPS(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
+			hooks := &printer.CUPSPrintHooks{
+				OnSubmitting: func() {
+					_ = c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
+				},
+				OnSubmitted: func(cupsJobID string) {
+					_ = c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
+				},
+			}
+			printErr = printer.PrintPDFWithCUPSHooksCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, streamCmd, printPath, onPage, 500*time.Millisecond, hooks)
 		}
 	} else {
 		log.Printf("[SPOOLER] Streaming job %s to PJL printer %s", cmd.JobID, c.cfg.PrinterAddr)
+		_ = c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
 		printErr = printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage)
 	}
 
@@ -714,10 +1024,15 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		return
 	}
 
-	// Reconcile remaining sheets if not already deducted
-	if sheetsPrinted < cmd.TotalSheets {
-		remainingToDeduct := cmd.TotalSheets - sheetsPrinted
-		_ = c.cfg.StateStore.DecrementSheets(ctx, remainingToDeduct)
+	if strings.TrimSpace(c.cfg.CUPSQueue) != "" && c.cfg.CUPSRunner != nil {
+		health := printer.PollCUPSHealthCustom(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, 0)
+		if !health.Online || health.State == "ERROR" || health.PaperTrayStatus == "CHECK_PRINTER" ||
+			strings.Contains(strings.ToLower(health.ErrorMessage), "jam") ||
+			strings.Contains(strings.ToLower(health.ErrorMessage), "out of paper") ||
+			strings.Contains(strings.ToLower(health.ErrorMessage), "media-empty") {
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer reported hardware error on completion (%s); physical output uncertain, manual reconciliation required", health.ErrorMessage))
+			return
+		}
 	}
 
 	// 9. Complete Job
@@ -727,13 +1042,6 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) {
 	log.Printf("[SPOOLER] Job %s successfully printed (%d pages, %d sheets)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets)
 
-	// Post-print document shredder: immediately delete the downloaded PDF payload from local disk
-	// to enforce ETSI EN 303 645 (Provision 5.4), NIST SP 800-213, and GDPR/DPDP storage limitation.
-	finalPath := filepath.Join(c.cfg.DownloadDir, cmd.JobID+".pdf")
-	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to shred local printed payload %s: %v", finalPath, err)
-	}
-
 	evt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
@@ -742,7 +1050,25 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 		SheetsPrinted: cmd.TotalSheets,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = c.cfg.StateStore.UpdateProgress(ctx, evt)
+	if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
+		log.Printf("[SPOOLER] Failed to record completion for job %s: %v", cmd.JobID, err)
+		lastPages := 0
+		lastSheets := 0
+		if existingJob, _ := c.cfg.StateStore.GetJob(ctx, cmd.JobID); existingJob != nil {
+			lastPages = existingJob.PagesPrinted
+			lastSheets = existingJob.SheetsPrinted
+		}
+		c.handleJobError(ctx, cmd, lastPages, lastSheets, fmt.Sprintf("failed to record completion: %v", err))
+		return
+	}
+
+	// Post-print document shredder: immediately delete the downloaded PDF payload from local disk
+	// to enforce ETSI EN 303 645 (Provision 5.4), NIST SP 800-213, and GDPR/DPDP storage limitation.
+	finalPath := filepath.Join(c.cfg.DownloadDir, cmd.JobID+".pdf")
+	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("[WARN] Failed to shred local printed payload %s: %v", finalPath, err)
+	}
+
 	c.sendProgress(ctx, evt)
 
 	_ = c.renderScreen(ui_ipc.ScreenState{
@@ -768,7 +1094,7 @@ func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobComma
 		ErrorReason:   reason,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = c.cfg.StateStore.UpdateProgress(ctx, evt)
+	_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
 	c.sendProgress(ctx, evt)
 
 	_ = c.renderScreen(ui_ipc.ScreenState{

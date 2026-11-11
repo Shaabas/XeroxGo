@@ -9,7 +9,30 @@ CREATE TABLE IF NOT EXISTS orders (
     status TEXT NOT NULL,
     price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
     created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL
+    updated_at_ns BIGINT NOT NULL,
+    pin_expires_at_ns BIGINT NOT NULL DEFAULT 0,
+    claim_token TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);
+
+CREATE TABLE IF NOT EXISTS pin_reservations (
+    kiosk_id TEXT NOT NULL,
+    pin TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    expires_at_ns BIGINT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    PRIMARY KEY (kiosk_id, pin)
+);
+CREATE INDEX IF NOT EXISTS idx_pin_reservations_order ON pin_reservations (order_id);
+CREATE INDEX IF NOT EXISTS idx_pin_reservations_expiry ON pin_reservations (kiosk_id, expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS pin_rate_limits (
+    kiosk_id TEXT PRIMARY KEY,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    first_failure_ns BIGINT NOT NULL DEFAULT 0,
+    last_failure_ns BIGINT NOT NULL DEFAULT 0,
+    blocked_until_ns BIGINT NOT NULL DEFAULT 0,
+    updated_at_ns BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS print_configs (
@@ -107,3 +130,70 @@ CREATE TABLE IF NOT EXISTS conversions (
 
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS kiosk_sessions (
+    session_id TEXT PRIMARY KEY,
+    kiosk_id TEXT NOT NULL,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    expires_at_ns BIGINT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);
+CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS payments (
+    payment_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    amount_paise BIGINT NOT NULL CHECK (amount_paise >= 0),
+    status TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);
+
+CREATE TABLE IF NOT EXISTS dispatch_intents (
+    order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
+    kiosk_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    dispatched_at_ns BIGINT NOT NULL DEFAULT 0,
+    acknowledged_at_ns BIGINT NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
+
+CREATE TABLE IF NOT EXISTS payment_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_order_id TEXT NOT NULL DEFAULT '',
+    provider_payment_id TEXT NOT NULL DEFAULT '',
+    amount_paise BIGINT NOT NULL CHECK (amount_paise >= 0),
+    currency TEXT NOT NULL DEFAULT 'INR',
+    status TEXT NOT NULL,
+    qr_payload TEXT NOT NULL DEFAULT '',
+    qr_image_url TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    expires_at_ns BIGINT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (session_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);
+
+
+

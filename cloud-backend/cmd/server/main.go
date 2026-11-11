@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/big"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -41,10 +43,23 @@ type serverConfig struct {
 }
 
 type appServer struct {
-	cfg      *serverConfig
-	db       *store.Store
-	hub      *ws.Hub
-	convWake chan struct{}
+	cfg             *serverConfig
+	db              *store.Store
+	hub             *ws.Hub
+	convWake        chan struct{}
+	pinLimiter      *PINRateLimiter
+	paymentProvider payments.Provider
+}
+
+func (s *appServer) getPaymentProvider() payments.Provider {
+	if s.paymentProvider != nil {
+		return s.paymentProvider
+	}
+	var secret string
+	if s.cfg != nil {
+		secret = string(s.cfg.webhookSecret)
+	}
+	return payments.NewMockProvider(secret)
 }
 
 func randomHex(bytesLen int) (string, error) {
@@ -56,15 +71,56 @@ func randomHex(bytesLen int) (string, error) {
 }
 
 func randomDisplayCode() (string, error) {
-	const charset = "0123456789"
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
+	n, err := rand.Int(rand.Reader, big.NewInt(10000))
+	if err != nil {
 		return "", err
 	}
-	for i := range b {
-		b[i] = charset[int(b[i])%len(charset)]
+	return fmt.Sprintf("%04d", n.Int64()), nil
+}
+
+func (s *appServer) generateUniquePIN(ctx context.Context, kioskID string) (string, error) {
+	if s.db == nil {
+		return randomDisplayCode()
 	}
-	return string(b), nil
+	for attempt := 0; attempt < 25; attempt++ {
+		pin, err := randomDisplayCode()
+		if err != nil {
+			return "", fmt.Errorf("generate pin: %w", err)
+		}
+		inUse, err := s.db.IsPINInUse(ctx, kioskID, pin, time.Now())
+		if err != nil {
+			return "", fmt.Errorf("check pin collision: %w", err)
+		}
+		if !inUse {
+			return pin, nil
+		}
+	}
+	return "", errors.New("unable to generate unique PIN after max attempts")
+}
+
+func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int) error {
+	if s.db == nil {
+		return errors.New("database not initialized")
+	}
+	if maxAttempts < 1 {
+		maxAttempts = 25
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		pin, err := randomDisplayCode()
+		if err != nil {
+			return fmt.Errorf("generate pin: %w", err)
+		}
+		order.Command.DisplayCode = pin
+		err = s.db.CreateOrder(ctx, *order)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, store.ErrPINCollision) {
+			continue
+		}
+		return err
+	}
+	return errors.New("unable to reserve unique PIN after maximum collision retries")
 }
 
 func generateSignedDownloadURL(baseURL, orderID string, secret []byte, ttl time.Duration) string {
@@ -233,12 +289,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jobID := "job_" + jobHex
-
-		displayCode, err := randomDisplayCode()
-		if err != nil {
-			http.Error(w, "failed to generate display code", http.StatusInternalServerError)
-			return
-		}
 
 		h := sha256.Sum256([]byte(orderID))
 		outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
@@ -491,7 +541,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		cmd := contracts.PrintJobCommand{
 			JobID:          jobID,
 			KioskID:        kioskID,
-			DisplayCode:    displayCode,
+			DisplayCode:    "",
 			DownloadURL:    downloadURL,
 			SHA256Checksum: sha256Checksum,
 			TotalPages:     totalPrintedPages,
@@ -501,25 +551,38 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			StartFromPage:  1,
 		}
 
-		order := store.Order{
-			OrderID:    orderID,
-			Command:    cmd,
-			Status:     contracts.JobStatusPendingPayment,
-			PricePaise: totalOrderPricePaise,
-			ColorMode:  overallColor,
+		claimToken, err := randomHex(32)
+		if err != nil {
+			http.Error(w, "failed to generate recovery credential", http.StatusInternalServerError)
+			return
 		}
 
-		if err := s.db.CreateOrder(r.Context(), order); err != nil {
+		pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
+		order := store.Order{
+			OrderID:      orderID,
+			Command:      cmd,
+			Status:       contracts.JobStatusPendingPayment,
+			PricePaise:   totalOrderPricePaise,
+			ColorMode:    overallColor,
+			PINExpiresAt: pinExpiresAt,
+			ClaimToken:   claimToken,
+		}
+
+		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 			_ = os.Remove(outputPath)
 			http.Error(w, "failed to persist order", http.StatusInternalServerError)
 			return
 		}
+		displayCode := order.Command.DisplayCode
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"order_id":              orderID,
 			"job_id":                jobID,
 			"display_code":          displayCode,
+			"claim_token":           claimToken,
+			"recovery_token":        claimToken,
+			"pin_expires_at":        pinExpiresAt.Format(time.RFC3339),
 			"color_mode":            overallColor,
 			"total_pages":           totalPrintedPages,
 			"total_sheets":          totalSheets,
@@ -655,12 +718,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID := "job_" + jobHex
 
-	displayCode, err := randomDisplayCode()
-	if err != nil {
-		http.Error(w, "failed to generate display code", http.StatusInternalServerError)
-		return
-	}
-
 	h := sha256.Sum256([]byte(orderID))
 	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
@@ -716,7 +773,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	cmd := contracts.PrintJobCommand{
 		JobID:          jobID,
 		KioskID:        kioskID,
-		DisplayCode:    displayCode,
+		DisplayCode:    "",
 		DownloadURL:    downloadURL,
 		SHA256Checksum: normRes.SHA256Checksum,
 		TotalPages:     normRes.TotalPages,
@@ -726,25 +783,38 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		StartFromPage:  1,
 	}
 
-	order := store.Order{
-		OrderID:    orderID,
-		Command:    cmd,
-		Status:     contracts.JobStatusPendingPayment,
-		PricePaise: totalPricePaise,
-		ColorMode:  colorMode,
+	claimToken, err := randomHex(32)
+	if err != nil {
+		http.Error(w, "failed to generate recovery credential", http.StatusInternalServerError)
+		return
 	}
 
-	if err := s.db.CreateOrder(r.Context(), order); err != nil {
+	pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
+	order := store.Order{
+		OrderID:      orderID,
+		Command:      cmd,
+		Status:       contracts.JobStatusPendingPayment,
+		PricePaise:   totalPricePaise,
+		ColorMode:    colorMode,
+		PINExpiresAt: pinExpiresAt,
+		ClaimToken:   claimToken,
+	}
+
+	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, "failed to persist order", http.StatusInternalServerError)
 		return
 	}
+	displayCode := order.Command.DisplayCode
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"order_id":              orderID,
 		"job_id":                jobID,
 		"display_code":          displayCode,
+		"claim_token":           claimToken,
+		"recovery_token":        claimToken,
+		"pin_expires_at":        pinExpiresAt.Format(time.RFC3339),
 		"color_mode":            colorMode,
 		"total_pages":           normRes.TotalPages,
 		"total_sheets":          normRes.TotalSheets,
@@ -1185,6 +1255,17 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if order.Status == contracts.JobStatusPendingPayment && !order.PINExpiresAt.IsZero() && !time.Now().UTC().Before(order.PINExpiresAt) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"order_id": orderID,
+			"status":   "EXPIRED",
+			"error":    "order has expired",
+		})
+		return
+	}
+
 	syntheticPayload := map[string]interface{}{
 		"event": "payment.captured",
 		"payload": map[string]interface{}{
@@ -1232,28 +1313,71 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := s.db.UpdateOrderStatus(r.Context(), orderID, contracts.JobStatusPaidWaiting); err != nil {
-		http.Error(w, "failed to update order status", http.StatusInternalServerError)
+	requireSession := r.URL.Query().Get("require_session") == "1" || r.URL.Query().Get("strict_session") == "1"
+	now := time.Now().UTC()
+
+	var simSessionID string
+	// In development simulation: if strict session is not required and no active session exists,
+	// auto-create a session so automated integration tests run end-to-end.
+	if !requireSession {
+		activeSess, _ := s.db.GetActiveKioskSession(r.Context(), order.Command.KioskID, orderID, now)
+		if activeSess == nil {
+			activeSess, _ = s.db.CreateOrGetKioskSession(r.Context(), order.Command.KioskID, orderID, 5*time.Minute, now)
+		}
+		if activeSess != nil {
+			simSessionID = activeSess.SessionID
+		}
+	} else {
+		if activeSess, _ := s.db.GetActiveKioskSession(r.Context(), order.Command.KioskID, orderID, now); activeSess != nil {
+			simSessionID = activeSess.SessionID
+		}
+	}
+	if sessParam := strings.TrimSpace(r.URL.Query().Get("session_id")); sessParam != "" {
+		simSessionID = sessParam
+	}
+
+	captureRes, err := s.db.CapturePaymentAndCheckDispatch(r.Context(), store.PaymentRecord{
+		PaymentID:   "pay_sim_" + orderID,
+		OrderID:     orderID,
+		KioskID:     order.Command.KioskID,
+		SessionID:   simSessionID,
+		AmountPaise: order.PricePaise,
+		Provider:    "simulate",
+		Status:      "captured",
+	}, now)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if err := s.hub.SendJob(r.Context(), order.Command); err != nil {
+	if captureRes.DispatchEligible && captureRes.Command != nil {
+		if s.hub != nil {
+			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"order_id": orderID,
+					"status":   string(contracts.JobStatusPaidWaiting),
+					"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
+				})
+				return
+			}
+			_ = s.db.MarkDispatchIntentSent(r.Context(), orderID)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"order_id": orderID,
-			"status":   string(contracts.JobStatusPaidWaiting),
-			"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
+			"status":   string(contracts.JobStatusDispatched),
 		})
 		return
 	}
 
-	_ = s.db.UpdateOrderStatus(r.Context(), orderID, contracts.JobStatusDispatched)
-
+	// No session or not dispatch eligible
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"order_id": orderID,
-		"status":   string(contracts.JobStatusDispatched),
+		"status":   string(captureRes.OrderStatus),
 	})
 }
 
@@ -1272,7 +1396,8 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 	}
 
 	sig := r.Header.Get("X-Razorpay-Signature")
-	if sig == "" || !payments.VerifyWebhookSignature(rawBody, sig, string(s.cfg.webhookSecret)) {
+	prov := s.getPaymentProvider()
+	if sig == "" || !prov.VerifyWebhookSignature(rawBody, sig) {
 		http.Error(w, "invalid signature", http.StatusBadRequest)
 		return
 	}
@@ -1282,12 +1407,15 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		Payload struct {
 			Payment struct {
 				Entity struct {
-					ID      string `json:"id"`
-					OrderID string `json:"order_id"`
-					Amount  int64  `json:"amount"`
-					Status  string `json:"status"`
-					Notes   struct {
-						OrderID string `json:"order_id"`
+					ID       string `json:"id"`
+					OrderID  string `json:"order_id"`
+					Amount   int64  `json:"amount"`
+					Currency string `json:"currency"`
+					Status   string `json:"status"`
+					Notes    struct {
+						OrderID   string `json:"order_id"`
+						SessionID string `json:"session_id"`
+						KioskID   string `json:"kiosk_id"`
 					} `json:"notes"`
 				} `json:"entity"`
 			} `json:"payment"`
@@ -1305,32 +1433,106 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	orderID := parsed.Payload.Payment.Entity.Notes.OrderID
-	if orderID == "" {
-		orderID = parsed.Payload.Payment.Entity.OrderID
+	entity := parsed.Payload.Payment.Entity
+	if entity.ID == "" {
+		http.Error(w, "payment id missing in payment entity", http.StatusBadRequest)
+		return
 	}
-	if orderID == "" {
-		http.Error(w, "order id missing in payment entity", http.StatusBadRequest)
+	if entity.Status != "captured" {
+		http.Error(w, "payment status is not captured", http.StatusBadRequest)
+		return
+	}
+	if entity.Currency != "" && strings.ToUpper(strings.TrimSpace(entity.Currency)) != "INR" {
+		http.Error(w, "invalid currency: only INR is supported", http.StatusBadRequest)
 		return
 	}
 
-	eventID := parsed.Payload.Payment.Entity.ID
-	if eventID == "" {
-		eventID = "evt_" + orderID
+	// Stored attempt association (Requirement 7 & 8: never trust notes alone as proof of transaction ownership)
+	var attempt *store.PaymentAttempt
+	providerOrderID := strings.TrimSpace(entity.OrderID)
+	notesOrderID := strings.TrimSpace(entity.Notes.OrderID)
+	notesSessionID := strings.TrimSpace(entity.Notes.SessionID)
+
+	if providerOrderID != "" {
+		att, err := s.db.GetPaymentAttemptByProviderOrder(r.Context(), "", providerOrderID)
+		if err == nil && att != nil {
+			attempt = att
+		}
+	}
+	if attempt == nil {
+		lookupOrderID := notesOrderID
+		if lookupOrderID == "" {
+			lookupOrderID = providerOrderID
+		}
+		if lookupOrderID != "" {
+			att, err := s.db.GetPaymentAttemptByOrderAndSession(r.Context(), lookupOrderID, notesSessionID)
+			if err == nil && att != nil {
+				attempt = att
+			}
+		}
 	}
 
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusBadRequest)
-		return
+	var (
+		orderID      string
+		sessionID    string
+		kioskID      string
+		amount       int64
+		providerName string
+	)
+
+	if attempt != nil {
+		// Strictly enforce attempt binding
+		if entity.Amount > 0 && entity.Amount != attempt.AmountPaise {
+			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", attempt.AmountPaise, entity.Amount), http.StatusBadRequest)
+			return
+		}
+		if entity.Currency != "" && attempt.Currency != "" && !strings.EqualFold(entity.Currency, attempt.Currency) {
+			http.Error(w, "payment currency mismatch with stored attempt", http.StatusBadRequest)
+			return
+		}
+		orderID = attempt.OrderID
+		kioskID = attempt.KioskID
+		sessionID = attempt.SessionID
+		amount = attempt.AmountPaise
+		providerName = attempt.Provider
+	} else {
+		// Fallback for orders without an explicit attempt:
+		// Requirement 8: Never trust payment notes alone as proof of transaction ownership!
+		// We do NOT trust notes.SessionID to authorize physical dispatch.
+		lookupOrderID := notesOrderID
+		if lookupOrderID == "" {
+			lookupOrderID = providerOrderID
+		}
+		if lookupOrderID == "" {
+			http.Error(w, "unassociated payment: order id missing", http.StatusBadRequest)
+			return
+		}
+		order, err := s.db.GetOrder(r.Context(), lookupOrderID)
+		if err != nil || order == nil {
+			http.Error(w, "unassociated payment attempt: no matching stored attempt or order found", http.StatusBadRequest)
+			return
+		}
+		if entity.Amount > 0 && entity.Amount != order.PricePaise {
+			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", order.PricePaise, entity.Amount), http.StatusBadRequest)
+			return
+		}
+		orderID = order.OrderID
+		kioskID = order.Command.KioskID
+		now := time.Now().UTC()
+		if notesSessionID != "" {
+			sess, sErr := s.db.GetKioskSession(r.Context(), notesSessionID, now)
+			if sErr == nil && sess != nil && sess.OrderID == orderID && sess.Status == store.KioskSessionPaymentPending && sess.ExpiresAt.After(now) {
+				sessionID = sess.SessionID
+			}
+		}
+		amount = order.PricePaise
+		providerName = "razorpay"
+	}
+	if providerName == "" {
+		providerName = "razorpay"
 	}
 
-	// Requirement 10 & 19: Verify the actual Razorpay order amount equals the stored order amount in paise.
-	if parsed.Payload.Payment.Entity.Amount > 0 && parsed.Payload.Payment.Entity.Amount != order.PricePaise {
-		http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", order.PricePaise, parsed.Payload.Payment.Entity.Amount), http.StatusBadRequest)
-		return
-	}
-
+	eventID := entity.ID
 	recorded, err := s.db.RecordWebhook(r.Context(), eventID)
 	if err != nil {
 		http.Error(w, "failed to record webhook", http.StatusInternalServerError)
@@ -1342,14 +1544,55 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = s.db.UpdateOrderStatus(r.Context(), orderID, contracts.JobStatusPaidWaiting)
-
-	if err := s.hub.SendJob(r.Context(), order.Command); err == nil {
-		_ = s.db.UpdateOrderStatus(r.Context(), orderID, contracts.JobStatusDispatched)
+	now := time.Now().UTC()
+	captureRes, err := s.db.CapturePaymentAndCheckDispatch(r.Context(), store.PaymentRecord{
+		PaymentID:   eventID,
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		SessionID:   sessionID,
+		AmountPaise: amount,
+		Provider:    providerName,
+		Status:      entity.Status,
+	}, now)
+	if err != nil {
+		if errors.Is(err, store.ErrOrderNotFound) {
+			http.Error(w, "order not found", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
+	if attempt != nil {
+		_ = s.db.MarkPaymentAttemptPaid(r.Context(), attempt.AttemptID, eventID)
+	}
+
+	if captureRes.AlreadyProcessed {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"already_processed"}`))
+		return
+	}
+
+	// PHYSICAL PRINT AUTHORIZATION GATE
+	// Only dispatch print if valid active kiosk session exists for customer presence
+	if captureRes.DispatchEligible && captureRes.Command != nil {
+		log.Printf("[PAYMENT] Order %s authorized for print (active session %s)", orderID, captureRes.ActiveSessionID)
+		if s.hub != nil {
+			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
+				log.Printf("[PAYMENT] Failed to dispatch job %s to kiosk %s: %v", captureRes.Command.JobID, captureRes.KioskID, err)
+			} else {
+				_ = s.db.MarkDispatchIntentSent(r.Context(), orderID)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"dispatched"}`))
+		return
+	}
+
+	// Late payment or absent active kiosk session: money captured in PAID_WAITING without unattended printing
+	log.Printf("[PAYMENT] Payment captured for order %s, but no active kiosk session authorizes printing. Preserving in PAID_WAITING.", orderID)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	_, _ = w.Write([]byte(`{"status":"paid_unprinted"}`))
 }
 
 func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
@@ -1398,19 +1641,35 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	secondsRemaining := int64(0)
+	now := time.Now().UTC()
+	if !order.PINExpiresAt.IsZero() {
+		if !now.Before(order.PINExpiresAt) {
+			secondsRemaining = 0
+			if currentStatus == string(contracts.JobStatusPendingPayment) {
+				currentStatus = "EXPIRED"
+			}
+		} else {
+			rem := order.PINExpiresAt.Sub(now)
+			secondsRemaining = int64(math.Ceil(rem.Seconds()))
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"order_id":       order.OrderID,
-		"display_code":   order.Command.DisplayCode,
-		"status":         currentStatus,
-		"total_pages":    order.Command.TotalPages,
-		"total_sheets":   order.Command.TotalSheets,
-		"copies":         order.Command.Copies,
-		"duplex":         string(order.Command.Duplex),
-		"pages_printed":  pagesPrinted,
-		"sheets_printed": sheetsPrinted,
-		"error_reason":   errorReason,
-		"price_paise":    order.PricePaise,
+		"order_id":          order.OrderID,
+		"display_code":      order.Command.DisplayCode,
+		"status":            currentStatus,
+		"total_pages":       order.Command.TotalPages,
+		"total_sheets":      order.Command.TotalSheets,
+		"copies":            order.Command.Copies,
+		"duplex":            string(order.Command.Duplex),
+		"pages_printed":     pagesPrinted,
+		"sheets_printed":    sheetsPrinted,
+		"error_reason":      errorReason,
+		"price_paise":       order.PricePaise,
+		"pin_expires_at":    order.PINExpiresAt.Format(time.RFC3339),
+		"seconds_remaining": secondsRemaining,
 	})
 }
 
@@ -1534,11 +1793,38 @@ func main() {
 		kioskSecret:        kioskSecretBytes,
 	}
 
+	rzpKeyID := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_ID"))
+	rzpKeySecret := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_SECRET"))
+	paymentProviderType := strings.ToLower(strings.TrimSpace(os.Getenv("PAYMENT_PROVIDER")))
+
+	var paymentProv payments.Provider
+	if paymentProviderType == "razorpay" || (paymentProviderType == "" && rzpKeyID != "" && rzpKeySecret != "") {
+		if rzpKeyID == "" || rzpKeySecret == "" {
+			log.Fatalf("RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be set when PAYMENT_PROVIDER=razorpay")
+		}
+		var err error
+		paymentProv, err = payments.NewRazorpayProvider(payments.RazorpayConfig{
+			KeyID:         rzpKeyID,
+			KeySecret:     rzpKeySecret,
+			WebhookSecret: whSecretStr,
+		})
+		if err != nil {
+			log.Fatalf("failed to initialize Razorpay provider: %v", err)
+		}
+		log.Printf("[PAYMENT] Initialized Razorpay payment provider (key_id=%s)", rzpKeyID)
+	} else {
+		paymentProv = payments.NewMockProvider(whSecretStr)
+		log.Printf("[PAYMENT] Initialized Mock payment provider (real payments disabled by default)")
+	}
+
+	pinLimiter := NewPINRateLimiter(storeDB, 5, 2*time.Minute, 2*time.Minute)
 	app := &appServer{
-		cfg:      cfg,
-		db:       storeDB,
-		hub:      hub,
-		convWake: make(chan struct{}, 1),
+		cfg:             cfg,
+		db:              storeDB,
+		hub:             hub,
+		convWake:        make(chan struct{}, 1),
+		pinLimiter:      pinLimiter,
+		paymentProvider: paymentProv,
 	}
 
 	mux := http.NewServeMux()
@@ -1554,6 +1840,22 @@ func main() {
 			app.handleUpload(w, r)
 		case strings.HasSuffix(path, "/recover"):
 			app.handleRecoverJob(w, r)
+		case strings.HasSuffix(path, "/orders/lookup"), strings.HasSuffix(path, "/pin/lookup"):
+			app.handlePINLookup(w, r)
+		case strings.HasSuffix(path, "/claim"), strings.HasSuffix(path, "/confirm"):
+			app.handleOrderClaim(w, r)
+		case strings.HasSuffix(path, "/release"):
+			app.handleOrderRelease(w, r)
+		case strings.HasSuffix(path, "/recovery-pin"):
+			app.handleRecoveryPIN(w, r)
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/cancel"), strings.HasSuffix(path, "/cancel-session"):
+			app.handleSessionCancel(w, r)
+		case strings.Contains(path, "/sessions/"):
+			app.handleGetSession(w, r)
+		case strings.HasSuffix(path, "/initiate-payment"):
+			app.handleInitiatePayment(w, r)
+		case strings.HasSuffix(path, "/refill"):
+			app.handleKioskRefill(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1572,6 +1874,8 @@ func main() {
 			app.handleOrderStatus(w, r)
 		case strings.HasSuffix(path, "/simulate-payment"):
 			app.handleSimulatePayment(w, r)
+		case strings.HasSuffix(path, "/recovery-pin"):
+			app.handleRecoveryPIN(w, r)
 		case strings.HasSuffix(path, "/pdf"):
 			app.handleDownloadPDF(w, r)
 		default:
@@ -1654,9 +1958,9 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 			isExempt := path == "/healthz" ||
 				path == "/ws" ||
 				path == "/api/webhooks/razorpay" ||
-				(strings.HasPrefix(path, "/api/orders/") && strings.HasSuffix(path, "/pdf")) ||
+				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
 				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
-				(strings.HasPrefix(path, "/api/k/") && strings.HasSuffix(path, "/recover"))
+				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.Contains(path, "/sessions/")))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))

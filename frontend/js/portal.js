@@ -173,6 +173,7 @@
 
   let activeOrderId = null;
   let activeDisplayCode = '';
+  let activeRecoveryToken = '';
   let orderPollTimer = null;
   let expiryCountdownTimer = null;
 
@@ -2003,7 +2004,18 @@
 
       const data = await resp.json();
       activeOrderId = data.order_id;
-      activeDisplayCode = String(data.display_code || '0000');
+      activeRecoveryToken = (data.recovery_token || data.claim_token || '').trim();
+      if (activeOrderId && activeRecoveryToken) {
+        try {
+          sessionStorage.setItem('xeroxgo_recovery_' + activeOrderId, activeRecoveryToken);
+          localStorage.setItem('xeroxgo_recovery_' + activeOrderId, activeRecoveryToken);
+        } catch (_) {}
+      }
+      const pinCode = data.display_code ? String(data.display_code).trim() : '';
+      if (!pinCode || !/^\d{4}$/.test(pinCode)) {
+        throw new Error('Order was created but server returned an invalid or missing 4-digit PIN. Please try again.');
+      }
+      activeDisplayCode = pinCode;
 
       // Populate Checkout View
       for (let i = 0; i < 4; i++) {
@@ -2020,7 +2032,7 @@
         checkoutTotalAmount.textContent = formatRupees(totalPaise);
       }
 
-      startExpiryCountdown();
+      startExpiryCountdown(data.pin_expires_at);
       startOrderStatusPolling(activeOrderId);
 
       switchView('checkout');
@@ -2032,21 +2044,34 @@
     }
   }
 
-  function startExpiryCountdown() {
+  let authoritativeExpiryMs = 0;
+
+  function startExpiryCountdown(expiryISO) {
     if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
-    let secondsLeft = 15 * 60;
+    if (expiryISO) {
+      const parsed = Date.parse(expiryISO);
+      if (!isNaN(parsed)) {
+        authoritativeExpiryMs = parsed;
+      }
+    }
+    if (!authoritativeExpiryMs) {
+      authoritativeExpiryMs = Date.now() + 15 * 60 * 1000;
+    }
 
     function tick() {
+      const now = Date.now();
+      const diffMs = authoritativeExpiryMs - now;
+      const secondsLeft = Math.max(0, Math.ceil(diffMs / 1000));
       const minutes = Math.floor(secondsLeft / 60);
       const seconds = secondsLeft % 60;
       if (pinExpiryText) {
-        pinExpiryText.textContent = `Expires in ${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+        if (secondsLeft <= 0) {
+          pinExpiryText.textContent = 'PIN expired. Please create a new order.';
+          if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+        } else {
+          pinExpiryText.textContent = `Expires in ${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+        }
       }
-      if (secondsLeft <= 0) {
-        clearInterval(expiryCountdownTimer);
-        if (pinExpiryText) pinExpiryText.textContent = 'PIN expired. Please create a new order.';
-      }
-      secondsLeft--;
     }
 
     tick();
@@ -2070,7 +2095,21 @@
     if (!statusData || !checkoutLiveStatusBox) return;
     const st = statusData.status || '';
 
-    if (st && st !== 'PENDING_PAYMENT') {
+    if (statusData.pin_expires_at) {
+      const parsed = Date.parse(statusData.pin_expires_at);
+      if (!isNaN(parsed)) {
+        authoritativeExpiryMs = parsed;
+      }
+    }
+
+    if (st === 'EXPIRED') {
+      if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+      if (pinExpiryText) {
+        pinExpiryText.textContent = 'PIN expired. Please create a new order.';
+      }
+    }
+
+    if (st && st !== 'PENDING_PAYMENT' && st !== 'EXPIRED') {
       checkoutLiveStatusBox.classList.remove('hidden');
     }
 
@@ -2105,6 +2144,41 @@
     }
   }
 
+  async function requestRecoveryPIN() {
+    if (!activeOrderId) return null;
+    let token = activeRecoveryToken;
+    if (!token) {
+      try {
+        token = sessionStorage.getItem('xeroxgo_recovery_' + activeOrderId) ||
+                localStorage.getItem('xeroxgo_recovery_' + activeOrderId) || '';
+      } catch (_) {}
+    }
+    if (!token) return null;
+    try {
+      const resp = await fetch(`/api/orders/${encodeURIComponent(activeOrderId)}/recovery-pin`, {
+        method: 'POST',
+        headers: {
+          'X-Recovery-Token': token
+        }
+      });
+      if (!resp.ok) return null;
+      const recData = await resp.json();
+      if (recData && recData.display_code) {
+        activeDisplayCode = String(recData.display_code).trim();
+        for (let i = 0; i < 4; i++) {
+          if (pinBoxes[i]) {
+            pinBoxes[i].textContent = activeDisplayCode[i] || '-';
+          }
+        }
+        if (recData.pin_expires_at) {
+          startExpiryCountdown(recData.pin_expires_at);
+        }
+        return recData;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   function setupCheckoutEventListeners() {
     btnCopyPin.addEventListener('click', async () => {
       if (!activeDisplayCode) return;
@@ -2133,6 +2207,7 @@
       cartItems = [];
       activeOrderId = null;
       activeDisplayCode = '';
+      activeRecoveryToken = '';
       switchView('cart');
       renderCart();
     });
