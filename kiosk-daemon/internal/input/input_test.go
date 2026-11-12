@@ -55,7 +55,7 @@ func TestSimulatedSource_Events(t *testing.T) {
 }
 
 func TestReaderSource_Mapping(t *testing.T) {
-	// Simulate keyboard stream: "45\b9c\r\x1b"
+	// Simulate keyboard stream: "45\b9c\r\x1b\x1bOM"
 	// '4' -> Digit
 	// '5' -> Digit
 	// '\b' -> Backspace
@@ -63,7 +63,8 @@ func TestReaderSource_Mapping(t *testing.T) {
 	// 'c' -> Clear
 	// '\r' -> Submit
 	// '\x1b' -> Cancel
-	inputData := "45\b9c\r\x1b"
+	// '\x1bOM' -> Keypad Submit
+	inputData := "45\b9c\r\x1b\x1bOM"
 	reader := strings.NewReader(inputData)
 	src := NewReaderSource(reader)
 	defer src.Close()
@@ -76,6 +77,7 @@ func TestReaderSource_Mapping(t *testing.T) {
 		ActionClear,
 		ActionSubmit,
 		ActionCancel,
+		ActionSubmit,
 	}
 
 	for i, exp := range expectedActions {

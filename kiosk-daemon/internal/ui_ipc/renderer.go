@@ -1046,7 +1046,7 @@ func renderOrderSummary(dst *image.RGBA, state ScreenState) {
 	}
 
 	// Left Card: Print Specifications
-	leftCard := image.Rect(90, 330, 1100, 780)
+	leftCard := image.Rect(90, 330, 1100, 750)
 	fillRoundedRect(dst, leftCard, 20, colorBgSlate)
 	strokeRoundedRect(dst, leftCard, 20, 2, colorBorder)
 
@@ -1077,41 +1077,64 @@ func renderOrderSummary(dst *image.RGBA, state ScreenState) {
 		{"Color Mode", colorDesc},
 	}
 
-	yRow := 430
+	yRow := 425
 	for _, sp := range specs {
 		drawText(dst, faceReg24, sp.label, 130, yRow, colorTextSecondary)
 		vW := measureTextWidth(faceBold24, sp.val)
 		drawText(dst, faceBold24, sp.val, 1060-vW, yRow, colorTextPrimary)
-		yRow += 65
+		yRow += 60
 	}
 
 	// Right Card: Authoritative Pricing
-	rightCard := image.Rect(1140, 330, 1830, 780)
+	rightCard := image.Rect(1140, 330, 1830, 750)
 	fillRoundedRect(dst, rightCard, 20, colorPillGreenBg)
 	strokeRoundedRect(dst, rightCard, 20, 2, colorPillGreenBorder)
 
 	drawText(dst, faceBold28, "Authoritative Cloud Price", 1180, 365, color.RGBA{R: 4, G: 120, B: 87, A: 255})
-	drawText(dst, faceReg24, "Total Amount", 1180, 440, colorTextSecondary)
+	drawText(dst, faceReg24, "Total Amount", 1180, 435, colorTextSecondary)
 
 	rupees := float64(summary.TotalPricePaise) / 100.0
 	priceStr := fmt.Sprintf("Rs. %.2f", rupees)
-	drawText(dst, faceBold56, priceStr, 1180, 500, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+	drawText(dst, faceBold56, priceStr, 1180, 495, color.RGBA{R: 4, G: 120, B: 87, A: 255})
 
-	drawText(dst, faceReg20, "Authoritative price computed by cloud engine.", 1180, 610, colorTextSecondary)
-	drawText(dst, faceReg20, "Duplex blank padding sides are not billed.", 1180, 645, colorTextSecondary)
+	drawText(dst, faceReg20, "Authoritative price computed by cloud engine.", 1180, 595, colorTextSecondary)
+	drawText(dst, faceReg20, "Duplex blank padding sides are not billed.", 1180, 630, colorTextSecondary)
 	if summary.OrderID != "" {
 		orderIdStr := fmt.Sprintf("Order ID: %s", summary.OrderID)
-		drawText(dst, faceBold20, orderIdStr, 1180, 700, colorTextMutedDark)
+		drawText(dst, faceBold20, orderIdStr, 1180, 680, colorTextMutedDark)
+	}
+
+	// Status / Error Banner
+	if state.PINLoading {
+		loadPill := image.Rect(90, 765, 1830, 815)
+		drawPill(dst, loadPill, colorPillBlueBg, colorPillBlueBorder)
+		msg := "Verifying printer readiness and creating payment session... please wait"
+		lW := measureTextWidth(faceBold24, msg)
+		drawText(dst, faceBold24, msg, loadPill.Min.X+(loadPill.Dx()-lW)/2, 780, colorPrimaryBlue)
+	} else if strings.TrimSpace(state.PINError) != "" {
+		errPill := image.Rect(90, 765, 1830, 815)
+		drawPill(dst, errPill, colorPillRedBg, colorPillRedBorder)
+		errMsg := "⚠️  " + state.PINError
+		eW := measureTextWidth(faceBold24, errMsg)
+		drawText(dst, faceBold24, errMsg, errPill.Min.X+(errPill.Dx()-eW)/2, 780, colorErrorRed)
 	}
 
 	// Action Bar: Proceed & Cancel
-	confirmPill := image.Rect(90, 820, 940, 900)
-	drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
-	drawText(dst, faceBold28, "[Submit / Confirm] Proceed to Payment", 140, 845, colorPrimaryBlue)
+	confirmPill := image.Rect(90, 830, 940, 905)
+	if state.PINLoading {
+		drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
+		drawText(dst, faceBold28, "[Please Wait...] Creating Session...", 140, 852, colorPrimaryBlue)
+	} else if strings.TrimSpace(state.PINError) != "" {
+		drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
+		drawText(dst, faceBold28, "[Enter / Submit] Retry Payment", 140, 852, colorPrimaryBlue)
+	} else {
+		drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
+		drawText(dst, faceBold28, "[Enter / Submit] Proceed to Payment", 140, 852, colorPrimaryBlue)
+	}
 
-	cancelPill := image.Rect(980, 820, 1830, 900)
+	cancelPill := image.Rect(980, 830, 1830, 905)
 	drawPill(dst, cancelPill, colorBgSlate, colorBorder)
-	drawText(dst, faceBold28, "[Cancel / Esc] Cancel & Return to Home", 1030, 845, colorTextSecondary)
+	drawText(dst, faceBold28, "[Cancel / Esc] Cancel & Return to Home", 1030, 852, colorTextSecondary)
 
 	// Countdown Timer
 	if state.TimeoutSeconds > 0 {

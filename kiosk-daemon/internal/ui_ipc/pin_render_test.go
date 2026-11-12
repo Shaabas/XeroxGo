@@ -115,6 +115,40 @@ func TestRenderOrderSummary(t *testing.T) {
 				TimeoutSeconds: 45,
 			},
 		},
+		{
+			name: "order_summary_loading",
+			state: ScreenState{
+				Mode: ModeOrderSummary,
+				OrderSummary: &OrderSummary{
+					OrderID:         "ord_sum_003",
+					TotalPricePaise: 2000,
+					TotalPages:      4,
+					TotalSheets:     4,
+					Copies:          1,
+					Duplex:          "simplex",
+					ColorMode:       "mono",
+				},
+				PINLoading:     true,
+				TimeoutSeconds: 60,
+			},
+		},
+		{
+			name: "order_summary_error",
+			state: ScreenState{
+				Mode: ModeOrderSummary,
+				OrderSummary: &OrderSummary{
+					OrderID:         "ord_sum_004",
+					TotalPricePaise: 2000,
+					TotalPages:      4,
+					TotalSheets:     4,
+					Copies:          1,
+					Duplex:          "simplex",
+					ColorMode:       "mono",
+				},
+				PINError:       "Paper tray supply is low or empty. Please ask attendant to refill paper and press Confirm.",
+				TimeoutSeconds: 60,
+			},
+		},
 	}
 
 	for _, tc := range testCases {

@@ -55,6 +55,7 @@ type Controller struct {
 	currentSession   *cloud.SessionDetails
 	currentQRPayload string
 	lookupSeq        uint64 // Monotonically increasing sequence to discard stale responses
+	isClaiming       bool
 
 	inactivityTimer *time.Timer
 	stopCountdown   chan struct{}
@@ -191,6 +192,7 @@ func (c *Controller) resetToIdleLocked() {
 	c.state = StateIdle
 	c.pinBuffer = ""
 	c.pinError = ""
+	c.isClaiming = false
 	c.currentOrder = nil
 	c.currentSession = nil
 	c.currentQRPayload = ""
@@ -304,6 +306,9 @@ func (c *Controller) handleOrderSummaryEvent(ev input.Event) {
 	case input.ActionCancel:
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
+		if c.isClaiming {
+			return
+		}
 		c.startClaimLocked()
 	}
 }
@@ -358,6 +363,10 @@ func (c *Controller) startClaimLocked() {
 		return
 	}
 
+	c.isClaiming = true
+	c.pinError = ""
+	c.renderOrderSummaryLocked(int(c.cfg.SummaryTimeout.Seconds()))
+
 	orderID := c.currentOrder.OrderID
 	c.stopInactivityTimerLocked()
 	c.stopCountdownLocked()
@@ -375,6 +384,7 @@ func (c *Controller) startClaimLocked() {
 		if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StateOrderSummary {
 			return
 		}
+		c.isClaiming = false
 
 		if err != nil {
 			log.Printf("[PIN-CONTROLLER] Failed to claim order %s: %v", ordID, err)
@@ -383,7 +393,7 @@ func (c *Controller) startClaimLocked() {
 			case errors.Is(err, cloud.ErrInsufficientPaper):
 				userError = "Paper tray supply is low or empty. Please ask attendant to refill paper and press Confirm."
 			case errors.Is(err, cloud.ErrPrinterOffline):
-				userError = "Printer is offline. Please ask attendant for assistance."
+				userError = "Printer is offline or disconnected. Please ask attendant for assistance."
 			case errors.Is(err, cloud.ErrPrinterError):
 				userError = "Printer hardware error. Please ask attendant for assistance."
 			case errors.Is(err, cloud.ErrOrderAlreadyClaimed):
@@ -563,6 +573,8 @@ func (c *Controller) renderOrderSummaryLocked(remainingSeconds int) {
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
 		Mode:           ui_ipc.ModeOrderSummary,
 		OrderSummary:   summary,
+		PINLoading:     c.isClaiming,
+		PINError:       c.pinError,
 		TimeoutSeconds: remainingSeconds,
 		PrinterModel:   c.cfg.PrinterModel,
 	})

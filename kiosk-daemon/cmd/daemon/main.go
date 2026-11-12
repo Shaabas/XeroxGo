@@ -335,13 +335,13 @@ func main() {
 			log.Fatalf("Fatal: failed to set simulated paper stock: %v", err)
 		}
 		log.Printf("Initialized simulated paper tray to %d sheets", *simulatedStock)
-	} else if *mockPrinter {
+	} else {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, calib, err := stateStore.GetPaperSupply(ctx)
-		if err == nil && !calib {
-			_ = stateStore.ResetPaperTray(ctx, 250)
-			log.Printf("Mock printer mode: initialized calibrated paper stock to 250 sheets")
+		sheets, calib, err := stateStore.GetPaperSupply(ctx)
+		if err == nil && !calib && sheets > 0 {
+			_ = stateStore.ResetPaperTray(ctx, sheets)
+			log.Printf("XeroxGo kiosk daemon: initialized calibrated paper supply to %d sheets", sheets)
 		}
 	}
 

@@ -64,7 +64,19 @@ func (s *ReaderSource) loop() {
 			ev = &Event{Type: ActionClear, Timestamp: now}
 		case r == '\r' || r == '\n': // Enter/Return -> Submit
 			ev = &Event{Type: ActionSubmit, Timestamp: now}
-		case r == 0x1b || r == 'x' || r == 'X' || r == 'q' || r == 'Q': // ESC or X/Q -> Cancel
+		case r == 0x1b: // ESC or escape sequence
+			// Check if this is an escape sequence (e.g. \x1bOM for Keypad Enter)
+			if br.Buffered() >= 2 {
+				peekBytes, _ := br.Peek(2)
+				if len(peekBytes) >= 2 && ((peekBytes[0] == 'O' || peekBytes[0] == '[') && peekBytes[1] == 'M') {
+					_, _, _ = br.ReadRune()
+					_, _, _ = br.ReadRune()
+					ev = &Event{Type: ActionSubmit, Timestamp: now}
+					break
+				}
+			}
+			ev = &Event{Type: ActionCancel, Timestamp: now}
+		case r == 'x' || r == 'X' || r == 'q' || r == 'Q': // Cancel
 			ev = &Event{Type: ActionCancel, Timestamp: now}
 		default:
 			// Ignore unrecognized keystrokes
