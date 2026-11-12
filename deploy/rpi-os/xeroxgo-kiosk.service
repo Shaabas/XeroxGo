@@ -24,7 +24,7 @@ TTYPath=/dev/tty1
 TTYReset=no
 TTYVHangup=no
 TTYVTDisallocate=no
-StandardInput=null
+StandardInput=tty
 StandardOutput=journal
 StandardError=journal
 
@@ -41,7 +41,9 @@ ExecStart=/home/xg1/xeroxgo-kiosk \
   --state-db=/var/kiosk/state.db \
   --download-dir=/var/kiosk/jobs \
   --framebuffer=/dev/fb0 \
-  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT}
+  --idle-qr-content=${XEROXGO_IDLE_QR_CONTENT} \
+  --enable-keypad=true \
+  --keypad-device=/dev/tty1
 
 # Security hardening and device access
 NoNewPrivileges=true

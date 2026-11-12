@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Auto-detect Pi on local ARP/neighbors if not provided
 TARGET_ARG="${1:-}"
 if [ -n "${TARGET_ARG}" ]; then
@@ -22,8 +24,9 @@ if [ ! -f "${KIOSK_BIN}" ]; then
     CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o "${KIOSK_BIN}" ./kiosk-daemon/cmd/daemon
 fi
 
-echo "1. Copying binary to ${PI_HOST}..."
+echo "1. Copying binary and service configuration to ${PI_HOST}..."
 scp "${KIOSK_BIN}" "${PI_HOST}:/home/xg1/xeroxgo-kiosk.new"
+scp "${SCRIPT_DIR}/../deploy/rpi-os/xeroxgo-kiosk.service" "${PI_HOST}:/tmp/xeroxgo-kiosk.service"
 
 echo "2. Activating new binary and restarting kiosk on ${PI_HOST}..."
 ssh -t "${PI_HOST}" "bash -c '
@@ -34,6 +37,8 @@ ssh -t "${PI_HOST}" "bash -c '
     sudo killall -9 xeroxgo-kiosk 2>/dev/null || true
     mv /home/xg1/xeroxgo-kiosk.new /home/xg1/xeroxgo-kiosk
     chmod +x /home/xg1/xeroxgo-kiosk
+    sudo cp /tmp/xeroxgo-kiosk.service /etc/systemd/system/xeroxgo-kiosk.service 2>/dev/null || true
+    sudo systemctl daemon-reload 2>/dev/null || true
     if systemctl is-enabled xeroxgo-kiosk >/dev/null 2>&1; then
         sudo systemctl restart xeroxgo-kiosk
         echo \"xeroxgo-kiosk service restarted via systemd.\"
@@ -44,7 +49,9 @@ ssh -t "${PI_HOST}" "bash -c '
             --cloud-url=wss://xeroxgo-cloud.onrender.com/ws \
             --cups-printer=DCPT310 \
             --framebuffer=/dev/fb0 \
-            --idle-qr-content=https://xeroxgo.vercel.app > /tmp/xeroxgo-kiosk.log 2>&1 &
+            --idle-qr-content=https://xeroxgo.vercel.app \
+            --enable-keypad=true \
+            --keypad-device=/dev/tty1 > /tmp/xeroxgo-kiosk.log 2>&1 &
         echo \"xeroxgo-kiosk launched directly on /dev/fb0.\"
     fi
 '"

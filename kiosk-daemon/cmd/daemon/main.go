@@ -265,7 +265,8 @@ func main() {
 	paymentURL := flag.String("payment-url", "", "Alias for -payment-url-base")
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
 	enableCloudRecovery := flag.Bool("enable-cloud-recovery", true, "Enable cloud-owned print recovery and continuation artifacts (disables Pi-side slicer)")
-	enableKeypad := flag.Bool("enable-keypad", false, "Enable keyboard/keypad input for PIN entry on stdin")
+	enableKeypad := flag.Bool("enable-keypad", true, "Enable keyboard/keypad input for PIN entry (default true)")
+	keypadDevice := flag.String("keypad-device", "", "Path to keyboard TTY device (e.g. /dev/tty1). If specified, reads from device; otherwise reads from stdin")
 	pinInactivityTimeout := flag.Duration("pin-timeout", 30*time.Second, "Inactivity timeout for PIN entry screen before returning to idle")
 	orderSummaryTimeout := flag.Duration("summary-timeout", 60*time.Second, "Inactivity timeout for order summary screen before returning to idle")
 	paymentPendingTimeout := flag.Duration("payment-timeout", 300*time.Second, "Inactivity timeout for payment pending screen before returning to idle")
@@ -485,10 +486,28 @@ func main() {
 	}
 
 	var inputSource input.Source
-	if *enableKeypad {
-		inputSource = input.NewReaderSource(os.Stdin)
-		defer inputSource.Close()
-		log.Printf("XeroxGo kiosk daemon: stdin keypad reader enabled")
+	if *enableKeypad || strings.TrimSpace(*keypadDevice) != "" {
+		devPath := strings.TrimSpace(*keypadDevice)
+		if devPath != "" {
+			ttySrc, err := input.OpenTTYSource(devPath)
+			if err == nil {
+				inputSource = ttySrc
+				defer inputSource.Close()
+				log.Printf("XeroxGo kiosk daemon: keyboard input enabled on %s (raw mode, echo suppressed)", devPath)
+			} else {
+				log.Printf("XeroxGo kiosk daemon: warning: could not open %s (%v), falling back to stdin", devPath, err)
+			}
+		}
+
+		if inputSource == nil {
+			if oldTerm, err := input.MakeRaw(int(os.Stdin.Fd())); err == nil {
+				defer input.Restore(int(os.Stdin.Fd()), oldTerm)
+				log.Printf("XeroxGo kiosk daemon: raw terminal mode active on stdin")
+			}
+			inputSource = input.NewReaderSource(os.Stdin)
+			defer inputSource.Close()
+			log.Printf("XeroxGo kiosk daemon: stdin keypad reader enabled")
+		}
 	}
 
 	clientCfg := spooler.ClientConfig{
