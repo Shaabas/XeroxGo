@@ -497,7 +497,7 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 	}
 
 	var demoToken string
-	if s.cfg != nil && s.cfg.demoMode {
+	if s.cfg != nil && (s.cfg.demoMode || prov.Name() == "mock") {
 		tokenHex, err := randomHex(24)
 		if err != nil {
 			log.Printf("[DEMO-MODE] Failed to generate secure random token: %v", err)
@@ -508,7 +508,9 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 
 		baseURL := s.getBaseURL(r)
 		checkoutURL := fmt.Sprintf("%s/pay/%s", baseURL, demoToken)
-		res.QRPayload = checkoutURL
+		if s.cfg.demoMode {
+			res.QRPayload = checkoutURL
+		}
 	}
 
 	attemptID := fmt.Sprintf("att_%s_%d", sess.OrderID, now.UnixNano())

@@ -25,6 +25,8 @@ services:
         value: 10000
       - key: XEROXGO_DEV_MODE
         value: "1"
+      - key: DEMO_MODE
+        value: "true"
       - key: XEROXGO_PRICE_PER_SHEET_PAISE
         value: "500"
       - key: XEROXGO_DOWNLOAD_SECRET

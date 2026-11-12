@@ -3322,11 +3322,11 @@ SELECT attempt_id, order_id, kiosk_id, session_id, provider,
        status, qr_payload, qr_image_url, idempotency_key, demo_token,
        expires_at_ns, created_at_ns, updated_at_ns
 FROM payment_attempts
-WHERE demo_token = ?
+WHERE demo_token = ? OR session_id = ? OR attempt_id = ?
 ORDER BY created_at_ns DESC
 LIMIT 1;
 `)
-	row := s.db.QueryRowContext(ctx, query, demoToken)
+	row := s.db.QueryRowContext(ctx, query, demoToken, demoToken, demoToken)
 	var att PaymentAttempt
 	var expNS, cNS, uNS int64
 	err := row.Scan(

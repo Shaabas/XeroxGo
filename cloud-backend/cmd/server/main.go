@@ -1731,9 +1731,9 @@ func main() {
 		jobsDir = "./data/jobs"
 	}
 
-	devMode := os.Getenv("XEROXGO_DEV_MODE") == "1"
-	if demoMode {
-		devMode = true
+	devMode := os.Getenv("XEROXGO_DEV_MODE") == "1" || os.Getenv("DEV_MODE") == "1"
+	if devMode {
+		demoMode = true
 	}
 
 	dlSecretStr := os.Getenv("XEROXGO_DOWNLOAD_SECRET")

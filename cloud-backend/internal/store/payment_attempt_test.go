@@ -70,6 +70,7 @@ func TestPaymentAttempt_StoreLifecycle(t *testing.T) {
 		Status:          "CREATED",
 		QRPayload:       "upi://pay?pa=mock@upi&am=15.00",
 		QRImageURL:      "https://example.com/qr.png",
+		DemoToken:       "dmo_test_attempt_123",
 		ExpiresAt:       time.Now().Add(10 * time.Minute),
 	}
 	if err := st.CreatePaymentAttempt(ctx, att); err != nil {
@@ -117,6 +118,20 @@ func TestPaymentAttempt_StoreLifecycle(t *testing.T) {
 	}
 	if byOrdSess.AttemptID != attemptID {
 		t.Errorf("expected attempt_id %s, got %s", attemptID, byOrdSess.AttemptID)
+	}
+
+	// 5b. Retrieve by demo token, session ID, or attempt ID
+	byTok, err := st.GetPaymentAttemptByToken(ctx, "dmo_test_attempt_123")
+	if err != nil || byTok == nil || byTok.AttemptID != attemptID {
+		t.Errorf("failed to retrieve attempt by demo_token: %v", err)
+	}
+	bySessTok, err := st.GetPaymentAttemptByToken(ctx, sessID)
+	if err != nil || bySessTok == nil || bySessTok.AttemptID != attemptID {
+		t.Errorf("failed to retrieve attempt by session_id: %v", err)
+	}
+	byAttTok, err := st.GetPaymentAttemptByToken(ctx, attemptID)
+	if err != nil || byAttTok == nil || byAttTok.AttemptID != attemptID {
+		t.Errorf("failed to retrieve attempt by attempt_id: %v", err)
 	}
 
 	// 6. Transition to PAID
