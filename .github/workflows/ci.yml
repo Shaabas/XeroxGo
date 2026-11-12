@@ -22,10 +22,10 @@ jobs:
           go-version: '1.26'
           cache: true
 
-      - name: Install Runtime Dependencies (qpdf, ghostscript, libreoffice, poppler-utils)
+      - name: Install Runtime Dependencies (qpdf, ghostscript, libreoffice, poppler-utils, cups-filters)
         run: |
           sudo apt-get update
-          sudo apt-get install -y qpdf ghostscript libreoffice poppler-utils
+          sudo apt-get install -y qpdf ghostscript libreoffice poppler-utils cups-filters
 
       - name: Run Verification Gates
         run: ./scripts/verify_gate.sh
