@@ -239,54 +239,45 @@
       <span class="demo-badge">Payment Simulation</span>
     </div>
 
-    <!-- State 1: Loading State -->
-    <div id="state-loading" class="pay-card" style="padding: 48px 20px; text-align: center;">
-      <div style="display: flex; justify-content: center; margin-bottom: 16px;">
-        <div class="spinner" style="border-color: #E2E8F0; border-top-color: #2563EB; width: 32px; height: 32px; border-width: 4px;"></div>
-      </div>
-      <div style="font-weight: 600; color: #1E293B; font-size: 16px;">Loading order details...</div>
-      <div style="font-size: 13px; color: #64748B; margin-top: 6px;">Connecting to kiosk session</div>
-    </div>
-
-    <!-- State 2: Active Payment Card -->
-    <div id="state-active" class="pay-card hidden">
+    <!-- State 2: Active Payment Card (Always Ready) -->
+    <div id="state-active" class="pay-card">
       <div class="card-hero">
-        <div class="hero-label">Total Amount Due</div>
-        <div class="hero-amount" id="display-amount">₹0.00</div>
+        <div class="hero-label">Payment Simulation</div>
+        <div class="hero-amount" id="display-amount">Scan & Pay</div>
         <div class="hero-sub" id="display-kiosk">Kiosk: kiosk-demo</div>
       </div>
 
       <div class="card-body">
         <div class="specs-grid">
           <div class="spec-row">
-            <span class="spec-label">Order ID</span>
-            <span class="spec-val" id="spec-order-id">-</span>
+            <span class="spec-label">Order Reference</span>
+            <span class="spec-val" id="spec-order-id">Active Kiosk Session</span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">Documents</span>
-            <span class="spec-val" id="spec-pages">- pages</span>
+            <span class="spec-label">Session PIN</span>
+            <span class="spec-val" id="spec-pin">-</span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">Physical Sheets</span>
-            <span class="spec-val" id="spec-sheets">- sheets</span>
-          </div>
-          <div class="spec-row">
-            <span class="spec-label">Print Mode</span>
-            <span class="spec-val" id="spec-mode">-</span>
-          </div>
-          <div class="spec-row">
-            <span class="spec-label">Copies</span>
-            <span class="spec-val" id="spec-copies">-</span>
+            <span class="spec-label">Simulation Status</span>
+            <span class="spec-val" style="color: #16A34A; font-weight: 700;">● Ready to Authorize</span>
           </div>
         </div>
 
+        <div id="pin-input-container" class="hidden" style="margin-bottom: 16px;">
+          <label style="font-size: 13px; font-weight: 600; color: #334155; display: block; margin-bottom: 6px;">
+            Enter 4-Digit Kiosk PIN:
+          </label>
+          <input type="text" id="manual-pin-input" maxlength="4" placeholder="e.g. 1234"
+                 style="width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 18px; font-weight: 700; text-align: center; letter-spacing: 0.2em; border: 2px solid #CBD5E1; border-radius: 10px; outline: none;" />
+        </div>
+
         <button id="btn-pay" class="btn-pay-now">
-          <span id="btn-pay-text">Pay Now (Simulate UPI)</span>
+          <span id="btn-pay-text">Confirm Payment & Print</span>
           <div id="btn-pay-spinner" class="spinner hidden"></div>
         </button>
 
         <div class="upi-apps-row">
-          <span>Simulated Providers:</span>
+          <span>Instant Providers:</span>
           <span class="upi-pill">GPay</span>
           <span class="upi-pill">PhonePe</span>
           <span class="upi-pill">Paytm</span>
@@ -328,21 +319,27 @@
 
   <script>
     (function() {
-      // 1. Extract Token from URL: /payment/<token> or query param ?token=
+      // 1. Extract Order ID, PIN, and Kiosk ID from URL path or query params
       var pathParts = window.location.pathname.split('/');
-      var token = '';
+      var pathToken = '';
       for (var i = 0; i < pathParts.length; i++) {
         if (pathParts[i] === 'payment' && pathParts[i+1]) {
-          token = pathParts[i+1];
+          pathToken = decodeURIComponent(pathParts[i+1]);
           break;
         }
       }
-      if (!token) {
-        var params = new URLSearchParams(window.location.search);
-        token = params.get('token') || '';
+
+      var params = new URLSearchParams(window.location.search);
+      var orderId = params.get('order') || '';
+      var pin = params.get('pin') || '';
+      var kioskId = params.get('kiosk') || 'kiosk-demo';
+      var token = params.get('token') || pathToken;
+
+      // If token looks like an order ID (starts with "ord_") and no order is set:
+      if (!orderId && token && token.startsWith('ord_')) {
+        orderId = token;
       }
 
-      var elLoading = document.getElementById('state-loading');
       var elActive = document.getElementById('state-active');
       var elSuccess = document.getElementById('state-success');
       var elError = document.getElementById('state-error');
@@ -350,10 +347,9 @@
       var displayAmount = document.getElementById('display-amount');
       var displayKiosk = document.getElementById('display-kiosk');
       var specOrderId = document.getElementById('spec-order-id');
-      var specPages = document.getElementById('spec-pages');
-      var specSheets = document.getElementById('spec-sheets');
-      var specMode = document.getElementById('spec-mode');
-      var specCopies = document.getElementById('spec-copies');
+      var specPin = document.getElementById('spec-pin');
+      var pinContainer = document.getElementById('pin-input-container');
+      var manualPinInput = document.getElementById('manual-pin-input');
 
       var btnPay = document.getElementById('btn-pay');
       var btnPayText = document.getElementById('btn-pay-text');
@@ -362,181 +358,174 @@
 
       var successAmount = document.getElementById('success-amount');
       var successKiosk = document.getElementById('success-kiosk');
-
       var errorTitle = document.getElementById('error-title');
       var errorDesc = document.getElementById('error-desc');
 
-      function showError(title, desc) {
-        elLoading.classList.add('hidden');
-        elActive.classList.add('hidden');
-        elSuccess.classList.add('hidden');
-        elError.classList.remove('hidden');
-        errorTitle.textContent = title;
-        errorDesc.textContent = desc;
+      // Populate Initial UI immediately (NO blocking loading screen!)
+      displayKiosk.textContent = 'Kiosk: ' + kioskId;
+      if (orderId) {
+        specOrderId.textContent = orderId;
+      } else {
+        specOrderId.textContent = 'Active Kiosk Session';
       }
 
-      function showSuccess(amountStr, kioskId) {
-        elLoading.classList.add('hidden');
+      if (pin) {
+        specPin.textContent = pin;
+        pinContainer.classList.add('hidden');
+      } else if (!orderId) {
+        // If neither order nor pin was provided in URL, show manual PIN input
+        specPin.textContent = 'Enter PIN below';
+        pinContainer.classList.remove('hidden');
+        manualPinInput.focus();
+      } else {
+        specPin.textContent = 'Linked to Order';
+        pinContainer.classList.add('hidden');
+      }
+
+      function showSuccess(kiosk) {
         elActive.classList.add('hidden');
         elError.classList.add('hidden');
         elSuccess.classList.remove('hidden');
-        successAmount.textContent = '₹' + amountStr;
-        successKiosk.textContent = kioskId || 'kiosk';
+        successAmount.textContent = '₹10.00';
+        successKiosk.textContent = kiosk || kioskId || 'kiosk';
       }
 
-      function renderOrderUI(data, isSample) {
-        var amountRupees = data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00');
-        displayAmount.textContent = '₹' + amountRupees;
-        displayKiosk.textContent = 'Kiosk: ' + (data.kiosk_id || 'kiosk-demo');
-        specOrderId.textContent = data.order_id || '-';
-        specPages.textContent = (data.total_pages || 1) + ' pages';
-        specSheets.textContent = (data.total_sheets || 1) + ' physical sheets';
-        specMode.textContent = (data.duplex || 'Simplex') + ' • ' + (data.color_mode || 'B&W');
-        specCopies.textContent = (data.copies || 1) + ' copy';
-
-        btnPayText.textContent = 'Pay ₹' + amountRupees + ' (Simulated UPI)';
-
-        elLoading.classList.add('hidden');
-        elActive.classList.remove('hidden');
-
-        // Setup Pay button click handler
-        btnPay.addEventListener('click', function() {
-          btnPay.disabled = true;
-          btnPayText.textContent = 'Authorizing payment...';
+      function setButtonLoading(loading) {
+        btnPay.disabled = loading;
+        if (loading) {
+          btnPayText.textContent = 'Confirming & Dispatching...';
           btnPaySpinner.classList.remove('hidden');
+        } else {
+          btnPayText.textContent = 'Confirm Payment & Print';
+          btnPaySpinner.classList.add('hidden');
+        }
+      }
 
-          setTimeout(function() {
-            if (isSample) {
-              showSuccess(amountRupees, data.kiosk_id);
-              return;
-            }
+      // Execute simulate-payment on an order ID
+      function dispatchSimulatePayment(targetOrderId, targetKiosk) {
+        var localEndpoint = '/api/orders/' + encodeURIComponent(targetOrderId) + '/simulate-payment';
+        var cloudEndpoint = 'https://xeroxgo-cloud.onrender.com/api/orders/' + encodeURIComponent(targetOrderId) + '/simulate-payment';
 
-            fetch(effectiveEndpoint, {
+        return fetch(localEndpoint, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }
+        })
+        .then(function(res) {
+          if (!res.ok) {
+            return fetch(cloudEndpoint, {
               method: 'POST',
-              headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-              }
-            })
+              headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }
+            });
+          }
+          return res;
+        })
+        .then(function(res) {
+          if (!res.ok) {
+            return res.text().then(function(txt) {
+              throw new Error(txt || ('Server error: ' + res.status));
+            });
+          }
+          return res.json().catch(function() { return { status: 'DISPATCHED' }; });
+        })
+        .then(function(data) {
+          showSuccess(targetKiosk);
+        });
+      }
+
+      // Execute order lookup by PIN, then simulate payment
+      function lookupAndPayByPin(targetPin, targetKiosk) {
+        var localLookup = '/api/k/' + encodeURIComponent(targetKiosk) + '/orders/lookup';
+        var cloudLookup = 'https://xeroxgo-cloud.onrender.com/api/k/' + encodeURIComponent(targetKiosk) + '/orders/lookup';
+
+        return fetch(localLookup, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: targetPin })
+        })
+        .then(function(res) {
+          if (!res.ok) {
+            return fetch(cloudLookup, {
+              method: 'POST',
+              headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ pin: targetPin })
+            });
+          }
+          return res;
+        })
+        .then(function(res) {
+          if (!res.ok) {
+            return res.text().then(function(txt) {
+              throw new Error('PIN lookup failed: ' + (txt || res.status));
+            });
+          }
+          return res.json();
+        })
+        .then(function(orderData) {
+          if (!orderData || !orderData.order_id) {
+            throw new Error('No active order found for this PIN.');
+          }
+          specOrderId.textContent = orderData.order_id;
+          return dispatchSimulatePayment(orderData.order_id, targetKiosk);
+        });
+      }
+
+      // Pay Button Click Handler
+      btnPay.addEventListener('click', function() {
+        var currentPin = pin || (manualPinInput ? manualPinInput.value.trim() : '');
+
+        // If we have an order ID directly, trigger simulate-payment immediately!
+        if (orderId) {
+          setButtonLoading(true);
+          dispatchSimulatePayment(orderId, kioskId)
+            .catch(function(err) {
+              setButtonLoading(false);
+              alert('Payment simulation notice: ' + (err.message || 'Dispatch failed'));
+            });
+          return;
+        }
+
+        // If we have a PIN (from URL or manual input)
+        if (currentPin) {
+          setButtonLoading(true);
+          lookupAndPayByPin(currentPin, kioskId)
+            .catch(function(err) {
+              setButtonLoading(false);
+              alert(err.message || 'Could not verify PIN. Please check the screen.');
+            });
+          return;
+        }
+
+        // If token is present and might be a token/session
+        if (token) {
+          setButtonLoading(true);
+          dispatchSimulatePayment(token, kioskId)
             .catch(function() {
-              if (effectiveEndpoint !== directRenderEndpoint) {
-                effectiveEndpoint = directRenderEndpoint;
-                return fetch(directRenderEndpoint, {
-                  method: 'POST',
-                  headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                  }
-                });
-              }
-              throw new Error('Connection failed');
-            })
-            .then(function(postRes) {
-              return postRes.json().then(function(postData) {
-                return { ok: postRes.ok, data: postData };
-              });
-            })
-            .then(function(result) {
-              if (result.ok && (result.data.ok || result.data.status === 'already_processed')) {
-                showSuccess(amountRupees, data.kiosk_id);
-              } else {
-                throw new Error(result.data.error || 'Payment failed');
-              }
+              // Fallback to legacy POST /pay/<token>
+              return fetch('https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token), { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function() { showSuccess(kioskId); });
             })
             .catch(function(err) {
-              btnPay.disabled = false;
-              btnPayText.textContent = 'Pay ₹' + amountRupees + ' (Simulated UPI)';
-              btnPaySpinner.classList.add('hidden');
-              alert('Simulated payment error: ' + (err.message || 'Payment capture failed.'));
+              setButtonLoading(false);
+              alert('Payment error: ' + (err.message || 'Could not dispatch'));
             });
-          }, 1200);
-        });
-
-        // Setup Fail button handler
-        btnFail.addEventListener('click', function() {
-          if (confirm('Simulate a payment failure? This tests how the kiosk handles declined transactions.')) {
-            showError('Payment Declined', 'Simulated failure: bank network declined the transaction. The kiosk session remains open for retry.');
-          }
-        });
-      }
-
-      if (!token) {
-        showError('Invalid Payment Link', 'No payment token was specified. Please scan the QR code displayed on the kiosk screen.');
-        return;
-      }
-
-      // Sample preview mode for manual / sandbox testing
-      if (token === 'demo' || token === 'sample') {
-        renderOrderUI({
-          status: 'pending',
-          order_id: 'ord_demo_preview',
-          amount_rupees: '10.00',
-          amount_paise: 1000,
-          total_pages: 4,
-          total_sheets: 2,
-          duplex: 'Double-sided (Duplex)',
-          color_mode: 'Black & White (Mono)',
-          copies: 1,
-          kiosk_id: 'kiosk-demo-01'
-        }, true);
-        return;
-      }
-
-      // 2. Fetch Order Details from Cloud Backend (with direct Render fallback)
-      var apiEndpoint = '/pay/' + encodeURIComponent(token);
-      var directRenderEndpoint = 'https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token);
-      var effectiveEndpoint = apiEndpoint;
-
-      fetch(apiEndpoint, {
-        headers: { 'Accept': 'application/json' }
-      })
-      .catch(function() {
-        // Network error reaching Vercel proxy, fallback to Render direct
-        effectiveEndpoint = directRenderEndpoint;
-        return fetch(directRenderEndpoint, {
-          headers: { 'Accept': 'application/json' }
-        });
-      })
-      .then(function(res) {
-        if (!res.ok && res.status === 404 && effectiveEndpoint !== directRenderEndpoint) {
-          // If Vercel proxy returned 404, try direct Render backend
-          effectiveEndpoint = directRenderEndpoint;
-          return fetch(directRenderEndpoint, {
-            headers: { 'Accept': 'application/json' }
-          });
-        }
-        return res;
-      })
-      .then(function(res) {
-        if (res.status === 404) {
-          throw new Error('NOT_FOUND');
-        } else if (res.status === 410) {
-          throw new Error('EXPIRED');
-        } else if (!res.ok) {
-          throw new Error('FETCH_ERROR');
-        }
-        return res.json();
-      })
-      .then(function(data) {
-        if (data.status === 'already_processed') {
-          showSuccess(data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00'), data.kiosk_id);
           return;
         }
 
-        if (data.status === 'expired') {
-          showError('Payment Session Expired', 'This kiosk session has timed out. Please enter your PIN on the kiosk to start a fresh session.');
-          return;
-        }
+        // Neither order nor PIN provided
+        pinContainer.classList.remove('hidden');
+        manualPinInput.focus();
+        manualPinInput.style.borderColor = '#EF4444';
+        setTimeout(function() { manualPinInput.style.borderColor = '#CBD5E1'; }, 2000);
+      });
 
-        renderOrderUI(data, false);
-      })
-      .catch(function(err) {
-        if (err.message === 'NOT_FOUND') {
-          showError('Payment Link Not Found', 'The link you scanned does not match any active payment attempt. Please re-scan from the kiosk screen.');
-        } else if (err.message === 'EXPIRED') {
-          showError('Payment Session Expired', 'This session has timed out. Please enter your PIN again on the kiosk.');
-        } else {
-          showError('Connection Error', 'Could not communicate with the cloud backend. Please check your internet connection and try again.');
+      // Fail Button Click Handler
+      btnFail.addEventListener('click', function() {
+        if (confirm('Simulate a payment failure? This tests how the kiosk handles declined transactions.')) {
+          elActive.classList.add('hidden');
+          elError.classList.remove('hidden');
+          errorTitle.textContent = 'Payment Declined';
+          errorDesc.textContent = 'Simulated failure: bank network declined the transaction. The kiosk session remains open for retry.';
         }
       });
     })();

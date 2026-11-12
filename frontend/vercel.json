@@ -10,11 +10,15 @@
       "destination": "https://xeroxgo-cloud.onrender.com/pay/:match*"
     },
     {
-      "source": "/payment/:token",
+      "source": "/payment",
       "destination": "/payment.html"
     },
     {
-      "source": "/payment/:token/",
+      "source": "/payment/",
+      "destination": "/payment.html"
+    },
+    {
+      "source": "/payment/:match*",
       "destination": "/payment.html"
     },
     {

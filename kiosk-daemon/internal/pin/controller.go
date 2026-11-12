@@ -37,6 +37,7 @@ type Config struct {
 	LookupClient      cloud.PINLookupClient
 	IdleQRContent     string
 	PaymentURLBase    string
+	KioskID           string
 	PrinterModel      string
 	OnTransactionEnd  func()
 }
@@ -48,6 +49,7 @@ type Controller struct {
 	mu             sync.Mutex
 	state          State
 	pinBuffer      string
+	activePIN      string
 	pinError       string
 	currentOrder     *cloud.OrderDetails
 	currentSession   *cloud.SessionDetails
@@ -424,7 +426,7 @@ func (c *Controller) startClaimLocked() {
 
 		c.state = StatePaymentPending
 		c.pinError = ""
-		c.currentQRPayload = ""
+		c.currentQRPayload = c.resolvePaymentQRPayload(nil)
 
 		timeoutSec := int(c.cfg.PaymentTimeout.Seconds())
 		if session.SecondsRemaining > 0 && int(session.SecondsRemaining) < timeoutSec {
@@ -472,6 +474,7 @@ func (c *Controller) startLookupLocked() {
 
 	seq := atomic.AddUint64(&c.lookupSeq, 1)
 	pinToLookup := c.pinBuffer
+	c.activePIN = pinToLookup
 
 	c.renderPINEntryLocked()
 
@@ -566,10 +569,16 @@ func (c *Controller) renderOrderSummaryLocked(remainingSeconds int) {
 }
 
 func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetails) string {
+	urlBase := strings.TrimRight(strings.TrimSpace(c.cfg.PaymentURLBase), "/")
 	if attempt == nil {
+		if urlBase != "" {
+			if c.currentOrder != nil && c.currentOrder.OrderID != "" {
+				return fmt.Sprintf("%s/%s", urlBase, c.currentOrder.OrderID)
+			}
+			return urlBase
+		}
 		return ""
 	}
-	urlBase := strings.TrimSpace(c.cfg.PaymentURLBase)
 	if urlBase != "" {
 		token := strings.TrimSpace(attempt.DemoToken)
 		if token == "" && strings.HasPrefix(attempt.QRPayload, "http") {
@@ -587,8 +596,11 @@ func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetail
 		if token == "" {
 			token = strings.TrimSpace(attempt.AttemptID)
 		}
+		if token == "" && c.currentOrder != nil {
+			token = strings.TrimSpace(c.currentOrder.OrderID)
+		}
 		if token != "" {
-			return fmt.Sprintf("%s/%s", strings.TrimRight(urlBase, "/"), token)
+			return fmt.Sprintf("%s/%s", urlBase, token)
 		}
 	}
 	return attempt.QRPayload

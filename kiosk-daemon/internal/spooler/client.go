@@ -249,6 +249,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				SummaryTimeout:    cfg.SummaryTimeout,
 				PaymentTimeout:    cfg.PaymentTimeout,
 				PaymentURLBase:    cfg.PaymentURLBase,
+				KioskID:           cfg.KioskID,
 				RenderScreen:      client.renderScreen,
 				LookupClient:      pinClient,
 				IdleQRContent:     cfg.IdleQRContent,
