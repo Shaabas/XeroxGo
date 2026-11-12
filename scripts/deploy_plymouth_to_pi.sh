@@ -11,7 +11,18 @@
 # ==============================================================================
 set -euo pipefail
 
-PI_HOST="${1:-xg1@10.252.178.225}"
+# Auto-detect Pi on local ARP/neighbors if not provided
+TARGET_ARG="${1:-}"
+if [ -n "${TARGET_ARG}" ]; then
+    PI_HOST="${TARGET_ARG}"
+else
+    DETECTED_IP="$(ip neigh 2>/dev/null | grep -E "d8:3a:dd|b8:27:eb|e4:5f:01|28:cd:c1" | awk '{print $1}' | head -n 1 || true)"
+    if [ -n "${DETECTED_IP}" ]; then
+        PI_HOST="xg1@${DETECTED_IP}"
+    else
+        PI_HOST="xg1@10.71.34.225"
+    fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}/.."
