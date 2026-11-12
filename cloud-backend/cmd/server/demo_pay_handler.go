@@ -21,6 +21,14 @@ func isJSONRequest(r *http.Request) bool {
 
 // handleDemoPayRoutes handles GET and POST requests under /pay/{token}.
 func (s *appServer) handleDemoPayRoutes(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if s.cfg == nil || !s.cfg.demoMode {
 		http.NotFound(w, r)
 		return
@@ -46,6 +54,12 @@ func (s *appServer) handleDemoPayRoutes(w http.ResponseWriter, r *http.Request) 
 func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Request, token string) {
 	att, err := s.db.GetPaymentAttemptByToken(r.Context(), token)
 	if err != nil || att == nil {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "payment link not found or expired"})
+			return
+		}
 		s.renderDemoErrorPage(w, http.StatusNotFound, "Payment Link Not Found", "The payment link you scanned is invalid or has expired. Please check the kiosk screen for an updated QR code.")
 		return
 	}
@@ -59,11 +73,31 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 	isCanceled := sess != nil && (sess.Status == store.KioskSessionCanceled || sess.Status == store.KioskSessionExpired)
 
 	if isAlreadyPaid {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":       "already_processed",
+				"order_id":     att.OrderID,
+				"kiosk_id":     att.KioskID,
+				"amount_paise": att.AmountPaise,
+			})
+			return
+		}
 		s.renderDemoSuccessPage(w, att, order, "already_processed")
 		return
 	}
 
 	if isExpired || isCanceled {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "expired",
+				"error":  "Payment session has expired or was canceled",
+			})
+			return
+		}
 		s.renderDemoErrorPage(w, http.StatusGone, "Payment Session Expired", "This kiosk payment session has timed out or was canceled. Please start a new session at the kiosk to print your documents.")
 		return
 	}
@@ -72,6 +106,7 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 	amountRupees := float64(att.AmountPaise) / 100.0
 	var totalPages, totalSheets, copies int
 	duplexStr := "Single-sided (Simplex)"
+	colorModeStr := "Black & White (Mono)"
 
 	if order != nil {
 		totalPages = order.Command.TotalPages
@@ -80,6 +115,29 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 		if order.Command.Duplex == contracts.DuplexLongEdge || order.Command.Duplex == contracts.DuplexShortEdge {
 			duplexStr = "Double-sided (Duplex)"
 		}
+		if strings.EqualFold(order.ColorMode, "COLOR") {
+			colorModeStr = "Full Color"
+		}
+	}
+
+	if isJSONRequest(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":        "ACTIVE",
+			"order_id":      att.OrderID,
+			"session_id":    att.SessionID,
+			"kiosk_id":      att.KioskID,
+			"amount_paise":  att.AmountPaise,
+			"amount_rupees": fmt.Sprintf("%.2f", amountRupees),
+			"total_pages":   totalPages,
+			"total_sheets":  totalSheets,
+			"copies":        copies,
+			"duplex":        duplexStr,
+			"color_mode":    colorModeStr,
+			"expires_at":    att.ExpiresAt.Format(time.RFC3339),
+		})
+		return
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

@@ -261,6 +261,8 @@ func main() {
 	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
+	paymentURLBase := flag.String("payment-url-base", "https://xeroxgo.vercel.app/payment", "Base URL for payment QR codes (e.g. https://xeroxgo.vercel.app/payment). If non-empty, wraps payment tokens in this URL")
+	paymentURL := flag.String("payment-url", "", "Alias for -payment-url-base")
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
 	enableCloudRecovery := flag.Bool("enable-cloud-recovery", true, "Enable cloud-owned print recovery and continuation artifacts (disables Pi-side slicer)")
 	enableKeypad := flag.Bool("enable-keypad", false, "Enable keyboard/keypad input for PIN entry on stdin")
@@ -280,6 +282,9 @@ func main() {
 	}
 	if *idleQRContent == "" && *idleQR != "" {
 		*idleQRContent = *idleQR
+	}
+	if *paymentURL != "" {
+		*paymentURLBase = *paymentURL
 	}
 
 	if strings.TrimSpace(*kioskID) == "" {
@@ -509,6 +514,7 @@ func main() {
 		InactivityTimeout:        *pinInactivityTimeout,
 		SummaryTimeout:           *orderSummaryTimeout,
 		PaymentTimeout:           *paymentPendingTimeout,
+		PaymentURLBase:           *paymentURLBase,
 		SoundPlayer:              soundPlayer,
 		OnJobCompleted: func(jobID string) {
 			if viewerServer != nil {

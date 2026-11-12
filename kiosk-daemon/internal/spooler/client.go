@@ -70,6 +70,7 @@ type ClientConfig struct {
 	InactivityTimeout        time.Duration
 	SummaryTimeout           time.Duration
 	PaymentTimeout           time.Duration
+	PaymentURLBase           string
 	SoundPlayer              audio.Player
 	OnJobCompleted           func(jobID string)
 	TrustedOrigins           []string
@@ -247,6 +248,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				InactivityTimeout: cfg.InactivityTimeout,
 				SummaryTimeout:    cfg.SummaryTimeout,
 				PaymentTimeout:    cfg.PaymentTimeout,
+				PaymentURLBase:    cfg.PaymentURLBase,
 				RenderScreen:      client.renderScreen,
 				LookupClient:      pinClient,
 				IdleQRContent:     cfg.IdleQRContent,

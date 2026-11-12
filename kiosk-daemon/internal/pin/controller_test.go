@@ -918,4 +918,116 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 	}
 }
 
+func TestController_PaymentURLBase_Wrapping(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	rnd := &mockRenderer{}
+
+	expectedDemoToken := "dmo_test_randomizer_777"
+	expectedWrappedURL := "https://xeroxgo.vercel.app/payment/" + expectedDemoToken
+
+	mockClient := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:         "ord_wrap_001",
+				KioskID:         "kiosk-1",
+				Status:          "DRAFT",
+				TotalPages:      3,
+				TotalSheets:     2,
+				Copies:          1,
+				Duplex:          "long_edge",
+				ColorMode:       "BW",
+				TotalPricePaise: 400,
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_wrap_101",
+				OrderID:          orderID,
+				Status:           "CLAIMED",
+				TotalPricePaise:  400,
+				SecondsRemaining: 300,
+			}, nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID:     "att_wrap_201",
+				SessionID:     sessionID,
+				DemoToken:     expectedDemoToken,
+				QRPayload:     "upi://pay?pa=mock@upi&am=4.00",
+				AmountPaise:   400,
+				Status:        "PAYMENT_PENDING",
+				AttemptStatus: "CREATED",
+			}, nil
+		},
+	}
+
+	cfg := Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    10 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      mockClient,
+		PaymentURLBase:    "https://xeroxgo.vercel.app/payment",
+		IdleQRContent:     "https://xeroxgo.vercel.app",
+		PrinterModel:      "Brother HL-L5210DN",
+	}
+
+	ctrl, err := NewController(cfg, sim)
+	if err != nil {
+		t.Fatalf("failed to create controller: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Enter PIN "1234"
+	sim.EmitDigit('1')
+	sim.EmitDigit('2')
+	sim.EmitDigit('3')
+	sim.EmitDigit('4')
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	}
+
+	// 2. Confirm order to transition to PaymentPending
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
+	}
+
+	// 3. Wait for InitiatePayment to deliver wrapped QR content
+	var foundWrappedQR bool
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rnd.mu.Lock()
+		for _, s := range rnd.states {
+			if s.Mode == ui_ipc.ModePaymentPending && s.QRContent == expectedWrappedURL {
+				foundWrappedQR = true
+				break
+			}
+		}
+		rnd.mu.Unlock()
+		if foundWrappedQR {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !foundWrappedQR {
+		t.Fatalf("expected QRContent %q to be rendered on payment screen", expectedWrappedURL)
+	}
+}
+
 

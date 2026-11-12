@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,7 @@ type Config struct {
 	RenderScreen      func(ui_ipc.ScreenState) error
 	LookupClient      cloud.PINLookupClient
 	IdleQRContent     string
+	PaymentURLBase    string
 	PrinterModel      string
 	OnTransactionEnd  func()
 }
@@ -338,7 +340,7 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 					return
 				}
-				c.currentQRPayload = attempt.QRPayload
+				c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
 				c.pinError = ""
 				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 			}(seq, sID)
@@ -456,7 +458,7 @@ func (c *Controller) startClaimLocked() {
 				return
 			}
 
-			c.currentQRPayload = attempt.QRPayload
+			c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
 			c.pinError = ""
 			c.renderPaymentPendingLocked(tSec)
 		}(targetSeq, sessID, timeoutSec)
@@ -561,6 +563,35 @@ func (c *Controller) renderOrderSummaryLocked(remainingSeconds int) {
 		TimeoutSeconds: remainingSeconds,
 		PrinterModel:   c.cfg.PrinterModel,
 	})
+}
+
+func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetails) string {
+	if attempt == nil {
+		return ""
+	}
+	urlBase := strings.TrimSpace(c.cfg.PaymentURLBase)
+	if urlBase != "" {
+		token := strings.TrimSpace(attempt.DemoToken)
+		if token == "" && strings.HasPrefix(attempt.QRPayload, "http") {
+			parts := strings.Split(strings.TrimRight(attempt.QRPayload, "/"), "/")
+			if len(parts) > 0 {
+				last := parts[len(parts)-1]
+				if strings.HasPrefix(last, "dmo_") || strings.HasPrefix(last, "tok_") {
+					token = last
+				}
+			}
+		}
+		if token == "" {
+			token = strings.TrimSpace(attempt.SessionID)
+		}
+		if token == "" {
+			token = strings.TrimSpace(attempt.AttemptID)
+		}
+		if token != "" {
+			return fmt.Sprintf("%s/%s", strings.TrimRight(urlBase, "/"), token)
+		}
+	}
+	return attempt.QRPayload
 }
 
 func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {

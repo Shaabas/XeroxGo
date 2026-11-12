@@ -257,6 +257,49 @@ func TestDemoCheckoutPage_Rendering(t *testing.T) {
 	}
 }
 
+func TestDemoCheckoutPage_JSONEndpoint(t *testing.T) {
+	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	defer cleanup()
+
+	kioskID := "kiosk-json-test"
+	orderID := "ord_json_001"
+	sess := createTestOrderAndSession(t, st, kioskID, orderID, "5555", 3, 600)
+
+	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID)
+	req, _ := http.NewRequest(http.MethodPost, initURL, nil)
+	req.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
+	resp, _ := http.DefaultClient.Do(req)
+	var initResp map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&initResp)
+	_ = resp.Body.Close()
+	demoToken := initResp["demo_token"].(string)
+
+	jsonReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/pay/%s", ts.URL, demoToken), nil)
+	jsonReq.Header.Set("Accept", "application/json")
+	jResp, err := http.DefaultClient.Do(jsonReq)
+	if err != nil {
+		t.Fatalf("GET /pay/ with json accept failed: %v", err)
+	}
+	defer jResp.Body.Close()
+
+	if jResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", jResp.StatusCode)
+	}
+	var data map[string]interface{}
+	if err := json.NewDecoder(jResp.Body).Decode(&data); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if data["status"] != "ACTIVE" {
+		t.Errorf("status = %v, want ACTIVE", data["status"])
+	}
+	if data["order_id"] != orderID {
+		t.Errorf("order_id = %v, want %s", data["order_id"], orderID)
+	}
+	if data["amount_rupees"] != "6.00" {
+		t.Errorf("amount_rupees = %v, want 6.00", data["amount_rupees"])
+	}
+}
+
 func TestDemoCheckoutPage_ExpiredAndAlreadyPaid(t *testing.T) {
 	_, ts, st, cleanup := setupDemoTestServer(t, true)
 	defer cleanup()

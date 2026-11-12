@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>XeroxGO - Payment Simulation</title>
+  <meta name="theme-color" content="#2563EB" />
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
+  <link rel="stylesheet" href="/css/portal.css?v=2.0.0" />
+  <style>
+    body {
+      background: #F1F5F9;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 16px;
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    .payment-container {
+      width: 100%;
+      max-width: 440px;
+      margin-top: 12px;
+      margin-bottom: 24px;
+    }
+    .brand-header {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .brand-logo {
+      height: 38px;
+      width: auto;
+    }
+    .demo-badge {
+      display: inline-block;
+      background: #E0E7FF;
+      color: #3730A3;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      border: 1px solid #C7D2FE;
+    }
+    .pay-card {
+      background: #FFFFFF;
+      border-radius: 20px;
+      box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.08), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
+      border: 1px solid #E2E8F0;
+      overflow: hidden;
+    }
+    .card-hero {
+      background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%);
+      padding: 24px 20px;
+      color: #FFFFFF;
+      text-align: center;
+    }
+    .hero-label {
+      font-size: 13px;
+      font-weight: 500;
+      color: #BFDBFE;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+    .hero-amount {
+      font-size: 42px;
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+    .hero-sub {
+      font-size: 13px;
+      color: #DBEAFE;
+      margin-top: 6px;
+    }
+    .card-body {
+      padding: 20px;
+    }
+    .specs-grid {
+      background: #F8FAFC;
+      border-radius: 14px;
+      border: 1px solid #E2E8F0;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .spec-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+    }
+    .spec-label {
+      color: #64748B;
+      font-weight: 500;
+    }
+    .spec-val {
+      color: #0F172A;
+      font-weight: 700;
+    }
+    .btn-pay-now {
+      width: 100%;
+      background: #2563EB;
+      color: #FFFFFF;
+      border: none;
+      border-radius: 14px;
+      padding: 16px 20px;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+      transition: all 0.2s ease;
+    }
+    .btn-pay-now:hover:not(:disabled) {
+      background: #1D4ED8;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(37, 99, 235, 0.45);
+    }
+    .btn-pay-now:active:not(:disabled) {
+      transform: translateY(0);
+    }
+    .btn-pay-now:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+    .upi-apps-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      margin-top: 14px;
+      color: #64748B;
+      font-size: 12px;
+    }
+    .upi-pill {
+      background: #F1F5F9;
+      border: 1px solid #CBD5E1;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 11px;
+      color: #475569;
+    }
+    .success-panel {
+      text-align: center;
+      padding: 36px 20px;
+    }
+    .check-icon-circle {
+      width: 72px;
+      height: 72px;
+      background: #DCFCE7;
+      color: #16A34A;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px;
+      font-size: 36px;
+      box-shadow: 0 0 0 8px #F0FDF4;
+    }
+    .success-title {
+      font-size: 22px;
+      font-weight: 800;
+      color: #0F172A;
+      margin-bottom: 8px;
+    }
+    .success-desc {
+      font-size: 14px;
+      color: #64748B;
+      line-height: 1.5;
+      margin-bottom: 24px;
+    }
+    .kiosk-pulse-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: #EFF6FF;
+      border: 1px solid #BFDBFE;
+      color: #1D4ED8;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 10px 18px;
+      border-radius: 12px;
+    }
+    .pulse-dot {
+      width: 10px;
+      height: 10px;
+      background: #2563EB;
+      border-radius: 50%;
+      animation: pulseAnimation 1.5s infinite;
+    }
+    @keyframes pulseAnimation {
+      0% { transform: scale(0.9); opacity: 0.8; }
+      50% { transform: scale(1.3); opacity: 1; }
+      100% { transform: scale(0.9); opacity: 0.8; }
+    }
+    .spinner {
+      border: 3px solid rgba(255, 255, 255, 0.3);
+      border-top-color: #FFFFFF;
+      border-radius: 50%;
+      width: 20px;
+      height: 20px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .error-card {
+      background: #FEF2F2;
+      border: 1px solid #FCA5A5;
+      color: #991B1B;
+      border-radius: 16px;
+      padding: 24px 20px;
+      text-align: center;
+    }
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div class="payment-container">
+    <div class="brand-header">
+      <img src="/assets/xeroxgo-logo-transparent.png" alt="XeroxGO" class="brand-logo" />
+      <span class="demo-badge">Payment Simulation</span>
+    </div>
+
+    <!-- State 1: Loading State -->
+    <div id="state-loading" class="pay-card" style="padding: 48px 20px; text-align: center;">
+      <div style="display: flex; justify-content: center; margin-bottom: 16px;">
+        <div class="spinner" style="border-color: #E2E8F0; border-top-color: #2563EB; width: 32px; height: 32px; border-width: 4px;"></div>
+      </div>
+      <div style="font-weight: 600; color: #1E293B; font-size: 16px;">Loading order details...</div>
+      <div style="font-size: 13px; color: #64748B; margin-top: 6px;">Connecting to kiosk session</div>
+    </div>
+
+    <!-- State 2: Active Payment Card -->
+    <div id="state-active" class="pay-card hidden">
+      <div class="card-hero">
+        <div class="hero-label">Total Amount Due</div>
+        <div class="hero-amount" id="display-amount">₹0.00</div>
+        <div class="hero-sub" id="display-kiosk">Kiosk: kiosk-demo</div>
+      </div>
+
+      <div class="card-body">
+        <div class="specs-grid">
+          <div class="spec-row">
+            <span class="spec-label">Order ID</span>
+            <span class="spec-val" id="spec-order-id">-</span>
+          </div>
+          <div class="spec-row">
+            <span class="spec-label">Documents</span>
+            <span class="spec-val" id="spec-pages">- pages</span>
+          </div>
+          <div class="spec-row">
+            <span class="spec-label">Physical Sheets</span>
+            <span class="spec-val" id="spec-sheets">- sheets</span>
+          </div>
+          <div class="spec-row">
+            <span class="spec-label">Print Mode</span>
+            <span class="spec-val" id="spec-mode">-</span>
+          </div>
+          <div class="spec-row">
+            <span class="spec-label">Copies</span>
+            <span class="spec-val" id="spec-copies">-</span>
+          </div>
+        </div>
+
+        <button id="btn-pay" class="btn-pay-now">
+          <span id="btn-pay-text">Pay Now (Simulate UPI)</span>
+          <div id="btn-pay-spinner" class="spinner hidden"></div>
+        </button>
+
+        <div class="upi-apps-row">
+          <span>Simulated Providers:</span>
+          <span class="upi-pill">GPay</span>
+          <span class="upi-pill">PhonePe</span>
+          <span class="upi-pill">Paytm</span>
+        </div>
+
+        <div style="margin-top: 18px; text-align: center;">
+          <button id="btn-fail" style="background: none; border: none; color: #94A3B8; font-size: 12px; text-decoration: underline; cursor: pointer;">
+            Simulate payment rejection / failure
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- State 3: Success State -->
+    <div id="state-success" class="pay-card success-panel hidden">
+      <div class="check-icon-circle">✓</div>
+      <div class="success-title">Payment Confirmed!</div>
+      <div class="success-desc">
+        Your simulated UPI payment of <strong id="success-amount" style="color: #0F172A;">₹0.00</strong> was verified.
+      </div>
+      <div class="kiosk-pulse-badge">
+        <div class="pulse-dot"></div>
+        <span>Printing at <span id="success-kiosk">kiosk</span> now...</span>
+      </div>
+      <div style="margin-top: 24px; font-size: 13px; color: #64748B;">
+        Please collect your printed pages from the output tray.
+      </div>
+    </div>
+
+    <!-- State 4: Error / Expired State -->
+    <div id="state-error" class="error-card hidden">
+      <div style="font-size: 32px; margin-bottom: 8px;">⚠️</div>
+      <div style="font-weight: 700; font-size: 17px; margin-bottom: 6px;" id="error-title">Session Expired</div>
+      <div style="font-size: 14px; line-height: 1.4;" id="error-desc">
+        The payment link you scanned is no longer active. Please enter your PIN again on the kiosk.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      // 1. Extract Token from URL: /payment/<token> or query param ?token=
+      var pathParts = window.location.pathname.split('/');
+      var token = '';
+      for (var i = 0; i < pathParts.length; i++) {
+        if (pathParts[i] === 'payment' && pathParts[i+1]) {
+          token = pathParts[i+1];
+          break;
+        }
+      }
+      if (!token) {
+        var params = new URLSearchParams(window.location.search);
+        token = params.get('token') || '';
+      }
+
+      var elLoading = document.getElementById('state-loading');
+      var elActive = document.getElementById('state-active');
+      var elSuccess = document.getElementById('state-success');
+      var elError = document.getElementById('state-error');
+
+      var displayAmount = document.getElementById('display-amount');
+      var displayKiosk = document.getElementById('display-kiosk');
+      var specOrderId = document.getElementById('spec-order-id');
+      var specPages = document.getElementById('spec-pages');
+      var specSheets = document.getElementById('spec-sheets');
+      var specMode = document.getElementById('spec-mode');
+      var specCopies = document.getElementById('spec-copies');
+
+      var btnPay = document.getElementById('btn-pay');
+      var btnPayText = document.getElementById('btn-pay-text');
+      var btnPaySpinner = document.getElementById('btn-pay-spinner');
+      var btnFail = document.getElementById('btn-fail');
+
+      var successAmount = document.getElementById('success-amount');
+      var successKiosk = document.getElementById('success-kiosk');
+
+      var errorTitle = document.getElementById('error-title');
+      var errorDesc = document.getElementById('error-desc');
+
+      function showError(title, desc) {
+        elLoading.classList.add('hidden');
+        elActive.classList.add('hidden');
+        elSuccess.classList.add('hidden');
+        elError.classList.remove('hidden');
+        errorTitle.textContent = title;
+        errorDesc.textContent = desc;
+      }
+
+      function showSuccess(amountStr, kioskId) {
+        elLoading.classList.add('hidden');
+        elActive.classList.add('hidden');
+        elError.classList.add('hidden');
+        elSuccess.classList.remove('hidden');
+        successAmount.textContent = '₹' + amountStr;
+        successKiosk.textContent = kioskId || 'kiosk';
+      }
+
+      if (!token) {
+        showError('Invalid Payment Link', 'No payment token was specified. Please scan the QR code displayed on the kiosk screen.');
+        return;
+      }
+
+      // 2. Fetch Order Details from Cloud Backend
+      fetch('/pay/' + encodeURIComponent(token), {
+        headers: { 'Accept': 'application/json' }
+      })
+      .then(function(res) {
+        if (res.status === 404) {
+          throw new Error('NOT_FOUND');
+        } else if (res.status === 410) {
+          throw new Error('EXPIRED');
+        } else if (!res.ok) {
+          throw new Error('FETCH_ERROR');
+        }
+        return res.json();
+      })
+      .then(function(data) {
+        if (data.status === 'already_processed') {
+          showSuccess(data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00'), data.kiosk_id);
+          return;
+        }
+
+        if (data.status === 'expired') {
+          showError('Payment Session Expired', 'This kiosk session has timed out. Please enter your PIN on the kiosk to start a fresh session.');
+          return;
+        }
+
+        // Active session: populate fields
+        var amountRupees = data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00');
+        displayAmount.textContent = '₹' + amountRupees;
+        displayKiosk.textContent = 'Kiosk: ' + (data.kiosk_id || 'kiosk-demo');
+        specOrderId.textContent = data.order_id || '-';
+        specPages.textContent = (data.total_pages || 1) + ' pages';
+        specSheets.textContent = (data.total_sheets || 1) + ' physical sheets';
+        specMode.textContent = (data.duplex || 'Simplex') + ' • ' + (data.color_mode || 'B&W');
+        specCopies.textContent = (data.copies || 1) + ' copy';
+
+        btnPayText.textContent = 'Pay ₹' + amountRupees + ' (Simulated UPI)';
+
+        elLoading.classList.add('hidden');
+        elActive.classList.remove('hidden');
+
+        // Setup Pay button click handler
+        btnPay.addEventListener('click', function() {
+          btnPay.disabled = true;
+          btnPayText.textContent = 'Authorizing payment...';
+          btnPaySpinner.classList.remove('hidden');
+
+          // Add simulated 1.2s bank network delay for realistic feel
+          setTimeout(function() {
+            fetch('/pay/' + encodeURIComponent(token), {
+              method: 'POST',
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+              }
+            })
+            .then(function(postRes) {
+              return postRes.json().then(function(postData) {
+                return { ok: postRes.ok, data: postData };
+              });
+            })
+            .then(function(result) {
+              if (result.ok && (result.data.ok || result.data.status === 'already_processed')) {
+                showSuccess(amountRupees, data.kiosk_id);
+              } else {
+                throw new Error(result.data.error || 'Payment failed');
+              }
+            })
+            .catch(function(err) {
+              btnPay.disabled = false;
+              btnPayText.textContent = 'Pay ₹' + amountRupees + ' (Simulated UPI)';
+              btnPaySpinner.classList.add('hidden');
+              alert('Simulated payment error: ' + (err.message || 'Payment capture failed.'));
+            });
+          }, 1200);
+        });
+
+        // Setup Fail button handler
+        btnFail.addEventListener('click', function() {
+          if (confirm('Simulate a payment failure? This tests how the kiosk handles declined transactions.')) {
+            showError('Payment Declined', 'Simulated failure: bank network declined the transaction. The kiosk session remains open for retry.');
+          }
+        });
+      })
+      .catch(function(err) {
+        if (err.message === 'NOT_FOUND') {
+          showError('Payment Link Not Found', 'The link you scanned does not match any active payment attempt. Please re-scan from the kiosk screen.');
+        } else if (err.message === 'EXPIRED') {
+          showError('Payment Session Expired', 'This session has timed out. Please enter your PIN again on the kiosk.');
+        } else {
+          showError('Connection Error', 'Could not communicate with the cloud backend. Please check your internet connection and try again.');
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
+
