@@ -6,6 +6,10 @@
       "destination": "https://xeroxgo-cloud.onrender.com/api/:match*"
     },
     {
+      "source": "/pay/:match*",
+      "destination": "https://xeroxgo-cloud.onrender.com/pay/:match*"
+    },
+    {
       "source": "/admin",
       "destination": "/admin.html"
     },
