@@ -389,9 +389,23 @@
         return;
       }
 
-      // 2. Fetch Order Details from Cloud Backend
-      fetch('/pay/' + encodeURIComponent(token), {
+      // 2. Fetch Order Details from Cloud Backend (with direct Render fallback)
+      var apiEndpoint = '/pay/' + encodeURIComponent(token);
+      var directRenderEndpoint = 'https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token);
+      var effectiveEndpoint = apiEndpoint;
+
+      fetch(apiEndpoint, {
         headers: { 'Accept': 'application/json' }
+      })
+      .then(function(res) {
+        if (!res.ok && res.status === 404) {
+          // If Vercel proxy 404s, try direct Render backend
+          effectiveEndpoint = directRenderEndpoint;
+          return fetch(directRenderEndpoint, {
+            headers: { 'Accept': 'application/json' }
+          });
+        }
+        return res;
       })
       .then(function(res) {
         if (res.status === 404) {
@@ -437,7 +451,7 @@
 
           // Add simulated 1.2s bank network delay for realistic feel
           setTimeout(function() {
-            fetch('/pay/' + encodeURIComponent(token), {
+            fetch(effectiveEndpoint, {
               method: 'POST',
               headers: {
                 'Accept': 'application/json',

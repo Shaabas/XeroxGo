@@ -1704,7 +1704,16 @@ func main() {
 	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
 	flag.Parse()
 
-	demoMode := *demoFlag || os.Getenv("DEMO_MODE") == "1" || strings.ToLower(os.Getenv("DEMO_MODE")) == "true" || os.Getenv("XEROXGO_DEMO_MODE") == "1" || strings.ToLower(os.Getenv("XEROXGO_DEMO_MODE")) == "true"
+	demoEnv := strings.TrimSpace(os.Getenv("DEMO_MODE"))
+	if demoEnv == "" {
+		demoEnv = strings.TrimSpace(os.Getenv("XEROXGO_DEMO_MODE"))
+	}
+	demoMode := true
+	if demoEnv == "0" || strings.ToLower(demoEnv) == "false" {
+		demoMode = false
+	} else if *demoFlag {
+		demoMode = true
+	}
 
 	addr := strings.TrimSpace(*addrFlag)
 	if addr == "" {
