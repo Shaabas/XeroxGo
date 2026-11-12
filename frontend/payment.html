@@ -384,51 +384,7 @@
         successKiosk.textContent = kioskId || 'kiosk';
       }
 
-      if (!token) {
-        showError('Invalid Payment Link', 'No payment token was specified. Please scan the QR code displayed on the kiosk screen.');
-        return;
-      }
-
-      // 2. Fetch Order Details from Cloud Backend (with direct Render fallback)
-      var apiEndpoint = '/pay/' + encodeURIComponent(token);
-      var directRenderEndpoint = 'https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token);
-      var effectiveEndpoint = apiEndpoint;
-
-      fetch(apiEndpoint, {
-        headers: { 'Accept': 'application/json' }
-      })
-      .then(function(res) {
-        if (!res.ok && res.status === 404) {
-          // If Vercel proxy 404s, try direct Render backend
-          effectiveEndpoint = directRenderEndpoint;
-          return fetch(directRenderEndpoint, {
-            headers: { 'Accept': 'application/json' }
-          });
-        }
-        return res;
-      })
-      .then(function(res) {
-        if (res.status === 404) {
-          throw new Error('NOT_FOUND');
-        } else if (res.status === 410) {
-          throw new Error('EXPIRED');
-        } else if (!res.ok) {
-          throw new Error('FETCH_ERROR');
-        }
-        return res.json();
-      })
-      .then(function(data) {
-        if (data.status === 'already_processed') {
-          showSuccess(data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00'), data.kiosk_id);
-          return;
-        }
-
-        if (data.status === 'expired') {
-          showError('Payment Session Expired', 'This kiosk session has timed out. Please enter your PIN on the kiosk to start a fresh session.');
-          return;
-        }
-
-        // Active session: populate fields
+      function renderOrderUI(data, isSample) {
         var amountRupees = data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00');
         displayAmount.textContent = '₹' + amountRupees;
         displayKiosk.textContent = 'Kiosk: ' + (data.kiosk_id || 'kiosk-demo');
@@ -449,14 +405,31 @@
           btnPayText.textContent = 'Authorizing payment...';
           btnPaySpinner.classList.remove('hidden');
 
-          // Add simulated 1.2s bank network delay for realistic feel
           setTimeout(function() {
+            if (isSample) {
+              showSuccess(amountRupees, data.kiosk_id);
+              return;
+            }
+
             fetch(effectiveEndpoint, {
               method: 'POST',
               headers: {
                 'Accept': 'application/json',
                 'Content-Type': 'application/json'
               }
+            })
+            .catch(function() {
+              if (effectiveEndpoint !== directRenderEndpoint) {
+                effectiveEndpoint = directRenderEndpoint;
+                return fetch(directRenderEndpoint, {
+                  method: 'POST',
+                  headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                  }
+                });
+              }
+              throw new Error('Connection failed');
             })
             .then(function(postRes) {
               return postRes.json().then(function(postData) {
@@ -485,6 +458,77 @@
             showError('Payment Declined', 'Simulated failure: bank network declined the transaction. The kiosk session remains open for retry.');
           }
         });
+      }
+
+      if (!token) {
+        showError('Invalid Payment Link', 'No payment token was specified. Please scan the QR code displayed on the kiosk screen.');
+        return;
+      }
+
+      // Sample preview mode for manual / sandbox testing
+      if (token === 'demo' || token === 'sample') {
+        renderOrderUI({
+          status: 'pending',
+          order_id: 'ord_demo_preview',
+          amount_rupees: '10.00',
+          amount_paise: 1000,
+          total_pages: 4,
+          total_sheets: 2,
+          duplex: 'Double-sided (Duplex)',
+          color_mode: 'Black & White (Mono)',
+          copies: 1,
+          kiosk_id: 'kiosk-demo-01'
+        }, true);
+        return;
+      }
+
+      // 2. Fetch Order Details from Cloud Backend (with direct Render fallback)
+      var apiEndpoint = '/pay/' + encodeURIComponent(token);
+      var directRenderEndpoint = 'https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token);
+      var effectiveEndpoint = apiEndpoint;
+
+      fetch(apiEndpoint, {
+        headers: { 'Accept': 'application/json' }
+      })
+      .catch(function() {
+        // Network error reaching Vercel proxy, fallback to Render direct
+        effectiveEndpoint = directRenderEndpoint;
+        return fetch(directRenderEndpoint, {
+          headers: { 'Accept': 'application/json' }
+        });
+      })
+      .then(function(res) {
+        if (!res.ok && res.status === 404 && effectiveEndpoint !== directRenderEndpoint) {
+          // If Vercel proxy returned 404, try direct Render backend
+          effectiveEndpoint = directRenderEndpoint;
+          return fetch(directRenderEndpoint, {
+            headers: { 'Accept': 'application/json' }
+          });
+        }
+        return res;
+      })
+      .then(function(res) {
+        if (res.status === 404) {
+          throw new Error('NOT_FOUND');
+        } else if (res.status === 410) {
+          throw new Error('EXPIRED');
+        } else if (!res.ok) {
+          throw new Error('FETCH_ERROR');
+        }
+        return res.json();
+      })
+      .then(function(data) {
+        if (data.status === 'already_processed') {
+          showSuccess(data.amount_rupees || (data.amount_paise ? (data.amount_paise / 100).toFixed(2) : '0.00'), data.kiosk_id);
+          return;
+        }
+
+        if (data.status === 'expired') {
+          showError('Payment Session Expired', 'This kiosk session has timed out. Please enter your PIN on the kiosk to start a fresh session.');
+          return;
+        }
+
+        renderOrderUI(data, false);
       })
       .catch(function(err) {
         if (err.message === 'NOT_FOUND') {
