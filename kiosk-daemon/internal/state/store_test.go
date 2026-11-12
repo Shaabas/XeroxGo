@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,6 +71,58 @@ func TestOpenInitializesDatabase(t *testing.T) {
 
 	if err := s.Close(); err != nil {
 		t.Fatalf("failed to close store: %v", err)
+	}
+}
+
+func TestMigration_OldPrinterStateWithoutIsCalibrated(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite: %v", err)
+	}
+	legacySchema := `
+CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    kiosk_id TEXT NOT NULL,
+    total_pages INTEGER NOT NULL,
+    total_sheets INTEGER NOT NULL,
+    copies INTEGER NOT NULL,
+    duplex TEXT NOT NULL,
+    start_from_page INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    pages_printed INTEGER NOT NULL DEFAULT 0,
+    sheets_printed INTEGER NOT NULL DEFAULT 0,
+    error_reason TEXT NOT NULL DEFAULT '',
+    updated_at_ns INTEGER NOT NULL
+);
+CREATE TABLE printer_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    estimated_sheets INTEGER NOT NULL CHECK (estimated_sheets >= 0 AND estimated_sheets <= 250)
+);
+INSERT INTO printer_state (id, estimated_sheets) VALUES (1, 150);
+`
+	if _, err := rawDB.Exec(legacySchema); err != nil {
+		t.Fatalf("failed to create legacy schema: %v", err)
+	}
+	_ = rawDB.Close()
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed on legacy schema: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	sheets, calib, err := s.GetPaperSupply(ctx)
+	if err != nil {
+		t.Fatalf("GetPaperSupply failed: %v", err)
+	}
+	if sheets != 150 {
+		t.Errorf("expected 150 sheets preserved, got %d", sheets)
+	}
+	if calib {
+		t.Errorf("expected is_calibrated=false on legacy schema, got true")
 	}
 }
 

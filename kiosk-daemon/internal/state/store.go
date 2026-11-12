@@ -132,9 +132,6 @@ CREATE TABLE IF NOT EXISTS printer_state (
         CHECK (estimated_sheets >= 0 AND estimated_sheets <= 250),
     is_calibrated INTEGER NOT NULL DEFAULT 0
 );
-
-INSERT OR IGNORE INTO printer_state (id, estimated_sheets, is_calibrated)
-VALUES (1, 250, 0);
 `
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		cleanup()
@@ -145,6 +142,15 @@ VALUES (1, 250, 0);
 	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN cups_job_id TEXT NOT NULL DEFAULT '';")
 	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN submitted_to_printer INTEGER NOT NULL DEFAULT 0;")
 	_, _ = db.ExecContext(ctx, "ALTER TABLE printer_state ADD COLUMN is_calibrated INTEGER NOT NULL DEFAULT 0;")
+
+	initQuery := `
+INSERT OR IGNORE INTO printer_state (id, estimated_sheets, is_calibrated)
+VALUES (1, 250, 0);
+`
+	if _, err := db.ExecContext(ctx, initQuery); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to initialize default printer state: %w", err)
+	}
 
 	return &Store{db: db}, nil
 }
