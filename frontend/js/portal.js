@@ -688,9 +688,7 @@
           metaText += ` · ${item.totalSheets} sheet${item.totalSheets > 1 ? 's' : ''}`;
         }
 
-        const priceDisplayHtml = (item.previewPending && !hasAuthPrice)
-          ? `<span class="price-loading-dots" role="status" aria-label="Calculating price"><span class="price-dot"></span><span class="price-dot"></span><span class="price-dot"></span></span>`
-          : formatRupees(itemPrice);
+        const priceDisplayHtml = formatRupees(itemPrice);
 
         card.innerHTML = `
           <div class="doc-card-top">
@@ -746,9 +744,9 @@
     if (cartDocsCount) {
       cartDocsCount.textContent = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
     }
-    const anyPending = cartItems.some(it => it.status === 'processing' || it.previewPending);
+    const isProcessing = cartItems.some(it => it.status === 'processing');
     if (cartTotalAmount) {
-      if (anyPending) {
+      if (isProcessing && readyCount === 0) {
         cartTotalAmount.innerHTML = `<span class="price-loading-dots" role="status" aria-label="Calculating price"><span class="price-dot"></span><span class="price-dot"></span><span class="price-dot"></span></span>`;
       } else if (readyCount > 0 && totalCartPaise > 0) {
         cartTotalAmount.textContent = formatRupees(totalCartPaise);
@@ -764,7 +762,7 @@
         <span>Review Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
-      const canProceed = !anyPending && readyCount > 0 && totalCartPaise > 0;
+      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0;
       btnReviewOrder.disabled = !canProceed;
     }
   }
@@ -995,12 +993,11 @@
       item.selectedPages = Array.from({ length: totalPages }, (_, idx) => idx + 1);
       item.status = 'ready';
       item.statusText = '';
-      item.previewPending = true;
+      item.previewPending = false;
       item.authoritativePricePaise = null;
       item.totalSheets = Math.ceil(totalPages / (defaultSides === 'Double-sided' ? 2 : 1));
       item.pricePaise = calculateDocPrice(totalPages, item.settings);
       renderCart();
-      scheduleCanonicalPreview(item, item.settings, true);
     } catch (err) {
       if (item.abortController?.signal?.aborted) {
         return;
@@ -1713,14 +1710,17 @@
       return;
     }
 
-    if (!activePreviewPdfDoc || !activePreviewMeta) {
+    const activeDocToRender = activePreviewPdfDoc || doc.pdfDoc;
+    if (!activeDocToRender) {
       if (doc.previewPending && previewLoadingSpinner) {
         previewLoadingSpinner.classList.remove('hidden');
       }
       return;
     }
 
-    const totalSheets = activePreviewMeta.totalSheets || 1;
+    const totalSheets = (activePreviewMeta && activePreviewMeta.totalSheets)
+      ? activePreviewMeta.totalSheets
+      : Math.max(1, Math.ceil(doc.totalPages / (isDuplex ? 2 : 1)));
 
     // Bounds check
     if (currentPreviewSheet < 1) currentPreviewSheet = 1;
@@ -1747,7 +1747,7 @@
       previewSheetIndicator.textContent = `Sheet ${currentPreviewSheet} of ${totalSheets}`;
     }
 
-    // Determine 1-based page of the canonical PDF to render
+    // Determine 1-based page of the PDF to render
     let pageNumToRender = 1;
     if (!isDuplex) {
       pageNumToRender = currentPreviewSheet;
@@ -1757,15 +1757,35 @@
         : (currentPreviewSheet - 1) * 2 + 2;
     }
 
-    if (pageNumToRender > activePreviewPdfDoc.numPages) {
-      pageNumToRender = activePreviewPdfDoc.numPages;
+    if (pageNumToRender > activeDocToRender.numPages) {
+      const canvas = previewCanvas;
+      if (canvas) {
+        const dpr = window.devicePixelRatio || 1;
+        const maxStageW = (window.innerWidth >= 600) ? 260 : 210;
+        const maxStageH = (window.innerWidth >= 600) ? 245 : 210;
+        canvas.width = Math.round(maxStageW * dpr);
+        canvas.height = Math.round(maxStageH * dpr);
+        canvas.style.width = `${maxStageW}px`;
+        canvas.style.height = `${maxStageH}px`;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '500 12px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('(Blank back side)', canvas.width / 2, canvas.height / 2);
+      }
+      if (previewLoadingSpinner) previewLoadingSpinner.classList.add('hidden');
+      return;
     }
 
     if (previewCanvas) {
       previewCanvas.classList.remove('page-excluded');
     }
 
-    if (previewLoadingSpinner) previewLoadingSpinner.classList.remove('hidden');
     if (previewErrorBox) previewErrorBox.classList.add('hidden');
 
     try {
@@ -1778,7 +1798,7 @@
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
 
-      const page = await activePreviewPdfDoc.getPage(pageNumToRender);
+      const page = await activeDocToRender.getPage(pageNumToRender);
 
       // The canonical PDF has already been rotated, imposed, grayscaled, and padded by the cloud backend
       const rawViewport = page.getViewport({ scale: 1.0 });
@@ -1798,8 +1818,12 @@
 
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-      // Reset any manual CSS filter - Ghostscript canonical PDF already has Color/BW applied
-      canvas.style.filter = 'none';
+      // Grayscale client fallback when server canonical preview hasn't loaded yet
+      if (!activePreviewPdfDoc && draftSettings && draftSettings.mode === 'B&W') {
+        canvas.style.filter = 'grayscale(100%)';
+      } else {
+        canvas.style.filter = 'none';
+      }
 
       const renderContext = {
         canvasContext: ctx,
@@ -1915,19 +1939,18 @@
     if (btnReviewOrder && btnReviewOrder.disabled) return;
     const readyItems = cartItems.filter(it => it.status === 'ready');
     const processingItems = cartItems.filter(it => it.status === 'processing');
-    const pendingPreviewItems = cartItems.filter(it => it.previewPending);
-    if (processingItems.length > 0 || pendingPreviewItems.length > 0) {
-      showCartError('Please wait for all documents to finish preparing.');
+    if (processingItems.length > 0) {
+      showCartError('Please wait for files to finish loading.');
       return;
     }
     if (readyItems.length === 0) {
-      showCartError('Please wait for at least one document to finish preparing.');
+      showCartError('Please add at least one document to proceed.');
       return;
     }
 
     btnReviewOrder.disabled = true;
     const originalText = btnReviewOrder.innerHTML;
-    btnReviewOrder.innerHTML = `<span>Preparing order...</span>`;
+    btnReviewOrder.innerHTML = `<span>Generating PIN...</span>`;
 
     try {
       const formData = new FormData();
