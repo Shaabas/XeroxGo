@@ -172,7 +172,14 @@ func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	demo := false
+	if s.cfg != nil {
+		demo = s.cfg.demoMode
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"demo_mode": demo,
+	})
 }
 
 func parseDuplex(val interface{}) contracts.DuplexMode {

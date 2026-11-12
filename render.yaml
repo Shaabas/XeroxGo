@@ -12,12 +12,6 @@ services:
         - Dockerfile
         - go.work*
         - render.yaml
-      ignoredPaths:
-        - frontend/**
-        - kiosk-daemon/**
-        - deploy/**
-        - docs/**
-        - "*.md"
     envVars:
       - key: DATABASE_URL
         sync: false
