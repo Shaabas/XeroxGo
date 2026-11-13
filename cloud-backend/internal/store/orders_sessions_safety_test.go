@@ -455,41 +455,58 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 		}
 	})
 
-	// Subtest 8: PostgreSQL Index Deployment Mechanism Verification
+	// Subtest 8: PostgreSQL Index Deployment Mechanism Verification (Schema-Isolated)
+	// Uses a dedicated, disposable schema to verify startup and explicit constraint installation
+	// without dropping or modifying any indexes or tables in the shared schema.
 	t.Run("Postgres_IndexDeployment_StartupVsExplicit", func(t *testing.T) {
-		// 1. Drop index to test startup behavior
-		_, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_kiosk_sessions_active_order;")
+		// 1. Create a dedicated isolated test schema
+		testSchema := fmt.Sprintf("test_deploy_iso_%d", time.Now().UnixNano()%100000000)
+		_, err := s.db.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA %s;", testSchema))
 		if err != nil {
-			t.Fatalf("failed to drop index for test: %v", err)
+			t.Fatalf("failed to create isolated test schema %s: %v", testSchema, err)
 		}
 
-		// 2. Open another store connection to simulate application server startup
-		s2, err := Open(pgURI)
-		if err != nil {
-			t.Fatalf("failed to reopen store: %v", err)
-		}
-		defer s2.Close()
+		// Ensure the isolated schema and all test-owned objects are dropped when the test finishes
+		t.Cleanup(func() {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = s.db.ExecContext(cleanCtx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE;", testSchema))
+		})
 
-		// 3. Verify server startup (Open) did NOT automatically create idx_kiosk_sessions_active_order
+		// 2. Build connection URI scoped to the isolated schema via search_path
+		separator := "?"
+		if strings.Contains(pgURI, "?") {
+			separator = "&"
+		}
+		isolatedURI := fmt.Sprintf("%s%ssearch_path=%s", pgURI, separator, testSchema)
+
+		// 3. Open store connection in the isolated schema to simulate application server startup
+		sIso, err := Open(isolatedURI)
+		if err != nil {
+			t.Fatalf("failed to open store in isolated schema: %v", err)
+		}
+		defer sIso.Close()
+
+		// 4. Verify server startup (Open) did NOT automatically create idx_kiosk_sessions_active_order in the schema
 		var idxCount int
-		err = s2.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM pg_indexes WHERE tablename = 'kiosk_sessions' AND indexname = 'idx_kiosk_sessions_active_order';").Scan(&idxCount)
+		err = sIso.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM pg_indexes WHERE schemaname = $1 AND tablename = 'kiosk_sessions' AND indexname = 'idx_kiosk_sessions_active_order';", testSchema).Scan(&idxCount)
 		if err != nil {
-			t.Fatalf("query pg_indexes: %v", err)
+			t.Fatalf("query pg_indexes in isolated schema: %v", err)
 		}
 		if idxCount != 0 {
 			t.Fatalf("REGRESSION: Open() automatically created idx_kiosk_sessions_active_order; production migration must be explicit")
 		}
 
-		// 4. Inject duplicate active sessions for a test order
+		// 5. Inject duplicate active sessions for a test order inside the isolated schema
 		orderID := fmt.Sprintf("ord_pg_dep_%d", time.Now().UnixNano())
 		kioskID1 := fmt.Sprintf("kiosk-pg-dep1-%d", time.Now().UnixNano()%100000)
 		kioskID2 := fmt.Sprintf("kiosk-pg-dep2-%d", time.Now().UnixNano()%100000)
 		pin := fmt.Sprintf("%04d", time.Now().UnixNano()%10000)
-		createTestOrderWithSheets(t, s2, ctx, orderID, kioskID1, pin, 2, contracts.JobStatusPendingPayment, now)
+		createTestOrderWithSheets(t, sIso, ctx, orderID, kioskID1, pin, 2, contracts.JobStatusPendingPayment, now)
 
 		sessID1 := fmt.Sprintf("sess_pg_dep_1_%d", time.Now().UnixNano())
 		sessID2 := fmt.Sprintf("sess_pg_dep_2_%d", time.Now().UnixNano())
-		_, err = s2.db.ExecContext(ctx, `
+		_, err = sIso.db.ExecContext(ctx, `
 INSERT INTO kiosk_sessions (session_id, kiosk_id, order_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns)
 VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
 `, sessID1, kioskID1, orderID, now.Add(5*time.Minute).UnixNano(), now.UnixNano())
@@ -497,7 +514,7 @@ VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
 			t.Fatalf("insert session 1: %v", err)
 		}
 
-		_, err = s2.db.ExecContext(ctx, `
+		_, err = sIso.db.ExecContext(ctx, `
 INSERT INTO kiosk_sessions (session_id, kiosk_id, order_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns)
 VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
 `, sessID2, kioskID2, orderID, now.Add(5*time.Minute).UnixNano(), now.UnixNano())
@@ -505,39 +522,51 @@ VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
 			t.Fatalf("insert session 2: %v", err)
 		}
 
-		// 5. Calling EnsureActiveSessionConstraint must fail closed on preflight detection
-		err = s2.EnsureActiveSessionConstraint(ctx)
+		// 6. Calling EnsureActiveSessionConstraint must fail closed on preflight detection
+		err = sIso.EnsureActiveSessionConstraint(ctx)
 		if err == nil {
 			t.Fatalf("expected EnsureActiveSessionConstraint to fail preflight with duplicate active sessions, but it succeeded")
 		}
-		t.Logf("Confirmed: EnsureActiveSessionConstraint aborted on preflight: %v", err)
+		t.Logf("Confirmed: EnsureActiveSessionConstraint aborted on preflight in isolated schema: %v", err)
 
-		// 6. Clean up the duplicate session
-		_, err = s2.db.ExecContext(ctx, "DELETE FROM kiosk_sessions WHERE session_id = $1;", sessID2)
+		// 7. Clean up the duplicate session in the isolated schema
+		_, err = sIso.db.ExecContext(ctx, "DELETE FROM kiosk_sessions WHERE session_id = $1;", sessID2)
 		if err != nil {
 			t.Fatalf("delete duplicate test session: %v", err)
 		}
 
-		// 7. Now EnsureActiveSessionConstraint should succeed and create the index
-		err = s2.EnsureActiveSessionConstraint(ctx)
+		// 8. Now EnsureActiveSessionConstraint should succeed and create the index in the isolated schema
+		err = sIso.EnsureActiveSessionConstraint(ctx)
 		if err != nil {
-			t.Fatalf("EnsureActiveSessionConstraint failed on clean database: %v", err)
+			t.Fatalf("EnsureActiveSessionConstraint failed in isolated schema: %v", err)
 		}
 
-		// 8. Verify the index is present and valid
+		// 9. Verify the index is present and valid specifically in the isolated schema
 		var isValid, isUnique bool
-		err = s2.db.QueryRowContext(ctx, `
+		err = sIso.db.QueryRowContext(ctx, `
 SELECT i.indisvalid, i.indisunique 
 FROM pg_class c 
 JOIN pg_index i ON c.oid = i.indexrelid 
-WHERE c.relname = 'idx_kiosk_sessions_active_order';
-`).Scan(&isValid, &isUnique)
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'idx_kiosk_sessions_active_order' AND n.nspname = $1;
+`, testSchema).Scan(&isValid, &isUnique)
 		if err != nil {
-			t.Fatalf("query index validity: %v", err)
+			t.Fatalf("query index validity in isolated schema: %v", err)
 		}
 		if !isValid || !isUnique {
-			t.Fatalf("expected valid unique index, got valid=%v unique=%v", isValid, isUnique)
+			t.Fatalf("expected valid unique index in isolated schema %s, got valid=%v unique=%v", testSchema, isValid, isUnique)
 		}
+
+		// 10. Verify that the unique constraint now actively rejects duplicate active session insertion
+		sessID3 := fmt.Sprintf("sess_pg_dep_3_%d", time.Now().UnixNano())
+		_, err = sIso.db.ExecContext(ctx, `
+INSERT INTO kiosk_sessions (session_id, kiosk_id, order_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns)
+VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
+`, sessID3, kioskID1, orderID, now.Add(5*time.Minute).UnixNano(), now.UnixNano())
+		if err == nil {
+			t.Fatalf("expected unique constraint violation on duplicate active session insertion, but it succeeded")
+		}
+		t.Logf("Confirmed: Partial unique index rejected duplicate active session: %v", err)
 	})
 }
 

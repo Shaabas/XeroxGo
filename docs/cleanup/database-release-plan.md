@@ -142,6 +142,12 @@ if err != nil {
 }
 ```
 
+### Migration Test Isolation
+To prevent non-deterministic test race conditions and eliminate destructive operations on shared schemas:
+- Tests must never drop, modify, or recreate an application's real index on shared test schemas (`public`).
+- Migration lifecycle tests (`Postgres_IndexDeployment_StartupVsExplicit`) dynamically create a disposable PostgreSQL schema (`test_deploy_iso_<timestamp>`) via `search_path`, validating startup behavior and constraint installation strictly on test-owned objects.
+- Cleanup is registered via Go's `t.Cleanup` to guarantee `DROP SCHEMA IF EXISTS ... CASCADE` executes even on test assertion failures or timeouts.
+
 ### Environment Variable Requirements for Integration Tests
 - **Designated Variable:** `XEROXGO_TEST_POSTGRES_URL` (or legacy alias `POSTGRES_TEST_URL`).
 - **Ignored Variables:** `DATABASE_URL`, `SUPABASE_URI`, `SUPABASE_DB_URL`, `POSTGRES_URL`.
@@ -164,3 +170,4 @@ If the partial unique index causes unexpected production behavior:
 DROP INDEX CONCURRENTLY IF EXISTS idx_kiosk_sessions_active_order;
 ```
 The application code gracefully falls back to transaction-level locking and status verification, maintaining backward compatibility.
+
