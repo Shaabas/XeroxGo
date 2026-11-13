@@ -171,12 +171,10 @@
 
     const tabNavOverview = document.getElementById('tab-nav-overview');
     const tabNavOrders = document.getElementById('tab-nav-orders');
-    const tabNavPricing = document.getElementById('tab-nav-pricing');
     const tabNavAds = document.getElementById('tab-nav-ads');
 
     const viewOverview = document.getElementById('view-overview');
     const viewOrders = document.getElementById('view-orders');
-    const viewPricing = document.getElementById('view-pricing');
     const viewAds = document.getElementById('view-ads');
 
     // Toast element
@@ -305,10 +303,10 @@
     // --- Tab Navigation ---
     function switchNavTab(tabName) {
       activeNavTab = tabName;
-      [tabNavOverview, tabNavOrders, tabNavPricing, tabNavAds].forEach(btn => {
+      [tabNavOverview, tabNavOrders, tabNavAds].forEach(btn => {
         if (btn) btn.classList.remove('active');
       });
-      [viewOverview, viewOrders, viewPricing, viewAds].forEach(view => {
+      [viewOverview, viewOrders, viewAds].forEach(view => {
         if (view) view.classList.add('hidden');
       });
 
@@ -320,10 +318,6 @@
         if (tabNavOrders) tabNavOrders.classList.add('active');
         if (viewOrders) viewOrders.classList.remove('hidden');
         loadOrders();
-      } else if (tabName === 'pricing') {
-        if (tabNavPricing) tabNavPricing.classList.add('active');
-        if (viewPricing) viewPricing.classList.remove('hidden');
-        loadPricing();
       } else if (tabName === 'ads') {
         if (tabNavAds) tabNavAds.classList.add('active');
         if (viewAds) viewAds.classList.remove('hidden');
@@ -333,7 +327,6 @@
 
     if (tabNavOverview) tabNavOverview.addEventListener('click', () => switchNavTab('overview'));
     if (tabNavOrders) tabNavOrders.addEventListener('click', () => switchNavTab('orders'));
-    if (tabNavPricing) tabNavPricing.addEventListener('click', () => switchNavTab('pricing'));
     if (tabNavAds) tabNavAds.addEventListener('click', () => switchNavTab('ads'));
 
     // ==========================================
@@ -692,133 +685,7 @@
     }
 
     // ==========================================
-    // 3. PRICING CONTROLLER & COST ESTIMATOR
-    // ==========================================
-    const pricingForm = document.getElementById('pricing-form');
-    const priceBwSimplexInput = document.getElementById('price-bw-simplex-input');
-    const priceBwDuplexInput = document.getElementById('price-bw-duplex-input');
-    const priceColorSimplexInput = document.getElementById('price-color-simplex-input');
-    const priceColorDuplexInput = document.getElementById('price-color-duplex-input');
-    const pricingColorEnabledToggle = document.getElementById('pricing-color-enabled-toggle');
-    const pricingSaveBtn = document.getElementById('pricing-save-btn');
-
-    const calcPagesInput = document.getElementById('calc-pages-input');
-    const calcResultSheets = document.getElementById('calc-result-sheets');
-    const calcResultBw = document.getElementById('calc-result-bw');
-    const calcResultColor = document.getElementById('calc-result-color');
-
-    async function loadPricing() {
-      try {
-        const res = await apiRequest('/api/admin/pricing');
-        if (!res.ok) throw new Error('Failed to load pricing');
-        const data = await parseResponseJSON(res);
-
-        currentBWSimplexPaise = data.bw_simplex_price_paise || data.bw_price_per_sheet_paise || 200;
-        currentBWDuplexPaise = data.bw_duplex_price_paise || 150;
-        currentColorSimplexPaise = data.color_simplex_price_paise || data.color_price_per_sheet_paise || 1000;
-        currentColorDuplexPaise = data.color_duplex_price_paise || 750;
-        currentColorEnabled = Boolean(data.color_enabled);
-
-        if (priceBwSimplexInput) priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
-        if (priceBwDuplexInput) priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
-        if (priceColorSimplexInput) priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
-        if (priceColorDuplexInput) priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
-        if (pricingColorEnabledToggle) pricingColorEnabledToggle.checked = currentColorEnabled;
-
-        updateCostEstimator();
-      } catch (err) {
-        showToast('Pricing load error: ' + err.message);
-      }
-    }
-
-    function updateCostEstimator() {
-      if (!calcPagesInput) return;
-      const pages = Math.max(1, parseInt(calcPagesInput.value, 10) || 1);
-      const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
-      const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
-
-      const bwRate = isDuplex
-        ? (priceBwDuplexInput && priceBwDuplexInput.value ? parseFloat(priceBwDuplexInput.value) : (currentBWDuplexPaise / 100))
-        : (priceBwSimplexInput && priceBwSimplexInput.value ? parseFloat(priceBwSimplexInput.value) : (currentBWSimplexPaise / 100));
-
-      const colorRate = isDuplex
-        ? (priceColorDuplexInput && priceColorDuplexInput.value ? parseFloat(priceColorDuplexInput.value) : (currentColorDuplexPaise / 100))
-        : (priceColorSimplexInput && priceColorSimplexInput.value ? parseFloat(priceColorSimplexInput.value) : (currentColorSimplexPaise / 100));
-
-      const bwCost = pages * bwRate;
-      const colorCost = pages * colorRate;
-
-      if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
-      if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
-      if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
-    }
-
-    if (calcPagesInput) calcPagesInput.addEventListener('input', updateCostEstimator);
-    document.querySelectorAll('input[name="calc-duplex"]').forEach(r => {
-      r.addEventListener('change', updateCostEstimator);
-    });
-    if (priceBwSimplexInput) priceBwSimplexInput.addEventListener('input', updateCostEstimator);
-    if (priceBwDuplexInput) priceBwDuplexInput.addEventListener('input', updateCostEstimator);
-    if (priceColorSimplexInput) priceColorSimplexInput.addEventListener('input', updateCostEstimator);
-    if (priceColorDuplexInput) priceColorDuplexInput.addEventListener('input', updateCostEstimator);
-    if (pricingColorEnabledToggle) pricingColorEnabledToggle.addEventListener('change', updateCostEstimator);
-
-    if (pricingForm) {
-      pricingForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const bwSimplex = parseFloat(priceBwSimplexInput.value);
-        const bwDuplex = parseFloat(priceBwDuplexInput.value);
-        const colorSimplex = parseFloat(priceColorSimplexInput.value);
-        const colorDuplex = parseFloat(priceColorDuplexInput.value);
-        const colorEnabled = pricingColorEnabledToggle ? pricingColorEnabledToggle.checked : false;
-
-        if (isNaN(bwSimplex) || bwSimplex <= 0 ||
-            isNaN(bwDuplex) || bwDuplex <= 0 ||
-            isNaN(colorSimplex) || colorSimplex <= 0 ||
-            isNaN(colorDuplex) || colorDuplex <= 0) {
-          alert('All prices must be valid positive numbers.');
-          return;
-        }
-
-        pricingSaveBtn.disabled = true;
-        pricingSaveBtn.textContent = 'Saving...';
-
-        try {
-          const res = await apiRequest('/api/admin/pricing', {
-            method: 'PUT',
-            body: {
-              bw_simplex_price_paise: Math.round(bwSimplex * 100),
-              bw_duplex_price_paise: Math.round(bwDuplex * 100),
-              color_simplex_price_paise: Math.round(colorSimplex * 100),
-              color_duplex_price_paise: Math.round(colorDuplex * 100),
-              color_enabled: colorEnabled
-            }
-          });
-
-          if (!res.ok) {
-            const data = await parseResponseJSON(res);
-            throw new Error(data.error || 'Failed to save');
-          }
-
-          currentBWSimplexPaise = Math.round(bwSimplex * 100);
-          currentBWDuplexPaise = Math.round(bwDuplex * 100);
-          currentColorSimplexPaise = Math.round(colorSimplex * 100);
-          currentColorDuplexPaise = Math.round(colorDuplex * 100);
-          currentColorEnabled = colorEnabled;
-
-          updateCostEstimator();
-          showToast('Print rates saved');
-        } catch (err) {
-          alert('Save error: ' + err.message);
-        } finally {
-          pricingSaveBtn.disabled = false;
-          pricingSaveBtn.textContent = 'Save Rates';
-        }
-      });
-    }
-
-    // ==========================================
-    // 4. PROMOTIONAL ADS & SIMULATOR
+    // 3. PROMOTIONAL ADS & SIMULATOR
     // ==========================================
     const SYSTEM_DEFAULT_CARDS = [
       {

@@ -48,7 +48,7 @@
   </script>
 </head>
 <body>
-  <div class="app-container" id="app-container" data-kiosk-id="kiosk-demo" data-dev-mode="true" data-price-per-sheet-paise="200">
+  <div class="app-container" id="app-container" data-kiosk-id="kiosk-demo" data-dev-mode="true" data-price-per-sheet-paise="300">
 
     <!-- Top Floating PWA Install Banner -->
     <div id="pwa-install-banner" class="pwa-install-banner animate-slide-down hidden">
@@ -298,14 +298,12 @@
             <button type="button" class="split-option-card active" id="card-mode-bw">
               <div class="split-card-text">
                 <span class="split-card-title">B&amp;W</span>
-                <span class="split-card-sub" id="settings-bw-price-label">&#8377;2.00/side</span>
               </div>
               <div class="choice-icon-sphere bw-sphere" aria-hidden="true"></div>
             </button>
             <button type="button" class="split-option-card" id="card-mode-color">
               <div class="split-card-text">
                 <span class="split-card-title">Color</span>
-                <span class="split-card-sub" id="settings-color-price-label">&#8377;10.00/side</span>
               </div>
               <div class="choice-icon-sphere color-sphere" aria-hidden="true"></div>
             </button>
@@ -319,12 +317,14 @@
             <button type="button" class="split-option-card active" id="card-side-single">
               <div class="split-card-text">
                 <span class="split-card-title">Single Side</span>
+                <span class="split-card-sub" id="settings-single-price-label">&#8377;3.00/sheet</span>
               </div>
               <div class="sheet-icon-single"></div>
             </button>
             <button type="button" class="split-option-card" id="card-side-double">
               <div class="split-card-text">
                 <span class="split-card-title">Double Side</span>
+                <span class="split-card-sub" id="settings-double-price-label">&#8377;5.00/sheet</span>
               </div>
               <div class="sheet-icon-double">
                 <div class="sheet-under"></div>

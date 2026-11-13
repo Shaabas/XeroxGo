@@ -207,37 +207,6 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 	}
 }
 
-func (s *appServer) resolveUnitPrice(pricing store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
-	if !hasPricing {
-		if s.cfg.pricePerSheetPaise > 0 {
-			return s.cfg.pricePerSheetPaise
-		}
-		return 200
-	}
-	isDuplex := duplex != contracts.DuplexSimplex
-	var unitPrice int64
-	if strings.EqualFold(colorMode, "COLOR") && pricing.ColorEnabled {
-		if isDuplex {
-			unitPrice = pricing.ColorDuplexPricePaise
-		} else {
-			unitPrice = pricing.ColorSimplexPricePaise
-		}
-	} else {
-		if isDuplex {
-			unitPrice = pricing.BWDuplexPricePaise
-		} else {
-			unitPrice = pricing.BWSimplexPricePaise
-		}
-	}
-	if unitPrice <= 0 {
-		unitPrice = s.cfg.pricePerSheetPaise
-	}
-	if unitPrice <= 0 {
-		unitPrice = 200
-	}
-	return unitPrice
-}
-
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -297,11 +266,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		pricing, err := s.db.GetPricing(r.Context())
 		if err != nil {
 			pricing = store.PricingConfig{
-				BWSimplexPricePaise:    200,
-				BWDuplexPricePaise:     150,
-				ColorSimplexPricePaise: 1000,
-				ColorDuplexPricePaise:  750,
-				ColorEnabled:           false,
+				BWSimplexPricePaise:    300,
+				BWDuplexPricePaise:     500,
+				ColorSimplexPricePaise: 800,
+				ColorDuplexPricePaise:  1000,
+				ColorEnabled:           true,
 			}
 		}
 
@@ -495,10 +464,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			unitPrice := s.resolveUnitPrice(pricing, true, docColorMode, docDuplexMode)
+			isDocColor := strings.EqualFold(docColorMode, "COLOR")
+			isDocDuplex := docDuplexMode != contracts.DuplexSimplex
 
-			docPrintedSides := normRes.TotalPages * docCopies
-			docPrice, err := payments.CalculatePricePaise(docPrintedSides, unitPrice)
+			docPrice, err := payments.CalculateDocumentPricePaise(normRes.TotalPages, isDocColor, isDocDuplex, docCopies)
 			if err != nil {
 				_ = os.Remove(outputPath)
 				http.Error(w, "failed to calculate price", http.StatusInternalServerError)
@@ -778,10 +747,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unitPrice := s.resolveUnitPrice(pricing, hasPricing, colorMode, duplexMode)
+	isColor := strings.EqualFold(colorMode, "COLOR")
+	isDuplex := duplexMode != contracts.DuplexSimplex
 
-	totalPrintedPages := normRes.TotalPages * copies
-	totalPricePaise, err := payments.CalculatePricePaise(totalPrintedPages, unitPrice)
+	totalPricePaise, err := payments.CalculateDocumentPricePaise(normRes.TotalPages, isColor, isDuplex, copies)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, "failed to calculate price", http.StatusInternalServerError)
@@ -1165,11 +1134,11 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	pricing, err := s.db.GetPricing(r.Context())
 	if err != nil {
 		pricing = store.PricingConfig{
-			BWSimplexPricePaise:    200,
-			BWDuplexPricePaise:     150,
-			ColorSimplexPricePaise: 1000,
-			ColorDuplexPricePaise:  750,
-			ColorEnabled:           false,
+			BWSimplexPricePaise:    300,
+			BWDuplexPricePaise:     500,
+			ColorSimplexPricePaise: 800,
+			ColorDuplexPricePaise:  1000,
+			ColorEnabled:           true,
 		}
 	}
 	if !pricing.ColorEnabled {
@@ -1189,9 +1158,9 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	unitPrice := s.resolveUnitPrice(pricing, true, colorMode, duplexMode)
-	totalPrintedSides := normRes.TotalPages * copies
-	totalPricePaise, err := payments.CalculatePricePaise(totalPrintedSides, unitPrice)
+	isColor := strings.EqualFold(colorMode, "COLOR")
+	isDuplex := duplexMode != contracts.DuplexSimplex
+	totalPricePaise, err := payments.CalculateDocumentPricePaise(normRes.TotalPages, isColor, isDuplex, copies)
 	if err != nil {
 		http.Error(w, "failed to calculate price", http.StatusInternalServerError)
 		return
