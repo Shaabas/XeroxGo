@@ -1721,10 +1721,20 @@
 
       const rawViewport = page.getViewport({ scale: 1.0, rotation: renderRotation });
 
-      // Responsive stage scale: target max dimensions 260px width x 215px height (245px on desktop)
-      const maxStageW = (window.innerWidth >= 600) ? 260 : 210;
-      const maxStageH = (window.innerWidth >= 600) ? 245 : 210;
-      const scale = Math.min(maxStageW / rawViewport.width, maxStageH / rawViewport.height, 1.5);
+      // Fit preview to the available stage dimensions while keeping aspect ratio
+      const stageEl = canvas.parentElement;
+      const stageStyle = stageEl ? window.getComputedStyle(stageEl) : null;
+      const padX = stageStyle
+        ? (parseFloat(stageStyle.paddingLeft) || 0) + (parseFloat(stageStyle.paddingRight) || 0)
+        : 16;
+      const availableW = (stageEl && stageEl.clientWidth > 0)
+        ? (stageEl.clientWidth - padX)
+        : Math.min(window.innerWidth - 64, 536);
+      const maxStageW = Math.max(220, availableW);
+      const maxStageH = (window.innerWidth >= 600)
+        ? Math.min(420, Math.max(320, Math.round(window.innerHeight * 0.48)))
+        : Math.min(360, Math.max(280, Math.round(window.innerHeight * 0.45)));
+      const scale = Math.min(maxStageW / rawViewport.width, maxStageH / rawViewport.height, 3.0);
       const scaledViewport = page.getViewport({ scale: scale, rotation: renderRotation });
 
       // Crisp rendering support
@@ -1732,7 +1742,7 @@
       canvas.width = Math.round(scaledViewport.width * dpr);
       canvas.height = Math.round(scaledViewport.height * dpr);
       canvas.style.width = `${Math.round(scaledViewport.width)}px`;
-      canvas.style.height = `${Math.round(scaledViewport.height)}px`;
+      canvas.style.height = 'auto';
 
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
@@ -1838,6 +1848,17 @@
     if (previewCanvas) {
       previewCanvas.addEventListener('click', triggerFlip);
     }
+
+    // Re-fit preview when viewport resizes
+    let previewResizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(previewResizeTimer);
+      previewResizeTimer = setTimeout(() => {
+        if (viewSettings && !viewSettings.classList.contains('hidden')) {
+          renderPreviewSheet();
+        }
+      }, 150);
+    });
 
     if (btnPreviewMenu) {
       btnPreviewMenu.addEventListener('click', (e) => {
