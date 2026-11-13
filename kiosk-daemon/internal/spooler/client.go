@@ -61,8 +61,9 @@ type ClientConfig struct {
 	IdleCarouselInterval     time.Duration
 	CompletedDisplayDuration time.Duration
 	ErrorDisplayDuration     time.Duration
-	HealthPollInterval       time.Duration
-	ScreenSink               ui_ipc.Sink
+	HealthPollInterval           time.Duration
+	RequiredRecoveryHealthyCount int
+	ScreenSink                   ui_ipc.Sink
 	HTTPClient               *http.Client
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
@@ -113,10 +114,12 @@ type Client struct {
 	currentMode   ui_ipc.ScreenMode
 	adSlideIndex  int
 
-	faultMu          sync.Mutex
-	hardwareFault    bool
-	faultReason      string
-	faultCustomerMsg string
+	faultMu               sync.Mutex
+	hardwareFault         bool
+	faultReason           string
+	faultCustomerMsg      string
+	consecutiveHealthy   int
+	requiredRecoveryCount int
 
 	renderMu sync.Mutex
 	canvas   *image.RGBA
@@ -270,17 +273,23 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		ui_ipc.ConfigureAds(cached)
 	}
 
+	reqHealthy := cfg.RequiredRecoveryHealthyCount
+	if reqHealthy <= 0 {
+		reqHealthy = 3
+	}
+
 	client := &Client{
-		cfg:               cfg,
-		normalizedURL:     normalizedURL,
-		jobQueue:          make(chan contracts.PrintJobCommand, 16),
-		activeJobs:        make(map[string]bool),
-		deferredJobs:      make([]contracts.PrintJobCommand, 0),
-		minBackoff:        1 * time.Second,
-		maxBackoff:        30 * time.Second,
-		heartbeatInterval: 15 * time.Second,
-		maxDownloadBytes:  250 * 1024 * 1024,
-		healthPoller:      poller,
+		cfg:                   cfg,
+		normalizedURL:         normalizedURL,
+		jobQueue:              make(chan contracts.PrintJobCommand, 16),
+		activeJobs:            make(map[string]bool),
+		deferredJobs:          make([]contracts.PrintJobCommand, 0),
+		minBackoff:            1 * time.Second,
+		maxBackoff:            30 * time.Second,
+		heartbeatInterval:     15 * time.Second,
+		maxDownloadBytes:      250 * 1024 * 1024,
+		healthPoller:          poller,
+		requiredRecoveryCount: reqHealthy,
 	}
 
 	if cfg.InputSource != nil {
@@ -805,6 +814,7 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 	}()
 
 	cmd := job.Command
+	var progressMu sync.Mutex
 	pagesPrinted := job.PagesPrinted
 	sheetsPrinted := job.SheetsPrinted
 
@@ -821,6 +831,27 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 	defer cancelJob()
 
 	var faultHandled atomic.Bool
+	var preserveCUPSJob atomic.Bool
+	jobCtx = printer.ContextWithPreserveCUPSJob(jobCtx, &preserveCUPSJob)
+
+	handleJobHardwareInterruption := func(reason string) {
+		if !faultHandled.CompareAndSwap(false, true) {
+			return
+		}
+		preserveCUPSJob.Store(true)
+		c.setHardwareFault(true, reason, "")
+		cancelJob()
+
+		progressMu.Lock()
+		curPages := pagesPrinted
+		curSheets := sheetsPrinted
+		progressMu.Unlock()
+
+		log.Printf("[SPOOLER] Hardware interruption during resumed monitoring for %s: %s (at page %d/%d, sheet %d/%d)",
+			cmd.JobID, reason, curPages, cmd.TotalPages, curSheets, cmd.TotalSheets)
+		c.handleJobError(ctx, cmd, curPages, curSheets, reason)
+	}
+
 	monitorDone := make(chan struct{})
 
 	// Active health poller during resumed CUPS monitoring
@@ -838,18 +869,9 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 			case <-jobCtx.Done():
 				return
 			case <-ticker.C:
-				s := 0
-				if est, err := c.cfg.StateStore.GetEstimatedSheets(jobCtx); err == nil {
-					s = est
-				}
-				h := c.healthPoller(jobCtx, s)
+				h := c.CheckPrinterHealth(jobCtx)
 				if isFault, reason, _ := isBlockingHardwareFault(h); isFault {
-					if faultHandled.CompareAndSwap(false, true) {
-						log.Printf("[SPOOLER] Active health poller detected hardware fault during resumed monitoring of %s: %s", cmd.JobID, reason)
-						c.setHardwareFault(true, reason, "")
-						cancelJob()
-						c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
-					}
+					handleJobHardwareInterruption(reason)
 					return
 				}
 			}
@@ -857,8 +879,15 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 	}()
 
 	onPage := func(streamSheetsCompleted int) {
-		if c.isHardwareFaultActive() || faultHandled.Load() {
-			log.Printf("[SPOOLER] Suppressing progress update during resumed monitoring for %s: hardware fault active", cmd.JobID)
+		if faultHandled.Load() || c.isHardwareFaultActive() || jobCtx.Err() != nil {
+			log.Printf("[SPOOLER] Suppressing progress update during resumed monitoring for %s: hardware fault active or context canceled", cmd.JobID)
+			return
+		}
+
+		progressMu.Lock()
+		defer progressMu.Unlock()
+
+		if faultHandled.Load() || c.isHardwareFaultActive() || jobCtx.Err() != nil {
 			return
 		}
 
@@ -887,14 +916,13 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 			SheetsPrinted: targetSheets,
 			Timestamp:     time.Now().UTC(),
 		}
-		if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
+		if err := c.cfg.StateStore.RecordSheetProgress(jobCtx, evt); err != nil {
 			log.Printf("[SPOOLER] RecordSheetProgress error during CUPS monitoring for job %s: %v", cmd.JobID, err)
 			cancelJob()
-			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("inventory deduction error: %v", err))
 			return
 		}
 		sheetsPrinted = targetSheets
-		c.sendProgress(ctx, evt)
+		c.sendProgress(jobCtx, evt)
 
 		if !c.isHardwareFaultActive() && !faultHandled.Load() {
 			_ = c.renderScreen(ui_ipc.ScreenState{
@@ -918,22 +946,23 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		return
 	}
 
+	progressMu.Lock()
+	curPages := pagesPrinted
+	curSheets := sheetsPrinted
+	progressMu.Unlock()
+
 	if err != nil {
 		if isHw, reason, _ := isBlockingHardwareFaultString(err.Error()); isHw {
-			c.setHardwareFault(true, reason, "")
+			handleJobHardwareInterruption(reason)
+			return
 		}
-		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("CUPS monitoring error: %v", err))
+		c.handleJobError(ctx, cmd, curPages, curSheets, fmt.Sprintf("CUPS monitoring error: %v", err))
 		return
 	}
 
-	compSheets := 0
-	if s, sErr := c.cfg.StateStore.GetEstimatedSheets(ctx); sErr == nil {
-		compSheets = s
-	}
-	compHealth := c.healthPoller(ctx, compSheets)
+	compHealth := c.CheckPrinterHealth(ctx)
 	if isFault, reason, _ := isBlockingHardwareFault(compHealth); isFault {
-		c.setHardwareFault(true, reason, "")
-		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer reported hardware error on completion (%s); physical output uncertain, manual reconciliation required", reason))
+		handleJobHardwareInterruption(fmt.Sprintf("printer reported hardware error on completion (%s); physical output uncertain, manual reconciliation required", reason))
 		return
 	}
 
@@ -1239,6 +1268,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 	defer f.Close()
 
+	var progressMu sync.Mutex
 	lastReportedStreamSheets := 0
 	initialSheetsOffset := sheetsPrinted
 
@@ -1246,6 +1276,27 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	defer cancelJob()
 
 	var faultHandled atomic.Bool
+	var preserveCUPSJob atomic.Bool
+	jobCtx = printer.ContextWithPreserveCUPSJob(jobCtx, &preserveCUPSJob)
+
+	handleJobHardwareInterruption := func(reason string) {
+		if !faultHandled.CompareAndSwap(false, true) {
+			return
+		}
+		preserveCUPSJob.Store(true)
+		c.setHardwareFault(true, reason, "")
+		cancelJob() // abort active transmission or monitoring
+
+		progressMu.Lock()
+		curPages := pagesPrinted
+		curSheets := sheetsPrinted
+		progressMu.Unlock()
+
+		log.Printf("[SPOOLER] Hardware interruption for job %s: %s (at page %d/%d, sheet %d/%d)",
+			cmd.JobID, reason, curPages, cmd.TotalPages, curSheets, cmd.TotalSheets)
+		c.handleJobError(ctx, cmd, curPages, curSheets, reason)
+	}
+
 	monitorDone := make(chan struct{})
 
 	// Active health poller during printing
@@ -1263,18 +1314,9 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 			case <-jobCtx.Done():
 				return
 			case <-ticker.C:
-				s := 0
-				if est, err := c.cfg.StateStore.GetEstimatedSheets(jobCtx); err == nil {
-					s = est
-				}
-				h := c.healthPoller(jobCtx, s)
+				h := c.CheckPrinterHealth(jobCtx)
 				if isFault, reason, _ := isBlockingHardwareFault(h); isFault {
-					if faultHandled.CompareAndSwap(false, true) {
-						log.Printf("[SPOOLER] Active health poller detected hardware fault during printing of %s: %s", cmd.JobID, reason)
-						c.setHardwareFault(true, reason, "")
-						cancelJob() // abort active transmission
-						c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
-					}
+					handleJobHardwareInterruption(reason)
 					return
 				}
 			}
@@ -1282,8 +1324,15 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}()
 
 	onPage := func(streamSheetsCompleted int) {
-		if c.isHardwareFaultActive() || faultHandled.Load() {
-			log.Printf("[SPOOLER] Suppressing progress update for job %s: hardware fault active", cmd.JobID)
+		if faultHandled.Load() || c.isHardwareFaultActive() || jobCtx.Err() != nil {
+			log.Printf("[SPOOLER] Suppressing progress update for job %s: hardware fault active or context canceled", cmd.JobID)
+			return
+		}
+
+		progressMu.Lock()
+		defer progressMu.Unlock()
+
+		if faultHandled.Load() || c.isHardwareFaultActive() || jobCtx.Err() != nil {
 			return
 		}
 
@@ -1353,7 +1402,8 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 				OnSubmitted: func(cupsJobID string) {
 					_ = c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
 				},
-				SNMPConfig: c.getSNMPConfig(),
+				SNMPConfig:          c.getSNMPConfig(),
+				PreserveJobOnCancel: preserveCUPSJob.Load,
 			}
 			printErr = printer.PrintPDFWithCUPSHooksCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, streamCmd, printPath, onPage, 500*time.Millisecond, hooks)
 		}
@@ -1370,22 +1420,23 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		return
 	}
 
+	progressMu.Lock()
+	curPages := pagesPrinted
+	curSheets := sheetsPrinted
+	progressMu.Unlock()
+
 	if printErr != nil {
 		if isHw, reason, _ := isBlockingHardwareFaultString(printErr.Error()); isHw {
-			c.setHardwareFault(true, reason, "")
+			handleJobHardwareInterruption(reason)
+			return
 		}
-		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printing failed: %v", printErr))
+		c.handleJobError(ctx, cmd, curPages, curSheets, fmt.Sprintf("printing failed: %v", printErr))
 		return
 	}
 
-	compSheets := 0
-	if s, sErr := c.cfg.StateStore.GetEstimatedSheets(ctx); sErr == nil {
-		compSheets = s
-	}
-	compHealth := c.healthPoller(ctx, compSheets)
+	compHealth := c.CheckPrinterHealth(ctx)
 	if isFault, reason, _ := isBlockingHardwareFault(compHealth); isFault {
-		c.setHardwareFault(true, reason, "")
-		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer reported hardware error on completion (%s); physical output uncertain, manual reconciliation required", reason))
+		handleJobHardwareInterruption(fmt.Sprintf("printer reported hardware error on completion (%s); physical output uncertain, manual reconciliation required", reason))
 		return
 	}
 
@@ -1584,7 +1635,7 @@ func isBlockingHardwareFaultString(errStr string) (bool, string, string) {
 }
 
 // CheckPrinterHealth polls the underlying printer health, updates fault state,
-// and synchronizes the local screen display.
+// and synchronizes the local screen display when safe.
 func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth {
 	sheets := 0
 	if s, err := c.cfg.StateStore.GetEstimatedSheets(ctx); err == nil {
@@ -1597,27 +1648,49 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	c.faultMu.Lock()
 	wasFault := c.hardwareFault
 	if isFault {
+		c.consecutiveHealthy = 0
 		c.hardwareFault = true
 		c.faultReason = reason
 		c.faultCustomerMsg = custMsg
 	} else {
-		c.hardwareFault = false
-		c.faultReason = ""
-		c.faultCustomerMsg = ""
-	}
-	c.faultMu.Unlock()
+		// Check for reliable recovery evidence (Point 6 & 7):
+		// A single transient healthy reading or SNMP timeout MUST NOT clear an active fault.
+		snmpUnverifiedOrTimeout := strings.Contains(strings.ToLower(h.ErrorMessage), "snmp") ||
+			strings.Contains(strings.ToLower(h.ErrorMessage), "timeout")
 
-	c.currentModeMu.Lock()
-	currentMode := c.currentMode
-	c.currentModeMu.Unlock()
+		if snmpUnverifiedOrTimeout || !h.Online || (h.State != "IDLE" && h.State != "READY" && h.State != "PRINTING") {
+			// SNMP timed out or unverified / offline reading: reset recovery streak
+			c.consecutiveHealthy = 0
+		} else {
+			c.consecutiveHealthy++
+			if c.consecutiveHealthy >= c.requiredRecoveryCount {
+				c.hardwareFault = false
+				c.faultReason = ""
+				c.faultCustomerMsg = ""
+			}
+		}
+	}
+	isNowFault := c.hardwareFault
+	c.faultMu.Unlock()
 
 	c.activeMu.Lock()
 	hasActiveJobs := len(c.activeJobs) > 0
 	c.activeMu.Unlock()
 
-	if wasFault && !isFault {
-		// Hardware recovered!
-		log.Printf("[SPOOLER] Printer hardware recovered from fault. Refreshing screen to idle.")
+	// If there are active jobs printing, the active job's worker owns job error
+	// handling and order-specific screen transitions. Background health checks
+	// MUST NOT overwrite the order-specific screen or race with active print flow.
+	if hasActiveJobs {
+		return h
+	}
+
+	c.currentModeMu.Lock()
+	currentMode := c.currentMode
+	c.currentModeMu.Unlock()
+
+	if wasFault && !isNowFault {
+		// Hardware reliably recovered while idle!
+		log.Printf("[SPOOLER] Printer hardware reliably recovered from fault (consecutive healthy: %d). Refreshing screen to idle.", c.requiredRecoveryCount)
 		c.idleMu.Lock()
 		if c.idleTimer != nil {
 			c.idleTimer.Stop()
@@ -1625,7 +1698,7 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 		}
 		c.idleMu.Unlock()
 
-		if !hasActiveJobs && (c.pinController == nil || !c.pinController.HasActiveTransaction()) {
+		if c.pinController == nil || !c.pinController.HasActiveTransaction() {
 			_ = c.renderScreen(ui_ipc.ScreenState{
 				Mode:      ui_ipc.ModeIdle,
 				QRContent: c.cfg.IdleQRContent,
@@ -1633,9 +1706,9 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 			})
 			c.drainDeferredJobsIfSafe(ctx)
 		}
-	} else if isFault && currentMode == ui_ipc.ModePrinting {
-		// Fault detected during ModePrinting!
-		log.Printf("[SPOOLER] Hardware fault detected during ModePrinting: %s", reason)
+	} else if isNowFault && currentMode == ui_ipc.ModeIdle {
+		// Hardware fault detected while kiosk was idle!
+		log.Printf("[SPOOLER] Hardware fault detected while idle: %s", reason)
 		_ = c.renderScreen(ui_ipc.ScreenState{
 			Mode:    ui_ipc.ModeError,
 			Message: custMsg,
@@ -1806,9 +1879,13 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 		state.PrinterModel = c.cfg.PrinterModel
 	}
 
-	// Prevent printing progress updates from overwriting an active hardware fault screen
-	if state.Mode == ui_ipc.ModePrinting && c.isHardwareFaultActive() {
-		log.Printf("[SPOOLER] Suppressing ModePrinting render: hardware fault active (%s)", c.getFaultReason())
+	c.currentModeMu.Lock()
+	currentMode := c.currentMode
+	c.currentModeMu.Unlock()
+
+	// Prevent printing/downloading progress updates from overwriting an active hardware fault screen or existing error
+	if (state.Mode == ui_ipc.ModePrinting || state.Mode == ui_ipc.ModeDownloading) && (c.isHardwareFaultActive() || currentMode == ui_ipc.ModeError) {
+		log.Printf("[SPOOLER] Suppressing %s render: hardware fault active or screen already in ModeError (%s)", state.Mode, c.getFaultReason())
 		return nil
 	}
 

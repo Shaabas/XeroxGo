@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"xeroxgo/pkg/contracts"
@@ -299,11 +300,45 @@ func extractJobBlock(output, jobID string) string {
 	return strings.Join(block, "\n")
 }
 
+type cupsContextKey string
+
+const (
+	preserveCUPSJobKey cupsContextKey = "preserve_cups_job"
+	preserveCheckerKey cupsContextKey = "preserve_checker"
+)
+
+// ContextWithPreserveCUPSJob returns a context carrying an atomic boolean flag.
+// When the flag is true at cancellation time, MonitorCUPSJob will NOT invoke CUPS cancel.
+func ContextWithPreserveCUPSJob(ctx context.Context, flag *atomic.Bool) context.Context {
+	return context.WithValue(ctx, preserveCUPSJobKey, flag)
+}
+
+// ContextWithPreserveChecker returns a context carrying a dynamic predicate.
+// When the predicate returns true at cancellation time, MonitorCUPSJob will NOT invoke CUPS cancel.
+func ContextWithPreserveChecker(ctx context.Context, checker func() bool) context.Context {
+	return context.WithValue(ctx, preserveCheckerKey, checker)
+}
+
+func shouldPreserveCUPSJob(ctx context.Context) bool {
+	if flag, ok := ctx.Value(preserveCUPSJobKey).(*atomic.Bool); ok && flag != nil {
+		if flag.Load() {
+			return true
+		}
+	}
+	if checker, ok := ctx.Value(preserveCheckerKey).(func() bool); ok && checker != nil {
+		if checker() {
+			return true
+		}
+	}
+	return false
+}
+
 // CUPSPrintHooks provides optional callbacks and SNMP configuration during CUPS submission and lifecycle.
 type CUPSPrintHooks struct {
-	OnSubmitting func()
-	OnSubmitted  func(cupsJobID string)
-	SNMPConfig   *SNMPConfig
+	OnSubmitting        func()
+	OnSubmitted         func(cupsJobID string)
+	SNMPConfig          *SNMPConfig
+	PreserveJobOnCancel func() bool
 }
 
 // PrintPDFWithCUPS submits a PDF file to the specified CUPS queue via the lp command
@@ -410,6 +445,9 @@ func PrintPDFWithCUPSHooksCustom(
 	var snmpCfg *SNMPConfig
 	if hooks != nil {
 		snmpCfg = hooks.SNMPConfig
+		if hooks.PreserveJobOnCancel != nil {
+			ctx = ContextWithPreserveChecker(ctx, hooks.PreserveJobOnCancel)
+		}
 	}
 
 	// 3. Monitor CUPS job until completed, failed, or context canceled
@@ -501,6 +539,10 @@ func MonitorCUPSJobWithTelemetryCustom(
 	for {
 		select {
 		case <-ctx.Done():
+			if shouldPreserveCUPSJob(ctx) {
+				log.Printf("[CUPS] Monitoring stopped for job %s (CUPS ID %s) with job preservation flag; leaving job in queue for manual reconciliation", cmd.JobID, cupsJobID)
+				return ctx.Err()
+			}
 			// Attempt to cancel the job in CUPS on timeout or context cancel
 			cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 2*time.Second)
 			_, _ = runner(cancelCtx, "cancel", cupsJobID)

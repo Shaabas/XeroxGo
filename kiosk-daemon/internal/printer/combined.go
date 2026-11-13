@@ -118,6 +118,15 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 			state = "IDLE"
 		}
 
+		combinedErr := cupsHealth.ErrorMessage
+		if snmpHealth.ErrorMessage != "" && !strings.Contains(combinedErr, snmpHealth.ErrorMessage) {
+			if combinedErr != "" {
+				combinedErr += "; " + snmpHealth.ErrorMessage
+			} else {
+				combinedErr = snmpHealth.ErrorMessage
+			}
+		}
+
 		return contracts.PrinterHealth{
 			Online:            true,
 			State:             state,
@@ -128,7 +137,7 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 			CoverOpen:         coverOpen,
 			PaperJam:          paperJam,
 			OutputBinFull:     outputBinFull,
-			ErrorMessage:      cupsHealth.ErrorMessage,
+			ErrorMessage:      combinedErr,
 			UpdatedAt:         now,
 		}
 	}

@@ -2,11 +2,16 @@ package spooler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"image"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +39,12 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 	defer store.Close()
 
 	_, pdfContent, pdfChecksum := createThreePageFixture(t, tmpDir)
+
+	hSum := sha256.Sum256([]byte("job-jam-override"))
+	finalName := hex.EncodeToString(hSum[:]) + ".pdf"
+	if err := os.WriteFile(filepath.Join(tmpDir, finalName), pdfContent, 0644); err != nil {
+		t.Fatalf("failed to pre-seed PDF file: %v", err)
+	}
 
 	dlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/pdf")
@@ -455,10 +466,21 @@ func TestHealthScreen_Recovery_RefreshesScreenWithoutReprintingOrCompleting(t *t
 	// 2. Printer hardware recovers
 	isRecovered.Store(true)
 
-	// Trigger CheckPrinterHealth
-	h := client.CheckPrinterHealth(ctx)
-	if h.State != "IDLE" {
-		t.Fatalf("expected healthy IDLE state on recovery, got %s", h.State)
+	// Step 2A: Verify a single transient healthy reading does NOT clear the fault (Point 6)
+	h1 := client.CheckPrinterHealth(ctx)
+	if h1.State != "IDLE" {
+		t.Fatalf("expected healthy IDLE state on recovery, got %s", h1.State)
+	}
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to remain active after single transient healthy reading")
+	}
+
+	// Step 2B: Supply remaining consecutive healthy readings to satisfy reliable recovery evidence (Point 7)
+	client.CheckPrinterHealth(ctx)
+	client.CheckPrinterHealth(ctx)
+
+	if client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to be cleared after reliable recovery evidence (3 consecutive healthy readings)")
 	}
 
 	// 3. Verify screen refreshed to ModeIdle ("Ready to print")
@@ -528,4 +550,714 @@ func TestHealthScreen_OtherHardwareFaults(t *testing.T) {
 			t.Errorf("msg = %q, want 'offline or unreachable'", msg)
 		}
 	})
+}
+
+// TestHealthScreen_SimultaneousProgressAndFault_RaceFree verifies that concurrent
+// progress callbacks (onPage) and active health fault detection execute without data races,
+// accurately record partial progress, and prevent late progress from overwriting PAUSED_ERROR.
+func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	_, pdfContent, pdfChecksum := createThreePageFixture(t, tmpDir)
+
+	hSum := sha256.Sum256([]byte("job-race-simul"))
+	finalName := hex.EncodeToString(hSum[:]) + ".pdf"
+	if err := os.WriteFile(filepath.Join(tmpDir, finalName), pdfContent, 0644); err != nil {
+		t.Fatalf("failed to pre-seed PDF file: %v", err)
+	}
+
+	dlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer dlServer.Close()
+
+	var jamReported atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if jamReported.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "ERROR",
+				PaperJam:        true,
+				ErrorMessage:    "paper feed jam detected in printer",
+				EstimatedSheets: sheets,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "IDLE",
+			PaperTrayStatus: "OK",
+			EstimatedSheets: sheets,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	printStarted := make(chan struct{})
+	var printOnce sync.Once
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printOnce.Do(func() { close(printStarted) })
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for i := 1; i <= cmd.TotalSheets; i++ {
+				if onPage != nil {
+					onPage(i)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			time.Sleep(7 * time.Millisecond)
+			jamReported.Store(true)
+		}()
+
+		<-ctx.Done()
+		wg.Wait()
+		return ctx.Err()
+	}
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		jobCmd := contracts.PrintJobCommand{
+			JobID:          "job-race-simul",
+			KioskID:        "kiosk-race",
+			DownloadURL:    dlServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     3,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = wsjson.Write(r.Context(), conn, map[string]interface{}{
+			"type": "job",
+			"job":  jobCmd,
+		})
+
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	cfg := ClientConfig{
+		CloudURL:           "ws" + strings.TrimPrefix(wsServer.URL, "http"),
+		KioskID:            "kiosk-race",
+		StateStore:         store,
+		CUPSQueue:          "HPTank",
+		DownloadDir:        tmpDir,
+		IdleQRContent:      "https://kiosk.test/race",
+		HealthPollInterval: 5 * time.Millisecond,
+		ScreenSink:         func(*image.RGBA) error { return nil },
+		MockHealth:         healthMock,
+		MockCUPSPrint:      mockCUPS,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	select {
+	case <-printStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for print job to start")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		savedJob, err := store.GetJob(ctx, "job-race-simul")
+		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+			paused = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !paused {
+		t.Fatal("expected job to be in PAUSED_ERROR state")
+	}
+
+	client.currentModeMu.Lock()
+	mode := client.currentMode
+	client.currentModeMu.Unlock()
+
+	if mode != ui_ipc.ModeError {
+		t.Fatalf("expected currentMode to be ModeError, got %s", mode)
+	}
+}
+
+// TestHealthScreen_DuplicateErrorHandling_ExactlyOnce verifies that if both the active
+// health poller AND the print execution return a hardware interruption error,
+// handleJobError executes exactly once and PAUSED_ERROR is preserved without double-transitions.
+func TestHealthScreen_DuplicateErrorHandling_ExactlyOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	_, pdfContent, pdfChecksum := createThreePageFixture(t, tmpDir)
+
+	hSum := sha256.Sum256([]byte("job-dup-error"))
+	finalName := hex.EncodeToString(hSum[:]) + ".pdf"
+	if err := os.WriteFile(filepath.Join(tmpDir, finalName), pdfContent, 0644); err != nil {
+		t.Fatalf("failed to pre-seed PDF file: %v", err)
+	}
+
+	dlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer dlServer.Close()
+
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper feed jam detected in printer",
+			EstimatedSheets: sheets,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		return errors.New("hardware interruption: paper feed jam detected in printer")
+	}
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		jobCmd := contracts.PrintJobCommand{
+			JobID:          "job-dup-error",
+			KioskID:        "kiosk-dup",
+			DownloadURL:    dlServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     3,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = wsjson.Write(r.Context(), conn, map[string]interface{}{
+			"type": "job",
+			"job":  jobCmd,
+		})
+
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	cfg := ClientConfig{
+		CloudURL:           "ws" + strings.TrimPrefix(wsServer.URL, "http"),
+		KioskID:            "kiosk-dup",
+		StateStore:         store,
+		CUPSQueue:          "HPTank",
+		DownloadDir:        tmpDir,
+		IdleQRContent:      "https://kiosk.test/dup",
+		HealthPollInterval: 10 * time.Millisecond,
+		ScreenSink:         func(*image.RGBA) error { return nil },
+		MockHealth:         healthMock,
+		MockCUPSPrint:      mockCUPS,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		savedJob, err := store.GetJob(ctx, "job-dup-error")
+		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+			paused = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !paused {
+		t.Fatal("expected job to be in PAUSED_ERROR state")
+	}
+
+	errorRenderCount := 0
+	for _, st := range client.RenderHistory() {
+		if st.Mode == ui_ipc.ModeError {
+			errorRenderCount++
+		}
+	}
+	if errorRenderCount != 1 {
+		t.Fatalf("expected ModeError to be rendered exactly once, rendered %d times", errorRenderCount)
+	}
+}
+
+// TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel verifies that when a
+// hardware jam interrupts a CUPS print job:
+// 1. Local monitoring stops.
+// 2. CUPS cancel command is NOT called, preserving the CUPS job in queue.
+// 3. CUPS job ID is retained in SQLite state store.
+// 4. Job status remains PAUSED_ERROR with uncertain physical output note for reconciliation.
+func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	_, pdfContent, pdfChecksum := createThreePageFixture(t, tmpDir)
+
+	hSum := sha256.Sum256([]byte("job-preserve-cups"))
+	finalName := hex.EncodeToString(hSum[:]) + ".pdf"
+	if err := os.WriteFile(filepath.Join(tmpDir, finalName), pdfContent, 0644); err != nil {
+		t.Fatalf("failed to pre-seed PDF file: %v", err)
+	}
+
+	dlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer dlServer.Close()
+
+	var cancelInvoked atomic.Bool
+	var jamReported atomic.Bool
+	cupsJobID := "HPTank-777"
+	printStarted := make(chan struct{})
+	var printOnce sync.Once
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			printOnce.Do(func() { close(printStarted) })
+			return []byte("request id is " + cupsJobID + " (1 file(s))"), nil
+		}
+		if name == "cancel" {
+			cancelInvoked.Store(true)
+			return []byte(""), nil
+		}
+		if name == "lpstat" {
+			if jamReported.Load() {
+				return []byte("printer HPTank is idle. enabled since Thu Nov 13 12:00:00 2026\n\tPrinter state reasons: media-jam-error"), nil
+			}
+			return []byte("printer HPTank is idle. enabled since Thu Nov 13 12:00:00 2026"), nil
+		}
+		return []byte(""), nil
+	}
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		jobCmd := contracts.PrintJobCommand{
+			JobID:          "job-preserve-cups",
+			KioskID:        "kiosk-pres",
+			DownloadURL:    dlServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     3,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = wsjson.Write(r.Context(), conn, map[string]interface{}{
+			"type": "job",
+			"job":  jobCmd,
+		})
+
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		jamReported.Store(true)
+	}()
+
+	cfg := ClientConfig{
+		CloudURL:           "ws" + strings.TrimPrefix(wsServer.URL, "http"),
+		KioskID:            "kiosk-pres",
+		StateStore:         store,
+		CUPSQueue:          "HPTank",
+		DownloadDir:        tmpDir,
+		IdleQRContent:      "https://kiosk.test/pres",
+		HealthPollInterval: 15 * time.Millisecond,
+		ScreenSink:         func(*image.RGBA) error { return nil },
+		CUPSRunner:         customRunner,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	select {
+	case <-printStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for print job to start")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		savedJob, err := store.GetJob(ctx, "job-preserve-cups")
+		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+			paused = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if !paused {
+		t.Fatal("expected job to be in PAUSED_ERROR state")
+	}
+
+	// 1. Verify cancel was NOT invoked on CUPS
+	if cancelInvoked.Load() {
+		t.Fatal("CUPS cancel was invoked! Jammed job must be preserved in CUPS queue for manual reconciliation")
+	}
+
+	// 2. Verify CUPS request ID is preserved in SQLite store
+	savedJob, err := store.GetJob(ctx, "job-preserve-cups")
+	if err != nil || savedJob == nil {
+		t.Fatalf("failed to retrieve job from store: %v", err)
+	}
+	if savedJob.CUPSJobID != cupsJobID {
+		t.Fatalf("savedJob.CUPSJobID = %q, want %q", savedJob.CUPSJobID, cupsJobID)
+	}
+}
+
+// TestHealthScreen_UnstableRecovery_TransientAndSNMPTimeoutRejected verifies that:
+// 1. A single transient healthy reading does NOT clear an active hardware fault.
+// 2. An SNMP timeout or unverified telemetry reading does NOT clear an active hardware fault.
+// 3. Sensor flapping resets the consecutive recovery streak.
+// 4. Reliable consecutive healthy readings clear the fault and refresh to ModeIdle.
+func TestHealthScreen_UnstableRecovery_TransientAndSNMPTimeoutRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	var stateMu sync.Mutex
+	currentHealth := contracts.PrinterHealth{
+		Online:       false,
+		State:        "ERROR",
+		PaperJam:     true,
+		ErrorMessage: "paper feed jam detected in printer",
+		UpdatedAt:    time.Now().UTC(),
+	}
+
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		h := currentHealth
+		h.EstimatedSheets = sheets
+		return h
+	}
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws://127.0.0.1:8080/ws",
+		KioskID:                      "kiosk-unstable",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/idle",
+		HealthPollInterval:           20 * time.Millisecond,
+		RequiredRecoveryHealthyCount: 3,
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	client.setHardwareFault(true, "paper feed jam detected in printer", "A paper feed issue occurred with the printer.")
+	_ = client.renderScreen(ui_ipc.ScreenState{
+		Mode:    ui_ipc.ModeError,
+		Message: "A paper feed issue occurred with the printer.",
+	})
+
+	// Case A: Single transient healthy reading
+	stateMu.Lock()
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+	stateMu.Unlock()
+
+	client.CheckPrinterHealth(ctx)
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to remain active after 1 transient healthy reading")
+	}
+
+	// Case B: SNMP timeout during active fault
+	stateMu.Lock()
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", ErrorMessage: "snmp connection timeout", UpdatedAt: time.Now().UTC()}
+	stateMu.Unlock()
+
+	client.CheckPrinterHealth(ctx)
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to remain active after SNMP timeout")
+	}
+
+	// Case C: Sensor flapping (healthy -> jam -> healthy -> healthy)
+	stateMu.Lock()
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+	stateMu.Unlock()
+	client.CheckPrinterHealth(ctx) // healthy 1
+
+	stateMu.Lock()
+	currentHealth = contracts.PrinterHealth{Online: true, State: "ERROR", PaperJam: true, ErrorMessage: "paper jam", UpdatedAt: time.Now().UTC()}
+	stateMu.Unlock()
+	client.CheckPrinterHealth(ctx) // jam: reset streak!
+
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to remain active on jam")
+	}
+
+	// Case D: Reliable recovery with 3 consecutive healthy readings
+	stateMu.Lock()
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+	stateMu.Unlock()
+
+	client.CheckPrinterHealth(ctx) // healthy 1
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected fault active at healthy streak = 1")
+	}
+	client.CheckPrinterHealth(ctx) // healthy 2
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected fault active at healthy streak = 2")
+	}
+	client.CheckPrinterHealth(ctx) // healthy 3 -> threshold met!
+	if client.isHardwareFaultActive() {
+		t.Fatal("expected fault to be cleared after 3 consecutive healthy readings")
+	}
+
+	client.currentModeMu.Lock()
+	mode := client.currentMode
+	client.currentModeMu.Unlock()
+
+	if mode != ui_ipc.ModeIdle {
+		t.Fatalf("expected currentMode to be ModeIdle after reliable recovery, got %s", mode)
+	}
+}
+
+// TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen verifies that background
+// health checks and active job error handling do not conflict or clobber order details.
+func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	_, pdfContent, pdfChecksum := createThreePageFixture(t, tmpDir)
+
+	hSum := sha256.Sum256([]byte("ord_coord_456"))
+	finalName := hex.EncodeToString(hSum[:]) + ".pdf"
+	if err := os.WriteFile(filepath.Join(tmpDir, finalName), pdfContent, 0644); err != nil {
+		t.Fatalf("failed to pre-seed PDF file: %v", err)
+	}
+
+	dlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer dlServer.Close()
+
+	var jamReported atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if jamReported.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "ERROR",
+				PaperJam:        true,
+				ErrorMessage:    "paper feed jam detected in printer",
+				EstimatedSheets: sheets,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "IDLE",
+			PaperTrayStatus: "OK",
+			EstimatedSheets: sheets,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		if onPage != nil {
+			onPage(1)
+		}
+		jamReported.Store(true)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		jobCmd := contracts.PrintJobCommand{
+			JobID:          "ord_coord_456",
+			KioskID:        "kiosk-coord",
+			DownloadURL:    dlServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     3,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = wsjson.Write(r.Context(), conn, map[string]interface{}{
+			"type": "job",
+			"job":  jobCmd,
+		})
+
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	cfg := ClientConfig{
+		CloudURL:           "ws" + strings.TrimPrefix(wsServer.URL, "http"),
+		KioskID:            "kiosk-coord",
+		StateStore:         store,
+		CUPSQueue:          "HPTank",
+		DownloadDir:        tmpDir,
+		IdleQRContent:      "https://kiosk.test/coord",
+		HealthPollInterval: 10 * time.Millisecond,
+		ScreenSink:         func(*image.RGBA) error { return nil },
+		MockHealth:         healthMock,
+		MockCUPSPrint:      mockCUPS,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		savedJob, err := store.GetJob(ctx, "ord_coord_456")
+		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+			paused = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !paused {
+		t.Fatal("expected job ord_coord_456 to be in PAUSED_ERROR state")
+	}
+
+	history := client.RenderHistory()
+	var finalError ui_ipc.ScreenState
+	found := false
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Mode == ui_ipc.ModeError {
+			finalError = history[i]
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Fatal("expected ModeError screen in render history")
+	}
+
+	if !strings.Contains(finalError.Detail, "ord_coord_456") {
+		t.Fatalf("expected error screen to retain Order Ref 'ord_coord_456', got detail: %q", finalError.Detail)
+	}
 }
