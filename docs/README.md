@@ -41,6 +41,11 @@ The documentation suite is structured into the following navigable references:
   - Verification of physical presence safety gates (`/release`) and distinct dual trust domains for customer vs kiosk recovery PIN generation.
   - 18-endpoint classification matrix and smallest safe cleanup proposal with regression test specifications.
 
+- 🔀 **[Branch Integration Assessment & Plan](file:///home/shabas/Projects/XeroxGo/docs/cleanup/branch-integration-plan.md)**
+  - Topological analysis and lineage verification for `main`, `bibin`, and `integration/agent-simplification`.
+  - Detailed behavioral comparison between Bibin's UI preview/edit updates and the agent's async conversion pipeline.
+  - Conflict analysis proving 0 merge conflicts, runtime compatibility audit, visual palette documentation, and merge execution strategy.
+
 - ⚡ **[Minimum Print Path Workflow](file:///home/shabas/Projects/XeroxGo/docs/workflows/minimum-print-path.md)**
   - Exact execution trace for a single A4 PDF (1 copy, B&W, simplex).
   - Function-by-function, file-by-file, and database mutation trace.
