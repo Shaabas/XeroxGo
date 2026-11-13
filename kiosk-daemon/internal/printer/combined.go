@@ -10,20 +10,29 @@ import (
 
 // CombineHealth merges CUPS queue availability with SNMP device health telemetry.
 //
-// Authoritative separation of responsibilities:
-// 1. CUPS is authoritative for queue status and active print job execution.
-//    If CUPS is actively PRINTING, the combined state remains PRINTING.
-// 2. SNMP is authoritative for physical hardware sensors:
+// Authoritative separation of responsibilities & fault hierarchy:
+// 1. Physical hardware faults (paper jam, paper empty, cover/door open, output bin full,
+//    or confirmed critical hardware error) take HIGHEST priority and immediately override
+//    active queue execution (including CUPS PRINTING) to ERROR. A blocked printer cannot print.
+// 2. When no blocking physical fault exists:
+//    - CUPS is authoritative for queue status and active print job execution.
+//      If CUPS is actively PRINTING, the combined state remains PRINTING.
+//    - If CUPS is IDLE or READY, SNMP WARMING_UP transitions to WARMING_UP, otherwise IDLE.
+// 3. SNMP is authoritative for physical hardware sensors:
 //    - TonerLevelPercent
 //    - DrumLifePercent
 //    - CoverOpen (door open)
 //    - PaperJam (jammed)
 //    - OutputBinFull (output tray full)
 //    - PaperTrayStatus (empty/low paper)
-// 3. If CUPS is online and SNMP is unreachable (network timeout / SNMP disabled),
-//    the printer remains online based on CUPS availability without disrupting the kiosk.
-// 4. If physical hardware faults (jam, door open, out of paper, bin full) occur,
-//    they are elevated to ErrorMessage and (when idle) transition the state to ERROR.
+//    Hardware telemetry, error details, and sensor flags are preserved across all states.
+// 4. When SNMP is unavailable (network timeout / SNMP disabled):
+//    - The printer remains online based on CUPS availability without disrupting the kiosk.
+//    - Available CUPS status is preserved without claiming verified hardware health
+//      (sensor levels remain 0%, hardware health is unverified).
+// 5. SNMP hrPrinterStatus=1 ("other") is NOT interpreted as healthy or actively printing.
+//    If SNMP returns status=1, it is treated as UNKNOWN and must never override CUPS queue status
+//    or falsely claim verified hardware health.
 func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.PrinterHealth) contracts.PrinterHealth {
 	now := time.Now().UTC()
 
@@ -44,9 +53,9 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 			EstimatedSheets:   cupsHealth.EstimatedSheets,
 			TonerLevelPercent: snmpHealth.TonerLevelPercent,
 			DrumLifePercent:   snmpHealth.DrumLifePercent,
-			CoverOpen:         snmpHealth.CoverOpen,
-			PaperJam:          snmpHealth.PaperJam,
-			OutputBinFull:     snmpHealth.OutputBinFull,
+			CoverOpen:         snmpHealth.CoverOpen || cupsHealth.CoverOpen,
+			PaperJam:          snmpHealth.PaperJam || cupsHealth.PaperJam,
+			OutputBinFull:     snmpHealth.OutputBinFull || cupsHealth.OutputBinFull,
 			ErrorMessage:      combinedErr,
 			UpdatedAt:         now,
 		}
@@ -69,26 +78,52 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 			EstimatedSheets:   cupsHealth.EstimatedSheets,
 			TonerLevelPercent: snmpHealth.TonerLevelPercent,
 			DrumLifePercent:   snmpHealth.DrumLifePercent,
-			CoverOpen:         snmpHealth.CoverOpen,
-			PaperJam:          snmpHealth.PaperJam,
-			OutputBinFull:     snmpHealth.OutputBinFull,
+			CoverOpen:         snmpHealth.CoverOpen || cupsHealth.CoverOpen,
+			PaperJam:          snmpHealth.PaperJam || cupsHealth.PaperJam,
+			OutputBinFull:     snmpHealth.OutputBinFull || cupsHealth.OutputBinFull,
 			ErrorMessage:      combinedErr,
 			UpdatedAt:         now,
 		}
 	}
 
-	// Case 3: CUPS is online, but SNMP is unreachable. Maintain printer readiness from CUPS.
+	// Case 3: CUPS is online, but SNMP is unreachable. Maintain printer readiness from CUPS without claiming verified hardware health.
 	if !snmpHealth.Online {
+		paperJam := cupsHealth.PaperJam
+		coverOpen := cupsHealth.CoverOpen
+		outputBinFull := cupsHealth.OutputBinFull
+		paperTray := cupsHealth.PaperTrayStatus
+
+		lowerCUPS := strings.ToLower(cupsHealth.ErrorMessage)
+		if strings.Contains(lowerCUPS, "jam") {
+			paperJam = true
+		}
+		if strings.Contains(lowerCUPS, "door open") || strings.Contains(lowerCUPS, "cover open") {
+			coverOpen = true
+		}
+		if strings.Contains(lowerCUPS, "out of paper") || strings.Contains(lowerCUPS, "media-empty") || strings.Contains(lowerCUPS, "no paper") {
+			paperTray = "EMPTY"
+		}
+		if strings.Contains(lowerCUPS, "output bin full") {
+			outputBinFull = true
+		}
+
+		state := cupsHealth.State
+		if paperJam || coverOpen || outputBinFull || paperTray == "EMPTY" || cupsHealth.State == "ERROR" {
+			state = "ERROR"
+		} else if state == "READY" {
+			state = "IDLE"
+		}
+
 		return contracts.PrinterHealth{
 			Online:            true,
-			State:             cupsHealth.State,
-			PaperTrayStatus:   cupsHealth.PaperTrayStatus,
+			State:             state,
+			PaperTrayStatus:   paperTray,
 			EstimatedSheets:   cupsHealth.EstimatedSheets,
 			TonerLevelPercent: 0,
 			DrumLifePercent:   0,
-			CoverOpen:         false,
-			PaperJam:          false,
-			OutputBinFull:     false,
+			CoverOpen:         coverOpen,
+			PaperJam:          paperJam,
+			OutputBinFull:     outputBinFull,
 			ErrorMessage:      cupsHealth.ErrorMessage,
 			UpdatedAt:         now,
 		}
@@ -97,33 +132,9 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 	// Case 4: Both CUPS and SNMP are online.
 	tonerPct := snmpHealth.TonerLevelPercent
 	drumPct := snmpHealth.DrumLifePercent
-	coverOpen := snmpHealth.CoverOpen
-	paperJam := snmpHealth.PaperJam
-	outputBinFull := snmpHealth.OutputBinFull
-
-	// Physical paper status from SNMP takes precedence over CUPS heuristics
-	paperTray := "OK"
-	if snmpHealth.PaperTrayStatus != "OK" && snmpHealth.PaperTrayStatus != "" && snmpHealth.PaperTrayStatus != "UNKNOWN" {
-		paperTray = snmpHealth.PaperTrayStatus
-	} else if cupsHealth.PaperTrayStatus != "OK" && cupsHealth.PaperTrayStatus != "UNKNOWN" {
-		paperTray = cupsHealth.PaperTrayStatus
-	}
-
-	// State determination:
-	// Rule 13: Never overwrite a confirmed CUPS printing state with an unsupported SNMP status.
-	finalState := cupsHealth.State
-	if cupsHealth.State == "PRINTING" {
-		finalState = "PRINTING"
-	} else {
-		// When idle or ready, elevate physical hardware faults to ERROR
-		if coverOpen || paperJam || outputBinFull || paperTray == "EMPTY" || snmpHealth.State == "ERROR" {
-			finalState = "ERROR"
-		} else if snmpHealth.State == "WARMING_UP" {
-			finalState = "WARMING_UP"
-		} else if cupsHealth.State == "READY" || cupsHealth.State == "IDLE" {
-			finalState = "IDLE"
-		}
-	}
+	coverOpen := snmpHealth.CoverOpen || cupsHealth.CoverOpen
+	paperJam := snmpHealth.PaperJam || cupsHealth.PaperJam
+	outputBinFull := snmpHealth.OutputBinFull || cupsHealth.OutputBinFull
 
 	// Consolidate non-duplicate error messages
 	var combinedIssues []string
@@ -137,6 +148,76 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 				combinedIssues = append(combinedIssues, issue)
 			}
 		}
+	}
+	combinedErrStr := strings.ToLower(strings.Join(combinedIssues, "; "))
+
+	// Elevate faults mentioned in combined error strings
+	if strings.Contains(combinedErrStr, "jam") {
+		paperJam = true
+	}
+	if strings.Contains(combinedErrStr, "door open") || strings.Contains(combinedErrStr, "cover open") {
+		coverOpen = true
+	}
+	if strings.Contains(combinedErrStr, "output bin full") {
+		outputBinFull = true
+	}
+
+	// Physical paper status resolution:
+	// If either reports EMPTY, tray is empty (critical fault).
+	paperTray := "OK"
+	if snmpHealth.PaperTrayStatus == "EMPTY" || cupsHealth.PaperTrayStatus == "EMPTY" ||
+		strings.Contains(combinedErrStr, "out of paper") || strings.Contains(combinedErrStr, "no paper") {
+		paperTray = "EMPTY"
+	} else if snmpHealth.PaperTrayStatus == "LOW" || cupsHealth.PaperTrayStatus == "LOW" {
+		paperTray = "LOW"
+	} else if snmpHealth.PaperTrayStatus != "" && snmpHealth.PaperTrayStatus != "OK" && snmpHealth.PaperTrayStatus != "UNKNOWN" {
+		paperTray = snmpHealth.PaperTrayStatus
+	} else if cupsHealth.PaperTrayStatus != "" && cupsHealth.PaperTrayStatus != "OK" && cupsHealth.PaperTrayStatus != "UNKNOWN" {
+		paperTray = cupsHealth.PaperTrayStatus
+	} else if snmpHealth.PaperTrayStatus == "OK" || cupsHealth.PaperTrayStatus == "OK" {
+		paperTray = "OK"
+	} else {
+		paperTray = "UNKNOWN"
+	}
+
+	// Determine if a confirmed physical fault or critical error exists
+	hasCriticalError := snmpHealth.State == "ERROR" || cupsHealth.State == "ERROR"
+	hasPhysicalFault := paperJam || coverOpen || outputBinFull || paperTray == "EMPTY" || hasCriticalError
+
+	// State determination:
+	// Priority 1: Confirmed physical faults override CUPS PRINTING and all other states.
+	// Priority 2: When no blocking fault exists, preserve CUPS authority for queue/job execution.
+	var finalState string
+	if hasPhysicalFault {
+		finalState = "ERROR"
+	} else {
+		if cupsHealth.State == "PRINTING" {
+			finalState = "PRINTING"
+		} else if snmpHealth.State == "WARMING_UP" {
+			finalState = "WARMING_UP"
+		} else if cupsHealth.State == "READY" || cupsHealth.State == "IDLE" {
+			finalState = "IDLE"
+		} else if cupsHealth.State != "" && cupsHealth.State != "UNKNOWN" {
+			finalState = cupsHealth.State
+		} else if snmpHealth.State == "IDLE" {
+			finalState = "IDLE"
+		} else {
+			finalState = "UNKNOWN"
+		}
+	}
+
+	// Ensure error messages reflect confirmed physical faults if not already described
+	if paperJam && !strings.Contains(combinedErrStr, "jam") {
+		combinedIssues = append(combinedIssues, "paper jam")
+	}
+	if coverOpen && !strings.Contains(combinedErrStr, "door open") && !strings.Contains(combinedErrStr, "cover open") {
+		combinedIssues = append(combinedIssues, "door open")
+	}
+	if outputBinFull && !strings.Contains(combinedErrStr, "output bin full") {
+		combinedIssues = append(combinedIssues, "output bin full")
+	}
+	if paperTray == "EMPTY" && !strings.Contains(combinedErrStr, "paper") && !strings.Contains(combinedErrStr, "empty") {
+		combinedIssues = append(combinedIssues, "out of paper")
 	}
 
 	return contracts.PrinterHealth{
