@@ -386,7 +386,6 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);",
 			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);",
 			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);",
-			"CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';",
 			"CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, created_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';",
@@ -403,16 +402,19 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 		}
 
 		// Preflight check: detect existing duplicate active sessions before migrating.
-		// Refuse to apply unique index automatically without manual operator resolution.
+		// Fail closed on any database query error or if duplicate active sessions exist.
 		var dupActiveSessions int
-		_ = db.QueryRow(`
+		if err := db.QueryRowContext(ctx, `
 SELECT COUNT(1) FROM (
     SELECT order_id FROM kiosk_sessions 
     WHERE status = 'PAYMENT_PENDING' 
     GROUP BY order_id 
     HAVING COUNT(1) > 1
 ) dups;
-`).Scan(&dupActiveSessions)
+`).Scan(&dupActiveSessions); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: postgres migration preflight query failed: %w", err)
+		}
 		if dupActiveSessions > 0 {
 			_ = db.Close()
 			return nil, fmt.Errorf("open store: postgres migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
@@ -698,18 +700,26 @@ func migrateSQLiteSchema(db *sql.DB) error {
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);")
 
 	// Preflight check: detect existing duplicate active sessions before migrating SQLite.
-	// Refuse to apply unique index automatically without manual operator resolution.
-	var dupActiveSessions int
-	errPre := db.QueryRow(`
+	// Must fail closed on any database query error or if duplicate active sessions exist.
+	var tableCount int
+	if err := db.QueryRow("SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='kiosk_sessions';").Scan(&tableCount); err != nil {
+		return fmt.Errorf("open store: sqlite check kiosk_sessions table: %w", err)
+	}
+	if tableCount > 0 {
+		var dupActiveSessions int
+		if err := db.QueryRow(`
 SELECT COUNT(1) FROM (
     SELECT order_id FROM kiosk_sessions 
     WHERE status = 'PAYMENT_PENDING' 
     GROUP BY order_id 
     HAVING COUNT(1) > 1
 ) dups;
-`).Scan(&dupActiveSessions)
-	if errPre == nil && dupActiveSessions > 0 {
-		return fmt.Errorf("open store: sqlite migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
+`).Scan(&dupActiveSessions); err != nil {
+			return fmt.Errorf("open store: sqlite migration preflight failed: %w", err)
+		}
+		if dupActiveSessions > 0 {
+			return fmt.Errorf("open store: sqlite migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
+		}
 	}
 
 	_, _ = db.Exec(`
@@ -871,7 +881,9 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 		_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);")
 	}
 
-	_, _ = db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';")
+	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';"); err != nil {
+		return fmt.Errorf("open store: sqlite create idx_kiosk_sessions_active_order: %w", err)
+	}
 
 	return nil
 }
@@ -2654,6 +2666,31 @@ HAVING COUNT(1) > 1;
 		dups = append(dups, orderID)
 	}
 	return dups, rows.Err()
+}
+
+// EnsureActiveSessionConstraint verifies preflight conditions and creates the
+// idx_kiosk_sessions_active_order partial unique index.
+// This is the supported mechanism for fresh development, CI, and disposable test databases.
+// In production PostgreSQL, the explicit standalone migration script
+// deploy/supabase/migrations/20261113_active_kiosk_sessions_unique.sql must be
+// applied via CREATE INDEX CONCURRENTLY outside transaction blocks instead of application startup.
+func (s *Store) EnsureActiveSessionConstraint(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return errors.New("store not initialized")
+	}
+	// Fail-closed preflight check:
+	dups, err := s.DetectDuplicateActiveSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure active session constraint preflight failed: %w", err)
+	}
+	if len(dups) > 0 {
+		return fmt.Errorf("ensure active session constraint preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", len(dups))
+	}
+	stmt := "CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';"
+	if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("apply active session unique constraint: %w", err)
+	}
+	return nil
 }
 
 // PaymentRecord encapsulates trusted payment metadata.

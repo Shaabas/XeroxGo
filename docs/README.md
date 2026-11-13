@@ -46,6 +46,11 @@ The documentation suite is structured into the following navigable references:
   - Detailed behavioral comparison between Bibin's UI preview/edit updates and the agent's async conversion pipeline.
   - Conflict analysis proving 0 merge conflicts, runtime compatibility audit, visual palette documentation, and merge execution strategy.
 
+- 🗄️ **[Database Release Plan: Orders & Sessions Concurrency Hardening](file:///home/shabas/Projects/XeroxGo/docs/cleanup/database-release-plan.md)**
+  - Resolution of 4 verified release blockers: decoupling PostgreSQL startup from index creation, fail-closed preflight duplicate checks, supported fresh dev/test constraint methods, and strict test database isolation.
+  - Phased production release protocol: preflight detection query, conflict resolution protocol, autocommit concurrent migration execution (`CREATE INDEX CONCURRENTLY`), validity verification (`indisvalid`), and safe recovery.
+  - Development and disposable test database guidelines with `XEROXGO_TEST_POSTGRES_URL`.
+
 - ⚡ **[Minimum Print Path Workflow](file:///home/shabas/Projects/XeroxGo/docs/workflows/minimum-print-path.md)**
   - Exact execution trace for a single A4 PDF (1 copy, B&W, simplex).
   - Function-by-function, file-by-file, and database mutation trace.

@@ -102,14 +102,15 @@ WHERE status = 'PAYMENT_PENDING';
 - **Exclusion of Historical Rows:** Records with status `EXPIRED`, `CANCELED`, or `COMPLETED` do not match the index filter predicate. An order can accumulate full lifecycle history across retried sessions.
 - **Mutual Exclusion:** Exactly one active transaction session can exist for an order at any single point in time.
 
-### 3.2 Preflight Detection of Conflicting Production Records
-In Task 4.3B, the initialization sequences in [`cloud-backend/internal/store/db.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go) were audited to verify that preflight checks execute **strictly before** any unique index creation statement is executed:
-1. In `initPostgresSchema`: Base tables are created without the unique index. The preflight duplicate query executes next. Only if zero duplicates are detected does `pgMigrations` create `idx_kiosk_sessions_active_order`.
-2. In `migrateSQLiteSchema`: The preflight duplicate query executes before `idx_kiosk_sessions_active_order` is created.
-3. If duplicate active sessions exist:
-   - Migration **ABORTS IMMEDIATELY**.
+### 3.2 Preflight Detection of Conflicting Production Records & Startup Decoupling
+In Task 4.3B and Task INT-4A, the initialization sequences in [`cloud-backend/internal/store/db.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go) were hardened:
+1. In `initPostgresSchema`: Startup is decoupled from index creation. PostgreSQL startup runs a fail-closed preflight duplicate check, but does **not** automatically run `CREATE UNIQUE INDEX` via `pgMigrations`. Production index deployment is owned exclusively by the explicit standalone migration script ([`deploy/supabase/migrations/20261113_active_kiosk_sessions_unique.sql`](file:///home/shabas/Projects/XeroxGo/deploy/supabase/migrations/20261113_active_kiosk_sessions_unique.sql)).
+2. In `EnsureActiveSessionConstraint(ctx)`: Provides the supported, documented method for fresh development and disposable test databases to obtain the partial unique constraint after running fail-closed preflight validation.
+3. In `migrateSQLiteSchema`: Preflight duplicate detection executes before `idx_kiosk_sessions_active_order` is created.
+4. Fail-Closed Error Handling: If the preflight query encounters any database error (connection drop, table lock, column resolution failure) or detects duplicate active sessions:
+   - Initialization **ABORTS IMMEDIATELY** (fails closed).
    - No rows are deleted, updated, or modified automatically.
-   - Application startup fails with: `found N orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required`.
+   - Startup fails with an explicit error requiring manual operator investigation.
 
 ### 3.3 Production Migration & `CREATE INDEX CONCURRENTLY`
 The production migration is documented in [`deploy/supabase/migrations/20261113_active_kiosk_sessions_unique.sql`](file:///home/shabas/Projects/XeroxGo/deploy/supabase/migrations/20261113_active_kiosk_sessions_unique.sql).
@@ -168,7 +169,7 @@ If a concurrent index build fails (due to connection loss, query timeout, deadlo
 Automated tests are housed in [`orders_sessions_safety_test.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/orders_sessions_safety_test.go) and [`concurrency_baseline_test.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/concurrency_baseline_test.go).
 
 ### 5.2 Live PostgreSQL 16 Integration Test Execution Output
-Executed against a disposable local PostgreSQL 16 Alpine container:
+Executed against a disposable local PostgreSQL 16 Alpine container via `XEROXGO_TEST_POSTGRES_URL`:
 
 ```text
 === RUN   TestPostgresConcurrency_IntegrationSuite
@@ -179,27 +180,28 @@ Executed against a disposable local PostgreSQL 16 Alpine container:
 === RUN   TestPostgresConcurrency_IntegrationSuite/Postgres_ExpirationAndReclaim
 === RUN   TestPostgresConcurrency_IntegrationSuite/Postgres_CompetingKiosks_NoPeerLeak
 === RUN   TestPostgresConcurrency_IntegrationSuite/Postgres_PreflightDuplicateActiveSessionsDetection
---- PASS: TestPostgresConcurrency_IntegrationSuite (0.12s)
-    --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_SimultaneousClaims_SameOrder (0.03s)
+=== RUN   TestPostgresConcurrency_IntegrationSuite/Postgres_IndexDeployment_StartupVsExplicit
+    orders_sessions_safety_test.go:512: Confirmed: EnsureActiveSessionConstraint aborted on preflight: ensure active session constraint preflight failed: found 1 orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required
+--- PASS: TestPostgresConcurrency_IntegrationSuite (0.28s)
+    --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_SimultaneousClaims_SameOrder (0.04s)
     --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_PaperOvercommitment_AdvisoryLock (0.03s)
     --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_RollbackIntegrity (0.00s)
     --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_CancellationAndReclaim (0.01s)
     --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_ExpirationAndReclaim (0.01s)
-    --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_CompetingKiosks_NoPeerLeak (0.00s)
+    --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_CompetingKiosks_NoPeerLeak (0.01s)
     --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_PreflightDuplicateActiveSessionsDetection (0.00s)
+    --- PASS: TestPostgresConcurrency_IntegrationSuite/Postgres_IndexDeployment_StartupVsExplicit (0.05s)
 PASS
-ok  	xeroxgo/cloud-backend/internal/store	0.121s
+ok  	xeroxgo/cloud-backend/internal/store	1.298s
 ```
 
-All 30 unit and concurrency tests in `cloud-backend/internal/store` passed with race detector enabled (`go test -race`).
-
 ### 5.3 Default Unset Environment Behavior
-When running in an environment without provisioned PostgreSQL connection strings:
+When running in an environment without provisioned PostgreSQL connection strings (or if generic production variables like `DATABASE_URL` / `SUPABASE_URI` are present):
 
 ```text
 === RUN   TestPostgresConcurrency_IntegrationSuite
-    orders_sessions_safety_test.go:176: [UNVERIFIED] PostgreSQL instance is not available (SUPABASE_URI / POSTGRES_URL not set). Live PostgreSQL concurrency guarantees are marked UNVERIFIED.
-    orders_sessions_safety_test.go:177: skipping live Postgres concurrency tests (SUPABASE_URI/POSTGRES_URL not set)
+    orders_sessions_safety_test.go:179: [UNVERIFIED] Disposable PostgreSQL test database not configured (XEROXGO_TEST_POSTGRES_URL / POSTGRES_TEST_URL not set). Production/staging environment variables (DATABASE_URL, SUPABASE_URI) are strictly ignored for safety. Live PostgreSQL concurrency guarantees remain marked UNVERIFIED.
+    orders_sessions_safety_test.go:180: skipping live Postgres concurrency tests (XEROXGO_TEST_POSTGRES_URL/POSTGRES_TEST_URL not set)
 --- SKIP: TestPostgresConcurrency_IntegrationSuite (0.00s)
 ```
 

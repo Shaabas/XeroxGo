@@ -11,9 +11,12 @@ import (
 )
 
 func TestSupabaseIntegration(t *testing.T) {
-	uri := os.Getenv("SUPABASE_URI")
+	uri := os.Getenv("XEROXGO_TEST_SUPABASE_URI")
 	if uri == "" {
-		t.Skip("skipping Supabase live integration test (SUPABASE_URI not set)")
+		uri = os.Getenv("SUPABASE_TEST_URI")
+	}
+	if uri == "" {
+		t.Skip("skipping Supabase live integration test (XEROXGO_TEST_SUPABASE_URI / SUPABASE_TEST_URI not set)")
 	}
 
 	s, err := Open(uri)

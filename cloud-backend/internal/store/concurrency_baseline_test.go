@@ -14,18 +14,23 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-// Helper to open a test store: uses SUPABASE_URI / POSTGRES_URL if provided, else temporary SQLite.
+// Helper to open a test store: uses XEROXGO_TEST_POSTGRES_URL / POSTGRES_TEST_URL if provided, else temporary SQLite.
+// Production environment variables (DATABASE_URL, SUPABASE_URI) are strictly ignored for safety.
 func openConcurrencyTestStore(t *testing.T, prefix string) (*Store, func()) {
 	t.Helper()
-	pgURI := os.Getenv("SUPABASE_URI")
+	pgURI := os.Getenv("XEROXGO_TEST_POSTGRES_URL")
 	if pgURI == "" {
-		pgURI = os.Getenv("POSTGRES_URL")
+		pgURI = os.Getenv("POSTGRES_TEST_URL")
 	}
 
 	if pgURI != "" {
 		s, err := Open(pgURI)
 		if err != nil {
 			t.Fatalf("failed to open postgres test store: %v", err)
+		}
+		if err := s.EnsureActiveSessionConstraint(context.Background()); err != nil {
+			_ = s.Close()
+			t.Fatalf("failed to ensure active session constraint on postgres test store: %v", err)
 		}
 		cleanup := func() {
 			_ = s.Close()
@@ -54,7 +59,7 @@ func TestConcurrencyBaseline_SimultaneousClaims_SameOrder(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC()
-	kioskID := "kiosk-concur-1"
+	kioskID := fmt.Sprintf("kiosk-concur-1-%d", time.Now().UnixNano()%1000000)
 	orderID := fmt.Sprintf("ord_same_%d", time.Now().UnixNano())
 	pin := "1234"
 
@@ -128,8 +133,8 @@ func TestConcurrencyBaseline_CompetingKiosks(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC()
-	ownerKiosk := "kiosk-legit"
-	intruderKiosk := "kiosk-intruder"
+	ownerKiosk := fmt.Sprintf("kiosk-legit-%d", time.Now().UnixNano()%1000000)
+	intruderKiosk := fmt.Sprintf("kiosk-intruder-%d", time.Now().UnixNano()%1000000)
 	orderID := fmt.Sprintf("ord_compete_%d", time.Now().UnixNano())
 
 	createTestOrderWithSheets(t, s, ctx, orderID, ownerKiosk, "5678", 3, contracts.JobStatusPendingPayment, now)
@@ -189,7 +194,7 @@ func TestConcurrencyBaseline_PaperOvercommitment_SimultaneousOrders(t *testing.T
 
 	ctx := context.Background()
 	now := time.Now().UTC()
-	kioskID := "kiosk-paper-guard"
+	kioskID := fmt.Sprintf("kiosk-paper-guard-%d", time.Now().UnixNano()%1000000)
 	availableStock := 15
 	sheetsPerOrder := 6
 	orderCount := 5
@@ -260,7 +265,7 @@ func TestConcurrencyBaseline_RepeatedClaims_Idempotency(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC()
-	kioskID := "kiosk-repeat-1"
+	kioskID := fmt.Sprintf("kiosk-repeat-1-%d", time.Now().UnixNano()%1000000)
 	orderID := fmt.Sprintf("ord_repeat_%d", time.Now().UnixNano())
 
 	createTestOrderWithSheets(t, s, ctx, orderID, kioskID, "9988", 4, contracts.JobStatusPendingPayment, now)
@@ -310,7 +315,7 @@ func TestConcurrencyBaseline_ExpiredSession_Reclaim(t *testing.T) {
 
 	ctx := context.Background()
 	t0 := time.Now().UTC()
-	kioskID := "kiosk-exp-1"
+	kioskID := fmt.Sprintf("kiosk-exp-1-%d", time.Now().UnixNano()%1000000)
 	orderID := fmt.Sprintf("ord_exp_%d", time.Now().UnixNano())
 
 	createTestOrderWithSheets(t, s, ctx, orderID, kioskID, "7711", 5, contracts.JobStatusPendingPayment, t0)
@@ -365,7 +370,7 @@ func TestConcurrencyBaseline_Cancellation_Reclaim(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC()
-	kioskID := "kiosk-cancel-1"
+	kioskID := fmt.Sprintf("kiosk-cancel-1-%d", time.Now().UnixNano()%1000000)
 	orderID := fmt.Sprintf("ord_cancel_%d", time.Now().UnixNano())
 
 	createTestOrderWithSheets(t, s, ctx, orderID, kioskID, "8822", 7, contracts.JobStatusPendingPayment, now)
@@ -417,7 +422,7 @@ func TestConcurrencyBaseline_RollbackIntegrity(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC()
-	kioskID := "kiosk-roll-1"
+	kioskID := fmt.Sprintf("kiosk-roll-1-%d", time.Now().UnixNano()%1000000)
 	orderID := fmt.Sprintf("ord_roll_%d", time.Now().UnixNano())
 
 	// Order requires 10 sheets, but kiosk only has 4 sheets

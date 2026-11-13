@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,17 +165,19 @@ func TestStore_UniquenessConflictSafeHandling(t *testing.T) {
 }
 
 // TestPostgresConcurrency_IntegrationSuite runs true concurrent integration tests against PostgreSQL
-// if SUPABASE_URI or POSTGRES_URL is configured in the environment.
+// if XEROXGO_TEST_POSTGRES_URL or POSTGRES_TEST_URL is configured in the environment.
+// Generic production variables (DATABASE_URL, SUPABASE_URI, SUPABASE_DB_URL, POSTGRES_URL)
+// are strictly ignored for safety.
 // If PostgreSQL is unavailable, it explicitly marks PostgreSQL concurrency guarantees as UNVERIFIED.
 func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
-	pgURI := os.Getenv("SUPABASE_URI")
+	pgURI := os.Getenv("XEROXGO_TEST_POSTGRES_URL")
 	if pgURI == "" {
-		pgURI = os.Getenv("POSTGRES_URL")
+		pgURI = os.Getenv("POSTGRES_TEST_URL")
 	}
 
 	if pgURI == "" {
-		t.Log("[UNVERIFIED] PostgreSQL instance is not available (SUPABASE_URI / POSTGRES_URL not set). Live PostgreSQL concurrency guarantees are marked UNVERIFIED.")
-		t.Skip("skipping live Postgres concurrency tests (SUPABASE_URI/POSTGRES_URL not set)")
+		t.Log("[UNVERIFIED] Disposable PostgreSQL test database not configured (XEROXGO_TEST_POSTGRES_URL / POSTGRES_TEST_URL not set). Production/staging environment variables (DATABASE_URL, SUPABASE_URI) are strictly ignored for safety. Live PostgreSQL concurrency guarantees remain marked UNVERIFIED.")
+		t.Skip("skipping live Postgres concurrency tests (XEROXGO_TEST_POSTGRES_URL/POSTGRES_TEST_URL not set)")
 		return
 	}
 
@@ -189,6 +192,12 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 	}
 
 	ctx := context.Background()
+
+	// Ensure the active session constraint is present on the disposable test database
+	if err := s.EnsureActiveSessionConstraint(ctx); err != nil {
+		t.Fatalf("failed to apply active session constraint on disposable test database: %v", err)
+	}
+
 	now := time.Now().UTC()
 	kioskID := fmt.Sprintf("kiosk-pg-%d", time.Now().UnixNano()%10000)
 
@@ -445,5 +454,124 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 			}
 		}
 	})
+
+	// Subtest 8: PostgreSQL Index Deployment Mechanism Verification
+	t.Run("Postgres_IndexDeployment_StartupVsExplicit", func(t *testing.T) {
+		// 1. Drop index to test startup behavior
+		_, err := s.db.ExecContext(ctx, "DROP INDEX IF EXISTS idx_kiosk_sessions_active_order;")
+		if err != nil {
+			t.Fatalf("failed to drop index for test: %v", err)
+		}
+
+		// 2. Open another store connection to simulate application server startup
+		s2, err := Open(pgURI)
+		if err != nil {
+			t.Fatalf("failed to reopen store: %v", err)
+		}
+		defer s2.Close()
+
+		// 3. Verify server startup (Open) did NOT automatically create idx_kiosk_sessions_active_order
+		var idxCount int
+		err = s2.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM pg_indexes WHERE tablename = 'kiosk_sessions' AND indexname = 'idx_kiosk_sessions_active_order';").Scan(&idxCount)
+		if err != nil {
+			t.Fatalf("query pg_indexes: %v", err)
+		}
+		if idxCount != 0 {
+			t.Fatalf("REGRESSION: Open() automatically created idx_kiosk_sessions_active_order; production migration must be explicit")
+		}
+
+		// 4. Inject duplicate active sessions for a test order
+		orderID := fmt.Sprintf("ord_pg_dep_%d", time.Now().UnixNano())
+		kioskID1 := fmt.Sprintf("kiosk-pg-dep1-%d", time.Now().UnixNano()%100000)
+		kioskID2 := fmt.Sprintf("kiosk-pg-dep2-%d", time.Now().UnixNano()%100000)
+		pin := fmt.Sprintf("%04d", time.Now().UnixNano()%10000)
+		createTestOrderWithSheets(t, s2, ctx, orderID, kioskID1, pin, 2, contracts.JobStatusPendingPayment, now)
+
+		sessID1 := fmt.Sprintf("sess_pg_dep_1_%d", time.Now().UnixNano())
+		sessID2 := fmt.Sprintf("sess_pg_dep_2_%d", time.Now().UnixNano())
+		_, err = s2.db.ExecContext(ctx, `
+INSERT INTO kiosk_sessions (session_id, kiosk_id, order_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns)
+VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
+`, sessID1, kioskID1, orderID, now.Add(5*time.Minute).UnixNano(), now.UnixNano())
+		if err != nil {
+			t.Fatalf("insert session 1: %v", err)
+		}
+
+		_, err = s2.db.ExecContext(ctx, `
+INSERT INTO kiosk_sessions (session_id, kiosk_id, order_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns)
+VALUES ($1, $2, $3, 'PAYMENT_PENDING', 200, $4, $5, $5);
+`, sessID2, kioskID2, orderID, now.Add(5*time.Minute).UnixNano(), now.UnixNano())
+		if err != nil {
+			t.Fatalf("insert session 2: %v", err)
+		}
+
+		// 5. Calling EnsureActiveSessionConstraint must fail closed on preflight detection
+		err = s2.EnsureActiveSessionConstraint(ctx)
+		if err == nil {
+			t.Fatalf("expected EnsureActiveSessionConstraint to fail preflight with duplicate active sessions, but it succeeded")
+		}
+		t.Logf("Confirmed: EnsureActiveSessionConstraint aborted on preflight: %v", err)
+
+		// 6. Clean up the duplicate session
+		_, err = s2.db.ExecContext(ctx, "DELETE FROM kiosk_sessions WHERE session_id = $1;", sessID2)
+		if err != nil {
+			t.Fatalf("delete duplicate test session: %v", err)
+		}
+
+		// 7. Now EnsureActiveSessionConstraint should succeed and create the index
+		err = s2.EnsureActiveSessionConstraint(ctx)
+		if err != nil {
+			t.Fatalf("EnsureActiveSessionConstraint failed on clean database: %v", err)
+		}
+
+		// 8. Verify the index is present and valid
+		var isValid, isUnique bool
+		err = s2.db.QueryRowContext(ctx, `
+SELECT i.indisvalid, i.indisunique 
+FROM pg_class c 
+JOIN pg_index i ON c.oid = i.indexrelid 
+WHERE c.relname = 'idx_kiosk_sessions_active_order';
+`).Scan(&isValid, &isUnique)
+		if err != nil {
+			t.Fatalf("query index validity: %v", err)
+		}
+		if !isValid || !isUnique {
+			t.Fatalf("expected valid unique index, got valid=%v unique=%v", isValid, isUnique)
+		}
+	})
+}
+
+// TestStore_PreflightFailClosed_OnDatabaseError verifies that if the duplicate-session preflight
+// query encounters any database error (e.g. malformed table, query execution error),
+// store initialization immediately fails closed and aborts without swallowing the error.
+func TestStore_PreflightFailClosed_OnDatabaseError(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "preflight_fail_closed.db")
+
+	// 1. Pre-create a malformed kiosk_sessions table that lacks required columns (order_id, status)
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite: %v", err)
+	}
+	_, err = rawDB.Exec(`CREATE TABLE kiosk_sessions (corrupt_column TEXT);`)
+	_ = rawDB.Close()
+	if err != nil {
+		t.Fatalf("failed to create malformed table: %v", err)
+	}
+
+	// 2. Attempt to open store on this database.
+	// Invariant: The preflight query on kiosk_sessions must fail with a column error,
+	// and Open() MUST NOT swallow this error — it must fail closed and abort!
+	s, err := Open(dbPath)
+	if err == nil {
+		_ = s.Close()
+		t.Fatalf("expected Open() to fail closed when preflight query encounters a database error, but it succeeded")
+	}
+	t.Logf("Confirmed: Open() aborted with expected preflight database error: %v", err)
+
+	// Verify the error mentions preflight failure
+	if !strings.Contains(err.Error(), "preflight failed") {
+		t.Fatalf("expected error to mention preflight failure, got: %v", err)
+	}
 }
 
