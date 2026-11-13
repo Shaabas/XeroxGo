@@ -147,6 +147,18 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
+# Gate 6 — Frontend Conversion Test Suite
+# -----------------------------------------------------------------------------
+echo "=== Gate 6: Frontend Conversion Test Suite ==="
+if node --test frontend/js/conversion_test.js; then
+    echo "Gate 6 PASSED: Frontend conversion tests passed."
+else
+    echo "Gate 6 FAILED: Frontend tests failed."
+    FAILED=1
+fi
+echo ""
+
+# -----------------------------------------------------------------------------
 # Final Verdict
 # -----------------------------------------------------------------------------
 echo "=== Verification Summary ==="

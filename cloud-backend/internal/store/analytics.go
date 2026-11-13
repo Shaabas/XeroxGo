@@ -7,22 +7,17 @@ import (
 	"strings"
 	"time"
 
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/pkg/contracts"
 )
 
 // PricingConfig represents comprehensive pricing for monochrome and color prints (simplex and duplex)
-// along with hardware capabilities.
-type PricingConfig struct {
-	BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
-	BWDuplexPricePaise     int64     `json:"bw_duplex_price_paise"`
-	ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
-	ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
-	ColorEnabled           bool      `json:"color_enabled"`
-	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
-	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
-	BWPricePerSidePaise    int64     `json:"bw_price_per_side_paise,omitempty"`
-	ColorPricePerSidePaise int64     `json:"color_price_per_side_paise,omitempty"`
-	UpdatedAt               time.Time `json:"updated_at"`
+// along with hardware capabilities. Aliased to authoritative internal/pricing.TariffConfig.
+type PricingConfig = pricing.TariffConfig
+
+// DefaultPricingConfig returns the authoritative default pricing configuration.
+func DefaultPricingConfig() PricingConfig {
+	return pricing.DefaultTariff()
 }
 
 // GetPricing retrieves the current pricing configuration.
@@ -60,27 +55,21 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		} else if legacyPrice > 0 {
 			bwSimplex = legacyPrice
 		} else {
-			bwSimplex = 200
+			bwSimplex = pricing.DefaultBWSimplexPaise
 		}
 	}
 	if bwDuplex <= 0 {
-		bwDuplex = (bwSimplex * 3) / 4
-		if bwDuplex <= 0 {
-			bwDuplex = 150
-		}
+		bwDuplex = pricing.ComputeDuplexDiscount(bwSimplex, pricing.DefaultBWDuplexPaise)
 	}
 	if colorSimplex <= 0 {
 		if colorPrice > 0 {
 			colorSimplex = colorPrice
 		} else {
-			colorSimplex = 1000
+			colorSimplex = pricing.DefaultColorSimplexPaise
 		}
 	}
 	if colorDuplex <= 0 {
-		colorDuplex = (colorSimplex * 3) / 4
-		if colorDuplex <= 0 {
-			colorDuplex = 750
-		}
+		colorDuplex = pricing.ComputeDuplexDiscount(colorSimplex, pricing.DefaultColorDuplexPaise)
 	}
 
 	return PricingConfig{
@@ -157,14 +146,8 @@ ON CONFLICT(id) DO UPDATE SET
 
 // SetPricing updates or inserts the dual pricing configuration (backward compatible).
 func (s *Store) SetPricing(ctx context.Context, bwPrice, colorPrice int64) error {
-	bwDuplex := (bwPrice * 3) / 4
-	if bwDuplex <= 0 {
-		bwDuplex = 150
-	}
-	colorDuplex := (colorPrice * 3) / 4
-	if colorDuplex <= 0 {
-		colorDuplex = 750
-	}
+	bwDuplex := pricing.ComputeDuplexDiscount(bwPrice, pricing.DefaultBWDuplexPaise)
+	colorDuplex := pricing.ComputeDuplexDiscount(colorPrice, pricing.DefaultColorDuplexPaise)
 	return s.SetDetailedPricing(ctx, bwPrice, bwDuplex, colorPrice, colorDuplex, false)
 }
 

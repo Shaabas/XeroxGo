@@ -195,6 +195,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				targetHost = strings.TrimSpace(cfg.PrinterAddr)
 			}
 		}
+		if targetHost == "" && strings.TrimSpace(cfg.CUPSQueue) != "" {
+			discovered := printer.DiscoverQueueHost(context.Background(), cfg.CUPSRunner, strings.TrimSpace(cfg.CUPSQueue))
+			if discovered != "" {
+				targetHost = discovered
+				cfg.SNMPTarget = discovered
+				log.Printf("[SPOOLER] Auto-discovered printer host %s from CUPS queue %s", discovered, cfg.CUPSQueue)
+			}
+		}
 
 		snmpCfg := printer.DefaultSNMPConfig()
 		if targetHost != "" {
@@ -208,8 +216,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		}
 
 		cupsQ := strings.TrimSpace(cfg.CUPSQueue)
+		runner := cfg.CUPSRunner
 		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			return printer.PollCombinedHealth(ctx, nil, cupsQ, snmpCfg, estimatedSheets)
+			return printer.PollCombinedHealth(ctx, runner, cupsQ, snmpCfg, estimatedSheets)
 		}
 	}
 
@@ -718,6 +727,36 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 }
 
+func (c *Client) getSNMPConfig() *printer.SNMPConfig {
+	targetHost := strings.TrimSpace(c.cfg.SNMPTarget)
+	if targetHost == "" {
+		if h, _, err := net.SplitHostPort(c.cfg.PrinterAddr); err == nil && h != "" {
+			targetHost = h
+		} else if strings.TrimSpace(c.cfg.PrinterAddr) != "" {
+			targetHost = strings.TrimSpace(c.cfg.PrinterAddr)
+		}
+	}
+	if targetHost == "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+		discovered := printer.DiscoverQueueHost(context.Background(), c.cfg.CUPSRunner, strings.TrimSpace(c.cfg.CUPSQueue))
+		if discovered != "" {
+			targetHost = discovered
+			c.cfg.SNMPTarget = discovered
+		}
+	}
+	if targetHost == "" {
+		return nil
+	}
+	snmpCfg := printer.DefaultSNMPConfig()
+	snmpCfg.Target = targetHost
+	if c.cfg.SNMPPort > 0 {
+		snmpCfg.Port = c.cfg.SNMPPort
+	}
+	if c.cfg.SNMPCommunity != "" {
+		snmpCfg.Community = c.cfg.SNMPCommunity
+	}
+	return &snmpCfg
+}
+
 func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob) {
 	defer func() {
 		c.activeMu.Lock()
@@ -782,7 +821,8 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		})
 	}
 
-	err := printer.MonitorCUPSJobCustom(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond)
+	snmpCfg := c.getSNMPConfig()
+	err := printer.MonitorCUPSJobWithSNMPCustom(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, snmpCfg)
 	if err != nil {
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("CUPS monitoring error: %v", err))
 		return
@@ -1172,6 +1212,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 				OnSubmitted: func(cupsJobID string) {
 					_ = c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
 				},
+				SNMPConfig: c.getSNMPConfig(),
 			}
 			printErr = printer.PrintPDFWithCUPSHooksCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, streamCmd, printPath, onPage, 500*time.Millisecond, hooks)
 		}
@@ -1253,6 +1294,30 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 	c.scheduleResetToIdle(c.cfg.CompletedDisplayDuration)
 }
 
+func formatCustomerError(cmd contracts.PrintJobCommand, pagesPrinted int, reason string) (string, string) {
+	lower := strings.ToLower(reason)
+	var msg string
+	switch {
+	case strings.Contains(lower, "jam"):
+		msg = "A paper feed issue occurred with the printer."
+	case strings.Contains(lower, "out of paper") || strings.Contains(lower, "empty") || strings.Contains(lower, "tray supply insufficient") || strings.Contains(lower, "media-empty"):
+		msg = "The printer has run out of paper."
+	case strings.Contains(lower, "cover") || strings.Contains(lower, "door"):
+		msg = "The printer cover was opened."
+	case strings.Contains(lower, "download failed") || strings.Contains(lower, "load"):
+		msg = "We could not load your document."
+	default:
+		msg = "A hardware issue interrupted printing your document."
+	}
+
+	jobRef := cmd.JobID
+	if strings.TrimSpace(jobRef) == "" {
+		jobRef = "Order"
+	}
+	detail := fmt.Sprintf("Order Ref: %s • Completed: %d of %d pages", jobRef, pagesPrinted, cmd.TotalPages)
+	return msg, detail
+}
+
 func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobCommand, pagesPrinted, sheetsPrinted int, reason string) {
 	log.Printf("[SPOOLER] Job %s error: %s", cmd.JobID, reason)
 	evt := contracts.JobProgressEvent{
@@ -1267,10 +1332,12 @@ func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobComma
 	_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
 	c.sendProgress(ctx, evt)
 
+	customerMsg, customerDetail := formatCustomerError(cmd, pagesPrinted, reason)
+
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:    ui_ipc.ModeError,
-		Message: reason,
-		Detail:  "Job ID: " + cmd.JobID,
+		Message: customerMsg,
+		Detail:  customerDetail,
 	})
 
 	c.scheduleResetToIdle(c.cfg.ErrorDisplayDuration)

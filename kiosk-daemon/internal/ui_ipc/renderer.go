@@ -914,40 +914,62 @@ func renderError(dst *image.RGBA, state ScreenState) {
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	// Bigger Title (56px) - Layman's terms
-	drawText(dst, faceBold56, "Printer Needs Attention", 90, 220, colorErrorRed)
+	// Clean Customer Title
+	drawText(dst, faceBold56, "Printing Interrupted", 90, 220, colorErrorRed)
 
 	msg := state.Message
 	if strings.TrimSpace(msg) == "" {
-		msg = "The printer has run out of paper or needs a quick check."
+		msg = "A hardware issue interrupted printing your document."
 	}
-	// Bigger Subtitle (32px)
+	// Subtitle
 	drawText(dst, faceReg32, msg, 90, 295, colorTextPrimary)
 
 	if strings.TrimSpace(state.Detail) != "" {
-		detailPill := image.Rect(90, 360, 750, 420)
+		detailPill := image.Rect(90, 350, 1150, 415)
 		drawPill(dst, detailPill, colorPillRedBg, colorPillRedBorder)
-		drawText(dst, faceBold22, state.Detail, 120, 380, colorErrorRed)
+		drawText(dst, faceBold22, state.Detail, 120, 372, colorErrorRed)
 	}
 
-	// Actionable recovery box - Layman's terms
-	boxRect := image.Rect(90, 450, 1830, 970)
-	fillRoundedRect(dst, boxRect, 20, color.RGBA{R: 255, G: 251, B: 235, A: 255})
-	strokeRoundedRect(dst, boxRect, 20, 2, color.RGBA{R: 253, G: 230, B: 138, A: 255})
+	// Customer Reassurance & Resolution Box
+	boxRect := image.Rect(90, 440, 1830, 960)
+	fillRoundedRect(dst, boxRect, 20, color.RGBA{R: 248, G: 250, B: 252, A: 255})
+	strokeRoundedRect(dst, boxRect, 20, 2, colorBorder)
 
-	drawText(dst, faceBold28, "What you can do to fix this:", 140, 500, color.RGBA{R: 180, G: 83, B: 9, A: 255})
+	drawText(dst, faceBold28, "What happens now:", 140, 490, colorTextPrimary)
 
-	recoverySteps := []string{
-		"1. Pull open the bottom paper tray and load standard A4 paper.",
-		"2. If paper is stuck, gently remove it and firmly close the printer cover.",
-		"3. Check that the printed output tray is empty and clear.",
-		"4. If it still doesn't print, please alert the shop or campus attendant.",
+	customerNotices := []struct {
+		title string
+		body  string
+	}{
+		{
+			"Automatic Refund",
+			"Any unprinted pages will be refunded automatically to your original payment method.",
+		},
+		{
+			"Exact Accounting",
+			"Only sheets that were physically delivered to the output tray are billed.",
+		},
+		{
+			"Attendant Dispatched",
+			"The kiosk has notified service personnel of this hardware interruption.",
+		},
+		{
+			"Need Immediate Assistance?",
+			"Please contact the kiosk attendant or customer support with the Order ID shown above.",
+		},
 	}
-	yR := 575
-	for _, step := range recoverySteps {
-		drawText(dst, faceBold24, step, 140, yR, colorTextPrimary)
-		yR += 70
+
+	yR := 560
+	for _, notice := range customerNotices {
+		drawText(dst, faceBold24, "• "+notice.title+": ", 140, yR, colorPrimaryBlue)
+		tW := measureTextWidth(faceBold24, "• "+notice.title+": ")
+		drawText(dst, faceReg24, notice.body, 140+tW, yR, colorTextPrimary)
+		yR += 65
 	}
+
+	footerText := "This screen will return to the home screen shortly."
+	fW := measureTextWidth(faceReg22, footerText)
+	drawText(dst, faceReg22, footerText, (ScreenWidth-fW)/2, 905, colorTextSecondary)
 }
 
 func renderPINEntry(dst *image.RGBA, state ScreenState) {

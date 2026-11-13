@@ -810,3 +810,133 @@ func TestPollHealthClosesSession(t *testing.T) {
 		t.Error("expected session to be closed even on malformed/error response")
 	}
 }
+
+func TestPollHardwareTelemetry(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("valid_telemetry_with_jam_and_lifecount", func(t *testing.T) {
+		packet := &gosnmp.SnmpPacket{
+			Error: gosnmp.NoError,
+			Variables: []gosnmp.SnmpPDU{
+				{
+					Name:  oidHrPrinterStatus,
+					Type:  gosnmp.Integer,
+					Value: 3, // IDLE
+				},
+				{
+					Name:  oidHrPrinterDetectedErrorState,
+					Type:  gosnmp.OctetString,
+					Value: []byte{0x04}, // JAMMED (bit 5)
+				},
+				{
+					Name:  oidPrtMarkerLifeCount,
+					Type:  gosnmp.Counter32,
+					Value: uint32(68544),
+				},
+			},
+		}
+
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				return packet, nil
+			},
+		}
+		factory := func(ctx context.Context) (snmpSession, error) {
+			return session, nil
+		}
+
+		telem := pollHardwareTelemetryWithFactory(ctx, factory)
+		if !telem.Online {
+			t.Fatal("expected telemetry Online = true")
+		}
+		if telem.StatusState != "IDLE" {
+			t.Errorf("StatusState = %q, want IDLE", telem.StatusState)
+		}
+		if !telem.HasFlags {
+			t.Fatal("expected HasFlags = true")
+		}
+		if !telem.Flags.Jammed {
+			t.Errorf("expected Flags.Jammed = true for 0x04")
+		}
+		if !telem.HasLife {
+			t.Fatal("expected HasLife = true")
+		}
+		if telem.LifeCount != 68544 {
+			t.Errorf("LifeCount = %d, want 68544", telem.LifeCount)
+		}
+		if !session.closed {
+			t.Error("expected session to be closed")
+		}
+	})
+
+	t.Run("fallback_when_lifecount_unsupported", func(t *testing.T) {
+		fallbackPacket := &gosnmp.SnmpPacket{
+			Error: gosnmp.NoError,
+			Variables: []gosnmp.SnmpPDU{
+				{
+					Name:  oidHrPrinterStatus,
+					Type:  gosnmp.Integer,
+					Value: 4, // PRINTING
+				},
+				{
+					Name:  oidHrPrinterDetectedErrorState,
+					Type:  gosnmp.OctetString,
+					Value: []byte{0x08}, // DoorOpen (bit 4, 0x08)
+				},
+			},
+		}
+
+		callCount := 0
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				callCount++
+				if len(oids) == 3 {
+					// Strict agent returns error for 3 OIDs including prtMarkerLifeCount
+					return nil, errors.New("no such name")
+				}
+				return fallbackPacket, nil
+			},
+		}
+		factory := func(ctx context.Context) (snmpSession, error) {
+			return session, nil
+		}
+
+		telem := pollHardwareTelemetryWithFactory(ctx, factory)
+		if !telem.Online {
+			t.Fatal("expected telemetry Online = true via fallback")
+		}
+		if telem.StatusState != "PRINTING" {
+			t.Errorf("StatusState = %q, want PRINTING", telem.StatusState)
+		}
+		if !telem.Flags.DoorOpen {
+			t.Errorf("expected Flags.DoorOpen = true")
+		}
+		if telem.HasLife {
+			t.Error("expected HasLife = false on fallback")
+		}
+		if callCount != 2 {
+			t.Errorf("expected 2 calls (initial + fallback), got %d", callCount)
+		}
+	})
+
+	t.Run("canceled_context", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		telem := pollHardwareTelemetryWithFactory(cancelCtx, func(ctx context.Context) (snmpSession, error) {
+			return &fakeSnmpSession{}, nil
+		})
+		if telem.Online {
+			t.Error("expected Online = false for canceled context")
+		}
+	})
+
+	t.Run("connection_failure", func(t *testing.T) {
+		telem := pollHardwareTelemetryWithFactory(ctx, func(ctx context.Context) (snmpSession, error) {
+			return nil, errors.New("network unreachable")
+		})
+		if telem.Online {
+			t.Error("expected Online = false on connection error")
+		}
+	})
+}

@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	"xeroxgo/cloud-backend/internal/pricing"
 )
 
-const maxInt64 = int64(1<<63 - 1)
+const maxInt64 = pricing.MaxInt64
 
 // Authoritative default fixed pricing constants in paise (₹1 = 100 paise)
 const (
@@ -72,20 +74,10 @@ func CalculateDocumentPricePaise(imposedPages int, isColor bool, isDuplex bool, 
 // CalculatePricePaise computes the total price in integer paise for a given
 // printed sides count and configured price per side. It validates that both
 // arguments are positive and protects against int64 overflow.
+// Deprecated: Provider-independent price arithmetic has been moved to internal/pricing.
+// This wrapper is preserved for backward compatibility.
 func CalculatePricePaise(totalSides int, pricePerSidePaise int64) (int64, error) {
-	if totalSides <= 0 {
-		return 0, fmt.Errorf("calculate price: totalSides must be > 0, got %d", totalSides)
-	}
-	if pricePerSidePaise <= 0 {
-		return 0, fmt.Errorf("calculate price: pricePerSidePaise must be > 0, got %d", pricePerSidePaise)
-	}
-
-	// Check overflow before multiplication
-	if int64(totalSides) > maxInt64/pricePerSidePaise {
-		return 0, errors.New("calculate price: total price overflows int64")
-	}
-
-	return int64(totalSides) * pricePerSidePaise, nil
+	return pricing.CalculatePricePaise(totalSides, pricePerSidePaise)
 }
 
 // VerifyWebhookSignature verifies the HMAC-SHA256 signature of the raw webhook payload
