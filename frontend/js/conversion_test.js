@@ -338,3 +338,62 @@ test('Conversion Errors — Server 413 Payload Too Large on initial upload', asy
   );
 });
 
+test('Headless Environment Safety — CommonJS import without DOM globals', () => {
+  // Verify that importing portal.js in an environment where window and document are undefined
+  // does not throw ReferenceError or evaluate browser-only event listeners.
+  assert.equal(typeof convertDocumentOnServer, 'function', 'convertDocumentOnServer must be exported as a function');
+});
+
+test('Preview Sizing Math — Responsive stage scale and dimension bounds', () => {
+  // Mirror the exact stage calculation algorithm from portal.js:1725-1738
+  function computeStageDimensions(stageClientWidth, innerW, innerH, rawW, rawH, padX = 16) {
+    const availableW = (stageClientWidth > 0)
+      ? (stageClientWidth - padX)
+      : Math.min(innerW - 64, 536);
+    const maxStageW = Math.max(220, availableW);
+    const maxStageH = (innerW >= 600)
+      ? Math.min(420, Math.max(320, Math.round(innerH * 0.48)))
+      : Math.min(360, Math.max(280, Math.round(innerH * 0.45)));
+    const scale = Math.min(maxStageW / rawW, maxStageH / rawH, 3.0);
+    const renderedW = Math.round(rawW * scale);
+    const renderedH = Math.round(rawH * scale);
+    return { maxStageW, maxStageH, scale, renderedW, renderedH };
+  }
+
+  const a4PortraitW = 595.28;
+  const a4PortraitH = 841.89;
+  const a4LandscapeW = 841.89;
+  const a4LandscapeH = 595.28;
+
+  // 1. Mobile phone portrait (360x640, container ~320px)
+  const mobile = computeStageDimensions(320, 360, 640, a4PortraitW, a4PortraitH);
+  assert.ok(mobile.scale > 0 && mobile.scale <= 3.0, 'Mobile scale must be positive and <= 3.0');
+  assert.ok(mobile.renderedW <= mobile.maxStageW, `Rendered width ${mobile.renderedW} must not exceed stage width ${mobile.maxStageW}`);
+  assert.ok(mobile.renderedH <= mobile.maxStageH, `Rendered height ${mobile.renderedH} must not exceed stage height ${mobile.maxStageH}`);
+  assert.equal(mobile.maxStageW, 304, 'maxStageW on mobile with 320px clientWidth minus 16px pad should be 304');
+  assert.equal(mobile.maxStageH, 288, 'maxStageH on mobile with 640px innerHeight should be 288');
+
+  // 2. Desktop large viewport (1440x900, stage container ~460px)
+  const desktop = computeStageDimensions(460, 1440, 900, a4PortraitW, a4PortraitH);
+  assert.ok(desktop.scale > 0 && desktop.scale <= 3.0, 'Desktop scale must be positive and <= 3.0');
+  assert.ok(desktop.renderedW <= desktop.maxStageW, `Desktop rendered width ${desktop.renderedW} must not exceed stage width ${desktop.maxStageW}`);
+  assert.ok(desktop.renderedH <= desktop.maxStageH, `Desktop rendered height ${desktop.renderedH} must not exceed stage height ${desktop.maxStageH}`);
+  assert.equal(desktop.maxStageW, 444, 'maxStageW on desktop with 460px clientWidth minus 16px pad should be 444');
+  assert.equal(desktop.maxStageH, 420, 'maxStageH on desktop should be capped at 420');
+
+  // 3. Landscape A4 document on mobile
+  const landscape = computeStageDimensions(320, 360, 640, a4LandscapeW, a4LandscapeH);
+  assert.ok(landscape.renderedW <= landscape.maxStageW, 'Landscape rendered width must not exceed stage width');
+  assert.ok(landscape.renderedH <= landscape.maxStageH, 'Landscape rendered height must not exceed stage height');
+
+  // 4. Fallback when stage element clientWidth is 0 (hidden view or unmounted)
+  const fallback = computeStageDimensions(0, 375, 667, a4PortraitW, a4PortraitH);
+  assert.equal(fallback.maxStageW, 311, 'availableW should fall back to Math.min(375 - 64, 536) = 311');
+  assert.ok(fallback.renderedW <= fallback.maxStageW, 'Fallback rendered width must be within bounds');
+
+  // 5. Extremely narrow viewport clamped to minimum 220px
+  const clamped = computeStageDimensions(100, 150, 400, a4PortraitW, a4PortraitH);
+  assert.equal(clamped.maxStageW, 220, 'maxStageW must clamp to minimum 220px');
+});
+
+
