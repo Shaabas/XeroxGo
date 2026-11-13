@@ -1382,7 +1382,7 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 		t.Fatal("expected hardware fault to clear after 3 consecutive healthy readings")
 	}
 
-	// 3. Verify state store: job MUST REMAIN in PAUSED_ERROR (never completed), but sheets reconciled to 4
+	// 3. Verify state store: job MUST REMAIN in PAUSED_ERROR (never completed), and sheets MUST REMAIN 1 (never promoted to unverified CUPS counter 4)
 	saved, err := store.GetJob(ctx, cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
@@ -1390,11 +1390,11 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	if saved.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected job to remain in PAUSED_ERROR, got %s", saved.Status)
 	}
-	if saved.SheetsPrinted != 4 {
-		t.Fatalf("expected SheetsPrinted=4, got %d", saved.SheetsPrinted)
+	if saved.SheetsPrinted != 1 {
+		t.Fatalf("expected SheetsPrinted to remain 1 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
 	}
-	if saved.PagesPrinted != 4 {
-		t.Fatalf("expected PagesPrinted=4, got %d", saved.PagesPrinted)
+	if saved.PagesPrinted != 1 {
+		t.Fatalf("expected PagesPrinted to remain 1, got %d", saved.PagesPrinted)
 	}
 	if saved.CUPSJobID != "HPTank-999" {
 		t.Fatalf("expected CUPSJobID=HPTank-999, got %s", saved.CUPSJobID)
@@ -1512,7 +1512,7 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 		t.Fatal("expected HoldCUPSJob to be called on active CUPS job upon independent printer recovery")
 	}
 
-	// 4. Verify job remains safely in PAUSED_ERROR with reconciled sheets
+	// 4. Verify job remains safely in PAUSED_ERROR with verified physical sheets (not promoted to CUPS counter)
 	saved, err := store.GetJob(ctx, cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
@@ -1520,8 +1520,8 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 	if saved.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
 	}
-	if saved.SheetsPrinted != 2 {
-		t.Fatalf("expected SheetsPrinted=2, got %d", saved.SheetsPrinted)
+	if saved.SheetsPrinted != 1 {
+		t.Fatalf("expected SheetsPrinted to remain 1 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
 	}
 }
 
@@ -1914,7 +1914,7 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 		_ = client.CheckPrinterHealth(ctx)
 	}
 
-	// 3. Verify state store: job remains in PAUSED_ERROR, sheets updated to unverified CUPS counter 3 (not 6), risk reported
+	// 3. Verify state store: job remains in PAUSED_ERROR, sheets MUST REMAIN 2 (never promoted to unverified CUPS counter 3 or total 6), risk reported
 	saved, err := store.GetJob(ctx, cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
@@ -1922,8 +1922,8 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 	if saved.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
 	}
-	if saved.SheetsPrinted != 3 {
-		t.Fatalf("expected SheetsPrinted=3, got %d", saved.SheetsPrinted)
+	if saved.SheetsPrinted != 2 {
+		t.Fatalf("expected SheetsPrinted to remain 2 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
 	}
 	if !strings.Contains(saved.ErrorReason, "job remains processing in CUPS") {
 		t.Fatalf("expected ErrorReason to mention job remains processing, got: %q", saved.ErrorReason)
@@ -2168,6 +2168,10 @@ func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesiz
 	}
 	defer store.Close()
 
+	if err := store.ResetPaperTray(ctx, 100); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
 	cmd := contracts.PrintJobCommand{
 		JobID:          "ord_startup_safety_05",
 		KioskID:        "kiosk-startup",
@@ -2257,13 +2261,168 @@ func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesiz
 	if saved == nil || saved.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected job to be preserved in PAUSED_ERROR during startup recovery, got status: %v", saved)
 	}
-	if saved.SheetsPrinted != 4 {
-		t.Fatalf("expected SheetsPrinted=4 (reconciled unverified counter), got %d (synthesized or regressed)", saved.SheetsPrinted)
+	// Verified physical sheets must NOT be promoted to CUPS unverified counter (4)
+	if saved.SheetsPrinted != 2 {
+		t.Fatalf("expected SheetsPrinted to remain 2 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
 	}
-	if saved.PagesPrinted != 4 {
-		t.Fatalf("expected PagesPrinted=4, got %d", saved.PagesPrinted)
+	if saved.PagesPrinted != 2 {
+		t.Fatalf("expected PagesPrinted to remain 2, got %d", saved.PagesPrinted)
 	}
 	if !strings.Contains(saved.ErrorReason, "without physical proof") {
 		t.Fatalf("expected ErrorReason to mention without physical proof, got: %q", saved.ErrorReason)
+	}
+	if !strings.Contains(saved.ErrorReason, "CUPS counter: 4 sheets") {
+		t.Fatalf("expected ErrorReason to report CUPS counter separately, got: %q", saved.ErrorReason)
+	}
+
+	// Verify paper tray inventory was NOT decremented for unverified CUPS sheets
+	stk, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("failed to query estimated sheets: %v", err)
+	}
+	if stk != 98 {
+		t.Fatalf("expected estimated sheets to remain 98 (100 - 2 verified physical sheets), got %d", stk)
+	}
+}
+
+// TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricatePhysicalSheets verifies that:
+// During independent printer recovery, when CUPS reports completed with an unverified sheet counter,
+// the client never promotes the counter into SheetsPrinted, never decrements paper inventory,
+// and strictly preserves PAUSED_ERROR with verified physical progress.
+func TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricatePhysicalSheets(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.ResetPaperTray(ctx, 100); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_inv_safety_07",
+		KioskID:        "kiosk-inv",
+		TotalPages:     10,
+		TotalSheets:    10,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("7", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-inv-77")
+	// 3 sheets physically printed prior to interruption
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  3,
+		SheetsPrinted: 3,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	stkBefore, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("GetEstimatedSheets failed: %v", err)
+	}
+	if stkBefore != 97 {
+		t.Fatalf("expected inventory 97 before recovery, got %d", stkBefore)
+	}
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			// CUPS reports completed with 10 sheets completed (unverified counter)
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 10\n"), nil
+		}
+		if name == "lpstat" {
+			return []byte("HPTank-inv-77 user 1024 Thu Nov 13 12:00:00 2026\n\tjob-completed-successfully\n\tjob-media-sheets-completed = 10"), nil
+		}
+		return []byte(""), nil
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: sheets,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: sheets,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws://127.0.0.1:8080/ws",
+		KioskID:                      "kiosk-inv",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/inv",
+		HealthPollInterval:           10 * time.Millisecond,
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+
+	// 2. Clear hardware fault with 3 consecutive healthy readings
+	isRecovered.Store(true)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	// 3. Verify state store: sheets MUST REMAIN 3 (never promoted to 10!) and status MUST BE PAUSED_ERROR
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 3 {
+		t.Fatalf("CRITICAL SAFETY FAILURE: expected SheetsPrinted to remain 3 (verified physical), but got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
+	}
+	if saved.PagesPrinted != 3 {
+		t.Fatalf("expected PagesPrinted to remain 3, got %d", saved.PagesPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "without physical proof") {
+		t.Fatalf("expected ErrorReason to mention without physical proof, got: %q", saved.ErrorReason)
+	}
+	if !strings.Contains(saved.ErrorReason, "CUPS counter: 10 sheets") {
+		t.Fatalf("expected ErrorReason to mention CUPS counter: 10 sheets, got: %q", saved.ErrorReason)
+	}
+
+	// 4. CRITICAL INVENTORY CHECK: Paper inventory must NOT have decremented from 97 to 90!
+	stkAfter, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("GetEstimatedSheets failed: %v", err)
+	}
+	if stkAfter != 97 {
+		t.Fatalf("CRITICAL INVENTORY LEAK: expected stock to remain 97, but got %d (decremented for unverified sheets!)", stkAfter)
 	}
 }

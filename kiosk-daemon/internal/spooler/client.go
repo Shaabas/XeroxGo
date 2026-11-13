@@ -1975,43 +1975,31 @@ func (c *Client) downloadAndVerify(ctx context.Context, cmd contracts.PrintJobCo
 	return nil
 }
 
-// reconcileSheetsAndPages calculates safe sheet and page progress based on verified physical
-// progress and unverified CUPS counters, ensuring sheet counts never regress, never exceed total
-// sheets, and never synthesize full completion from CUPS state alone.
+// reconcileSheetsAndPages preserves verified physical sheet and page progress during reconciliation
+// of interrupted jobs. Unverified CUPS sheet counters are never promoted into physically verified
+// progress, preventing spurious paper inventory decrements and false completion claims.
 func reconcileSheetsAndPages(
 	cmd contracts.PrintJobCommand,
 	savedSheets int,
 	savedPages int,
 	cupsSheetsCompleted int,
 ) (int, int) {
+	// Physical progress must never be promoted from unverified CUPS counters during reconciliation.
+	// Preserve the last verified physical sheets and pages.
 	reconciledSheets := savedSheets
-	if cupsSheetsCompleted > reconciledSheets {
-		reconciledSheets = cupsSheetsCompleted
-	}
 	if reconciledSheets > cmd.TotalSheets {
 		reconciledSheets = cmd.TotalSheets
 	}
-	if reconciledSheets < savedSheets {
-		reconciledSheets = savedSheets
+	if reconciledSheets < 0 {
+		reconciledSheets = 0
 	}
 
 	reconciledPages := savedPages
-	if cmd.Duplex == contracts.DuplexSimplex {
-		computedPages := (cmd.StartFromPage - 1) + reconciledSheets/cmd.Copies
-		if computedPages > reconciledPages {
-			reconciledPages = computedPages
-		}
-	} else {
-		computedPages := (cmd.StartFromPage - 1) + (reconciledSheets*2)/cmd.Copies
-		if computedPages > reconciledPages {
-			reconciledPages = computedPages
-		}
-	}
 	if reconciledPages > cmd.TotalPages {
 		reconciledPages = cmd.TotalPages
 	}
-	if reconciledPages < savedPages {
-		reconciledPages = savedPages
+	if reconciledPages < 0 {
+		reconciledPages = 0
 	}
 
 	return reconciledSheets, reconciledPages

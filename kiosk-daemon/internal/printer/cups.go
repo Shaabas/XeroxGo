@@ -739,8 +739,13 @@ func MonitorCUPSJobWithTelemetryCustom(
 			case CUPSJobStateCompleted:
 				log.Printf("[CUPS] Job %s (CUPS ID %s) confirmed completed by CUPS", cmd.JobID, cupsJobID)
 				if !hasOdometer {
-					if onPage != nil {
-						onPage(cmd.TotalSheets)
+					// Fall back to CUPS IPP sheets completed counter if reported,
+					// but NEVER fabricate full cmd.TotalSheets solely from CUPS completion.
+					if info.SheetsCompleted > lastSheetsReported && info.SheetsCompleted <= cmd.TotalSheets {
+						lastSheetsReported = info.SheetsCompleted
+						if onPage != nil {
+							onPage(info.SheetsCompleted)
+						}
 					}
 				}
 				return nil

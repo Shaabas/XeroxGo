@@ -156,8 +156,10 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 		t.Errorf("unexpected lp invocation: %s", executedCommands[0])
 	}
 
-	if len(completedSheets) == 0 || completedSheets[len(completedSheets)-1] != 4 {
-		t.Errorf("expected final progress to be 4 sheets, got %v", completedSheets)
+	// Without hardware SNMP odometer or IPP sheets completed counter,
+	// CUPS completion must NOT fabricate full physical sheet progress.
+	if len(completedSheets) != 0 {
+		t.Errorf("expected no synthetic physical sheet progress without hardware proof, got %v", completedSheets)
 	}
 }
 
@@ -401,8 +403,10 @@ job-state-reasons (keyword) = job-completed-successfully
 		t.Fatalf("expected successful recovery and print completion, got %v", err)
 	}
 
-	if completedSheets != 3 {
-		t.Fatalf("expected 3 completed sheets, got %d", completedSheets)
+	// Without hardware odometer or IPP sheets counter, recovering and completing in CUPS
+	// must NOT fabricate full physical sheet progress.
+	if completedSheets != 0 {
+		t.Fatalf("expected 0 synthetic completed sheets without odometer, got %d", completedSheets)
 	}
 }
 
@@ -512,9 +516,10 @@ job-state-reasons (keyword) = job-completed-successfully
 		}
 	}
 
-	// Should only be called once with 10 on completion
-	if len(sheetsReported) != 1 || sheetsReported[0] != 10 {
-		t.Fatalf("expected exactly [10] sheets reported on completion, got %v", sheetsReported)
+	// Without hardware odometer or IPP sheets counter, ensure onPage was NOT called
+	// with synthetic halfway progress (5) or synthetic completion (10).
+	if len(sheetsReported) != 0 {
+		t.Fatalf("expected no synthetic progress reported without odometer, got %v", sheetsReported)
 	}
 }
 
