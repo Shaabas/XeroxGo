@@ -105,6 +105,73 @@ func HoldCUPSJob(ctx context.Context, runner CommandRunner, cupsJobID string) er
 	return nil
 }
 
+// HoldResult represents the verified outcome of attempting to hold a CUPS job.
+type HoldResult struct {
+	HoldRequested    bool
+	HoldErr          error
+	State            CUPSJobState
+	JobInfo          CUPSJobInfo
+	QueryErr         error
+	ConfirmedHeld    bool
+	StillProcessing  bool
+	AlreadyCompleted bool
+	IsUnknown        bool
+}
+
+// HoldAndVerifyCUPSJob requests that CUPS hold the job, authoritatively queries its resulting
+// state, and distinguishes confirmed held, failed, unknown, already completed, and still processing.
+// Note: Even when confirmed held, already-buffered sheets in printer hardware memory may continue
+// printing before physical ejection ceases.
+func HoldAndVerifyCUPSJob(ctx context.Context, runner CommandRunner, queue string, cupsJobID string) HoldResult {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	res := HoldResult{HoldRequested: true}
+
+	if strings.TrimSpace(cupsJobID) == "" {
+		res.HoldErr = errors.New("cupsJobID cannot be empty")
+		res.IsUnknown = true
+		return res
+	}
+
+	res.HoldErr = HoldCUPSJob(ctx, runner, cupsJobID)
+	if res.HoldErr != nil {
+		log.Printf("[CUPS] Warning: hold request for job %s failed: %v", cupsJobID, res.HoldErr)
+	}
+
+	info, qErr := QueryCUPSJobInfo(ctx, runner, queue, cupsJobID)
+	res.QueryErr = qErr
+	res.JobInfo = info
+	res.State = info.State
+
+	if qErr != nil {
+		log.Printf("[CUPS] Warning: error querying job %s state after hold request: %v", cupsJobID, qErr)
+		res.IsUnknown = true
+		return res
+	}
+
+	switch info.State {
+	case CUPSJobStateHeld:
+		res.ConfirmedHeld = true
+		log.Printf("[CUPS] Job %s confirmed HELD in CUPS (note: buffered sheets may continue printing)", cupsJobID)
+	case CUPSJobStateProcessing, CUPSJobStatePending:
+		res.StillProcessing = true
+		log.Printf("[CUPS] Warning: Job %s still %s after hold request; unmonitored sheet ejection risk", cupsJobID, info.State)
+	case CUPSJobStateCompleted:
+		res.AlreadyCompleted = true
+		log.Printf("[CUPS] Job %s was already COMPLETED in CUPS before or during hold request", cupsJobID)
+	case CUPSJobStateProcessingStopped:
+		log.Printf("[CUPS] Job %s is processing-stopped in CUPS: %v", cupsJobID, info.Reasons)
+	case CUPSJobStateCanceled, CUPSJobStateAborted:
+		log.Printf("[CUPS] Job %s is %s in CUPS", cupsJobID, info.State)
+	default:
+		res.IsUnknown = true
+		log.Printf("[CUPS] Warning: Job %s state is %s (unknown/ambiguous) after hold request", cupsJobID, info.State)
+	}
+
+	return res
+}
+
 func extractJobNumber(cupsJobID string) string {
 	parts := strings.Split(cupsJobID, "-")
 	last := parts[len(parts)-1]
@@ -565,10 +632,13 @@ func MonitorCUPSJobWithTelemetryCustom(
 		select {
 		case <-ctx.Done():
 			if shouldPreserveCUPSJob(ctx) {
-				log.Printf("[CUPS] Monitoring stopped for job %s (CUPS ID %s) with job preservation flag; placing job on hold in CUPS for safe reconciliation", cmd.JobID, cupsJobID)
+				log.Printf("[CUPS] Monitoring stopped for job %s (CUPS ID %s) with job preservation flag; holding job in CUPS for safe reconciliation", cmd.JobID, cupsJobID)
 				holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-				_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+				holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
 				holdTimeout()
+				if holdRes.HoldErr != nil {
+					log.Printf("[CUPS] Warning: hold request on cancellation failed for job %s: %v", cupsJobID, holdRes.HoldErr)
+				}
 				return ctx.Err()
 			}
 			// Attempt to cancel the job in CUPS on timeout or context cancel
@@ -585,22 +655,31 @@ func MonitorCUPSJobWithTelemetryCustom(
 					if telem.Flags.Jammed {
 						log.Printf("[CUPS-SNMP] Hardware paper jam detected (error 0x04) during job %s; placing job on hold in CUPS", cupsJobID)
 						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-						_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+						holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
 						holdTimeout()
+						if holdRes.HoldErr != nil {
+							log.Printf("[CUPS-SNMP] Warning: hold request failed during jam for job %s: %v", cupsJobID, holdRes.HoldErr)
+						}
 						return errors.New("hardware interruption: paper feed jam detected in printer")
 					}
 					if telem.Flags.DoorOpen {
 						log.Printf("[CUPS-SNMP] Hardware cover open detected during job %s; placing job on hold in CUPS", cupsJobID)
 						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-						_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+						holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
 						holdTimeout()
+						if holdRes.HoldErr != nil {
+							log.Printf("[CUPS-SNMP] Warning: hold request failed during cover-open for job %s: %v", cupsJobID, holdRes.HoldErr)
+						}
 						return errors.New("hardware interruption: printer cover is open")
 					}
 					if telem.Flags.NoPaper || telem.Flags.InputTrayEmpty {
 						log.Printf("[CUPS-SNMP] Hardware out of paper detected during job %s; placing job on hold in CUPS", cupsJobID)
 						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-						_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+						holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
 						holdTimeout()
+						if holdRes.HoldErr != nil {
+							log.Printf("[CUPS-SNMP] Warning: hold request failed during paper-empty for job %s: %v", cupsJobID, holdRes.HoldErr)
+						}
 						return errors.New("hardware interruption: printer paper tray is empty")
 					}
 				}
@@ -659,8 +738,10 @@ func MonitorCUPSJobWithTelemetryCustom(
 
 			case CUPSJobStateCompleted:
 				log.Printf("[CUPS] Job %s (CUPS ID %s) confirmed completed by CUPS", cmd.JobID, cupsJobID)
-				if onPage != nil {
-					onPage(cmd.TotalSheets)
+				if !hasOdometer {
+					if onPage != nil {
+						onPage(cmd.TotalSheets)
+					}
 				}
 				return nil
 

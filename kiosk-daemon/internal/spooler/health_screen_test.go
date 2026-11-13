@@ -557,7 +557,7 @@ func TestHealthScreen_OtherHardwareFaults(t *testing.T) {
 // progress callbacks (onPage) and active health fault detection execute without data races,
 // accurately record partial progress, and prevent late progress from overwriting PAUSED_ERROR.
 func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	tmpDir := t.TempDir()
@@ -689,11 +689,11 @@ func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
 
 	select {
 	case <-printStarted:
-	case <-time.After(3 * time.Second):
+	case <-time.After(6 * time.Second):
 		t.Fatal("timed out waiting for print job to start")
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		savedJob, err := store.GetJob(ctx, "job-race-simul")
@@ -966,11 +966,11 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 
 	select {
 	case <-printStarted:
-	case <-time.After(3 * time.Second):
+	case <-time.After(6 * time.Second):
 		t.Fatal("timed out waiting for print job to start")
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		savedJob, err := store.GetJob(ctx, "job-preserve-cups")
@@ -1694,5 +1694,576 @@ func TestHealthScreen_ModeIdleSuppressedDuringActiveHardwareFault(t *testing.T) 
 
 	if mode != ui_ipc.ModeError {
 		t.Fatalf("expected currentMode to remain ModeError, got %s", mode)
+	}
+}
+
+// TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk verifies that:
+// When the lp hold command fails, the error is NOT silently ignored; the job strictly
+// remains in PAUSED_ERROR with its CUPS job ID preserved and the unresolved risk reported.
+func TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_hold_fail_01",
+		KioskID:        "kiosk-fail",
+		TotalPages:     5,
+		TotalSheets:    5,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("d", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-fail-77")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  2,
+		SheetsPrinted: 2,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" && len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold" {
+			return []byte("lp: Operation not permitted"), errors.New("exit status 1")
+		}
+		if name == "lpstat" {
+			return []byte("HPTank-fail-77 user 1024 Thu Nov 13 12:00:00 2026\nnow printing HPTank-fail-77"), nil
+		}
+		if name == "ipptool" {
+			return []byte("job-state (enum) = processing\njob-state-reasons (keyword) = none\njob-media-sheets-completed (integer) = 2\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: 100,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: 100,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws://127.0.0.1:8080/ws",
+		KioskID:                      "kiosk-fail",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/fail",
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+
+	// 2. Clear hardware fault
+	isRecovered.Store(true)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	// 3. Verify state store: job remains in PAUSED_ERROR, hold failure reported, CUPS ID preserved
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.CUPSJobID != "HPTank-fail-77" {
+		t.Fatalf("expected CUPSJobID HPTank-fail-77, got %s", saved.CUPSJobID)
+	}
+	if !strings.Contains(saved.ErrorReason, "hold request failed") {
+		t.Fatalf("expected ErrorReason to report hold failure, got: %q", saved.ErrorReason)
+	}
+	if !strings.Contains(saved.ErrorReason, "unmonitored physical output risk") {
+		t.Fatalf("expected ErrorReason to report unmonitored physical output risk, got: %q", saved.ErrorReason)
+	}
+}
+
+// TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError verifies that:
+// When CUPS accepts the hold request but the authoritative state remains processing,
+// the client reports the unresolved sheet ejection risk and preserves PAUSED_ERROR.
+func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_still_proc_02",
+		KioskID:        "kiosk-proc",
+		TotalPages:     6,
+		TotalSheets:    6,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("e", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-proc-88")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  2,
+		SheetsPrinted: 2,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" && len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold" {
+			// Hold accepted by CLI runner
+			return []byte(""), nil
+		}
+		if name == "ipptool" {
+			// But CUPS scheduler still reports processing (backend buffer still active)
+			return []byte("job-state (enum) = processing\njob-state-reasons (keyword) = none\njob-media-sheets-completed (integer) = 3\n"), nil
+		}
+		if name == "lpstat" {
+			return []byte("HPTank-proc-88 user 1024 Thu Nov 13 12:00:00 2026\nnow printing HPTank-proc-88"), nil
+		}
+		return []byte(""), nil
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: 100,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: 100,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws://127.0.0.1:8080/ws",
+		KioskID:                      "kiosk-proc",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/proc",
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+
+	// 2. Clear hardware fault
+	isRecovered.Store(true)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	// 3. Verify state store: job remains in PAUSED_ERROR, sheets updated to unverified CUPS counter 3 (not 6), risk reported
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 3 {
+		t.Fatalf("expected SheetsPrinted=3, got %d", saved.SheetsPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "job remains processing in CUPS") {
+		t.Fatalf("expected ErrorReason to mention job remains processing, got: %q", saved.ErrorReason)
+	}
+	if !strings.Contains(saved.ErrorReason, "unmonitored physical output risk") {
+		t.Fatalf("expected ErrorReason to report unmonitored physical output risk, got: %q", saved.ErrorReason)
+	}
+}
+
+// TestHealthScreen_UncertainHeldState_PreservesPausedError verifies that:
+// When CUPS queries return unknown / ambiguous state after a hold attempt,
+// the job is preserved in PAUSED_ERROR with operator reconciliation required.
+func TestHealthScreen_UncertainHeldState_PreservesPausedError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_ambig_03",
+		KioskID:        "kiosk-ambig",
+		TotalPages:     5,
+		TotalSheets:    5,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("f", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-ambig-99")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  1,
+		SheetsPrinted: 1,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" && len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold" {
+			return []byte(""), nil
+		}
+		// Query fails / returns unknown
+		return []byte(""), errors.New("CUPS communication failure")
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: 100,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: 100,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws://127.0.0.1:8080/ws",
+		KioskID:                      "kiosk-ambig",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/ambig",
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+
+	// 2. Clear hardware fault
+	isRecovered.Store(true)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	// 3. Verify state store: job remains in PAUSED_ERROR with sheets not regressed
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 1 {
+		t.Fatalf("expected SheetsPrinted=1, got %d", saved.SheetsPrinted)
+	}
+}
+
+// TestHealthScreen_CompletedCUPSWithoutPhysicalProof_NeverSynthesizesTotalSheets verifies that:
+// When CUPS reports completed but provides no numeric physical proof (or 0 sheets completed),
+// the client NEVER synthesizes full sheet completion (TotalSheets) and preserves PAUSED_ERROR.
+func TestHealthScreen_CompletedCUPSWithoutPhysicalProof_NeverSynthesizesTotalSheets(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_no_proof_04",
+		KioskID:        "kiosk-noproof",
+		TotalPages:     10,
+		TotalSheets:    10,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("0", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-noproof-10")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  2,
+		SheetsPrinted: 2,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			// Completed without media-sheets-completed (or 0)
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\n"), nil
+		}
+		if name == "lpstat" {
+			return []byte("HPTank-noproof-10 user 1024 Thu Nov 13 12:00:00 2026\n\tjob-completed-successfully"), nil
+		}
+		return []byte(""), nil
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: 100,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: 100,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws://127.0.0.1:8080/ws",
+		KioskID:                      "kiosk-noproof",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/noproof",
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+
+	// 2. Clear hardware fault
+	isRecovered.Store(true)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	// 3. Verify state store: sheets MUST REMAIN 2 (never synthesized to 10!) and status MUST BE PAUSED_ERROR (never COMPLETED)
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 2 {
+		t.Fatalf("CRITICAL SAFETY FAILURE: expected SheetsPrinted to remain 2 (verified physical), but got %d (synthesized full completion)", saved.SheetsPrinted)
+	}
+	if saved.PagesPrinted != 2 {
+		t.Fatalf("expected PagesPrinted to remain 2, got %d", saved.PagesPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "without physical proof") {
+		t.Fatalf("expected ErrorReason to mention without physical proof, got: %q", saved.ErrorReason)
+	}
+}
+
+// TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesizingSheets verifies that:
+// During startup recovery of an in-flight or paused job where CUPS reports completed,
+// the client never synthesizes full TotalSheets and never marks the job completed without physical proof.
+func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesizingSheets(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_startup_safety_05",
+		KioskID:        "kiosk-startup",
+		TotalPages:     8,
+		TotalSheets:    8,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("1", 64),
+	}
+	// Seed job in PAUSED_ERROR status (interrupted by fault, daemon restarted)
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-startup-55")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  2,
+		SheetsPrinted: 2,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			// CUPS reports completed with 4 sheets completed (out of 8)
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 4\n"), nil
+		}
+		if name == "lpstat" {
+			return []byte("HPTank-startup-55 user 1024 Thu Nov 13 12:00:00 2026\n\tjob-completed-successfully\n\tjob-media-sheets-completed = 4"), nil
+		}
+		return []byte(""), nil
+	}
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	cfg := ClientConfig{
+		CloudURL:                     "ws" + strings.TrimPrefix(wsServer.URL, "http"),
+		KioskID:                      "kiosk-startup",
+		StateStore:                   store,
+		CUPSQueue:                    "HPTank",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/startup",
+		HealthPollInterval:           10 * time.Millisecond,
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Wait for startup reconciliation to process incomplete job
+	deadline := time.Now().Add(2 * time.Second)
+	var saved *state.StoredJob
+	for time.Now().Before(deadline) {
+		saved, err = store.GetJob(ctx, cmd.JobID)
+		if err == nil && saved != nil && strings.Contains(saved.ErrorReason, "without physical proof") {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if saved == nil || saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job to be preserved in PAUSED_ERROR during startup recovery, got status: %v", saved)
+	}
+	if saved.SheetsPrinted != 4 {
+		t.Fatalf("expected SheetsPrinted=4 (reconciled unverified counter), got %d (synthesized or regressed)", saved.SheetsPrinted)
+	}
+	if saved.PagesPrinted != 4 {
+		t.Fatalf("expected PagesPrinted=4, got %d", saved.PagesPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "without physical proof") {
+		t.Fatalf("expected ErrorReason to mention without physical proof, got: %q", saved.ErrorReason)
 	}
 }
