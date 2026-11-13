@@ -46,9 +46,13 @@ func CombineHealth(cupsHealth contracts.PrinterHealth, snmpHealth contracts.Prin
 				combinedErr = snmpHealth.ErrorMessage
 			}
 		}
+		finalState := "OFFLINE"
+		if cupsHealth.PaperJam || snmpHealth.PaperJam || cupsHealth.CoverOpen || snmpHealth.CoverOpen || cupsHealth.OutputBinFull || snmpHealth.OutputBinFull {
+			finalState = "ERROR"
+		}
 		return contracts.PrinterHealth{
 			Online:            false,
-			State:             "OFFLINE",
+			State:             finalState,
 			PaperTrayStatus:   "UNKNOWN",
 			EstimatedSheets:   cupsHealth.EstimatedSheets,
 			TonerLevelPercent: snmpHealth.TonerLevelPercent,

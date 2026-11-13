@@ -653,6 +653,8 @@ func PollCUPSHealth(ctx context.Context, queue string, estimatedSheets int) cont
 }
 
 // PollCUPSHealthCustom allows injection of a custom command runner for testing CUPS health checks.
+// It queries CUPS using 'lpstat -l -p' to inspect extended printer status and state reasons (e.g. media-jam-error),
+// falling back to 'lpstat -p' if extended status is unavailable.
 func PollCUPSHealthCustom(
 	ctx context.Context,
 	runner CommandRunner,
@@ -673,7 +675,14 @@ func PollCUPSHealthCustom(
 	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	out, err := runner(pollCtx, "lpstat", "-p", queue)
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+
+	out, err := runner(pollCtx, "lpstat", "-l", "-p", queue)
+	if err != nil {
+		out, err = runner(pollCtx, "lpstat", "-p", queue)
+	}
 	if err != nil {
 		return contracts.PrinterHealth{
 			Online:          false,
@@ -686,19 +695,83 @@ func PollCUPSHealthCustom(
 
 	raw := strings.ToLower(string(out))
 
-	if strings.Contains(raw, "disabled") || strings.Contains(raw, "stopped") || strings.Contains(raw, "error") || strings.Contains(raw, "jam") {
-		errMsg := "printer is stopped or disabled"
-		if strings.Contains(raw, "jam") {
-			errMsg = "paper jam"
-		} else if strings.Contains(raw, "out of paper") || strings.Contains(raw, "media-empty") {
-			errMsg = "out of paper"
+	// Hardware fault indicators from printer status line and IPP printer-state-reasons
+	isJam := strings.Contains(raw, "media-jam") || strings.Contains(raw, "jam")
+	isCoverOpen := strings.Contains(raw, "cover-open") || strings.Contains(raw, "door-open") || strings.Contains(raw, "cover open") || strings.Contains(raw, "door open")
+	isOutputBinFull := strings.Contains(raw, "output-bin-full") || strings.Contains(raw, "output-area-full") || strings.Contains(raw, "bin full")
+	isMediaEmpty := strings.Contains(raw, "out of paper") || strings.Contains(raw, "media-empty") || strings.Contains(raw, "media-needed")
+	isStopped := strings.Contains(raw, "disabled") || strings.Contains(raw, "stopped") || strings.Contains(raw, "error") || strings.Contains(raw, "filter failed")
+
+	if isJam {
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "ERROR",
+			PaperJam:        true,
+			CoverOpen:       isCoverOpen,
+			OutputBinFull:   isOutputBinFull,
+			PaperTrayStatus: "CHECK_PRINTER",
+			EstimatedSheets: estimatedSheets,
+			ErrorMessage:    "paper jam",
+			UpdatedAt:       now,
 		}
+	}
+
+	if isCoverOpen {
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "ERROR",
+			CoverOpen:       true,
+			PaperJam:        isJam,
+			OutputBinFull:   isOutputBinFull,
+			PaperTrayStatus: "CHECK_PRINTER",
+			EstimatedSheets: estimatedSheets,
+			ErrorMessage:    "printer cover is open",
+			UpdatedAt:       now,
+		}
+	}
+
+	if isOutputBinFull {
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "ERROR",
+			OutputBinFull:   true,
+			PaperJam:        isJam,
+			CoverOpen:       isCoverOpen,
+			PaperTrayStatus: "CHECK_PRINTER",
+			EstimatedSheets: estimatedSheets,
+			ErrorMessage:    "output bin full",
+			UpdatedAt:       now,
+		}
+	}
+
+	if isMediaEmpty {
+		if isStopped || !strings.Contains(raw, "is idle") {
+			return contracts.PrinterHealth{
+				Online:          false,
+				State:           "ERROR",
+				PaperTrayStatus: "EMPTY",
+				EstimatedSheets: estimatedSheets,
+				ErrorMessage:    "out of paper",
+				UpdatedAt:       now,
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "IDLE",
+			PaperTrayStatus: "EMPTY",
+			EstimatedSheets: estimatedSheets,
+			ErrorMessage:    "out of paper",
+			UpdatedAt:       now,
+		}
+	}
+
+	if isStopped {
 		return contracts.PrinterHealth{
 			Online:          false,
 			State:           "ERROR",
 			PaperTrayStatus: "CHECK_PRINTER",
 			EstimatedSheets: estimatedSheets,
-			ErrorMessage:    errMsg,
+			ErrorMessage:    "printer is stopped or disabled",
 			UpdatedAt:       now,
 		}
 	}
@@ -714,14 +787,10 @@ func PollCUPSHealthCustom(
 	}
 
 	if strings.Contains(raw, "is idle") {
-		paperStatus := "OK"
-		if strings.Contains(raw, "out of paper") || strings.Contains(raw, "media-empty") {
-			paperStatus = "EMPTY"
-		}
 		return contracts.PrinterHealth{
 			Online:          true,
 			State:           "IDLE",
-			PaperTrayStatus: paperStatus,
+			PaperTrayStatus: "OK",
 			EstimatedSheets: estimatedSheets,
 			UpdatedAt:       now,
 		}

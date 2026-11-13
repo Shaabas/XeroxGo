@@ -690,6 +690,90 @@ func TestPollCUPSHealth(t *testing.T) {
 	}
 }
 
+func TestPollCUPSHealth_ExtendedPrinterStateReasons(t *testing.T) {
+	t.Run("media_jam_error_reason_reports_error_and_paper_jam", func(t *testing.T) {
+		output := "printer HPTank is idle.  enabled since Thu 13 Nov 2026 10:00:00 AM\n\tReady to print.\n\tPrinter state reasons: media-jam-error"
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte(output), nil
+		}
+
+		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		if h.State != "ERROR" {
+			t.Errorf("State: got %q, want ERROR", h.State)
+		}
+		if !h.PaperJam {
+			t.Error("expected PaperJam = true")
+		}
+		if !strings.Contains(strings.ToLower(h.ErrorMessage), "jam") {
+			t.Errorf("expected ErrorMessage containing 'jam', got %q", h.ErrorMessage)
+		}
+	})
+
+	t.Run("cover_open_error_reason_reports_error_and_cover_open", func(t *testing.T) {
+		output := "printer HPTank is idle.  enabled since Thu 13 Nov 2026 10:00:00 AM\n\tPrinter state reasons: cover-open-error"
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte(output), nil
+		}
+
+		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		if h.State != "ERROR" {
+			t.Errorf("State: got %q, want ERROR", h.State)
+		}
+		if !h.CoverOpen {
+			t.Error("expected CoverOpen = true")
+		}
+	})
+
+	t.Run("media_empty_reason_reports_error_and_paper_tray_empty", func(t *testing.T) {
+		output := "printer HPTank is stopped.  enabled since Thu 13 Nov 2026 10:00:00 AM\n\tPrinter state reasons: media-empty-error"
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte(output), nil
+		}
+
+		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		if h.State != "ERROR" {
+			t.Errorf("State: got %q, want ERROR", h.State)
+		}
+		if h.PaperTrayStatus != "EMPTY" {
+			t.Errorf("PaperTrayStatus: got %q, want EMPTY", h.PaperTrayStatus)
+		}
+	})
+
+	t.Run("output_bin_full_reason_reports_error_and_output_bin_full", func(t *testing.T) {
+		output := "printer HPTank is idle.  enabled since Thu 13 Nov 2026 10:00:00 AM\n\tPrinter state reasons: output-bin-full"
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte(output), nil
+		}
+
+		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		if h.State != "ERROR" {
+			t.Errorf("State: got %q, want ERROR", h.State)
+		}
+		if !h.OutputBinFull {
+			t.Error("expected OutputBinFull = true")
+		}
+	})
+
+	t.Run("fallback_without_l_flag_when_l_fails", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			for _, arg := range args {
+				if arg == "-l" {
+					return nil, errors.New("lpstat: invalid option -l")
+				}
+			}
+			return []byte("printer HPTank is idle. enabled since Thu Nov 13"), nil
+		}
+
+		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		if h.State != "IDLE" {
+			t.Errorf("State: got %q, want IDLE via fallback", h.State)
+		}
+		if !h.Online {
+			t.Error("expected Online = true")
+		}
+	})
+}
+
 func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
