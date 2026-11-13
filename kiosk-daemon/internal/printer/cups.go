@@ -87,6 +87,24 @@ func QueryCUPSJobInfo(ctx context.Context, runner CommandRunner, queue string, c
 	return queryLPStatJobInfo(ctx, runner, queue, cupsJobID)
 }
 
+// HoldCUPSJob places an active or queued CUPS job on hold so it will not print unmonitored.
+func HoldCUPSJob(ctx context.Context, runner CommandRunner, cupsJobID string) error {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	if ctx == nil {
+		return errors.New("context cannot be nil")
+	}
+	if strings.TrimSpace(cupsJobID) == "" {
+		return errors.New("cupsJobID cannot be empty")
+	}
+	out, err := runner(ctx, "lp", "-i", cupsJobID, "-H", "hold")
+	if err != nil {
+		return fmt.Errorf("failed to hold CUPS job %s: %w (output: %s)", cupsJobID, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func extractJobNumber(cupsJobID string) string {
 	parts := strings.Split(cupsJobID, "-")
 	last := parts[len(parts)-1]
@@ -160,6 +178,13 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 	// A. Check active (not-completed) queue
 	activeOut, activeErr := runner(ctx, "lpstat", "-W", "not-completed", "-o", queue)
 	if activeErr == nil && strings.Contains(string(activeOut), cupsJobID) {
+		if strings.Contains(strings.ToLower(string(activeOut)), "held") {
+			return CUPSJobInfo{
+				State:     CUPSJobStateHeld,
+				Reasons:   []string{"job-held"},
+				RawStatus: strings.TrimSpace(string(activeOut)),
+			}, nil
+		}
 		// Job is active in CUPS queue. Check if printer queue is stopped or actively printing.
 		pOut, pErr := runner(ctx, "lpstat", "-p", queue)
 		if pErr == nil {
@@ -540,7 +565,10 @@ func MonitorCUPSJobWithTelemetryCustom(
 		select {
 		case <-ctx.Done():
 			if shouldPreserveCUPSJob(ctx) {
-				log.Printf("[CUPS] Monitoring stopped for job %s (CUPS ID %s) with job preservation flag; leaving job in queue for manual reconciliation", cmd.JobID, cupsJobID)
+				log.Printf("[CUPS] Monitoring stopped for job %s (CUPS ID %s) with job preservation flag; placing job on hold in CUPS for safe reconciliation", cmd.JobID, cupsJobID)
+				holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+				holdTimeout()
 				return ctx.Err()
 			}
 			// Attempt to cancel the job in CUPS on timeout or context cancel
@@ -555,15 +583,24 @@ func MonitorCUPSJobWithTelemetryCustom(
 				telem := telemetryPoller(ctx)
 				if telem.Online && telem.HasFlags {
 					if telem.Flags.Jammed {
-						log.Printf("[CUPS-SNMP] Hardware paper jam detected (error 0x04) during job %s", cupsJobID)
+						log.Printf("[CUPS-SNMP] Hardware paper jam detected (error 0x04) during job %s; placing job on hold in CUPS", cupsJobID)
+						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+						_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+						holdTimeout()
 						return errors.New("hardware interruption: paper feed jam detected in printer")
 					}
 					if telem.Flags.DoorOpen {
-						log.Printf("[CUPS-SNMP] Hardware cover open detected during job %s", cupsJobID)
+						log.Printf("[CUPS-SNMP] Hardware cover open detected during job %s; placing job on hold in CUPS", cupsJobID)
+						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+						_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+						holdTimeout()
 						return errors.New("hardware interruption: printer cover is open")
 					}
 					if telem.Flags.NoPaper || telem.Flags.InputTrayEmpty {
-						log.Printf("[CUPS-SNMP] Hardware out of paper detected during job %s", cupsJobID)
+						log.Printf("[CUPS-SNMP] Hardware out of paper detected during job %s; placing job on hold in CUPS", cupsJobID)
+						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+						_ = HoldCUPSJob(holdCtx, runner, cupsJobID)
+						holdTimeout()
 						return errors.New("hardware interruption: printer paper tray is empty")
 					}
 				}

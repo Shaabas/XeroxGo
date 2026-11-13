@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"net/http"
 	"net/http/httptest"
@@ -874,6 +875,7 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 	defer dlServer.Close()
 
 	var cancelInvoked atomic.Bool
+	var holdInvoked atomic.Bool
 	var jamReported atomic.Bool
 	cupsJobID := "HPTank-777"
 	printStarted := make(chan struct{})
@@ -881,6 +883,10 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 
 	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		if name == "lp" {
+			if len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold" {
+				holdInvoked.Store(true)
+				return []byte(""), nil
+			}
 			printOnce.Do(func() { close(printStarted) })
 			return []byte("request id is " + cupsJobID + " (1 file(s))"), nil
 		}
@@ -984,7 +990,12 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 		t.Fatal("CUPS cancel was invoked! Jammed job must be preserved in CUPS queue for manual reconciliation")
 	}
 
-	// 2. Verify CUPS request ID is preserved in SQLite store
+	// 2. Verify hold WAS invoked on CUPS to prevent unmonitored printing
+	if !holdInvoked.Load() {
+		t.Fatal("CUPS hold was NOT invoked! Jammed job must be placed on hold in CUPS")
+	}
+
+	// 3. Verify CUPS request ID is preserved in SQLite store
 	savedJob, err := store.GetJob(ctx, "job-preserve-cups")
 	if err != nil || savedJob == nil {
 		t.Fatalf("failed to retrieve job from store: %v", err)
@@ -1259,5 +1270,429 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 
 	if !strings.Contains(finalError.Detail, "ord_coord_456") {
 		t.Fatalf("expected error screen to retain Order Ref 'ord_coord_456', got detail: %q", finalError.Detail)
+	}
+}
+
+// TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoCompleting verifies that:
+// When the printer hardware recovers independently and CUPS has finished the job,
+// the client reconciles the actual sheets printed into the state store without double-counting,
+// but NEVER automatically marks the interrupted job COMPLETED.
+func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoCompleting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_recov_001",
+		KioskID:        "kiosk-recov",
+		TotalPages:     4,
+		TotalSheets:    4,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("b", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-999")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  1,
+		SheetsPrinted: 1,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			// CUPS reports job completed with 4 sheets
+			if len(args) >= 3 && args[1] == "completed" {
+				return []byte("HPTank-999 user 1024 Thu Nov 13 12:00:00 2026\n\tjob-completed-successfully\n\tjob-media-sheets-completed = 4"), nil
+			}
+			return []byte(""), nil
+		}
+		if name == "ipptool" {
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 4\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: 100,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: 100,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:         "ws://127.0.0.1:8080/ws",
+		KioskID:          "kiosk-recov",
+		StateStore:       store,
+		CUPSQueue:        "HPTank",
+		DownloadDir:      tmpDir,
+		IdleQRContent:    "https://kiosk.test/recov",
+		ScreenSink:       func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+	if !client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to be active")
+	}
+
+	// 2. Transition printer hardware to recovered
+	isRecovered.Store(true)
+
+	// Call CheckPrinterHealth 3 times to satisfy required recovery count
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	if client.isHardwareFaultActive() {
+		t.Fatal("expected hardware fault to clear after 3 consecutive healthy readings")
+	}
+
+	// 3. Verify state store: job MUST REMAIN in PAUSED_ERROR (never completed), but sheets reconciled to 4
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job to remain in PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 4 {
+		t.Fatalf("expected SheetsPrinted=4, got %d", saved.SheetsPrinted)
+	}
+	if saved.PagesPrinted != 4 {
+		t.Fatalf("expected PagesPrinted=4, got %d", saved.PagesPrinted)
+	}
+	if saved.CUPSJobID != "HPTank-999" {
+		t.Fatalf("expected CUPSJobID=HPTank-999, got %s", saved.CUPSJobID)
+	}
+	if !strings.Contains(saved.ErrorReason, "physical output uncertain") {
+		t.Fatalf("expected ErrorReason to mention physical output uncertain, got: %q", saved.ErrorReason)
+	}
+}
+
+// TestHealthScreen_IndependentCUPSResume_HoldsActiveJob verifies that:
+// When the printer hardware recovers independently and CUPS has resumed an existing job (processing/pending),
+// the client immediately places the CUPS job on hold to prevent unmonitored printing.
+func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "ord_resume_hold_002",
+		KioskID:        "kiosk-hold",
+		TotalPages:     4,
+		TotalSheets:    4,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("c", 64),
+	}
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-888")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  1,
+		SheetsPrinted: 1,
+		ErrorReason:   "paper feed jam detected in printer",
+		Timestamp:     time.Now().UTC(),
+	})
+
+	var holdCalled atomic.Bool
+	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" && len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold" {
+			if args[1] == "HPTank-888" {
+				holdCalled.Store(true)
+			}
+			return []byte(""), nil
+		}
+		if name == "lpstat" {
+			// CUPS reports job active in queue
+			return []byte("HPTank-888 user 1024 Thu Nov 13 12:00:00 2026\nnow printing HPTank-888"), nil
+		}
+		if name == "ipptool" {
+			return []byte("job-state (enum) = processing\njob-state-reasons (keyword) = none\njob-media-sheets-completed (integer) = 2\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	var isRecovered atomic.Bool
+	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		if isRecovered.Load() {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "IDLE",
+				PaperTrayStatus: "OK",
+				EstimatedSheets: 100,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		}
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperJam:        true,
+			ErrorMessage:    "paper jam",
+			EstimatedSheets: 100,
+			UpdatedAt:       time.Now().UTC(),
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:         "ws://127.0.0.1:8080/ws",
+		KioskID:          "kiosk-hold",
+		StateStore:       store,
+		CUPSQueue:        "HPTank",
+		DownloadDir:      tmpDir,
+		IdleQRContent:    "https://kiosk.test/hold",
+		ScreenSink:       func(*image.RGBA) error { return nil },
+		MockHealth:                   healthMock,
+		CUPSRunner:                   customRunner,
+		RequiredRecoveryHealthyCount: 3,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Prime hardware fault
+	_ = client.CheckPrinterHealth(ctx)
+
+	// 2. Recover printer
+	isRecovered.Store(true)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+
+	// 3. Verify hold was invoked on CUPS job
+	if !holdCalled.Load() {
+		t.Fatal("expected HoldCUPSJob to be called on active CUPS job upon independent printer recovery")
+	}
+
+	// 4. Verify job remains safely in PAUSED_ERROR with reconciled sheets
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 2 {
+		t.Fatalf("expected SheetsPrinted=2, got %d", saved.SheetsPrinted)
+	}
+}
+
+// TestHealthScreen_ConcurrentCheckThenRender_ErrorScreenNeverOverwritten proves that:
+// Concurrent calls to renderScreen(ModePrinting) cannot race with hardware-fault transitions
+// to overwrite ModeError.
+func TestHealthScreen_ConcurrentCheckThenRender_ErrorScreenNeverOverwritten(t *testing.T) {
+	for iter := 0; iter < 10; iter++ {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+
+		var lastScreenState ui_ipc.ScreenState
+		var screenStateMu sync.Mutex
+
+		cfg := ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-race-render",
+			StateStore:    store,
+			CUPSQueue:     "HPTank",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk.test/race",
+			ScreenSink: func(img *image.RGBA) error {
+				return nil
+			},
+		}
+
+		client, err := NewClient(cfg)
+		if err != nil {
+			store.Close()
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.cfg.ScreenSink = func(img *image.RGBA) error {
+			screenStateMu.Lock()
+			client.currentModeMu.Lock()
+			mode := client.currentMode
+			client.currentModeMu.Unlock()
+			lastScreenState.Mode = mode
+			screenStateMu.Unlock()
+			return nil
+		}
+
+		// Initial idle render
+		_ = client.renderScreen(ui_ipc.ScreenState{
+			Mode:    ui_ipc.ModeIdle,
+			Message: "Ready to print",
+		})
+
+		var wg sync.WaitGroup
+		stopPrinting := make(chan struct{})
+
+		// Start 5 concurrent goroutines calling renderScreen(ModePrinting)
+		for g := 0; g < 5; g++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				page := 1
+				for {
+					select {
+					case <-stopPrinting:
+						return
+					default:
+						_ = client.renderScreen(ui_ipc.ScreenState{
+							Mode:            ui_ipc.ModePrinting,
+							CurrentPage:     page,
+							TotalPages:      10,
+							ProgressPercent: page * 10,
+							Message:         "Printing document...",
+							Detail:          fmt.Sprintf("Worker %d", id),
+						})
+						page = (page % 10) + 1
+						time.Sleep(1 * time.Millisecond)
+					}
+				}
+			}(g)
+		}
+
+		// Let printing frames render briefly
+		time.Sleep(10 * time.Millisecond)
+
+		// Fault transition: set hardware fault active and render ModeError
+		client.setHardwareFault(true, "paper feed jam detected in printer", "A paper feed issue occurred with the printer.")
+		_ = client.renderScreen(ui_ipc.ScreenState{
+			Mode:    ui_ipc.ModeError,
+			Message: "A paper feed issue occurred with the printer.",
+			Detail:  "Order Ref: ord_race_123 • Completed: 3 of 10 pages",
+		})
+
+		// Stop printing goroutines
+		close(stopPrinting)
+		wg.Wait()
+
+		// Verify final mode is ModeError
+		client.currentModeMu.Lock()
+		finalMode := client.currentMode
+		client.currentModeMu.Unlock()
+
+		if finalMode != ui_ipc.ModeError {
+			store.Close()
+			t.Fatalf("iteration %d: expected finalMode ModeError, got %s", iter, finalMode)
+		}
+
+		screenStateMu.Lock()
+		sinkMode := lastScreenState.Mode
+		screenStateMu.Unlock()
+
+		if sinkMode != ui_ipc.ModeError {
+			store.Close()
+			t.Fatalf("iteration %d: expected ScreenSink final state ModeError, got %s", iter, sinkMode)
+		}
+
+		store.Close()
+	}
+}
+
+// TestHealthScreen_ModeIdleSuppressedDuringActiveHardwareFault verifies that
+// ModeIdle frames are suppressed from rendering while a hardware fault is active.
+func TestHealthScreen_ModeIdleSuppressedDuringActiveHardwareFault(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	cfg := ClientConfig{
+		CloudURL:      "ws://127.0.0.1:8080/ws",
+		KioskID:       "kiosk-idle-suppress",
+		StateStore:    store,
+		CUPSQueue:     "HPTank",
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://kiosk.test/idle",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Hardware fault active and ModeError rendered
+	client.setHardwareFault(true, "printer cover is open", "The printer cover was opened.")
+	_ = client.renderScreen(ui_ipc.ScreenState{
+		Mode:    ui_ipc.ModeError,
+		Message: "The printer cover was opened.",
+		Detail:  "A printer hardware fault requires attention.",
+	})
+
+	historyLen := len(client.RenderHistory())
+
+	// 2. Attempt to render ModeIdle
+	_ = client.renderScreen(ui_ipc.ScreenState{
+		Mode:      ui_ipc.ModeIdle,
+		QRContent: "https://kiosk.test/idle",
+		Message:   "Ready to print",
+	})
+
+	// History must NOT have grown
+	if len(client.RenderHistory()) != historyLen {
+		t.Fatalf("expected render history length %d, got %d (ModeIdle was not suppressed)", historyLen, len(client.RenderHistory()))
+	}
+
+	// Mode must remain ModeError
+	client.currentModeMu.Lock()
+	mode := client.currentMode
+	client.currentModeMu.Unlock()
+
+	if mode != ui_ipc.ModeError {
+		t.Fatalf("expected currentMode to remain ModeError, got %s", mode)
 	}
 }
