@@ -51,9 +51,7 @@ func setupTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		convWake: make(chan struct{}, 100),
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
-	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
+	mux := app.routes()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -339,4 +337,46 @@ func TestAsyncConversion_FailureReporting(t *testing.T) {
 		t.Fatalf("expected non-empty error message on failure")
 	}
 }
+
+func TestConvertRoute_RetiredReturns404(t *testing.T) {
+	_, mux := setupTestServer(t)
+
+	// Verify that POST /api/convert is no longer registered and returns 404 Not Found
+	req := createMultipartRequest(t, "/api/convert", "file", "document.docx", []byte("sample office document content"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected HTTP 404 Not Found for retired route /api/convert, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify GET /api/convert also returns 404
+	getReq := httptest.NewRequest(http.MethodGet, "/api/convert", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusNotFound {
+		t.Fatalf("expected HTTP 404 Not Found for GET /api/convert, got %d", getRec.Code)
+	}
+
+	// Verify that the asynchronous conversion pipeline remains functional on the exact same server mux
+	asyncReq := createMultipartRequest(t, "/api/conversions", "file", "valid.txt", []byte("Async Conversion Still Works Verification"))
+	asyncRec := httptest.NewRecorder()
+	mux.ServeHTTP(asyncRec, asyncReq)
+
+	if asyncRec.Code != http.StatusAccepted {
+		t.Fatalf("expected HTTP 202 Accepted for async conversion, got %d: %s", asyncRec.Code, asyncRec.Body.String())
+	}
+
+	var res struct {
+		JobID string `json:"job_id"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(asyncRec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode async conversion response: %v", err)
+	}
+	if res.JobID == "" || res.Token == "" {
+		t.Fatalf("expected non-empty JobID and Token, got %+v", res)
+	}
+}
+
 

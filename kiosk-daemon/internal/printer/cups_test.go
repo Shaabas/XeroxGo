@@ -779,3 +779,293 @@ func TestMonitorCUPSJobCustom_ActiveToCompleted(t *testing.T) {
 		t.Errorf("expected at least 2 polls, got %d", pollCount)
 	}
 }
+
+func TestExtractHostFromCUPSDeviceURI(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "standard IPP URI with port and path",
+			input:    "ipp://10.42.0.210:631/ipp/print",
+			expected: "10.42.0.210",
+		},
+		{
+			name:     "secure IPPS URI with hostname",
+			input:    "ipps://print-server.lan:443/printers/LaserJet",
+			expected: "print-server.lan",
+		},
+		{
+			name:     "raw socket port 9100",
+			input:    "socket://192.168.1.150:9100",
+			expected: "192.168.1.150",
+		},
+		{
+			name:     "lpd URI",
+			input:    "lpd://10.0.0.5/queue",
+			expected: "10.0.0.5",
+		},
+		{
+			name:     "http URI",
+			input:    "http://10.42.0.210:631/ipp",
+			expected: "10.42.0.210",
+		},
+		{
+			name:     "lpstat output line with prefix",
+			input:    "device for HPTank: ipp://10.42.0.210:631/ipp/print",
+			expected: "10.42.0.210",
+		},
+		{
+			name:     "local USB URI returns empty",
+			input:    "usb://HP/LaserJet%20Tank%201020w?serial=VNC3J00928",
+			expected: "",
+		},
+		{
+			name:     "file or pipe URI returns empty",
+			input:    "file:///dev/null",
+			expected: "",
+		},
+		{
+			name:     "empty string returns empty",
+			input:    "",
+			expected: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ExtractHostFromCUPSDeviceURI(tc.input)
+			if got != tc.expected {
+				t.Errorf("ExtractHostFromCUPSDeviceURI(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestDiscoverQueueHost(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful discovery from lpstat -v", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" && len(args) == 2 && args[0] == "-v" && args[1] == "HPTank" {
+				return []byte("device for HPTank: ipp://10.42.0.210:631/ipp/print\n"), nil
+			}
+			return nil, errors.New("unexpected command")
+		}
+
+		host := DiscoverQueueHost(ctx, runner, "HPTank")
+		if host != "10.42.0.210" {
+			t.Errorf("DiscoverQueueHost = %q, want 10.42.0.210", host)
+		}
+	})
+
+	t.Run("runner failure returns empty", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return nil, errors.New("lpstat failed")
+		}
+
+		host := DiscoverQueueHost(ctx, runner, "HPTank")
+		if host != "" {
+			t.Errorf("DiscoverQueueHost = %q, want empty", host)
+		}
+	})
+
+	t.Run("USB printer returns empty", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("device for Deskjet: usb://HP/Deskjet%202700?serial=CN123\n"), nil
+		}
+
+		host := DiscoverQueueHost(ctx, runner, "Deskjet")
+		if host != "" {
+			t.Errorf("DiscoverQueueHost = %q, want empty", host)
+		}
+	})
+}
+
+func TestMonitorCUPSJobWithTelemetryCustom_PaperJam(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-jam-test",
+		Copies:      1,
+		TotalPages:  9,
+		TotalSheets: 9,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			// CUPS reports processing
+			return []byte("HPTank-101 user 1024 Tue Nov 3 14:00:00 2026"), nil
+		}
+		return []byte(""), nil
+	}
+
+	// Telemetry poller reporting paper jam (bit 0x04)
+	poller := func(ctx context.Context) HardwareTelemetry {
+		return HardwareTelemetry{
+			Online:   true,
+			HasFlags: true,
+			Flags: PrinterErrorFlags{
+				Jammed: true,
+			},
+		}
+	}
+
+	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-101", nil, 10*time.Millisecond, poller)
+	if err == nil {
+		t.Fatal("expected error from paper jam, got nil")
+	}
+	if !strings.Contains(err.Error(), "paper feed jam detected") {
+		t.Errorf("expected error containing 'paper feed jam detected', got %v", err)
+	}
+}
+
+func TestMonitorCUPSJobWithTelemetryCustom_CoverOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-cover-test",
+		Copies:      1,
+		TotalPages:  5,
+		TotalSheets: 5,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("HPTank-102 user 1024 Tue Nov 3 14:00:00 2026"), nil
+	}
+
+	poller := func(ctx context.Context) HardwareTelemetry {
+		return HardwareTelemetry{
+			Online:   true,
+			HasFlags: true,
+			Flags: PrinterErrorFlags{
+				DoorOpen: true,
+			},
+		}
+	}
+
+	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-102", nil, 10*time.Millisecond, poller)
+	if err == nil {
+		t.Fatal("expected error from cover open, got nil")
+	}
+	if !strings.Contains(err.Error(), "printer cover is open") {
+		t.Errorf("expected error containing 'printer cover is open', got %v", err)
+	}
+}
+
+func TestMonitorCUPSJobWithTelemetryCustom_OutOfPaper(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-empty-test",
+		Copies:      1,
+		TotalPages:  5,
+		TotalSheets: 5,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("HPTank-103 user 1024 Tue Nov 3 14:00:00 2026"), nil
+	}
+
+	poller := func(ctx context.Context) HardwareTelemetry {
+		return HardwareTelemetry{
+			Online:   true,
+			HasFlags: true,
+			Flags: PrinterErrorFlags{
+				NoPaper: true,
+			},
+		}
+	}
+
+	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-103", nil, 10*time.Millisecond, poller)
+	if err == nil {
+		t.Fatal("expected error from out of paper, got nil")
+	}
+	if !strings.Contains(err.Error(), "printer paper tray is empty") {
+		t.Errorf("expected error containing 'printer paper tray is empty', got %v", err)
+	}
+}
+
+func TestMonitorCUPSJobWithTelemetryCustom_OdometerTracking(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-odometer-test",
+		Copies:      1,
+		TotalPages:  3,
+		TotalSheets: 3,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	var pollCount int32
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			c := atomic.AddInt32(&pollCount, 1)
+			if c <= 3 {
+				// While active
+				for i, arg := range args {
+					if arg == "-W" && i+1 < len(args) && args[i+1] == "not-completed" {
+						return []byte("HPTank-104 user 1024 Tue Nov 3 14:00:00 2026"), nil
+					}
+				}
+				return []byte("HPTank-104 user 1024 Tue Nov 3 14:00:00 2026"), nil
+			}
+			// When completed (not in not-completed anymore)
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("HPTank-104 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+			}
+			return []byte(""), nil
+		}
+		return []byte(""), nil
+	}
+
+	var odoCalls int32
+	poller := func(ctx context.Context) HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		// Baseline life is sampled on first call (return 1000)
+		// Subsequent calls increment: 1001, 1002, 1003
+		var life int64 = 1000
+		if c > 1 {
+			life += int64(c - 1)
+		}
+		return HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
+	var reportedSheets []int
+	var sheetsMu sync.Mutex
+	onPage := func(sheets int) {
+		sheetsMu.Lock()
+		defer sheetsMu.Unlock()
+		reportedSheets = append(reportedSheets, sheets)
+	}
+
+	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-104", onPage, 10*time.Millisecond, poller)
+	if err != nil {
+		t.Fatalf("MonitorCUPSJobWithTelemetryCustom failed: %v", err)
+	}
+
+	sheetsMu.Lock()
+	defer sheetsMu.Unlock()
+	if len(reportedSheets) == 0 {
+		t.Fatal("expected sheets to be reported via odometer delta, got none")
+	}
+	// Last reported should reach total sheets
+	last := reportedSheets[len(reportedSheets)-1]
+	if last != 3 {
+		t.Errorf("last reported sheet = %d, want 3", last)
+	}
+}

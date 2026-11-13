@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS kiosk_sessions (
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';
 
 CREATE TABLE IF NOT EXISTS payments (
     payment_id TEXT PRIMARY KEY,

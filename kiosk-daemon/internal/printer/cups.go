@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -298,10 +299,11 @@ func extractJobBlock(output, jobID string) string {
 	return strings.Join(block, "\n")
 }
 
-// CUPSPrintHooks provides optional callbacks during CUPS submission and lifecycle.
+// CUPSPrintHooks provides optional callbacks and SNMP configuration during CUPS submission and lifecycle.
 type CUPSPrintHooks struct {
 	OnSubmitting func()
 	OnSubmitted  func(cupsJobID string)
+	SNMPConfig   *SNMPConfig
 }
 
 // PrintPDFWithCUPS submits a PDF file to the specified CUPS queue via the lp command
@@ -405,8 +407,13 @@ func PrintPDFWithCUPSHooksCustom(
 		hooks.OnSubmitted(cupsJobID)
 	}
 
+	var snmpCfg *SNMPConfig
+	if hooks != nil {
+		snmpCfg = hooks.SNMPConfig
+	}
+
 	// 3. Monitor CUPS job until completed, failed, or context canceled
-	return MonitorCUPSJobCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval)
+	return MonitorCUPSJobWithSNMPCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, snmpCfg)
 }
 
 // MonitorCUPSJobCustom monitors an active or queued CUPS job until completion, failure, or context cancellation.
@@ -419,6 +426,40 @@ func MonitorCUPSJobCustom(
 	onPage func(sheetsCompleted int),
 	pollInterval time.Duration,
 ) error {
+	return MonitorCUPSJobWithSNMPCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, nil)
+}
+
+// MonitorCUPSJobWithSNMPCustom monitors an active or queued CUPS job with optional SNMP hardware-truth verification.
+func MonitorCUPSJobWithSNMPCustom(
+	ctx context.Context,
+	runner CommandRunner,
+	queue string,
+	cmd contracts.PrintJobCommand,
+	cupsJobID string,
+	onPage func(sheetsCompleted int),
+	pollInterval time.Duration,
+	snmpCfg *SNMPConfig,
+) error {
+	var poller func(ctx context.Context) HardwareTelemetry
+	if snmpCfg != nil && strings.TrimSpace(snmpCfg.Target) != "" {
+		poller = func(c context.Context) HardwareTelemetry {
+			return PollHardwareTelemetry(c, *snmpCfg)
+		}
+	}
+	return MonitorCUPSJobWithTelemetryCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, poller)
+}
+
+// MonitorCUPSJobWithTelemetryCustom monitors an active or queued CUPS job with hardware-truth verification from a telemetry poller.
+func MonitorCUPSJobWithTelemetryCustom(
+	ctx context.Context,
+	runner CommandRunner,
+	queue string,
+	cmd contracts.PrintJobCommand,
+	cupsJobID string,
+	onPage func(sheetsCompleted int),
+	pollInterval time.Duration,
+	telemetryPoller func(ctx context.Context) HardwareTelemetry,
+) error {
 	if ctx == nil {
 		return errors.New("context cannot be nil")
 	}
@@ -430,6 +471,19 @@ func MonitorCUPSJobCustom(
 	}
 	if pollInterval <= 0 {
 		pollInterval = 500 * time.Millisecond
+	}
+
+	var initialLife int64 = -1
+	var lastOdometerSheets int = 0
+	hasOdometer := false
+
+	if telemetryPoller != nil {
+		initialTelem := telemetryPoller(ctx)
+		if initialTelem.Online && initialTelem.HasLife {
+			initialLife = initialTelem.LifeCount
+			hasOdometer = true
+			log.Printf("[CUPS-SNMP] Baseline hardware odometer for job %s: %d sheets", cmd.JobID, initialLife)
+		}
 	}
 
 	ticker := time.NewTicker(pollInterval)
@@ -454,6 +508,37 @@ func MonitorCUPSJobCustom(
 			return ctx.Err()
 
 		case <-ticker.C:
+			// 1. If hardware telemetry monitoring is active, check real-time hardware status
+			if telemetryPoller != nil {
+				telem := telemetryPoller(ctx)
+				if telem.Online && telem.HasFlags {
+					if telem.Flags.Jammed {
+						log.Printf("[CUPS-SNMP] Hardware paper jam detected (error 0x04) during job %s", cupsJobID)
+						return errors.New("hardware interruption: paper feed jam detected in printer")
+					}
+					if telem.Flags.DoorOpen {
+						log.Printf("[CUPS-SNMP] Hardware cover open detected during job %s", cupsJobID)
+						return errors.New("hardware interruption: printer cover is open")
+					}
+					if telem.Flags.NoPaper || telem.Flags.InputTrayEmpty {
+						log.Printf("[CUPS-SNMP] Hardware out of paper detected during job %s", cupsJobID)
+						return errors.New("hardware interruption: printer paper tray is empty")
+					}
+				}
+
+				if telem.Online && telem.HasLife && hasOdometer {
+					curSheets := int(telem.LifeCount - initialLife)
+					if curSheets > lastOdometerSheets && curSheets <= cmd.TotalSheets {
+						lastOdometerSheets = curSheets
+						log.Printf("[CUPS-SNMP] Verified physical sheets ejected via odometer: %d/%d", curSheets, cmd.TotalSheets)
+						if onPage != nil {
+							onPage(curSheets)
+						}
+					}
+				}
+			}
+
+			// 2. Query CUPS job state
 			info, err := QueryCUPSJobInfo(ctx, runner, queue, cupsJobID)
 			if err != nil {
 				consecutivePollErrors++
@@ -477,11 +562,14 @@ func MonitorCUPSJobCustom(
 
 			case CUPSJobStateProcessing:
 				consecutiveUnknown = 0
-				// Report real progress only if authoritative sheet count is available from IPP
-				if info.SheetsCompleted > lastSheetsReported && info.SheetsCompleted <= cmd.TotalSheets {
-					lastSheetsReported = info.SheetsCompleted
-					if onPage != nil {
-						onPage(info.SheetsCompleted)
+				// If hardware odometer is available, odometer drives onPage.
+				// Otherwise fall back to CUPS IPP sheets counter.
+				if !hasOdometer {
+					if info.SheetsCompleted > lastSheetsReported && info.SheetsCompleted <= cmd.TotalSheets {
+						lastSheetsReported = info.SheetsCompleted
+						if onPage != nil {
+							onPage(info.SheetsCompleted)
+						}
 					}
 				}
 
@@ -522,6 +610,41 @@ func MonitorCUPSJobCustom(
 			}
 		}
 	}
+}
+
+// ExtractHostFromCUPSDeviceURI parses a CUPS device line like:
+// "device for HPTank: ipp://10.42.0.210:631/ipp/print"
+// and returns the target host or IP (e.g. "10.42.0.210").
+func ExtractHostFromCUPSDeviceURI(rawURI string) string {
+	rawURI = strings.TrimSpace(rawURI)
+	if idx := strings.Index(rawURI, ":"); idx != -1 && strings.HasPrefix(rawURI, "device for") {
+		rawURI = strings.TrimSpace(rawURI[idx+1:])
+	}
+	u, err := url.Parse(rawURI)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "ipp", "ipps", "socket", "lpd", "http", "https":
+		return u.Hostname()
+	default:
+		return ""
+	}
+}
+
+// DiscoverQueueHost queries CUPS via lpstat -v to find the device URI host for queue.
+func DiscoverQueueHost(ctx context.Context, runner CommandRunner, queue string) string {
+	if strings.TrimSpace(queue) == "" {
+		return ""
+	}
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	out, err := runner(ctx, "lpstat", "-v", queue)
+	if err != nil {
+		return ""
+	}
+	return ExtractHostFromCUPSDeviceURI(string(out))
 }
 
 // PollCUPSHealth checks the operational status of a CUPS queue using lpstat.

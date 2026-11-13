@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 )
 
@@ -18,17 +19,13 @@ func (app *appServer) handlePublicPricing(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	pricing, err := app.db.GetPricing(r.Context())
+	pricingConfig, err := app.db.GetPricing(r.Context())
 	if err != nil {
-		pricing = store.PricingConfig{
-			BWPricePerSheetPaise:    200,
-			ColorPricePerSheetPaise: 1000,
-			UpdatedAt:               time.Now().UTC(),
-		}
+		pricingConfig = store.DefaultPricingConfig()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(pricing)
+	_ = json.NewEncoder(w).Encode(pricingConfig)
 }
 
 // handleAdminPricing handles GET and PUT /api/admin/pricing
@@ -40,16 +37,12 @@ func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request)
 
 	switch r.Method {
 	case http.MethodGet:
-		pricing, err := app.db.GetPricing(r.Context())
+		pricingConfig, err := app.db.GetPricing(r.Context())
 		if err != nil {
-			pricing = store.PricingConfig{
-				BWPricePerSheetPaise:    200,
-				ColorPricePerSheetPaise: 1000,
-				UpdatedAt:               time.Now().UTC(),
-			}
+			pricingConfig = store.DefaultPricingConfig()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(pricing)
+		_ = json.NewEncoder(w).Encode(pricingConfig)
 
 	case http.MethodPut:
 		var req struct {
@@ -70,19 +63,13 @@ func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request)
 			req.BWSimplexPricePaise = req.BWPricePerSheetPaise
 		}
 		if req.BWDuplexPricePaise <= 0 {
-			req.BWDuplexPricePaise = (req.BWSimplexPricePaise * 3) / 4
-			if req.BWDuplexPricePaise <= 0 {
-				req.BWDuplexPricePaise = 150
-			}
+			req.BWDuplexPricePaise = pricing.ComputeDuplexDiscount(req.BWSimplexPricePaise, pricing.DefaultBWDuplexPaise)
 		}
 		if req.ColorSimplexPricePaise <= 0 && req.ColorPricePerSheetPaise > 0 {
 			req.ColorSimplexPricePaise = req.ColorPricePerSheetPaise
 		}
 		if req.ColorDuplexPricePaise <= 0 {
-			req.ColorDuplexPricePaise = (req.ColorSimplexPricePaise * 3) / 4
-			if req.ColorDuplexPricePaise <= 0 {
-				req.ColorDuplexPricePaise = 750
-			}
+			req.ColorDuplexPricePaise = pricing.ComputeDuplexDiscount(req.ColorSimplexPricePaise, pricing.DefaultColorDuplexPaise)
 		}
 
 		if req.BWSimplexPricePaise <= 0 || req.BWDuplexPricePaise <= 0 || req.ColorSimplexPricePaise <= 0 || req.ColorDuplexPricePaise <= 0 {

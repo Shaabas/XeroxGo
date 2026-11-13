@@ -8,7 +8,7 @@ on:
 
 jobs:
   verify:
-    name: Verification Gates (Gate 1 - 5)
+    name: Verification Gates (Gate 1 - 6)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -21,6 +21,11 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Install Runtime Dependencies (qpdf, ghostscript, libreoffice, poppler-utils, cups-filters)
         run: |
