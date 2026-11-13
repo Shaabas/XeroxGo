@@ -531,3 +531,95 @@ func PollHealth(
 ) contracts.PrinterHealth {
 	return PollHealthTarget(ctx, defaultTarget, estimatedSheets)
 }
+
+// HardwareTelemetry encapsulates physical hardware readings from SNMP.
+type HardwareTelemetry struct {
+	Online      bool
+	LifeCount   int64
+	HasLife     bool
+	Flags       PrinterErrorFlags
+	HasFlags    bool
+	StatusState string
+	ErrorMsg    string
+}
+
+func pollHardwareTelemetryWithFactory(
+	ctx context.Context,
+	factory sessionFactory,
+) HardwareTelemetry {
+	if ctx == nil || ctx.Err() != nil {
+		return HardwareTelemetry{Online: false, ErrorMsg: "context canceled"}
+	}
+	session, err := factory(ctx)
+	if err != nil {
+		return HardwareTelemetry{Online: false, ErrorMsg: err.Error()}
+	}
+	defer session.Close()
+
+	packet, err := session.Get([]string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState, oidPrtMarkerLifeCount})
+	if err != nil || packet == nil {
+		// Fallback to essential OIDs if prtMarkerLifeCount is unsupported on strict agents
+		packet, err = session.Get([]string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState})
+		if err != nil || packet == nil {
+			return HardwareTelemetry{Online: false, ErrorMsg: "SNMP GET failed"}
+		}
+	}
+
+	var telem HardwareTelemetry
+	telem.Online = true
+
+	// 1. Status
+	if pdu, ok := findPDU(packet, oidHrPrinterStatus, 0); ok && isValidPDU(pdu) {
+		if v, okVal := pduToInt64(pdu); okVal {
+			switch int(v) {
+			case 3:
+				telem.StatusState = "IDLE"
+			case 4:
+				telem.StatusState = "PRINTING"
+			case 5:
+				telem.StatusState = "WARMING_UP"
+			default:
+				telem.StatusState = "UNKNOWN"
+			}
+		}
+	}
+
+	// 2. Error flags
+	if pdu, ok := findPDU(packet, oidHrPrinterDetectedErrorState, 1); ok && isValidPDU(pdu) {
+		var rawBytes []byte
+		switch v := pdu.Value.(type) {
+		case []byte:
+			rawBytes = v
+		case string:
+			rawBytes = []byte(v)
+		}
+		if len(rawBytes) > 0 {
+			telem.Flags = DecodeErrorBitmask(rawBytes)
+			telem.HasFlags = true
+		}
+	}
+
+	// 3. LifeCount
+	if pdu, ok := findPDU(packet, oidPrtMarkerLifeCount, 2); ok && isValidPDU(pdu) {
+		if v, okVal := pduToInt64(pdu); okVal {
+			telem.LifeCount = v
+			telem.HasLife = true
+		}
+	}
+
+	return telem
+}
+
+// PollHardwareTelemetry queries physical hardware telemetry from SNMP.
+func PollHardwareTelemetry(ctx context.Context, cfg SNMPConfig) HardwareTelemetry {
+	return pollHardwareTelemetryWithFactory(ctx, realSessionFactoryWithConfig(cfg))
+}
+
+// PollMarkerLifeCount returns the current physical odometer count from SNMP, or -1 if unavailable.
+func PollMarkerLifeCount(ctx context.Context, cfg SNMPConfig) int64 {
+	t := PollHardwareTelemetry(ctx, cfg)
+	if t.Online && t.HasLife {
+		return t.LifeCount
+	}
+	return -1
+}

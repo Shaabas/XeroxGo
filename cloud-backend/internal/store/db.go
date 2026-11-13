@@ -386,6 +386,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);",
 			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);",
 			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);",
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';",
 			"CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, created_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';",
@@ -400,6 +401,23 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);",
 		}
+
+		// Preflight check: detect existing duplicate active sessions before migrating.
+		// Refuse to apply unique index automatically without manual operator resolution.
+		var dupActiveSessions int
+		_ = db.QueryRow(`
+SELECT COUNT(1) FROM (
+    SELECT order_id FROM kiosk_sessions 
+    WHERE status = 'PAYMENT_PENDING' 
+    GROUP BY order_id 
+    HAVING COUNT(1) > 1
+) dups;
+`).Scan(&dupActiveSessions)
+		if dupActiveSessions > 0 {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: postgres migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
+		}
+
 		for _, mig := range pgMigrations {
 			if _, err := db.Exec(mig); err != nil {
 				_ = db.Close()
@@ -679,6 +697,21 @@ func migrateSQLiteSchema(db *sql.DB) error {
 	}
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);")
 
+	// Preflight check: detect existing duplicate active sessions before migrating SQLite.
+	// Refuse to apply unique index automatically without manual operator resolution.
+	var dupActiveSessions int
+	errPre := db.QueryRow(`
+SELECT COUNT(1) FROM (
+    SELECT order_id FROM kiosk_sessions 
+    WHERE status = 'PAYMENT_PENDING' 
+    GROUP BY order_id 
+    HAVING COUNT(1) > 1
+) dups;
+`).Scan(&dupActiveSessions)
+	if errPre == nil && dupActiveSessions > 0 {
+		return fmt.Errorf("open store: sqlite migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
+	}
+
 	_, _ = db.Exec(`
 CREATE TABLE IF NOT EXISTS conversions (
     id TEXT PRIMARY KEY,
@@ -837,6 +870,8 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 		_, _ = db.Exec("ALTER TABLE payment_attempts ADD COLUMN demo_token TEXT NOT NULL DEFAULT '';")
 		_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);")
 	}
+
+	_, _ = db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';")
 
 	return nil
 }
@@ -2207,6 +2242,13 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Serialize paper commitment checks and session creation per kiosk in PostgreSQL
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", kioskID); err != nil {
+			return nil, fmt.Errorf("create kiosk session: acquire kiosk advisory lock: %w", err)
+		}
+	}
+
 	// 1. Verify order existence, kiosk ownership, status, and expiry
 	var (
 		orderKioskID   string
@@ -2343,6 +2385,43 @@ VALUES (?, ?, ?, 'PAYMENT_PENDING', ?, ?, ?, ?);
 `)
 	_, err = tx.ExecContext(ctx, insertQuery, sessID, kioskID, orderID, pricePaise, expiresAtNS, nowNS, nowNS)
 	if err != nil {
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "unique") || strings.Contains(errStr, "23505") {
+			// Uniqueness conflict on idx_kiosk_sessions_active_order:
+			// Another transaction created an active session for this order concurrently.
+			_ = tx.Rollback()
+
+			var (
+				existingID, existingKiosk, existingStatus string
+				existingPrice, expNS, createNS, updateNS   int64
+			)
+			queryExisting := s.rebind(`
+SELECT session_id, kiosk_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns
+FROM kiosk_sessions
+WHERE order_id = ? AND status = 'PAYMENT_PENDING';
+`)
+			qErr := s.db.QueryRowContext(ctx, queryExisting, orderID).Scan(
+				&existingID, &existingKiosk, &existingStatus, &existingPrice, &expNS, &createNS, &updateNS,
+			)
+			if qErr == nil {
+				// Only return the session if it belongs to the same authorized kiosk and has not expired
+				if existingKiosk == kioskID && expNS > nowNS {
+					return &KioskSession{
+						SessionID:  existingID,
+						KioskID:    existingKiosk,
+						OrderID:    orderID,
+						Status:     KioskSessionStatus(existingStatus),
+						PricePaise: existingPrice,
+						ExpiresAt:  time.Unix(0, expNS).UTC(),
+						CreatedAt:  time.Unix(0, createNS).UTC(),
+						UpdatedAt:  time.Unix(0, updateNS).UTC(),
+					}, nil
+				}
+				// Belongs to a different kiosk or was claimed by another customer
+				return nil, ErrOrderAlreadyClaimed
+			}
+			return nil, ErrOrderAlreadyClaimed
+		}
 		return nil, fmt.Errorf("create kiosk session: insert session: %w", err)
 	}
 
@@ -2443,20 +2522,35 @@ func (s *Store) CancelKioskSession(ctx context.Context, sessionID, kioskID strin
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
+	kioskID = strings.TrimSpace(kioskID)
+	sessionID = strings.TrimSpace(sessionID)
 	nowNS := now.UTC().UnixNano()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("cancel kiosk session: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if s.dialect == "postgres" && kioskID != "" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", kioskID); err != nil {
+			return fmt.Errorf("cancel kiosk session: acquire kiosk advisory lock: %w", err)
+		}
+	}
+
 	query := s.rebind(`
 UPDATE kiosk_sessions
 SET status = 'CANCELED', updated_at_ns = ?
 WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 `)
-	res, err := s.db.ExecContext(ctx, query, nowNS, sessionID, kioskID)
+	res, err := tx.ExecContext(ctx, query, nowNS, sessionID, kioskID)
 	if err != nil {
 		return fmt.Errorf("cancel kiosk session: %w", err)
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		var currentStatus string
-		err := s.db.QueryRowContext(ctx, s.rebind(`SELECT status FROM kiosk_sessions WHERE session_id = ? AND kiosk_id = ?;`), sessionID, kioskID).Scan(&currentStatus)
+		err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM kiosk_sessions WHERE session_id = ? AND kiosk_id = ?;`), sessionID, kioskID).Scan(&currentStatus)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrSessionNotFound
@@ -2466,14 +2560,14 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 	}
 
 	// Cancel any pending or unacknowledged dispatch intents for this session
-	_, _ = s.db.ExecContext(ctx, s.rebind(`
+	_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'CANCELED', updated_at_ns = ?
 WHERE session_id = ? AND status IN ('PENDING', 'SENT');
 `), nowNS, sessionID)
 
 	// Revert order status from DISPATCHED to PAID_WAITING if not already durably acknowledged
-	_, _ = s.db.ExecContext(ctx, s.rebind(`
+	_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE order_id = (SELECT order_id FROM kiosk_sessions WHERE session_id = ?)
@@ -2481,6 +2575,9 @@ WHERE order_id = (SELECT order_id FROM kiosk_sessions WHERE session_id = ?)
   AND order_id NOT IN (SELECT order_id FROM dispatch_intents WHERE status = 'ACKNOWLEDGED');
 `), string(contracts.JobStatusPaidWaiting), nowNS, sessionID, string(contracts.JobStatusDispatched))
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("cancel kiosk session: commit tx: %w", err)
+	}
 	return nil
 }
 
@@ -2489,13 +2586,31 @@ func (s *Store) CompleteKioskSession(ctx context.Context, orderID string, now ti
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
+	orderID = strings.TrimSpace(orderID)
 	nowNS := now.UTC().UnixNano()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("complete kiosk session: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if s.dialect == "postgres" {
+		var kioskID string
+		_ = tx.QueryRowContext(ctx, "SELECT kiosk_id FROM kiosk_sessions WHERE order_id = $1 AND status = 'PAYMENT_PENDING';", orderID).Scan(&kioskID)
+		if kioskID != "" {
+			if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", kioskID); err != nil {
+				return fmt.Errorf("complete kiosk session: acquire advisory lock: %w", err)
+			}
+		}
+	}
+
 	query := s.rebind(`
 UPDATE kiosk_sessions
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 `)
-	res, err := s.db.ExecContext(ctx, query, nowNS, orderID)
+	res, err := tx.ExecContext(ctx, query, nowNS, orderID)
 	if err != nil {
 		return fmt.Errorf("complete kiosk session: %w", err)
 	}
@@ -2503,7 +2618,42 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 	if rows == 0 {
 		return ErrSessionNotFound
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("complete kiosk session: commit tx: %w", err)
+	}
 	return nil
+}
+
+// DetectDuplicateActiveSessions queries the database for any orders that currently have
+// more than one active (PAYMENT_PENDING) session. It returns the offending order IDs.
+// This is used for preflight migration validation and operational health monitoring.
+func (s *Store) DetectDuplicateActiveSessions(ctx context.Context) ([]string, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store not initialized")
+	}
+	query := s.rebind(`
+SELECT order_id
+FROM kiosk_sessions
+WHERE status = 'PAYMENT_PENDING'
+GROUP BY order_id
+HAVING COUNT(1) > 1;
+`)
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("detect duplicate active sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var dups []string
+	for rows.Next() {
+		var orderID string
+		if err := rows.Scan(&orderID); err != nil {
+			return nil, fmt.Errorf("scan duplicate order id: %w", err)
+		}
+		dups = append(dups, orderID)
+	}
+	return dups, rows.Err()
 }
 
 // PaymentRecord encapsulates trusted payment metadata.

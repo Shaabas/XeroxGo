@@ -11,8 +11,13 @@
   'use strict';
 
   // --- Configuration from DOM ---
-  const container = document.getElementById('app-container') || document.querySelector('.app-container');
-  if (!container) return;
+  const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
+  if (!container) {
+    if (typeof module !== 'undefined' && module.exports) {
+      module.exports = { convertDocumentOnServer };
+    }
+    return;
+  }
 
   let kioskID = container.dataset.kioskId || 'kiosk-demo';
   const pathMatch = window.location.pathname.match(/\/k\/([^/]+)/);
@@ -693,66 +698,147 @@
     const formData = new FormData();
     formData.append('file', selectedFile);
 
+    let lastStatusMsg = '';
+    const reportStatus = (msg) => {
+      if (onStatusUpdate && msg !== lastStatusMsg) {
+        lastStatusMsg = msg;
+        onStatusUpdate(msg);
+      }
+    };
+
+    // 1. Initial Job Submission (POST /api/conversions)
+    reportStatus('Uploading for conversion...');
+
     let resp;
     try {
-      if (onStatusUpdate) onStatusUpdate('Uploading for conversion...');
       resp = await fetch('/api/conversions', { method: 'POST', body: formData, signal });
     } catch (err) {
-      if (signal && signal.aborted) throw err;
-      if (onStatusUpdate) onStatusUpdate('Converting document on server...');
-      resp = await fetch('/api/convert', { method: 'POST', body: formData, signal });
-      if (!resp.ok) throw new Error('Document conversion failed');
-      return await resp.arrayBuffer();
-    }
-
-    if (resp.status === 404) {
-      if (onStatusUpdate) onStatusUpdate('Converting document on server...');
-      const fallbackResp = await fetch('/api/convert', { method: 'POST', body: formData, signal });
-      if (!fallbackResp.ok) throw new Error('Document conversion failed');
-      return await fallbackResp.arrayBuffer();
+      if (signal && signal.aborted) throw new Error('Cancelled');
+      // Do not retry POST or fall back to sync endpoint. Ambiguous network failures
+      // must not trigger duplicate conversion jobs.
+      throw new Error('Network error while uploading document for conversion: ' + (err.message || 'connection failed'));
     }
 
     if (!resp.ok) {
-      const err = await resp.text();
-      throw new Error(err || 'Document conversion request failed');
+      let errDetail = '';
+      try {
+        errDetail = await resp.text();
+      } catch (_) {}
+
+      if (resp.status === 413) {
+        throw new Error('File exceeds server size limit (25 MiB)');
+      } else if (resp.status === 400) {
+        throw new Error(errDetail || 'Unsupported file format or invalid document');
+      } else if (resp.status >= 500) {
+        throw new Error('Conversion service error on server: ' + (errDetail || 'internal error'));
+      }
+      throw new Error(errDetail || `Conversion submission failed (HTTP ${resp.status})`);
     }
 
-    const createData = await resp.json();
+    let createData;
+    try {
+      createData = await resp.json();
+    } catch (err) {
+      throw new Error('Invalid JSON response received from conversion server');
+    }
+
     const jobId = createData.job_id;
     const token = createData.token;
+    if (!jobId || !token) {
+      throw new Error('Conversion server response missing job_id or token');
+    }
+
     const pollUrl = createData.poll_url || `/api/conversions/${encodeURIComponent(jobId)}?token=${encodeURIComponent(token)}`;
-    let status = createData.status;
+    let status = createData.status || 'queued';
     let downloadUrl = null;
 
-    if (onStatusUpdate) onStatusUpdate('Waiting in conversion queue...');
+    reportStatus('Waiting in conversion queue...');
 
+    // 2. Status Polling Loop (GET pollUrl)
     const startTime = Date.now();
+    const maxPollTimeMs = 90000; // 90 seconds
+    const pollIntervalMs = 1200;
+    let consecutiveNetworkErrors = 0;
+    const maxConsecutiveNetworkErrors = 3;
+
     while (status === 'queued' || status === 'processing') {
       if (signal && signal.aborted) throw new Error('Cancelled');
-      if (Date.now() - startTime > 90000) {
-        throw new Error('Document conversion timed out');
+      if (Date.now() - startTime > maxPollTimeMs) {
+        throw new Error('Document conversion timed out after 90 seconds');
       }
-      if (onStatusUpdate) {
-        onStatusUpdate(status === 'processing' ? 'Converting pages on server...' : 'Waiting in conversion queue...');
-      }
-      await new Promise(r => setTimeout(r, 1200));
+
+      reportStatus(status === 'processing' ? 'Converting pages on server...' : 'Waiting in conversion queue...');
+
+      await new Promise(r => setTimeout(r, pollIntervalMs));
       if (signal && signal.aborted) throw new Error('Cancelled');
-      const pollResp = await fetch(pollUrl, { signal });
-      if (!pollResp.ok) throw new Error('Failed to query conversion progress');
-      const pollData = await pollResp.json();
+
+      let pollResp;
+      try {
+        pollResp = await fetch(pollUrl, { signal });
+        consecutiveNetworkErrors = 0; // reset on successful network exchange
+      } catch (pollErr) {
+        if (signal && signal.aborted) throw new Error('Cancelled');
+        consecutiveNetworkErrors++;
+        // Transient network glitch during polling: do NOT create duplicate job, retry status check
+        if (consecutiveNetworkErrors <= maxConsecutiveNetworkErrors) {
+          reportStatus('Connection interrupted, retrying status check...');
+          continue;
+        }
+        throw new Error('Network error while checking conversion progress: ' + (pollErr.message || 'connection failed'));
+      }
+
+      if (pollResp.status === 404) {
+        throw new Error('Conversion job expired or not found on server');
+      }
+      if (pollResp.status === 401 || pollResp.status === 403) {
+        throw new Error('Unauthorized to query conversion job status');
+      }
+      if (!pollResp.ok) {
+        let pollErrDetail = '';
+        try { pollErrDetail = await pollResp.text(); } catch (_) {}
+        throw new Error(`Failed to query conversion progress (HTTP ${pollResp.status}): ${pollErrDetail || pollResp.statusText}`);
+      }
+
+      let pollData;
+      try {
+        pollData = await pollResp.json();
+      } catch (jsonErr) {
+        throw new Error('Malformed JSON received while polling conversion progress');
+      }
+
       status = pollData.status;
       if (status === 'completed') {
         downloadUrl = pollData.download_url;
         break;
       } else if (status === 'failed') {
-        throw new Error(pollData.error_message || 'Conversion engine failed');
+        throw new Error(pollData.error_message || 'Conversion engine failed to convert document');
+      } else if (status === 'expired') {
+        throw new Error('Conversion job expired before completion');
       }
     }
 
-    if (!downloadUrl) throw new Error('Conversion result URL missing');
-    if (onStatusUpdate) onStatusUpdate('Downloading converted PDF...');
-    const pdfResp = await fetch(downloadUrl, { signal });
-    if (!pdfResp.ok) throw new Error('Failed to download converted PDF');
+    // 3. Artifact Download (GET downloadUrl)
+    if (!downloadUrl) {
+      downloadUrl = `/api/conversions/${encodeURIComponent(jobId)}/pdf?token=${encodeURIComponent(token)}`;
+    }
+
+    reportStatus('Downloading converted PDF...');
+
+    let pdfResp;
+    try {
+      pdfResp = await fetch(downloadUrl, { signal });
+    } catch (dlErr) {
+      if (signal && signal.aborted) throw new Error('Cancelled');
+      throw new Error('Network error while downloading converted PDF: ' + (dlErr.message || 'connection failed'));
+    }
+
+    if (!pdfResp.ok) {
+      if (pdfResp.status === 404) {
+        throw new Error('Converted PDF artifact not found or expired');
+      }
+      throw new Error(`Failed to download converted PDF (HTTP ${pdfResp.status})`);
+    }
+
     return await pdfResp.arrayBuffer();
   }
 
@@ -2215,6 +2301,7 @@
         },
         renderCart,
         submitOrder,
+        convertDocumentOnServer,
         renderPreviewSheet,
         calculateDocPrice,
         switchView,

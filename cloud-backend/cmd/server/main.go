@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"xeroxgo/cloud-backend/internal/payments"
-	"xeroxgo/cloud-backend/internal/pdf"
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -207,35 +207,8 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 	}
 }
 
-func (s *appServer) resolveUnitPrice(pricing store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
-	if !hasPricing {
-		if s.cfg.pricePerSheetPaise > 0 {
-			return s.cfg.pricePerSheetPaise
-		}
-		return 200
-	}
-	isDuplex := duplex != contracts.DuplexSimplex
-	var unitPrice int64
-	if strings.EqualFold(colorMode, "COLOR") && pricing.ColorEnabled {
-		if isDuplex {
-			unitPrice = pricing.ColorDuplexPricePaise
-		} else {
-			unitPrice = pricing.ColorSimplexPricePaise
-		}
-	} else {
-		if isDuplex {
-			unitPrice = pricing.BWDuplexPricePaise
-		} else {
-			unitPrice = pricing.BWSimplexPricePaise
-		}
-	}
-	if unitPrice <= 0 {
-		unitPrice = s.cfg.pricePerSheetPaise
-	}
-	if unitPrice <= 0 {
-		unitPrice = 200
-	}
-	return unitPrice
+func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
+	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
 }
 
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -280,15 +253,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	metadataRaw := strings.TrimSpace(r.FormValue("metadata"))
 	if len(fileHeaders) > 1 || metadataRaw != "" {
-		type docItemMeta struct {
-			Copies        int         `json:"copies"`
-			Duplex        interface{} `json:"duplex"`
-			ColorMode     string      `json:"color_mode"`
-			PageRange     string      `json:"page_range"`
-			Orientation   string      `json:"orientation"`
-			PagesPerSheet int         `json:"pages_per_sheet"`
-			Nup           int         `json:"nup"`
-		}
 		var metaItems []docItemMeta
 		if metadataRaw != "" {
 			_ = json.Unmarshal([]byte(metadataRaw), &metaItems)
@@ -296,13 +260,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		pricing, err := s.db.GetPricing(r.Context())
 		if err != nil {
-			pricing = store.PricingConfig{
-				BWSimplexPricePaise:    200,
-				BWDuplexPricePaise:     150,
-				ColorSimplexPricePaise: 1000,
-				ColorDuplexPricePaise:  750,
-				ColorEnabled:           false,
-			}
+			pricing = store.DefaultPricingConfig()
 		}
 
 		orderHex, err := randomHex(12)
@@ -337,12 +295,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		for idx, fh := range fileHeaders {
 			originalFilename := fh.Filename
-			if !pdf.IsSupportedFormat(originalFilename) {
-				_ = os.Remove(outputPath)
-				http.Error(w, fmt.Sprintf("unsupported file format %q in document %d", filepath.Ext(originalFilename), idx+1), http.StatusBadRequest)
-				return
-			}
-
 			f, err := fh.Open()
 			if err != nil {
 				_ = os.Remove(outputPath)
@@ -350,124 +302,32 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			ext := strings.ToLower(filepath.Ext(originalFilename))
-			if ext == "" {
-				ext = ".pdf"
+			var docOpts docPrintOptions
+			if idx < len(metaItems) {
+				docOpts, err = parseMetadataPrintOptions(metaItems[idx], pricing.ColorEnabled, idx+1)
+			} else {
+				docOpts, err = parseFormPrintOptions(r, pricing.ColorEnabled, idx+1)
 			}
-			tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "upload_in_*"+ext)
 			if err != nil {
 				_ = f.Close()
 				_ = os.Remove(outputPath)
-				http.Error(w, "failed to create temp file", http.StatusInternalServerError)
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			tmpInputName := tmpInput.Name()
-			_, copyErr := io.Copy(tmpInput, f)
+
+			prep, err := prepareInputPDF(r.Context(), f, originalFilename, s.cfg.jobsDir, "upload_in_*", idx+1)
 			_ = f.Close()
-			_ = tmpInput.Close()
-			if copyErr != nil {
-				_ = os.Remove(tmpInputName)
+			if err != nil {
 				_ = os.Remove(outputPath)
-				http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+			defer prep.cleanup()
 
-			normalizedInputPath := tmpInputName
-			if ext != ".pdf" {
-				tmpConverted, err := os.CreateTemp(s.cfg.jobsDir, "upload_conv_*.pdf")
-				if err != nil {
-					_ = os.Remove(tmpInputName)
-					_ = os.Remove(outputPath)
-					http.Error(w, "failed to create temp file for conversion", http.StatusInternalServerError)
-					return
-				}
-				tmpConvertedName := tmpConverted.Name()
-				_ = tmpConverted.Close()
-
-				if err := pdf.ConvertToPDF(r.Context(), tmpInputName, originalFilename, tmpConvertedName); err != nil {
-					_ = os.Remove(tmpInputName)
-					_ = os.Remove(tmpConvertedName)
-					_ = os.Remove(outputPath)
-					http.Error(w, fmt.Sprintf("conversion failed for %q: %v", originalFilename, err), http.StatusBadRequest)
-					return
-				}
-				_ = os.Remove(tmpInputName)
-				normalizedInputPath = tmpConvertedName
-			}
-			defer func(path string) { _ = os.Remove(path) }(normalizedInputPath)
-
-			docCopies := 1
-			docDuplexMode := contracts.DuplexSimplex
-			docColorMode := "BW"
-			docPageRange := ""
-			docOrientation := "AUTO"
-			docPagesPerSheet := 1
-
-			if idx < len(metaItems) {
-				if metaItems[idx].Copies >= 1 && metaItems[idx].Copies <= 999 {
-					docCopies = metaItems[idx].Copies
-				}
-				docDuplexMode = parseDuplex(metaItems[idx].Duplex)
-				if strings.EqualFold(metaItems[idx].ColorMode, "COLOR") && pricing.ColorEnabled {
-					docColorMode = "COLOR"
-				}
-				docPageRange = strings.TrimSpace(metaItems[idx].PageRange)
-				if metaItems[idx].Orientation != "" {
-					docOrientation = strings.ToUpper(strings.TrimSpace(metaItems[idx].Orientation))
-					if docOrientation != "AUTO" && docOrientation != "PORTRAIT" && docOrientation != "LANDSCAPE" {
-						_ = os.Remove(outputPath)
-						http.Error(w, fmt.Sprintf("invalid orientation %q in document %d: only AUTO, PORTRAIT, and LANDSCAPE are supported", metaItems[idx].Orientation, idx+1), http.StatusBadRequest)
-						return
-					}
-				}
-				nup := metaItems[idx].PagesPerSheet
-				if nup <= 0 && metaItems[idx].Nup > 0 {
-					nup = metaItems[idx].Nup
-				}
-				if nup > 0 {
-					if nup != 1 && nup != 2 && nup != 4 && nup != 6 {
-						_ = os.Remove(outputPath)
-						http.Error(w, fmt.Sprintf("invalid pages_per_sheet %d in document %d: only 1, 2, 4, and 6 are supported", nup, idx+1), http.StatusBadRequest)
-						return
-					}
-					docPagesPerSheet = nup
-				}
-			} else {
-				if c, err := strconv.Atoi(r.FormValue("copies")); err == nil && c >= 1 && c <= 999 {
-					docCopies = c
-				}
-				docDuplexMode = parseDuplex(r.FormValue("duplex"))
-				if strings.EqualFold(r.FormValue("color_mode"), "COLOR") && pricing.ColorEnabled {
-					docColorMode = "COLOR"
-				}
-				docPageRange = strings.TrimSpace(r.FormValue("page_range"))
-				if o := strings.ToUpper(strings.TrimSpace(r.FormValue("orientation"))); o != "" {
-					if o != "AUTO" && o != "PORTRAIT" && o != "LANDSCAPE" {
-						_ = os.Remove(outputPath)
-						http.Error(w, fmt.Sprintf("invalid orientation %q in document %d: only AUTO, PORTRAIT, and LANDSCAPE are supported", r.FormValue("orientation"), idx+1), http.StatusBadRequest)
-						return
-					}
-					docOrientation = o
-				}
-				nupStr := strings.TrimSpace(r.FormValue("pages_per_sheet"))
-				if nupStr == "" {
-					nupStr = strings.TrimSpace(r.FormValue("nup"))
-				}
-				if nupStr != "" {
-					n, err := strconv.Atoi(nupStr)
-					if err != nil || (n != 1 && n != 2 && n != 4 && n != 6) {
-						_ = os.Remove(outputPath)
-						http.Error(w, fmt.Sprintf("invalid pages_per_sheet %q in document %d: only 1, 2, 4, and 6 are supported", nupStr, idx+1), http.StatusBadRequest)
-						return
-					}
-					docPagesPerSheet = n
-				}
-			}
-
-			if docDuplexMode != contracts.DuplexSimplex {
+			if docOpts.Duplex != contracts.DuplexSimplex {
 				anyDuplex = true
 			}
-			if docColorMode == "COLOR" {
+			if docOpts.ColorMode == "COLOR" {
 				anyColor = true
 			}
 
@@ -481,33 +341,16 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = tmpNorm.Close()
 			intermediateNormPDFs = append(intermediateNormPDFs, tmpNormPath)
 
-			normRes, err := pdf.NormalizeAndCountWithOptions(r.Context(), normalizedInputPath, tmpNormPath, pdf.NormalizeOptions{
-				Copies:        docCopies,
-				Duplex:        docDuplexMode,
-				ColorMode:     docColorMode,
-				PageRange:     docPageRange,
-				Orientation:   docOrientation,
-				PagesPerSheet: docPagesPerSheet,
-			})
+			res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpNormPath, docOpts, pricing, true)
 			if err != nil {
 				_ = os.Remove(outputPath)
 				http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
 				return
 			}
 
-			unitPrice := s.resolveUnitPrice(pricing, true, docColorMode, docDuplexMode)
-
-			docPrintedSides := normRes.TotalPages * docCopies
-			docPrice, err := payments.CalculatePricePaise(docPrintedSides, unitPrice)
-			if err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, "failed to calculate price", http.StatusInternalServerError)
-				return
-			}
-
-			totalOrderPricePaise += docPrice
-			totalPrintedPages += docPrintedSides
-			totalSheets += normRes.TotalSheets
+			totalOrderPricePaise += res.PricePaise
+			totalPrintedPages += res.PrintedSides
+			totalSheets += res.NormResult.TotalSheets
 		}
 
 		if len(intermediateNormPDFs) == 1 {
@@ -633,105 +476,23 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	originalFilename := fileHeader.Filename
-	if !pdf.IsSupportedFormat(originalFilename) {
-		http.Error(w, fmt.Sprintf("unsupported file format %q: only PDF, Office documents (DOCX, PPTX, XLSX), and Images (JPG, PNG) are supported", filepath.Ext(originalFilename)), http.StatusBadRequest)
-		return
-	}
 
-	copiesStr := r.FormValue("copies")
-	copies := 1
-	if copiesStr != "" {
-		c, err := strconv.Atoi(copiesStr)
-		if err != nil || c < 1 || c > 999 {
-			http.Error(w, "copies must be between 1 and 999", http.StatusBadRequest)
-			return
-		}
-		copies = c
-	}
+	pricing, err := s.db.GetPricing(r.Context())
+	hasPricing := err == nil
+	colorEnabled := hasPricing && pricing.ColorEnabled
 
-	duplexStr := strings.TrimSpace(r.FormValue("duplex"))
-	var duplexMode contracts.DuplexMode
-	if duplexStr == "" {
-		duplexMode = contracts.DuplexSimplex
-	} else {
-		switch strings.ToUpper(duplexStr) {
-		case string(contracts.DuplexSimplex), "SINGLE", "SINGLE-SIDED", "FALSE":
-			duplexMode = contracts.DuplexSimplex
-		case string(contracts.DuplexLongEdge), "LONG_EDGE", "DUPLEX", "DOUBLE", "DOUBLE-SIDED", "TRUE":
-			duplexMode = contracts.DuplexLongEdge
-		case string(contracts.DuplexShortEdge), "SHORT_EDGE":
-			duplexMode = contracts.DuplexShortEdge
-		default:
-			http.Error(w, "invalid duplex mode", http.StatusBadRequest)
-			return
-		}
-	}
-
-	orientationStr := strings.ToUpper(strings.TrimSpace(r.FormValue("orientation")))
-	if orientationStr == "" {
-		orientationStr = "AUTO"
-	}
-	if orientationStr != "AUTO" && orientationStr != "PORTRAIT" && orientationStr != "LANDSCAPE" {
-		http.Error(w, fmt.Sprintf("invalid orientation %q: only AUTO, PORTRAIT, and LANDSCAPE are supported", r.FormValue("orientation")), http.StatusBadRequest)
-		return
-	}
-
-	pagesPerSheet := 1
-	nupStr := strings.TrimSpace(r.FormValue("pages_per_sheet"))
-	if nupStr == "" {
-		nupStr = strings.TrimSpace(r.FormValue("nup"))
-	}
-	if nupStr != "" {
-		n, err := strconv.Atoi(nupStr)
-		if err != nil || (n != 1 && n != 2 && n != 4 && n != 6) {
-			http.Error(w, fmt.Sprintf("invalid pages_per_sheet %q: only 1, 2, 4, and 6 are supported", nupStr), http.StatusBadRequest)
-			return
-		}
-		pagesPerSheet = n
-	}
-
-	ext := strings.ToLower(filepath.Ext(originalFilename))
-	if ext == "" {
-		ext = ".pdf"
-	}
-	tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "upload_in_*"+ext)
+	opts, err := parseFormPrintOptions(r, colorEnabled, 0)
 	if err != nil {
-		http.Error(w, "failed to create temp file", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	tmpInputName := tmpInput.Name()
-	defer func() {
-		_ = tmpInput.Close()
-		_ = os.Remove(tmpInputName)
-	}()
 
-	if _, err := io.Copy(tmpInput, file); err != nil {
-		http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
+	prep, err := prepareInputPDF(r.Context(), file, originalFilename, s.cfg.jobsDir, "upload_in_*", 0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	_ = tmpInput.Close()
-
-	// Convert to PDF if non-PDF document or image
-	normalizedInputPath := tmpInputName
-	if ext != ".pdf" {
-		tmpConverted, err := os.CreateTemp(s.cfg.jobsDir, "upload_conv_*.pdf")
-		if err != nil {
-			http.Error(w, "failed to create temp file for conversion", http.StatusInternalServerError)
-			return
-		}
-		tmpConvertedName := tmpConverted.Name()
-		defer func() {
-			_ = tmpConverted.Close()
-			_ = os.Remove(tmpConvertedName)
-		}()
-		_ = tmpConverted.Close()
-
-		if err := pdf.ConvertToPDF(r.Context(), tmpInputName, originalFilename, tmpConvertedName); err != nil {
-			http.Error(w, fmt.Sprintf("document conversion failed: %v", err), http.StatusBadRequest)
-			return
-		}
-		normalizedInputPath = tmpConvertedName
-	}
+	defer prep.cleanup()
 
 	orderHex, err := randomHex(12)
 	if err != nil {
@@ -750,41 +511,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	h := sha256.Sum256([]byte(orderID))
 	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
-	colorMode := strings.ToUpper(strings.TrimSpace(r.FormValue("color_mode")))
-	if colorMode != "COLOR" {
-		colorMode = "BW"
-	}
-
-	pricing, err := s.db.GetPricing(r.Context())
-	hasPricing := err == nil
-	if hasPricing && !pricing.ColorEnabled {
-		// Hardware enforcement: coerce to BW if kiosk color is disabled
-		colorMode = "BW"
-	}
-
-	pageRange := strings.TrimSpace(r.FormValue("page_range"))
-
-	normRes, err := pdf.NormalizeAndCountWithOptions(r.Context(), normalizedInputPath, outputPath, pdf.NormalizeOptions{
-		Copies:        copies,
-		Duplex:        duplexMode,
-		ColorMode:     colorMode,
-		PageRange:     pageRange,
-		Orientation:   orientationStr,
-		PagesPerSheet: pagesPerSheet,
-	})
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, outputPath, opts, pricing, hasPricing)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	unitPrice := s.resolveUnitPrice(pricing, hasPricing, colorMode, duplexMode)
-
-	totalPrintedPages := normRes.TotalPages * copies
-	totalPricePaise, err := payments.CalculatePricePaise(totalPrintedPages, unitPrice)
-	if err != nil {
-		_ = os.Remove(outputPath)
-		http.Error(w, "failed to calculate price", http.StatusInternalServerError)
 		return
 	}
 
@@ -804,11 +534,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		KioskID:        kioskID,
 		DisplayCode:    "",
 		DownloadURL:    downloadURL,
-		SHA256Checksum: normRes.SHA256Checksum,
-		TotalPages:     normRes.TotalPages,
-		TotalSheets:    normRes.TotalSheets,
-		Copies:         copies,
-		Duplex:         duplexMode,
+		SHA256Checksum: res.NormResult.SHA256Checksum,
+		TotalPages:     res.NormResult.TotalPages,
+		TotalSheets:    res.NormResult.TotalSheets,
+		Copies:         opts.Copies,
+		Duplex:         opts.Duplex,
 		StartFromPage:  1,
 	}
 
@@ -823,8 +553,8 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		OrderID:      orderID,
 		Command:      cmd,
 		Status:       contracts.JobStatusPendingPayment,
-		PricePaise:   totalPricePaise,
-		ColorMode:    colorMode,
+		PricePaise:   res.PricePaise,
+		ColorMode:    opts.ColorMode,
 		PINExpiresAt: pinExpiresAt,
 		ClaimToken:   claimToken,
 	}
@@ -844,15 +574,15 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"claim_token":           claimToken,
 		"recovery_token":        claimToken,
 		"pin_expires_at":        pinExpiresAt.Format(time.RFC3339),
-		"color_mode":            colorMode,
-		"total_pages":           normRes.TotalPages,
-		"total_sheets":          normRes.TotalSheets,
-		"copies":                copies,
-		"duplex":                string(duplexMode),
-		"price_per_sheet_paise": unitPrice,
-		"price_per_side_paise":  unitPrice,
-		"unit_price_paise":      unitPrice,
-		"total_price_paise":     totalPricePaise,
+		"color_mode":            opts.ColorMode,
+		"total_pages":           res.NormResult.TotalPages,
+		"total_sheets":          res.NormResult.TotalSheets,
+		"copies":                opts.Copies,
+		"duplex":                string(opts.Duplex),
+		"price_per_sheet_paise": res.UnitPrice,
+		"price_per_side_paise":  res.UnitPrice,
+		"unit_price_paise":      res.UnitPrice,
+		"total_price_paise":     res.PricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
 	})
 }
@@ -929,77 +659,6 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, f)
 }
 
-func (s *appServer) handleConvert(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	const maxUploadSize = 25 * 1024 * 1024 // 25 MiB
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
-		http.Error(w, "file exceeds 25 MiB limit or malformed", http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "missing file field", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	filename := header.Filename
-	if !pdf.IsSupportedFormat(filename) {
-		http.Error(w, fmt.Sprintf("unsupported file format %q: only PDF, Office documents (DOCX, PPTX, XLSX), and Images (JPG, PNG) are supported", filepath.Ext(filename)), http.StatusBadRequest)
-		return
-	}
-
-	ext := strings.ToLower(filepath.Ext(filename))
-	if ext == "" {
-		ext = ".tmp"
-	}
-	tmpInput, err := os.CreateTemp("", "conv_in_*"+ext)
-	if err != nil {
-		http.Error(w, "failed to create temp file", http.StatusInternalServerError)
-		return
-	}
-	tmpInputName := tmpInput.Name()
-	defer os.Remove(tmpInputName)
-	defer tmpInput.Close()
-
-	if _, err := io.Copy(tmpInput, file); err != nil {
-		http.Error(w, "failed to read uploaded file", http.StatusInternalServerError)
-		return
-	}
-	_ = tmpInput.Close()
-
-	tmpOutput, err := os.CreateTemp("", "conv_out_*.pdf")
-	if err != nil {
-		http.Error(w, "failed to create output file", http.StatusInternalServerError)
-		return
-	}
-	tmpOutputName := tmpOutput.Name()
-	defer os.Remove(tmpOutputName)
-	defer tmpOutput.Close()
-
-	if err := pdf.ConvertToPDF(r.Context(), tmpInputName, filename, tmpOutputName); err != nil {
-		http.Error(w, fmt.Sprintf("conversion failed: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	pdfBytes, err := os.ReadFile(tmpOutputName)
-	if err != nil {
-		http.Error(w, "failed to read converted pdf", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/pdf")
-	w.Header().Set("Content-Length", strconv.Itoa(len(pdfBytes)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(pdfBytes)
-}
-
 // handleDocumentPreview handles POST /api/documents/preview.
 // It accepts a single document and print settings, validates them, runs the canonical
 // normalization pipeline, and returns the print-ready PDF along with authoritative pricing
@@ -1044,111 +703,23 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}
 	defer file.Close()
 
-	if !pdf.IsSupportedFormat(filename) {
-		http.Error(w, fmt.Sprintf("unsupported file format %q: only PDF, Office documents (DOCX, PPTX, XLSX), and Images (JPG, PNG) are supported", filepath.Ext(filename)), http.StatusBadRequest)
-		return
-	}
-
-	copiesStr := strings.TrimSpace(r.FormValue("copies"))
-	copies := 1
-	if copiesStr != "" {
-		c, err := strconv.Atoi(copiesStr)
-		if err != nil || c < 1 || c > 999 {
-			http.Error(w, "copies must be between 1 and 999", http.StatusBadRequest)
-			return
-		}
-		copies = c
-	}
-
-	duplexStr := strings.TrimSpace(r.FormValue("duplex"))
-	var duplexMode contracts.DuplexMode
-	if duplexStr == "" {
-		duplexMode = contracts.DuplexSimplex
-	} else {
-		switch strings.ToUpper(duplexStr) {
-		case string(contracts.DuplexSimplex), "SINGLE", "SINGLE-SIDED", "FALSE":
-			duplexMode = contracts.DuplexSimplex
-		case string(contracts.DuplexLongEdge), "LONG_EDGE", "DUPLEX", "DOUBLE", "DOUBLE-SIDED", "TRUE":
-			duplexMode = contracts.DuplexLongEdge
-		case string(contracts.DuplexShortEdge), "SHORT_EDGE":
-			duplexMode = contracts.DuplexShortEdge
-		default:
-			http.Error(w, "invalid duplex mode", http.StatusBadRequest)
-			return
-		}
-	}
-
-	orientationStr := strings.ToUpper(strings.TrimSpace(r.FormValue("orientation")))
-	if orientationStr == "" {
-		orientationStr = "AUTO"
-	}
-	if orientationStr != "AUTO" && orientationStr != "PORTRAIT" && orientationStr != "LANDSCAPE" {
-		http.Error(w, fmt.Sprintf("invalid orientation %q: only AUTO, PORTRAIT, and LANDSCAPE are supported", r.FormValue("orientation")), http.StatusBadRequest)
-		return
-	}
-
-	pagesPerSheet := 1
-	nupStr := strings.TrimSpace(r.FormValue("pages_per_sheet"))
-	if nupStr == "" {
-		nupStr = strings.TrimSpace(r.FormValue("nup"))
-	}
-	if nupStr != "" {
-		n, err := strconv.Atoi(nupStr)
-		if err != nil || (n != 1 && n != 2 && n != 4 && n != 6) {
-			http.Error(w, fmt.Sprintf("invalid pages_per_sheet %q: only 1, 2, 4, and 6 are supported", nupStr), http.StatusBadRequest)
-			return
-		}
-		pagesPerSheet = n
-	}
-
-	colorMode := strings.ToUpper(strings.TrimSpace(r.FormValue("color_mode")))
-	if colorMode != "COLOR" {
-		colorMode = "BW"
-	}
-
-	pageRange := strings.TrimSpace(r.FormValue("page_range"))
-
-	ext := strings.ToLower(filepath.Ext(filename))
-	if ext == "" {
-		ext = ".pdf"
-	}
-	tmpInput, err := os.CreateTemp(s.cfg.jobsDir, "preview_in_*"+ext)
+	pricing, err := s.db.GetPricing(r.Context())
 	if err != nil {
-		http.Error(w, "failed to create temp file", http.StatusInternalServerError)
+		pricing = store.DefaultPricingConfig()
+	}
+
+	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, 0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	tmpInputName := tmpInput.Name()
-	defer func() {
-		_ = tmpInput.Close()
-		_ = os.Remove(tmpInputName)
-	}()
 
-	if _, err := io.Copy(tmpInput, file); err != nil {
-		http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
+	prep, err := prepareInputPDF(r.Context(), file, filename, s.cfg.jobsDir, "preview_in_*", 0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	_ = tmpInput.Close()
-
-	normalizedInputPath := tmpInputName
-	if ext != ".pdf" {
-		tmpConverted, err := os.CreateTemp(s.cfg.jobsDir, "preview_conv_*.pdf")
-		if err != nil {
-			http.Error(w, "failed to create temp file for conversion", http.StatusInternalServerError)
-			return
-		}
-		tmpConvertedName := tmpConverted.Name()
-		defer func() {
-			_ = tmpConverted.Close()
-			_ = os.Remove(tmpConvertedName)
-		}()
-		_ = tmpConverted.Close()
-
-		if err := pdf.ConvertToPDF(r.Context(), tmpInputName, filename, tmpConvertedName); err != nil {
-			http.Error(w, fmt.Sprintf("document conversion failed: %v", err), http.StatusBadRequest)
-			return
-		}
-		normalizedInputPath = tmpConvertedName
-	}
+	defer prep.cleanup()
 
 	tmpOutput, err := os.CreateTemp(s.cfg.jobsDir, "preview_out_*.pdf")
 	if err != nil {
@@ -1162,38 +733,9 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}()
 	_ = tmpOutput.Close()
 
-	pricing, err := s.db.GetPricing(r.Context())
-	if err != nil {
-		pricing = store.PricingConfig{
-			BWSimplexPricePaise:    200,
-			BWDuplexPricePaise:     150,
-			ColorSimplexPricePaise: 1000,
-			ColorDuplexPricePaise:  750,
-			ColorEnabled:           false,
-		}
-	}
-	if !pricing.ColorEnabled {
-		colorMode = "BW"
-	}
-
-	normRes, err := pdf.NormalizeAndCountWithOptions(r.Context(), normalizedInputPath, tmpOutputName, pdf.NormalizeOptions{
-		Copies:        copies,
-		Duplex:        duplexMode,
-		ColorMode:     colorMode,
-		PageRange:     pageRange,
-		Orientation:   orientationStr,
-		PagesPerSheet: pagesPerSheet,
-	})
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, pricing, true)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("preview generation failed: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	unitPrice := s.resolveUnitPrice(pricing, true, colorMode, duplexMode)
-	totalPrintedSides := normRes.TotalPages * copies
-	totalPricePaise, err := payments.CalculatePricePaise(totalPrintedSides, unitPrice)
-	if err != nil {
-		http.Error(w, "failed to calculate price", http.StatusInternalServerError)
 		return
 	}
 
@@ -1206,17 +748,17 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	if isJSON {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"billed_sides":      totalPrintedSides,
-			"total_sheets":     normRes.TotalSheets,
-			"copies":           copies,
-			"total_price_paise": totalPricePaise,
-			"normalized_pages": normRes.TotalPages,
-			"padded_pages":     normRes.PaddedPages,
-			"sha256_checksum":  normRes.SHA256Checksum,
-			"color_mode":       colorMode,
-			"duplex":           string(duplexMode),
-			"orientation":      orientationStr,
-			"pages_per_sheet":  pagesPerSheet,
+			"billed_sides":      res.PrintedSides,
+			"total_sheets":     res.NormResult.TotalSheets,
+			"copies":           opts.Copies,
+			"total_price_paise": res.PricePaise,
+			"normalized_pages": res.NormResult.TotalPages,
+			"padded_pages":     res.NormResult.PaddedPages,
+			"sha256_checksum":  res.NormResult.SHA256Checksum,
+			"color_mode":       opts.ColorMode,
+			"duplex":           string(opts.Duplex),
+			"orientation":      opts.Orientation,
+			"pages_per_sheet":  opts.PagesPerSheet,
 		})
 		return
 	}
@@ -1229,13 +771,13 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Length", strconv.Itoa(len(pdfBytes)))
-	w.Header().Set("X-Billed-Sides", strconv.Itoa(totalPrintedSides))
-	w.Header().Set("X-Total-Sheets", strconv.Itoa(normRes.TotalSheets))
-	w.Header().Set("X-Copies", strconv.Itoa(copies))
-	w.Header().Set("X-Total-Price-Paise", strconv.FormatInt(totalPricePaise, 10))
-	w.Header().Set("X-Normalized-Pages", strconv.Itoa(normRes.TotalPages))
-	w.Header().Set("X-Padded-Pages", strconv.Itoa(normRes.PaddedPages))
-	w.Header().Set("X-SHA256-Checksum", normRes.SHA256Checksum)
+	w.Header().Set("X-Billed-Sides", strconv.Itoa(res.PrintedSides))
+	w.Header().Set("X-Total-Sheets", strconv.Itoa(res.NormResult.TotalSheets))
+	w.Header().Set("X-Copies", strconv.Itoa(opts.Copies))
+	w.Header().Set("X-Total-Price-Paise", strconv.FormatInt(res.PricePaise, 10))
+	w.Header().Set("X-Normalized-Pages", strconv.Itoa(res.NormResult.TotalPages))
+	w.Header().Set("X-Padded-Pages", strconv.Itoa(res.NormResult.PaddedPages))
+	w.Header().Set("X-SHA256-Checksum", res.NormResult.SHA256Checksum)
 	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, X-Billed-Sides, X-Total-Sheets, X-Copies, X-Total-Price-Paise, X-Normalized-Pages, X-Padded-Pages, X-SHA256-Checksum")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(pdfBytes)
@@ -1885,10 +1427,47 @@ func main() {
 		paymentProvider: paymentProv,
 	}
 
+	mux := app.routes()
+
+	proxySecret := strings.TrimSpace(os.Getenv("XEROXGO_PROXY_SECRET"))
+	handler := createIngressHandler(mux, proxySecret, devMode)
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go app.startConversionWorker(sigCtx)
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v, price=%d paise)", addr, devMode, pricePaise)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrCh <- err
+		}
+	}()
+
+	select {
+	case err := <-serverErrCh:
+		log.Fatalf("server failure: %v", err)
+	case <-sigCtx.Done():
+		log.Printf("shutting down cloud backend...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown error: %v", err)
+		}
+	}
+}
+
+// routes registers and returns the standard HTTP request multiplexer for the cloud backend.
+func (app *appServer) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.handleHealthz)
 	mux.HandleFunc("/api/documents/preview", app.handleDocumentPreview)
-	mux.HandleFunc("/api/convert", app.handleConvert)
 	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
 	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
 	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
@@ -1941,7 +1520,9 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
-	mux.HandleFunc("/ws", hub.ServeHTTP)
+	if app.hub != nil {
+		mux.HandleFunc("/ws", app.hub.ServeHTTP)
+	}
 	mux.HandleFunc("/pay/", app.handleDemoPayRoutes)
 
 	// Public Ads API
@@ -1970,38 +1551,7 @@ func main() {
 	mux.HandleFunc("/api/admin/orders", app.handleAdminOrders)
 	mux.HandleFunc("/api/admin/orders/export", app.handleAdminOrdersExport)
 
-	proxySecret := strings.TrimSpace(os.Getenv("XEROXGO_PROXY_SECRET"))
-	handler := createIngressHandler(mux, proxySecret, devMode)
-
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: handler,
-	}
-
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	go app.startConversionWorker(sigCtx)
-
-	serverErrCh := make(chan error, 1)
-	go func() {
-		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v, price=%d paise)", addr, devMode, pricePaise)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErrCh <- err
-		}
-	}()
-
-	select {
-	case err := <-serverErrCh:
-		log.Fatalf("server failure: %v", err)
-	case <-sigCtx.Done():
-		log.Printf("shutting down cloud backend...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("graceful shutdown error: %v", err)
-		}
-	}
+	return mux
 }
 
 // createIngressHandler wraps the root HTTP mux with CORS headers and proxy secret validation.
