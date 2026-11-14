@@ -1217,14 +1217,18 @@ func TestClientStartupRecovery(t *testing.T) {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
+		completedCh := make(chan string, 1)
 		client, err := NewClient(ClientConfig{
-			CloudURL:      "ws://127.0.0.1:8080/ws",
-			KioskID:       "kiosk-j",
-			StateStore:    store,
-			PrinterAddr:   printerLn.Addr().String(),
-			DownloadDir:   tmpDir,
-			IdleQRContent: "https://example.com/kiosk-j",
-			ScreenSink:    noopSink,
+			CloudURL:       "ws://127.0.0.1:8080/ws",
+			KioskID:        "kiosk-j",
+			StateStore:     store,
+			PrinterAddr:    printerLn.Addr().String(),
+			DownloadDir:    tmpDir,
+			IdleQRContent:  "https://example.com/kiosk-j",
+			ScreenSink:     noopSink,
+			OnJobCompleted: func(jobID string) {
+				completedCh <- jobID
+			},
 		})
 		if err != nil {
 			t.Fatalf("NewClient failed: %v", err)
@@ -1237,19 +1241,39 @@ func TestClientStartupRecovery(t *testing.T) {
 			_ = client.Run(ctx)
 		}()
 
-		deadline := time.Now().Add(3 * time.Second)
-		completed := false
-		for time.Now().Before(deadline) {
-			inc, err := store.GetIncompleteJob(ctx)
-			if err == nil && inc == nil {
-				completed = true
-				break
+		select {
+		case completedID := <-completedCh:
+			if completedID != job0.JobID {
+				t.Fatalf("expected completed job %s, got %s", job0.JobID, completedID)
 			}
-			time.Sleep(30 * time.Millisecond)
+		case <-time.After(10 * time.Second):
+			t.Fatal("incomplete job with 0 pages was not recovered to COMPLETED within 10s")
 		}
 
-		if !completed {
-			t.Fatal("incomplete job with 0 pages was not recovered to COMPLETED")
+		// Verify the persisted job status is actually COMPLETED, not merely absent from the incomplete-job query
+		savedJob, err := store.GetJob(context.Background(), job0.JobID)
+		if err != nil {
+			t.Fatalf("failed to query recovered job: %v", err)
+		}
+		if savedJob == nil {
+			t.Fatalf("expected job %s to be persisted in store, found nil", job0.JobID)
+		}
+		if savedJob.Status != contracts.JobStatusCompleted {
+			t.Fatalf("expected recovered job status to be %s, got %s", contracts.JobStatusCompleted, savedJob.Status)
+		}
+		if savedJob.SheetsPrinted != job0.TotalSheets {
+			t.Fatalf("expected %d sheets printed, got %d", job0.TotalSheets, savedJob.SheetsPrinted)
+		}
+		if savedJob.PagesPrinted != job0.TotalPages {
+			t.Fatalf("expected %d pages printed, got %d", job0.TotalPages, savedJob.PagesPrinted)
+		}
+
+		inc, err := store.GetIncompleteJob(context.Background())
+		if err != nil {
+			t.Fatalf("GetIncompleteJob failed: %v", err)
+		}
+		if inc != nil {
+			t.Fatalf("expected no incomplete job, found %+v", inc)
 		}
 	})
 
@@ -1321,7 +1345,7 @@ func TestClientStartupRecovery(t *testing.T) {
 			_ = client.Run(ctx)
 		}()
 
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(5 * time.Second)
 		paused := false
 		for time.Now().Before(deadline) {
 			inc, err := store.GetIncompleteJob(ctx)
@@ -1331,11 +1355,26 @@ func TestClientStartupRecovery(t *testing.T) {
 					break
 				}
 			}
-			time.Sleep(30 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 
 		if !paused {
 			t.Fatal("partially printed job was not paused in PAUSED_ERROR with reconciliation required")
+		}
+
+		// Verify job record in store is preserved in PAUSED_ERROR
+		savedPartial, err := store.GetJob(context.Background(), jobSlice.JobID)
+		if err != nil {
+			t.Fatalf("failed to query partially printed job: %v", err)
+		}
+		if savedPartial == nil {
+			t.Fatalf("expected job %s to be persisted in store, found nil", jobSlice.JobID)
+		}
+		if savedPartial.Status != contracts.JobStatusPausedError {
+			t.Fatalf("expected job status %s, got %s", contracts.JobStatusPausedError, savedPartial.Status)
+		}
+		if !strings.Contains(savedPartial.ErrorReason, "reconciliation required") {
+			t.Fatalf("expected error reason to require reconciliation, got %q", savedPartial.ErrorReason)
 		}
 
 		// Verify zero bytes were submitted to the printer (no Pi slicing or duplicate reprint)
