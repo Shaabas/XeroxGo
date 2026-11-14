@@ -548,10 +548,10 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 		t.Fatalf("cloud WS hub did not receive final COMPLETED progress event: %+v", receivedProgress)
 	}
 
-	// 5. Verify local PDF payload was shredded immediately after printing (ETSI EN 303 645 / GDPR compliance)
-	shreddedPath := filepath.Join(tmpDir, jobCmd.JobID+".pdf")
-	if _, err := os.Stat(shreddedPath); !os.IsNotExist(err) {
-		t.Fatalf("expected printed document payload to be deleted from disk, but file still exists at %s", shreddedPath)
+	// 5. Verify local PDF payload was deleted immediately after printing (ETSI EN 303 645 / GDPR compliance)
+	deletedPath := jobPDFPath(tmpDir, jobCmd.JobID)
+	if _, err := os.Stat(deletedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected printed document payload to be deleted from disk, but file still exists at %s", deletedPath)
 	}
 }
 
@@ -1805,6 +1805,325 @@ func TestSpooler_SNMPTargetSelectionPolicy(t *testing.T) {
 		snmp2 := c2.getSNMPConfig()
 		if snmp2 != nil {
 			t.Errorf("expected getSNMPConfig() = nil for loopback raw TCP address, got %+v", snmp2)
+		}
+	})
+}
+
+func TestJobPDFCleanup(t *testing.T) {
+	// Test A — Successful completion
+	t.Run("successful completion deletes intended PDF and preserves others", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		cmd := contracts.PrintJobCommand{
+			JobID:         "job-clean-A",
+			KioskID:       "kiosk-cleanup",
+			TotalPages:    2,
+			TotalSheets:   2,
+			Copies:        1,
+			StartFromPage: 1,
+			Duplex:        contracts.DuplexSimplex,
+		}
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		intendedPDF := jobPDFPath(tmpDir, cmd.JobID)
+		if err := os.WriteFile(intendedPDF, []byte("%PDF-1.4 intended"), 0644); err != nil {
+			t.Fatalf("failed to write intended PDF: %v", err)
+		}
+
+		otherCmd := contracts.PrintJobCommand{
+			JobID:         "job-clean-other",
+			KioskID:       "kiosk-cleanup",
+			TotalPages:    1,
+			TotalSheets:   1,
+			Copies:        1,
+			StartFromPage: 1,
+			Duplex:        contracts.DuplexSimplex,
+		}
+		otherPDF := jobPDFPath(tmpDir, otherCmd.JobID)
+		if err := os.WriteFile(otherPDF, []byte("%PDF-1.4 other"), 0644); err != nil {
+			t.Fatalf("failed to write other PDF: %v", err)
+		}
+
+		var completedCalled bool
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-cleanup",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-cleanup",
+			ScreenSink:    noopSink,
+			OnJobCompleted: func(jobID string) {
+				if jobID == cmd.JobID {
+					completedCalled = true
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.completeJob(ctx, cmd)
+
+		// Assert that the job becomes COMPLETED
+		saved, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved == nil || saved.Status != contracts.JobStatusCompleted {
+			t.Fatalf("expected job status COMPLETED, got %+v", saved)
+		}
+
+		// Assert that the PDF is removed from disk
+		if _, err := os.Stat(intendedPDF); !os.IsNotExist(err) {
+			t.Errorf("expected intended PDF %s to be deleted, but it exists", intendedPDF)
+		}
+
+		// Assert that only the intended job file was deleted (other job PDF remains)
+		if _, err := os.Stat(otherPDF); err != nil {
+			t.Errorf("expected other PDF %s to remain on disk, got err: %v", otherPDF, err)
+		}
+
+		if !completedCalled {
+			t.Error("expected OnJobCompleted callback to be invoked")
+		}
+	})
+
+	// Test B — Persistence failure
+	t.Run("persistence failure preserves PDF and does not invoke callback", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		cmd := contracts.PrintJobCommand{
+			JobID:         "job-clean-B",
+			KioskID:       "kiosk-cleanup",
+			TotalPages:    2,
+			TotalSheets:   2,
+			Copies:        1,
+			StartFromPage: 1,
+			Duplex:        contracts.DuplexSimplex,
+		}
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		// Arrange for persistence failure by exhausting paper inventory to 0 while job requires 2 sheets
+		if err := store.ResetPaperTray(ctx, 0); err != nil {
+			t.Fatalf("ResetPaperTray failed: %v", err)
+		}
+
+		pdfPath := jobPDFPath(tmpDir, cmd.JobID)
+		if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 fail-test"), 0644); err != nil {
+			t.Fatalf("failed to write PDF: %v", err)
+		}
+
+		var callbackInvoked bool
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-cleanup",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-cleanup",
+			ScreenSink:    noopSink,
+			OnJobCompleted: func(jobID string) {
+				callbackInvoked = true
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.completeJob(ctx, cmd)
+
+		// Assert the PDF still exists
+		if _, err := os.Stat(pdfPath); err != nil {
+			t.Errorf("expected PDF %s to still exist after persistence failure, got err: %v", pdfPath, err)
+		}
+
+		// Assert the completion callback is not invoked
+		if callbackInvoked {
+			t.Error("expected completion callback NOT to be invoked on persistence failure")
+		}
+
+		// Assert job was not marked completed (transitions to PAUSED_ERROR via handleJobError)
+		saved, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved != nil && saved.Status == contracts.JobStatusCompleted {
+			t.Errorf("job must not be marked COMPLETED when persistence fails")
+		}
+	})
+
+	// Test C — Missing PDF
+	t.Run("missing PDF does not prevent successful completion", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		cmd := contracts.PrintJobCommand{
+			JobID:         "job-clean-C",
+			KioskID:       "kiosk-cleanup",
+			TotalPages:    1,
+			TotalSheets:   1,
+			Copies:        1,
+			StartFromPage: 1,
+			Duplex:        contracts.DuplexSimplex,
+		}
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		// Ensure PDF does NOT exist on disk
+		pdfPath := jobPDFPath(tmpDir, cmd.JobID)
+		_ = os.Remove(pdfPath)
+
+		var callbackInvoked bool
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-cleanup",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-cleanup",
+			ScreenSink:    noopSink,
+			OnJobCompleted: func(jobID string) {
+				callbackInvoked = true
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.completeJob(ctx, cmd)
+
+		saved, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved == nil || saved.Status != contracts.JobStatusCompleted {
+			t.Fatalf("expected job status COMPLETED despite missing PDF, got %+v", saved)
+		}
+
+		if !callbackInvoked {
+			t.Error("expected completion callback to be invoked even if PDF was already absent")
+		}
+	})
+
+	// Test D — Path consistency
+	t.Run("path consistency, uniqueness, and path traversal resistance", func(t *testing.T) {
+		downloadDir := "/var/kiosk/downloads"
+
+		// 1. Verify canonical hash formulation matches download & cleanup
+		jobID := "order-12345"
+		expectedHash := sha256.Sum256([]byte(jobID))
+		expectedPath := filepath.Join(downloadDir, hex.EncodeToString(expectedHash[:])+".pdf")
+		if got := jobPDFPath(downloadDir, jobID); got != expectedPath {
+			t.Errorf("jobPDFPath() = %q, want %q", got, expectedPath)
+		}
+
+		// 2. Distinct job IDs produce distinct paths
+		path1 := jobPDFPath(downloadDir, "job-alpha")
+		path2 := jobPDFPath(downloadDir, "job-beta")
+		if path1 == path2 {
+			t.Errorf("distinct job IDs produced identical path: %s", path1)
+		}
+
+		// 3. Path traversal resistance
+		traversalIDs := []string{
+			"../../etc/passwd",
+			"../../../tmp/evil",
+			"..",
+			"/absolute/path/override",
+			"sub/dir/job",
+			"foo\x00bar",
+		}
+		for _, evilID := range traversalIDs {
+			p := jobPDFPath(downloadDir, evilID)
+			if filepath.Dir(p) != filepath.Clean(downloadDir) {
+				t.Errorf("job ID %q escaped download directory: %s", evilID, p)
+			}
+			base := filepath.Base(p)
+			if !strings.HasSuffix(base, ".pdf") || len(base) != 64+4 {
+				t.Errorf("job ID %q generated unexpected base filename: %s", evilID, base)
+			}
+		}
+	})
+
+	// Test E — Interrupted / paused jobs retain their files
+	t.Run("interrupted and paused jobs retain downloaded PDF files", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		cmd := contracts.PrintJobCommand{
+			JobID:         "job-clean-E-interrupted",
+			KioskID:       "kiosk-cleanup",
+			TotalPages:    4,
+			TotalSheets:   2,
+			Copies:        1,
+			StartFromPage: 1,
+			Duplex:        contracts.DuplexSimplex,
+		}
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		pdfPath := jobPDFPath(tmpDir, cmd.JobID)
+		if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 recovery-data"), 0644); err != nil {
+			t.Fatalf("failed to write PDF: %v", err)
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-cleanup",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-cleanup",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		// Trigger job error (e.g. hardware fault interruption)
+		client.handleJobError(ctx, cmd, 1, 1, "paper feed jam detected in printer")
+
+		// Verify job is PAUSED_ERROR
+		saved, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved == nil || saved.Status != contracts.JobStatusPausedError {
+			t.Fatalf("expected job status PAUSED_ERROR, got %+v", saved)
+		}
+
+		// Verify PDF file was NOT deleted
+		if _, err := os.Stat(pdfPath); err != nil {
+			t.Fatalf("interrupted job PDF must remain on disk for recovery, but got err: %v", err)
 		}
 	})
 }

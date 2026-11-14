@@ -1187,6 +1187,11 @@ func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 	}
 }
 
+func jobPDFPath(downloadDir, jobID string) string {
+	h := sha256.Sum256([]byte(jobID))
+	return filepath.Join(downloadDir, hex.EncodeToString(h[:])+".pdf")
+}
+
 func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) {
 	if c.pinController != nil && c.pinController.HasActiveTransaction() {
 		activeOrderID := c.pinController.ActiveOrderID()
@@ -1238,9 +1243,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 
 	// 3. Download & verify PDF
-	h := sha256.Sum256([]byte(cmd.JobID))
-	finalName := hex.EncodeToString(h[:]) + ".pdf"
-	finalPath := filepath.Join(c.cfg.DownloadDir, finalName)
+	finalPath := jobPDFPath(c.cfg.DownloadDir, cmd.JobID)
 
 	needDownload := true
 	if existingData, err := os.ReadFile(finalPath); err == nil {
@@ -1587,11 +1590,11 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 		return
 	}
 
-	// Post-print document shredder: immediately delete the downloaded PDF payload from local disk
+	// Post-print cleanup: remove downloaded PDF payload from local disk
 	// to enforce ETSI EN 303 645 (Provision 5.4), NIST SP 800-213, and GDPR/DPDP storage limitation.
-	finalPath := filepath.Join(c.cfg.DownloadDir, cmd.JobID+".pdf")
+	finalPath := jobPDFPath(c.cfg.DownloadDir, cmd.JobID)
 	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("[WARN] Failed to shred local printed payload %s: %v", finalPath, err)
+		log.Printf("[WARN] Failed to remove local printed payload %s: %v", finalPath, err)
 	}
 
 	c.sendProgress(ctx, evt)
