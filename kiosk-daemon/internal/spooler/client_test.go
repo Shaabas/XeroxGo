@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"image"
 	"io"
 	"net"
@@ -1628,4 +1629,143 @@ func TestClientResetsToIdleAfterCompletion(t *testing.T) {
 	if !resetSeen {
 		t.Fatal("expected kiosk screen to reset to ModeIdle after completion duration")
 	}
+}
+
+func TestSpooler_SNMPTargetSelectionPolicy(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "state.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test state db: %v", err)
+	}
+	defer store.Close()
+
+	baseCfg := ClientConfig{
+		CloudURL:      "ws://127.0.0.1:8080/ws",
+		KioskID:       "kiosk-target-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://kiosk.test/idle",
+		ScreenSink:    noopSink,
+		PrinterAddr:   "192.168.99.2:9100", // Default PJL address
+	}
+
+	t.Run("CUPS XeroxGoSim localhost device URI yields no automatic SNMP target", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.CUPSQueue = "XeroxGoSim"
+		cfg.CUPSRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" && len(args) == 2 && args[0] == "-v" && args[1] == "XeroxGoSim" {
+				return []byte("device for XeroxGoSim: ipp://localhost:8631/ipp/print\n"), nil
+			}
+			return nil, errors.New("unexpected command")
+		}
+
+		c, err := NewClient(cfg)
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		snmp := c.getSNMPConfig()
+		if snmp != nil {
+			t.Errorf("expected getSNMPConfig() to return nil for loopback discovery, got %+v", snmp)
+		}
+	})
+
+	t.Run("CUPS HPTank yields discovered host 10.42.0.210", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.CUPSQueue = "HPTank"
+		cfg.CUPSRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" && len(args) == 2 && args[0] == "-v" && args[1] == "HPTank" {
+				return []byte("device for HPTank: ipp://10.42.0.210:631/ipp/print\n"), nil
+			}
+			return nil, errors.New("unexpected command")
+		}
+
+		c, err := NewClient(cfg)
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		snmp := c.getSNMPConfig()
+		if snmp == nil {
+			t.Fatal("expected non-nil SNMPConfig for HPTank discovery")
+		}
+		if snmp.Target != "10.42.0.210" {
+			t.Errorf("expected SNMP target 10.42.0.210, got %s", snmp.Target)
+		}
+	})
+
+	t.Run("explicit SNMP target overrides CUPS discovery", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.CUPSQueue = "HPTank"
+		cfg.SNMPTarget = "127.0.0.1" // Explicit 127.0.0.1 must be honored
+		cfg.CUPSRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("device for HPTank: ipp://10.42.0.210:631/ipp/print\n"), nil
+		}
+
+		c, err := NewClient(cfg)
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		snmp := c.getSNMPConfig()
+		if snmp == nil {
+			t.Fatal("expected non-nil SNMPConfig for explicit SNMP target")
+		}
+		if snmp.Target != "127.0.0.1" {
+			t.Errorf("expected SNMP target 127.0.0.1, got %s", snmp.Target)
+		}
+	})
+
+	t.Run("failed CUPS discovery does not use 192.168.99.2", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.CUPSQueue = "BrokenQueue"
+		cfg.PrinterAddr = "192.168.99.2:9100"
+		cfg.CUPSRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return nil, errors.New("lpstat: queue not found")
+		}
+
+		c, err := NewClient(cfg)
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		snmp := c.getSNMPConfig()
+		if snmp != nil {
+			t.Errorf("expected getSNMPConfig() = nil when CUPS discovery fails, got %+v (must not use 192.168.99.2)", snmp)
+		}
+	})
+
+	t.Run("raw TCP/PJL mode preserves current target behavior", func(t *testing.T) {
+		// Non-loopback printer address
+		cfg1 := baseCfg
+		cfg1.CUPSQueue = ""
+		cfg1.PrinterAddr = "192.168.1.50:9100"
+
+		c1, err := NewClient(cfg1)
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+		snmp1 := c1.getSNMPConfig()
+		if snmp1 == nil {
+			t.Fatal("expected non-nil SNMPConfig for raw TCP 192.168.1.50")
+		}
+		if snmp1.Target != "192.168.1.50" {
+			t.Errorf("expected SNMP target 192.168.1.50, got %s", snmp1.Target)
+		}
+
+		// Loopback printer address
+		cfg2 := baseCfg
+		cfg2.CUPSQueue = ""
+		cfg2.PrinterAddr = "127.0.0.1:9100"
+
+		c2, err := NewClient(cfg2)
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+		snmp2 := c2.getSNMPConfig()
+		if snmp2 != nil {
+			t.Errorf("expected getSNMPConfig() = nil for loopback raw TCP address, got %+v", snmp2)
+		}
+	})
 }

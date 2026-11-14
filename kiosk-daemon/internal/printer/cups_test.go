@@ -1244,3 +1244,116 @@ func TestMonitorCUPSJobWithTelemetryCustom_OdometerTracking(t *testing.T) {
 		t.Errorf("last reported sheet = %d, want 3", last)
 	}
 }
+
+func TestIsLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"localhost", true},
+		{"LocalHost", true},
+		{"127.0.0.1", true},
+		{"127.0.0.2", true},
+		{"127.1.2.3", true},
+		{"127.255.255.255", true},
+		{"::1", true},
+		{"10.42.0.210", false},
+		{"192.168.99.2", false},
+		{"192.168.1.50", false},
+		{"printer.example.com", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		got := IsLoopbackHost(tc.host)
+		if got != tc.want {
+			t.Errorf("IsLoopbackHost(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
+}
+
+func TestResolveSNMPTarget(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("CUPS XeroxGoSim loopback device URI yields no automatic SNMP target", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" && len(args) == 2 && args[0] == "-v" && args[1] == "XeroxGoSim" {
+				return []byte("device for XeroxGoSim: ipp://localhost:8631/ipp/print\n"), nil
+			}
+			return nil, errors.New("unexpected command")
+		}
+
+		// Even when printerAddr defaults to 192.168.99.2:9100, do not fall back!
+		target := ResolveSNMPTarget(ctx, runner, "", "XeroxGoSim", "192.168.99.2:9100")
+		if target != "" {
+			t.Errorf("ResolveSNMPTarget for XeroxGoSim loopback = %q, want empty", target)
+		}
+	})
+
+	t.Run("CUPS HPTank yields discovered host 10.42.0.210", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" && len(args) == 2 && args[0] == "-v" && args[1] == "HPTank" {
+				return []byte("device for HPTank: ipp://10.42.0.210:631/ipp/print\n"), nil
+			}
+			return nil, errors.New("unexpected command")
+		}
+
+		target := ResolveSNMPTarget(ctx, runner, "", "HPTank", "192.168.99.2:9100")
+		if target != "10.42.0.210" {
+			t.Errorf("ResolveSNMPTarget for HPTank = %q, want 10.42.0.210", target)
+		}
+	})
+
+	t.Run("explicit SNMP target overrides CUPS discovery", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("device for HPTank: ipp://10.42.0.210:631/ipp/print\n"), nil
+		}
+
+		// Explicit 127.0.0.1 wins
+		target1 := ResolveSNMPTarget(ctx, runner, "127.0.0.1", "HPTank", "192.168.99.2:9100")
+		if target1 != "127.0.0.1" {
+			t.Errorf("ResolveSNMPTarget with explicit 127.0.0.1 = %q, want 127.0.0.1", target1)
+		}
+
+		// Explicit 10.0.0.99 wins
+		target2 := ResolveSNMPTarget(ctx, runner, "10.0.0.99", "HPTank", "192.168.99.2:9100")
+		if target2 != "10.0.0.99" {
+			t.Errorf("ResolveSNMPTarget with explicit 10.0.0.99 = %q, want 10.0.0.99", target2)
+		}
+	})
+
+	t.Run("failed CUPS discovery does not use 192.168.99.2", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return nil, errors.New("lpstat error: queue not found")
+		}
+
+		target := ResolveSNMPTarget(ctx, runner, "", "BrokenQueue", "192.168.99.2:9100")
+		if target != "" {
+			t.Errorf("ResolveSNMPTarget on discovery failure = %q, want empty (must not use 192.168.99.2)", target)
+		}
+	})
+
+	t.Run("raw TCP/PJL mode preserves current target behavior", func(t *testing.T) {
+		// Non-loopback printer address returns host
+		target1 := ResolveSNMPTarget(ctx, nil, "", "", "192.168.1.50:9100")
+		if target1 != "192.168.1.50" {
+			t.Errorf("ResolveSNMPTarget raw TCP non-loopback = %q, want 192.168.1.50", target1)
+		}
+
+		// Loopback printer address returns empty (ignores loopback candidate)
+		target2 := ResolveSNMPTarget(ctx, nil, "", "", "127.0.0.1:9100")
+		if target2 != "" {
+			t.Errorf("ResolveSNMPTarget raw TCP loopback 127.0.0.1 = %q, want empty", target2)
+		}
+
+		target3 := ResolveSNMPTarget(ctx, nil, "", "", "localhost:9100")
+		if target3 != "" {
+			t.Errorf("ResolveSNMPTarget raw TCP loopback localhost = %q, want empty", target3)
+		}
+
+		// Empty printer address returns empty
+		target4 := ResolveSNMPTarget(ctx, nil, "", "", "")
+		if target4 != "" {
+			t.Errorf("ResolveSNMPTarget raw TCP empty = %q, want empty", target4)
+		}
+	})
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os/exec"
 	"regexp"
@@ -798,6 +799,9 @@ func DiscoverQueueHost(ctx context.Context, runner CommandRunner, queue string) 
 	if strings.TrimSpace(queue) == "" {
 		return ""
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if runner == nil {
 		runner = defaultCommandRunner
 	}
@@ -806,6 +810,63 @@ func DiscoverQueueHost(ctx context.Context, runner CommandRunner, queue string) 
 		return ""
 	}
 	return ExtractHostFromCUPSDeviceURI(string(out))
+}
+
+// IsLoopbackHost returns true if host is localhost, ::1, or within 127.0.0.0/8.
+func IsLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+// ResolveSNMPTarget determines the SNMP target host according to the system policy:
+// 1. Explicit nonempty SNMPTarget always wins, including 127.0.0.1.
+// 2. Otherwise, when CUPSQueue is configured, discover its device host using DiscoverQueueHost.
+// 3. If that host is loopback (localhost, 127.0.0.0/8, ::1), treat automatic SNMP as unconfigured. Do not fall back to PrinterAddr.
+// 4. If CUPS host discovery fails, leave automatic SNMP unconfigured. Do not fall back to the default PJL address.
+// 5. When no CUPS queue is configured, preserve existing non-loopback PrinterAddr-based SNMP selection.
+func ResolveSNMPTarget(
+	ctx context.Context,
+	runner CommandRunner,
+	explicitTarget string,
+	cupsQueue string,
+	printerAddr string,
+) string {
+	if explicit := strings.TrimSpace(explicitTarget); explicit != "" {
+		return explicit
+	}
+
+	if queue := strings.TrimSpace(cupsQueue); queue != "" {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		discovered := DiscoverQueueHost(ctx, runner, queue)
+		if discovered == "" || IsLoopbackHost(discovered) {
+			return ""
+		}
+		return discovered
+	}
+
+	var candidate string
+	if h, _, err := net.SplitHostPort(printerAddr); err == nil && h != "" {
+		candidate = h
+	} else if trimmed := strings.TrimSpace(printerAddr); trimmed != "" {
+		candidate = trimmed
+	}
+
+	if candidate != "" && !IsLoopbackHost(candidate) {
+		return candidate
+	}
+	return ""
 }
 
 // PollCUPSHealth checks the operational status of a CUPS queue using lpstat.
