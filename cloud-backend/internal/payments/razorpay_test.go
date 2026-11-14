@@ -38,6 +38,53 @@ func TestCalculatePricePaise(t *testing.T) {
 	}
 }
 
+func TestCalculateDocumentPricePaise(t *testing.T) {
+	testCases := []struct {
+		name     string
+		pages    int
+		isColor  bool
+		isDuplex bool
+		copies   int
+		expected int64
+	}{
+		// 3-page odd duplex test cases (crucial user requirement: 5 for first 2 pages, 3 for 3rd page = 8)
+		{name: "3-page BW Duplex (1 copy)", pages: 3, isColor: false, isDuplex: true, copies: 1, expected: 800},
+		{name: "3-page BW Duplex (2 copies)", pages: 3, isColor: false, isDuplex: true, copies: 2, expected: 1600},
+		{name: "1-page BW Duplex (1 copy)", pages: 1, isColor: false, isDuplex: true, copies: 1, expected: 300},
+		{name: "2-page BW Duplex (1 copy)", pages: 2, isColor: false, isDuplex: true, copies: 1, expected: 500},
+		{name: "4-page BW Duplex (1 copy)", pages: 4, isColor: false, isDuplex: true, copies: 1, expected: 1000},
+		{name: "5-page BW Duplex (1 copy)", pages: 5, isColor: false, isDuplex: true, copies: 1, expected: 1300}, // 5 + 5 + 3 = 13
+
+		// Single-sided BW
+		{name: "1-page BW Simplex", pages: 1, isColor: false, isDuplex: false, copies: 1, expected: 300},
+		{name: "2-page BW Simplex", pages: 2, isColor: false, isDuplex: false, copies: 1, expected: 600},
+		{name: "3-page BW Simplex", pages: 3, isColor: false, isDuplex: false, copies: 1, expected: 900},
+
+		// Color Duplex
+		{name: "1-page Color Duplex", pages: 1, isColor: true, isDuplex: true, copies: 1, expected: 800},
+		{name: "2-page Color Duplex", pages: 2, isColor: true, isDuplex: true, copies: 1, expected: 1000},
+		{name: "3-page Color Duplex", pages: 3, isColor: true, isDuplex: true, copies: 1, expected: 1800}, // 10 + 8 = 18
+		{name: "4-page Color Duplex", pages: 4, isColor: true, isDuplex: true, copies: 1, expected: 2000},
+
+		// Color Simplex
+		{name: "1-page Color Simplex", pages: 1, isColor: true, isDuplex: false, copies: 1, expected: 800},
+		{name: "2-page Color Simplex", pages: 2, isColor: true, isDuplex: false, copies: 1, expected: 1600},
+		{name: "3-page Color Simplex", pages: 3, isColor: true, isDuplex: false, copies: 1, expected: 2400},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := CalculateDocumentPricePaise(tc.pages, tc.isColor, tc.isDuplex, tc.copies)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actual != tc.expected {
+				t.Fatalf("got %d paise, want %d paise", actual, tc.expected)
+			}
+		})
+	}
+}
+
 // Test B — TestCalculatePricePaiseRejectsInvalidInputs
 func TestCalculatePricePaiseRejectsInvalidInputs(t *testing.T) {
 	invalidCases := []struct {

@@ -210,7 +210,6 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
 	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
 }
-
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -738,7 +737,6 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 		http.Error(w, fmt.Sprintf("preview generation failed: %v", err), http.StatusBadRequest)
 		return
 	}
-
 	format := strings.ToLower(strings.TrimSpace(r.FormValue("format")))
 	if format == "" {
 		format = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
