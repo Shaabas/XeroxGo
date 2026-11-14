@@ -2746,7 +2746,8 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 	checkPayQuery := s.rebind(`SELECT status FROM payments WHERE payment_id = ?;`)
 	err = tx.QueryRowContext(ctx, checkPayQuery, p.PaymentID).Scan(&existingPaymentStatus)
 	if err == nil {
-		// Already recorded
+		// Already recorded: rollback transaction immediately to release connection
+		_ = tx.Rollback()
 		order, oErr := s.GetOrder(ctx, p.OrderID)
 		if oErr != nil || order == nil {
 			return &PaymentCaptureResult{AlreadyProcessed: true}, nil
@@ -2799,7 +2800,28 @@ WHERE order_id = ?;
 INSERT INTO payments (payment_id, order_id, kiosk_id, session_id, amount_paise, status, provider, created_at_ns)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 `)
-		_, _ = tx.ExecContext(ctx, insertPay, p.PaymentID, p.OrderID, orderKioskID, p.SessionID, pricePaise, p.Status, p.Provider, nowNS)
+		resPay, err := tx.ExecContext(ctx, insertPay, p.PaymentID, p.OrderID, orderKioskID, p.SessionID, pricePaise, p.Status, p.Provider, nowNS)
+		if err != nil {
+			return nil, fmt.Errorf("capture payment: insert payment record (already dispatched): %w", err)
+		}
+		if _, err := resPay.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("capture payment: insert payment rows affected (already dispatched): %w", err)
+		}
+
+		// Update matching payment_attempts to PAID
+		updateAtt := s.rebind(`
+UPDATE payment_attempts
+SET status = 'PAID', provider_payment_id = ?, updated_at_ns = ?
+WHERE order_id = ? AND status = 'CREATED';
+`)
+		resAtt, err := tx.ExecContext(ctx, updateAtt, p.PaymentID, nowNS, p.OrderID)
+		if err != nil {
+			return nil, fmt.Errorf("capture payment: update payment attempt (already dispatched): %w", err)
+		}
+		if _, err := resAtt.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("capture payment: update payment attempt rows affected (already dispatched): %w", err)
+		}
+
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("capture payment: commit tx: %w", err)
 		}
@@ -2829,10 +2851,19 @@ WHERE order_id = ? AND status = ?;
 		if err != nil {
 			return nil, fmt.Errorf("capture payment: update order status: %w", err)
 		}
-		rows, _ := res.RowsAffected()
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("capture payment: update order status rows affected: %w", err)
+		}
 		if rows == 0 {
 			var newStatus string
-			_ = tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM orders WHERE order_id = ?;`), p.OrderID).Scan(&newStatus)
+			err = tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM orders WHERE order_id = ?;`), p.OrderID).Scan(&newStatus)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, ErrOrderNotFound
+				}
+				return nil, fmt.Errorf("capture payment: query fallback order status: %w", err)
+			}
 			currentStatus = contracts.JobStatus(newStatus)
 		} else {
 			currentStatus = contracts.JobStatusPaidWaiting
@@ -2871,31 +2902,64 @@ SET status = 'COMPLETED', updated_at_ns = ?
 WHERE session_id = ? AND status = 'PAYMENT_PENDING';
 `)
 			resSess, err := tx.ExecContext(ctx, updateSession, nowNS, sessID)
-			if err == nil {
-				rowsSess, _ := resSess.RowsAffected()
-				if rowsSess > 0 {
-					updateDispatched := s.rebind(`
+			if err != nil {
+				return nil, fmt.Errorf("capture payment: complete session: %w", err)
+			}
+			rowsSess, err := resSess.RowsAffected()
+			if err != nil {
+				return nil, fmt.Errorf("capture payment: complete session rows affected: %w", err)
+			}
+			if rowsSess > 0 {
+				updateDispatched := s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE order_id = ? AND status = ?;
 `)
-					resOrd, err := tx.ExecContext(ctx, updateDispatched, string(contracts.JobStatusDispatched), nowNS, p.OrderID, string(contracts.JobStatusPaidWaiting))
-					if err == nil {
-						rowsOrd, _ := resOrd.RowsAffected()
-						if rowsOrd > 0 {
-							dispatchEligible = true
-							activeSessionID = sessID
-							currentStatus = contracts.JobStatusDispatched
+				resOrd, err := tx.ExecContext(ctx, updateDispatched, string(contracts.JobStatusDispatched), nowNS, p.OrderID, string(contracts.JobStatusPaidWaiting))
+				if err != nil {
+					return nil, fmt.Errorf("capture payment: update order dispatched: %w", err)
+				}
+				rowsOrd, err := resOrd.RowsAffected()
+				if err != nil {
+					return nil, fmt.Errorf("capture payment: update order dispatched rows affected: %w", err)
+				}
+				if rowsOrd > 0 {
+					// Check existing dispatch intent status before modifying
+					var existingIntentStatus string
+					queryIntent := s.rebind(`SELECT status FROM dispatch_intents WHERE order_id = ?;`)
+					errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingIntentStatus)
+					if errIntent == nil {
+						if existingIntentStatus == "ACKNOWLEDGED" || existingIntentStatus == "COMPLETED" {
+							return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already %s", p.OrderID, existingIntentStatus)
+						}
+					} else if !errors.Is(errIntent, sql.ErrNoRows) {
+						return nil, fmt.Errorf("capture payment: check dispatch intent: %w", errIntent)
+					}
 
-							// Record durable dispatch intent in PENDING status
-							_, _ = tx.ExecContext(ctx, s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ?;`), p.OrderID)
-							insertIntent := s.rebind(`
+					deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
+					resDel, err := tx.ExecContext(ctx, deleteIntent, p.OrderID)
+					if err != nil {
+						return nil, fmt.Errorf("capture payment: delete dispatch intent: %w", err)
+					}
+					if _, err := resDel.RowsAffected(); err != nil {
+						return nil, fmt.Errorf("capture payment: delete dispatch intent rows affected: %w", err)
+					}
+
+					insertIntent := s.rebind(`
 INSERT INTO dispatch_intents (order_id, job_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-							_, _ = tx.ExecContext(ctx, insertIntent, p.OrderID, orderJobID, orderKioskID, sessID, nowNS, nowNS)
-						}
+					resIns, err := tx.ExecContext(ctx, insertIntent, p.OrderID, orderJobID, orderKioskID, sessID, nowNS, nowNS)
+					if err != nil {
+						return nil, fmt.Errorf("capture payment: insert dispatch intent: %w", err)
 					}
+					if _, err := resIns.RowsAffected(); err != nil {
+						return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected: %w", err)
+					}
+
+					dispatchEligible = true
+					activeSessionID = sessID
+					currentStatus = contracts.JobStatusDispatched
 				}
 			}
 		}
@@ -2910,9 +2974,12 @@ VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 INSERT INTO payments (payment_id, order_id, kiosk_id, session_id, amount_paise, status, provider, created_at_ns)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 `)
-	_, err = tx.ExecContext(ctx, insertPay, p.PaymentID, p.OrderID, orderKioskID, recordSessionID, pricePaise, p.Status, p.Provider, nowNS)
+	resPay, err := tx.ExecContext(ctx, insertPay, p.PaymentID, p.OrderID, orderKioskID, recordSessionID, pricePaise, p.Status, p.Provider, nowNS)
 	if err != nil {
 		return nil, fmt.Errorf("capture payment: insert payment record: %w", err)
+	}
+	if _, err := resPay.RowsAffected(); err != nil {
+		return nil, fmt.Errorf("capture payment: insert payment rows affected: %w", err)
 	}
 
 	// Update matching payment_attempts to PAID
@@ -2921,7 +2988,13 @@ UPDATE payment_attempts
 SET status = 'PAID', provider_payment_id = ?, updated_at_ns = ?
 WHERE order_id = ? AND status = 'CREATED';
 `)
-	_, _ = tx.ExecContext(ctx, updateAtt, p.PaymentID, nowNS, p.OrderID)
+	resAtt, err := tx.ExecContext(ctx, updateAtt, p.PaymentID, nowNS, p.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("capture payment: update payment attempt: %w", err)
+	}
+	if _, err := resAtt.RowsAffected(); err != nil {
+		return nil, fmt.Errorf("capture payment: update payment attempt rows affected: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("capture payment: commit tx: %w", err)
@@ -3002,7 +3075,19 @@ WHERE session_id = ? AND order_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PEN
 		return nil, fmt.Errorf("release paid order: verify session: %w", err)
 	}
 
-	// 3. Mark session COMPLETED
+	// 3. Ensure we do not delete or overwrite an acknowledged or completed dispatch intent
+	var existingIntentStatus string
+	queryIntent := s.rebind(`SELECT status FROM dispatch_intents WHERE order_id = ?;`)
+	errIntent := tx.QueryRowContext(ctx, queryIntent, orderID).Scan(&existingIntentStatus)
+	if errIntent == nil {
+		if existingIntentStatus == "ACKNOWLEDGED" || existingIntentStatus == "COMPLETED" {
+			return nil, fmt.Errorf("order %s cannot be released: dispatch intent is already %s", orderID, existingIntentStatus)
+		}
+	} else if !errors.Is(errIntent, sql.ErrNoRows) {
+		return nil, fmt.Errorf("release paid order: check existing dispatch intent: %w", errIntent)
+	}
+
+	// 4. Mark session COMPLETED
 	updateSession := s.rebind(`
 UPDATE kiosk_sessions
 SET status = 'COMPLETED', updated_at_ns = ?
@@ -3012,12 +3097,15 @@ WHERE session_id = ? AND status = 'PAYMENT_PENDING';
 	if err != nil {
 		return nil, fmt.Errorf("release paid order: complete session: %w", err)
 	}
-	rowsSess, _ := resSess.RowsAffected()
+	rowsSess, err := resSess.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("release paid order: complete session rows affected: %w", err)
+	}
 	if rowsSess == 0 {
 		return nil, ErrSessionNotFound
 	}
 
-	// 4. Mark order DISPATCHED
+	// 5. Mark order DISPATCHED
 	updateOrder := s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
@@ -3027,19 +3115,34 @@ WHERE order_id = ? AND status = ?;
 	if err != nil {
 		return nil, fmt.Errorf("release paid order: update order status: %w", err)
 	}
-	rowsOrd, _ := resOrd.RowsAffected()
+	rowsOrd, err := resOrd.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("release paid order: update order status rows affected: %w", err)
+	}
 	if rowsOrd == 0 {
 		return nil, fmt.Errorf("order state conflict: could not transition to DISPATCHED")
 	}
 
-	// 5. Record durable dispatch intent in PENDING status
-	_, _ = tx.ExecContext(ctx, s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ?;`), orderID)
+	// 6. Record durable dispatch intent in PENDING status
+	deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
+	resDel, err := tx.ExecContext(ctx, deleteIntent, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("release paid order: delete dispatch intent: %w", err)
+	}
+	if _, err := resDel.RowsAffected(); err != nil {
+		return nil, fmt.Errorf("release paid order: delete dispatch intent rows affected: %w", err)
+	}
+
 	insertIntent := s.rebind(`
 INSERT INTO dispatch_intents (order_id, job_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-	if _, err := tx.ExecContext(ctx, insertIntent, orderID, orderJobID, kioskID, sessID, nowNS, nowNS); err != nil {
+	resIns, err := tx.ExecContext(ctx, insertIntent, orderID, orderJobID, kioskID, sessID, nowNS, nowNS)
+	if err != nil {
 		return nil, fmt.Errorf("release paid order: record dispatch intent: %w", err)
+	}
+	if _, err := resIns.RowsAffected(); err != nil {
+		return nil, fmt.Errorf("release paid order: record dispatch intent rows affected: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
