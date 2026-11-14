@@ -4,11 +4,72 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 
 	"xeroxgo/cloud-backend/internal/pricing"
 )
 
 const maxInt64 = pricing.MaxInt64
+
+// Authoritative default fixed pricing constants in paise (₹1 = 100 paise)
+const (
+	RateBWSimplexPaise    int64 = 300  // ₹3 for single side B&W
+	RateBWDuplexPaise     int64 = 500  // ₹5 for double side B&W (2 pages)
+	RateColorSimplexPaise int64 = 800  // ₹8 for single side Colour
+	RateColorDuplexPaise  int64 = 1000 // ₹10 for double side Colour (2 pages)
+)
+
+// CalculateDocumentPricePaise calculates the total price in integer paise for a document
+// based on default in-code rates:
+// - 3 for single side b&w (300 paise)
+// - 5 for double side b&w (500 paise for 2 pages)
+// - 8 for single side colour (800 paise)
+// - 10 for double side colour (1000 paise for 2 pages)
+//
+// For a double-sided order with an odd number of pages (e.g. 3 page pdf):
+// - Every full 2-page sheet is charged at the double-side rate (₹5 B&W / ₹10 Colour).
+// - The trailing single page is charged at the single-side rate (₹3 B&W / ₹8 Colour)
+//   because there is no fourth page to print as double-sided.
+//
+// The total for one copy is multiplied by copies, protected against overflow.
+func CalculateDocumentPricePaise(imposedPages int, isColor bool, isDuplex bool, copies int) (int64, error) {
+	if imposedPages <= 0 {
+		return 0, fmt.Errorf("calculate price: imposedPages must be > 0, got %d", imposedPages)
+	}
+	if copies <= 0 {
+		copies = 1
+	}
+
+	var singleCopyPrice int64
+	if isDuplex {
+		fullSheets := int64(imposedPages / 2)
+		hasOddPage := (imposedPages%2 != 0)
+		if isColor {
+			singleCopyPrice = fullSheets * RateColorDuplexPaise
+			if hasOddPage {
+				singleCopyPrice += RateColorSimplexPaise
+			}
+		} else {
+			singleCopyPrice = fullSheets * RateBWDuplexPaise
+			if hasOddPage {
+				singleCopyPrice += RateBWSimplexPaise
+			}
+		}
+	} else {
+		if isColor {
+			singleCopyPrice = int64(imposedPages) * RateColorSimplexPaise
+		} else {
+			singleCopyPrice = int64(imposedPages) * RateBWSimplexPaise
+		}
+	}
+
+	if int64(copies) > maxInt64/singleCopyPrice {
+		return 0, errors.New("calculate price: total price overflows int64")
+	}
+
+	return singleCopyPrice * int64(copies), nil
+}
 
 // CalculatePricePaise computes the total price in integer paise for a given
 // printed sides count and configured price per side. It validates that both

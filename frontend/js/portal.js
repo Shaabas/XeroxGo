@@ -1,7 +1,7 @@
 /**
  * XeroxGo Mobile Upload & Print Portal
  * Responsive Mobile UX matching reference design:
- * 1. Files Cart (Multi-file upload, document cards, delete, preview, edit settings, review order)
+ * 1. Files Cart (Multi-file upload, document cards, delete, preview, edit settings, Place Order)
  * 2. Document Settings (Page selection, copies stepper, B&W/Color, single/double sided, orientation, 1-up/2-up)
  * 3. Print Preview (PDF.js canvas rendering, Sheet X of Y (Front/Back) pager, Flip Sheet action)
  * 4. Checkout/PIN (4 large PIN boxes, 15m expiration, Copy PIN, order summary, live kiosk status)
@@ -28,12 +28,15 @@
   }
   const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
-  // Rates in paise (Authoritative defaults)
-  let bwSimplexPricePaise = parseInt(container.dataset.pricePerSheetPaise, 10) || 200;
-  let bwDuplexPricePaise = 150;
-  let colorSimplexPricePaise = 1000;
-  let colorDuplexPricePaise = 750;
-  let colorHardwareEnabled = false;
+  // Rates in paise (Authoritative default fixed rates in code)
+  // 3 for single side b&w (300p)
+  // 5 for double side b&w (500p per 2 pages)
+  // 8 for single side colour (800p)
+  // 10 for double side colour (1000p per 2 pages)
+  const RATE_BW_SINGLE_PAISE = 300;
+  const RATE_BW_DOUBLE_PAISE = 500;
+  const RATE_COLOR_SINGLE_PAISE = 800;
+  const RATE_COLOR_DOUBLE_PAISE = 1000;
 
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
@@ -108,11 +111,10 @@
 
   const cardModeBw = document.getElementById('card-mode-bw');
   const cardModeColor = document.getElementById('card-mode-color');
-  const settingsBwPriceLabel = document.getElementById('settings-bw-price-label');
-  const settingsColorPriceLabel = document.getElementById('settings-color-price-label');
-
   const cardSideSingle = document.getElementById('card-side-single');
   const cardSideDouble = document.getElementById('card-side-double');
+  const settingsSinglePriceLabel = document.getElementById('settings-single-price-label');
+  const settingsDoublePriceLabel = document.getElementById('settings-double-price-label');
 
   const btnOrientAuto = document.getElementById('btn-orient-auto');
   const btnOrientPortrait = document.getElementById('btn-orient-portrait');
@@ -286,8 +288,14 @@
   }
 
   // Per-document price calculation in integer paise
+  // Rates:
+  // - 3 for single side b&w (₹3 per page)
+  // - 5 for double side b&w (₹5 per 2 pages)
+  // - 8 for single side colour (₹8 per page)
+  // - 10 for double side colour (₹10 per 2 pages)
+  // Odd trailing page on double side: charged at single side rate (₹3 for B&W, ₹8 for Colour)
   function calculateDocPrice(totalPages, settings) {
-    if (!settings) return 0;
+    if (!settings || totalPages <= 0) return 0;
     let pagesCount = totalPages;
     if (settings.pageSelection === 'Custom Range') {
       const from = Math.max(1, Math.min(settings.rangeFrom || 1, totalPages));
@@ -303,17 +311,32 @@
       }
     }
 
-    const nup = parseInt(settings.pagesPerSheet, 10) || 1;
-    const imposedSides = Math.ceil(pagesCount / nup);
+    if (pagesCount <= 0) return 0;
 
-    let ratePaise = bwSimplexPricePaise;
-    if (settings.mode === 'Color') {
-      ratePaise = (settings.sides === 'Double-sided') ? colorDuplexPricePaise : colorSimplexPricePaise;
+    const nup = parseInt(settings.pagesPerSheet, 10) || 1;
+    const imposedPages = Math.ceil(pagesCount / nup);
+    const isColor = (settings.mode === 'Color');
+    const isDuplex = (settings.sides === 'Double-sided');
+    const copies = Math.max(1, parseInt(settings.copies, 10) || 1);
+
+    let singleCopyPricePaise = 0;
+    if (isDuplex) {
+      const fullSheets = Math.floor(imposedPages / 2);
+      const hasOddPage = (imposedPages % 2 !== 0);
+      if (isColor) {
+        singleCopyPricePaise = (fullSheets * RATE_COLOR_DOUBLE_PAISE) + (hasOddPage ? RATE_COLOR_SINGLE_PAISE : 0);
+      } else {
+        singleCopyPricePaise = (fullSheets * RATE_BW_DOUBLE_PAISE) + (hasOddPage ? RATE_BW_SINGLE_PAISE : 0);
+      }
     } else {
-      ratePaise = (settings.sides === 'Double-sided') ? bwDuplexPricePaise : bwSimplexPricePaise;
+      if (isColor) {
+        singleCopyPricePaise = imposedPages * RATE_COLOR_SINGLE_PAISE;
+      } else {
+        singleCopyPricePaise = imposedPages * RATE_BW_SINGLE_PAISE;
+      }
     }
 
-    return imposedSides * (settings.copies || 1) * ratePaise;
+    return singleCopyPricePaise * copies;
   }
 
   function getDocSelectedPages(totalPages, settings) {
@@ -592,7 +615,7 @@
 
     if (btnReviewOrder) {
       btnReviewOrder.innerHTML = `
-        <span>Review Order</span>
+        <span>Place Orderr</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
       const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0;
@@ -617,7 +640,7 @@
     if (item && item.abortController) {
       try {
         item.abortController.abort();
-      } catch (_) {}
+      } catch (_) { }
     }
     cartItems = cartItems.filter(item => item.id !== docId);
     renderCart();
@@ -1031,9 +1054,10 @@
     currentPreviewSheet = 1;
     currentPreviewSide = 'front';
 
-    // Rate labels
-    if (settingsBwPriceLabel) settingsBwPriceLabel.textContent = `${formatRupees(bwSimplexPricePaise)}/side`;
-    if (settingsColorPriceLabel) settingsColorPriceLabel.textContent = `${formatRupees(colorSimplexPricePaise)}/side`;
+    // Dynamic rate labels on Single vs Double side based on Print Mode
+    const isColor = (draftSettings.mode === 'Color');
+    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColor ? '₹8.00/sheet' : '₹3.00/sheet';
+    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColor ? '₹10.00/sheet' : '₹5.00/sheet';
 
     syncSettingsUI(doc);
     renderPreviewSheet();
@@ -1215,6 +1239,11 @@
     // 4. Print Sides
     cardSideSingle.classList.toggle('active', draftSettings.sides === 'Single-sided');
     cardSideDouble.classList.toggle('active', draftSettings.sides === 'Double-sided');
+
+    // Dynamic rate labels on Single vs Double side based on Print Mode
+    const isColorChoice = (draftSettings.mode === 'Color');
+    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColorChoice ? '₹8.00/sheet' : '₹3.00/sheet';
+    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColorChoice ? '₹10.00/sheet' : '₹5.00/sheet';
 
     // 5. Orientation
     btnOrientAuto.classList.toggle('active', draftSettings.orientation === 'Auto');
@@ -1678,7 +1707,7 @@
 
     try {
       if (activeRenderTask) {
-        try { activeRenderTask.cancel(); } catch (_) {}
+        try { activeRenderTask.cancel(); } catch (_) { }
         activeRenderTask = null;
       }
 
@@ -1708,7 +1737,7 @@
       }
 
       const page = await doc.pdfDoc.getPage(pageNumToRender);
-      
+
       // Determine orientation rotation
       let renderRotation = page.rotate || 0;
       if (draftSettings) {
@@ -1974,7 +2003,7 @@
         try {
           sessionStorage.setItem('xeroxgo_recovery_' + activeOrderId, activeRecoveryToken);
           localStorage.setItem('xeroxgo_recovery_' + activeOrderId, activeRecoveryToken);
-        } catch (_) {}
+        } catch (_) { }
       }
       const pinCode = data.display_code ? String(data.display_code).trim() : '';
       if (!pinCode || !/^\d{4}$/.test(pinCode)) {
@@ -2052,7 +2081,7 @@
         if (!resp.ok) return;
         const statusData = await resp.json();
         updateCheckoutStatus(statusData);
-      } catch (_) {}
+      } catch (_) { }
     }, 2500);
   }
 
@@ -2115,8 +2144,8 @@
     if (!token) {
       try {
         token = sessionStorage.getItem('xeroxgo_recovery_' + activeOrderId) ||
-                localStorage.getItem('xeroxgo_recovery_' + activeOrderId) || '';
-      } catch (_) {}
+          localStorage.getItem('xeroxgo_recovery_' + activeOrderId) || '';
+      } catch (_) { }
     }
     if (!token) return null;
     try {
@@ -2140,7 +2169,7 @@
         }
         return recData;
       }
-    } catch (_) {}
+    } catch (_) { }
     return null;
   }
 
@@ -2166,7 +2195,7 @@
       if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
       cartItems.forEach(it => {
         if (it.abortController) {
-          try { it.abortController.abort(); } catch (_) {}
+          try { it.abortController.abort(); } catch (_) { }
         }
       });
       cartItems = [];
@@ -2176,27 +2205,6 @@
       switchView('cart');
       renderCart();
     });
-  }
-
-  // --- Pricing Fetch ---
-  async function fetchPricing() {
-    try {
-      const resp = await fetch(`/api/pricing?kiosk_id=${encodeURIComponent(kioskID)}`);
-      if (resp.ok) {
-        const data = await resp.json();
-        if (typeof data.bw_simplex_price_paise === 'number') bwSimplexPricePaise = data.bw_simplex_price_paise;
-        if (typeof data.bw_duplex_price_paise === 'number') bwDuplexPricePaise = data.bw_duplex_price_paise;
-        if (typeof data.color_simplex_price_paise === 'number') colorSimplexPricePaise = data.color_simplex_price_paise;
-        if (typeof data.color_duplex_price_paise === 'number') colorDuplexPricePaise = data.color_duplex_price_paise;
-        colorHardwareEnabled = !!data.color_hardware_enabled;
-
-        // Update settings labels
-        if (settingsBwPriceLabel) settingsBwPriceLabel.textContent = `${formatRupees(bwSimplexPricePaise)}/side`;
-        if (settingsColorPriceLabel) settingsColorPriceLabel.textContent = `${formatRupees(colorSimplexPricePaise)}/side`;
-      }
-    } catch (err) {
-      console.warn('Could not load remote pricing tiers:', err);
-    }
   }
 
   // --- Banner & PWA Setup ---
@@ -2335,7 +2343,6 @@
     setupSettingsEventListeners();
     setupPreviewEventListeners();
     setupCheckoutEventListeners();
-    fetchPricing();
     renderCart();
   }
 

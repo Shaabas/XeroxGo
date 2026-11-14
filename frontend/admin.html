@@ -70,7 +70,6 @@
       <div class="nav-tabs-bar">
         <button id="tab-nav-overview" class="nav-tab-item active" type="button">Overview</button>
         <button id="tab-nav-orders" class="nav-tab-item" type="button">Orders</button>
-        <button id="tab-nav-pricing" class="nav-tab-item" type="button">Pricing</button>
         <button id="tab-nav-ads" class="nav-tab-item" type="button">Ads</button>
       </div>
     </nav>
@@ -173,138 +172,7 @@
         </div>
       </section>
 
-      <!-- 3. PRICING VIEW -->
-      <section id="view-pricing" class="admin-view hidden">
-        <div class="pricing-grid">
-          
-          <!-- Pricing Editor Card -->
-          <div class="panel-card">
-            <div class="panel-header" style="margin-bottom:1.5rem;">
-              <div>
-                <h2 class="panel-title">Print Rates</h2>
-              </div>
-            </div>
-
-            <form id="pricing-form">
-              <!-- Black & White Section -->
-              <div style="font-size:0.8125rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted); margin-bottom:0.75rem;">
-                Black &amp; White (Monochrome)
-              </div>
-              <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem;">
-                <div class="form-group">
-                  <label class="form-label" for="price-bw-simplex-input">B&amp;W Single Side</label>
-                  <div style="position:relative; display:flex; align-items:center;">
-                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
-                    <input id="price-bw-simplex-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
-                  </div>
-                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed page.</div>
-                </div>
-
-                <div class="form-group">
-                  <label class="form-label" for="price-bw-duplex-input">B&amp;W Double Side</label>
-                  <div style="position:relative; display:flex; align-items:center;">
-                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
-                    <input id="price-bw-duplex-input" class="form-input" type="number" step="0.5" min="0.5" max="100" style="padding-left:2.2rem;" required />
-                  </div>
-                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed side.</div>
-                </div>
-              </div>
-
-              <!-- Color Section -->
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; padding-top:1rem; border-top:1px solid var(--border);">
-                <div style="font-size:0.8125rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);">
-                  Color Printing
-                </div>
-                <div style="display:flex; align-items:center; gap:0.5rem;">
-                  <span style="font-size:0.75rem; color:var(--text-muted);">Enable Kiosk Color</span>
-                  <label class="switch">
-                    <input type="checkbox" id="pricing-color-enabled-toggle" />
-                    <span class="slider"></span>
-                  </label>
-                </div>
-              </div>
-
-              <div id="pricing-hardware-notice" style="font-size:0.75rem; color:var(--text-muted); background:var(--bg-slate); padding:0.6rem 0.85rem; border-radius:var(--radius-sm); margin-bottom:1rem; border:1px solid var(--border);">
-                <strong>Kiosk Status:</strong> Production printer is Monochrome Laser. When disabled, mobile web orders are locked to B&amp;W.
-              </div>
-
-              <div style="display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem;">
-                <div class="form-group">
-                  <label class="form-label" for="price-color-simplex-input">Color Single Side</label>
-                  <div style="position:relative; display:flex; align-items:center;">
-                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
-                    <input id="price-color-simplex-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
-                  </div>
-                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed page.</div>
-                </div>
-
-                <div class="form-group">
-                  <label class="form-label" for="price-color-duplex-input">Color Double Side</label>
-                  <div style="position:relative; display:flex; align-items:center;">
-                    <span style="position:absolute; left:0.85rem; font-weight:700; color:var(--text-muted);">₹</span>
-                    <input id="price-color-duplex-input" class="form-input" type="number" step="0.5" min="1" max="200" style="padding-left:2.2rem;" required />
-                  </div>
-                  <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">Rate per printed side.</div>
-                </div>
-              </div>
-
-              <div style="margin-top:1.5rem;">
-                <button id="pricing-save-btn" class="btn-primary" type="submit" style="width:100%;">
-                  Save Rates
-                </button>
-              </div>
-            </form>
-          </div>
-
-          <!-- Live Cost Estimator -->
-          <div class="panel-card">
-            <div class="panel-header" style="margin-bottom:1.5rem;">
-              <div>
-                <h2 class="panel-title">Cost Estimator</h2>
-              </div>
-            </div>
-
-            <div style="display:flex; flex-direction:column; gap:1rem;">
-              <div class="form-group">
-                <label class="form-label" for="calc-pages-input">Document Pages</label>
-                <input id="calc-pages-input" class="form-input" type="number" min="1" max="500" value="10" />
-              </div>
-
-              <div class="form-group">
-                <label class="form-label">Sides</label>
-                <div style="display:flex; gap:0.75rem;">
-                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
-                    <input type="radio" name="calc-duplex" value="simplex" checked />
-                    <span style="font-weight:600; font-size:0.875rem;">Single Side</span>
-                  </label>
-                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
-                    <input type="radio" name="calc-duplex" value="duplex" />
-                    <span style="font-weight:600; font-size:0.875rem;">Double Side</span>
-                  </label>
-                </div>
-              </div>
-
-              <div style="margin-top:1rem; padding:1.25rem; background:#F8FAFC; border:1px solid var(--border); border-radius:var(--radius-sm);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Physical Sheets:</span>
-                  <span id="calc-result-sheets" style="font-weight:700;">10 sheets</span>
-                </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Monochrome:</span>
-                  <span id="calc-result-bw" style="font-weight:800; font-size:1.15rem; color:var(--text-main);">₹20.00</span>
-                </div>
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Color:</span>
-                  <span id="calc-result-color" style="font-weight:800; font-size:1.15rem; color:var(--primary);">₹100.00</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-        </div>
-      </section>
-
-      <!-- 4. ADS VIEW -->
+      <!-- 3. ADS VIEW -->
       <section id="view-ads" class="admin-view hidden">
         <div class="admin-grid">
 
