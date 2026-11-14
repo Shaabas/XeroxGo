@@ -2153,19 +2153,6 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			t.Fatalf("failed to create trigger: %v", err)
 		}
 
-		client, err := NewClient(ClientConfig{
-			CloudURL:      "ws://127.0.0.1:8080/ws",
-			KioskID:       "kiosk-a",
-			StateStore:    store,
-			PrinterAddr:   "127.0.0.1:9100",
-			DownloadDir:   tmpDir,
-			IdleQRContent: "https://kiosk-a",
-			ScreenSink:    noopSink,
-		})
-		if err != nil {
-			t.Fatalf("NewClient failed: %v", err)
-		}
-
 		cmd := contracts.PrintJobCommand{
 			JobID:          "job-scenario-a",
 			KioskID:        "kiosk-a",
@@ -2179,7 +2166,84 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			StartFromPage:  1,
 		}
 
-		client.handleIncomingJob(cmd)
+		var receivedMessages []wireMessage
+		var msgMu sync.Mutex
+		doneSync := make(chan struct{})
+
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			// Send the job that will fail persistence
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+			// Deterministic synchronization probe: send refill immediately after.
+			// Because handleConnection processes messages sequentially on a single goroutine,
+			// receiving "health" deterministically proves handleIncomingJob finished.
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				msgMu.Lock()
+				receivedMessages = append(receivedMessages, msg)
+				msgMu.Unlock()
+				if msg.Type == "health" {
+					close(doneSync)
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-a",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-a",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		connCtx, connCancel := context.WithCancel(context.Background())
+		defer connCancel()
+
+		conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(connCtx, conn)
+		}()
+
+		select {
+		case <-doneSync:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for deterministic sync health message")
+		}
+
+		// Assert that neither job_ack nor false SPOOLING progress was transmitted
+		msgMu.Lock()
+		for _, m := range receivedMessages {
+			if m.Type == "job_ack" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				t.Errorf("job_ack must NOT be transmitted on persistence failure: %+v", m)
+			}
+			if m.Type == "progress" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				t.Errorf("progress must NOT be transmitted on persistence failure: %+v", m)
+			}
+		}
+		msgMu.Unlock()
 
 		// Assert: reservation released
 		client.activeMu.Lock()
@@ -2386,7 +2450,9 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 
 		sendDup := make(chan struct{})
+		var dupSent atomic.Bool
 		var ackCount atomic.Int32
+		var dupSpoolingProgressCount atomic.Int32
 		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			c, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -2394,22 +2460,34 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			}
 			defer c.CloseNow()
 
+			readDone := make(chan struct{})
+			go func() {
+				defer close(readDone)
+				for {
+					var msg wireMessage
+					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+						break
+					}
+					if msg.Type == "job_ack" {
+						ackCount.Add(1)
+					}
+					if msg.Type == "progress" && msg.Progress != nil && msg.Progress.JobID == cmd.JobID {
+						if dupSent.Load() && msg.Progress.Status == contracts.JobStatusSpooling {
+							dupSpoolingProgressCount.Add(1)
+						}
+					}
+				}
+			}()
+
 			// Send first command
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
 
 			<-sendDup
+			dupSent.Store(true)
 			// Send duplicate command
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
 
-			for {
-				var msg wireMessage
-				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
-					break
-				}
-				if msg.Type == "job_ack" {
-					ackCount.Add(1)
-				}
-			}
+			<-readDone
 		}))
 		defer wsServer.Close()
 
@@ -2459,6 +2537,11 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 		if ackCount.Load() < 2 {
 			t.Fatalf("expected at least 2 job_ack messages (1 for original, 1 for duplicate), got %d", ackCount.Load())
+		}
+
+		// Verify duplicate delivery did not emit a redundant or stale SPOOLING progress event
+		if dupSpoolingProgressCount.Load() != 0 {
+			t.Fatalf("expected 0 SPOOLING progress events from duplicate delivery, got %d (duplicate must not emit stale progress)", dupSpoolingProgressCount.Load())
 		}
 
 		// Ensure printer connections count remains strictly 1
@@ -2516,6 +2599,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 
 		receivedAck := make(chan wireMessage, 1)
+		var gotProgress atomic.Bool
 		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			c, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -2530,6 +2614,9 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 				var msg wireMessage
 				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
 					break
+				}
+				if msg.Type == "progress" && msg.Progress != nil && msg.Progress.JobID == cmd.JobID {
+					gotProgress.Store(true)
 				}
 				if msg.Type == "job_ack" {
 					receivedAck <- msg
@@ -2580,6 +2667,10 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("timeout waiting for job_ack")
+		}
+
+		if gotProgress.Load() {
+			t.Error("duplicate command for already submitted job must not emit redundant progress event")
 		}
 
 		// Assert: not submitted to jobQueue
@@ -2635,6 +2726,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 
 		receivedAck := make(chan wireMessage, 1)
+		var gotProgress atomic.Bool
 		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			c, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -2648,6 +2740,9 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 				var msg wireMessage
 				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
 					break
+				}
+				if msg.Type == "progress" && msg.Progress != nil && msg.Progress.JobID == cmd.JobID {
+					gotProgress.Store(true)
 				}
 				if msg.Type == "job_ack" {
 					receivedAck <- msg
@@ -2700,6 +2795,10 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			t.Fatal("timeout waiting for job_ack")
 		}
 
+		if gotProgress.Load() {
+			t.Error("duplicate command for already completed job must not emit redundant progress event")
+		}
+
 		// Queue must remain empty
 		if len(client.jobQueue) != 0 {
 			t.Errorf("expected empty jobQueue, got %d", len(client.jobQueue))
@@ -2748,6 +2847,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		conflictingCmd.Duplex = contracts.DuplexSimplex // Conflict!
 
 		var gotAck atomic.Bool
+		doneSync := make(chan struct{})
 		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			c, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -2756,6 +2856,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			defer c.CloseNow()
 
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &conflictingCmd})
+			// Deterministic synchronization: probe with refill message
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
 
 			for {
 				var msg wireMessage
@@ -2764,6 +2866,10 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 				}
 				if msg.Type == "job_ack" {
 					gotAck.Store(true)
+				}
+				if msg.Type == "health" {
+					close(doneSync)
+					return
 				}
 			}
 		}))
@@ -2796,8 +2902,11 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			client.handleConnection(connCtx, conn)
 		}()
 
-		// Wait briefly with polling for potential messages
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-doneSync:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for sync health message")
+		}
 
 		if gotAck.Load() {
 			t.Fatal("conflicting command must not be acknowledged")
@@ -2827,8 +2936,53 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 		defer store.Close()
 
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-g",
+			KioskID:        "kiosk-g",
+			DisplayCode:    "0007",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		var receivedMessages []wireMessage
+		var msgMu sync.Mutex
+		doneSync := make(chan struct{})
+
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			// Send the job command that will fail queue admission
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				msgMu.Lock()
+				receivedMessages = append(receivedMessages, msg)
+				msgMu.Unlock()
+				// The client sends wireMessage{Type: "error", Error: "kiosk job queue is full"} on queue admission failure!
+				if msg.Type == "error" && msg.Error == "kiosk job queue is full" {
+					close(doneSync)
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
 		client, err := NewClient(ClientConfig{
-			CloudURL:      "ws://127.0.0.1:8080/ws",
+			CloudURL:      wsURL,
 			KioskID:       "kiosk-g",
 			StateStore:    store,
 			PrinterAddr:   "127.0.0.1:9100",
@@ -2845,20 +2999,36 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			client.jobQueue <- contracts.PrintJobCommand{JobID: "dummy-fill"}
 		}
 
-		cmd := contracts.PrintJobCommand{
-			JobID:          "job-scenario-g",
-			KioskID:        "kiosk-g",
-			DisplayCode:    "0007",
-			DownloadURL:    "https://storage.example.com/job.pdf",
-			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-			TotalPages:     2,
-			TotalSheets:    1,
-			Copies:         1,
-			Duplex:         contracts.DuplexSimplex,
-			StartFromPage:  1,
+		connCtx, connCancel := context.WithCancel(context.Background())
+		defer connCancel()
+
+		conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(connCtx, conn)
+		}()
+
+		select {
+		case <-doneSync:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for queue full error message")
 		}
 
-		client.handleIncomingJob(cmd)
+		// Assert that neither job_ack nor false SPOOLING progress was transmitted
+		msgMu.Lock()
+		for _, m := range receivedMessages {
+			if m.Type == "job_ack" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				t.Errorf("job_ack must NOT be transmitted on queue full: %+v", m)
+			}
+			if m.Type == "progress" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				t.Errorf("progress must NOT be transmitted on queue full: %+v", m)
+			}
+		}
+		msgMu.Unlock()
 
 		// Assert: reservation released
 		client.activeMu.Lock()

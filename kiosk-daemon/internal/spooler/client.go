@@ -699,9 +699,7 @@ func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEv
 	_ = wsjson.Write(ctx, conn, wireMessage{Type: "progress", Progress: &event})
 }
 
-func (c *Client) sendAckAndProgress(ctx context.Context, event contracts.JobProgressEvent) {
-	c.sendProgress(ctx, event)
-
+func (c *Client) sendJobAck(ctx context.Context, event contracts.JobProgressEvent) {
 	c.connMu.Lock()
 	activeConn := c.conn
 	c.connMu.Unlock()
@@ -714,16 +712,16 @@ func (c *Client) sendAckAndProgress(ctx context.Context, event contracts.JobProg
 }
 
 func isConflictingDuplicate(stored, incoming contracts.PrintJobCommand) bool {
-	if incoming.TotalPages != stored.TotalPages ||
+	if incoming.JobID != stored.JobID ||
+		incoming.KioskID != stored.KioskID ||
+		incoming.TotalPages != stored.TotalPages ||
 		incoming.TotalSheets != stored.TotalSheets ||
 		incoming.Copies != stored.Copies ||
 		incoming.Duplex != stored.Duplex ||
 		incoming.StartFromPage != stored.StartFromPage ||
 		!strings.EqualFold(incoming.SHA256Checksum, stored.SHA256Checksum) ||
-		incoming.DownloadURL != stored.DownloadURL {
-		return true
-	}
-	if stored.DisplayCode != "" && incoming.DisplayCode != "" && stored.DisplayCode != incoming.DisplayCode {
+		incoming.DownloadURL != stored.DownloadURL ||
+		incoming.DisplayCode != stored.DisplayCode {
 		return true
 	}
 	return false
@@ -775,7 +773,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			return
 		}
 
-		// Stored, completed: Never resubmit; report existing completed state
+		// Stored, completed: Never resubmit; report existing completed state via job_ack only
 		if existing.Status == contracts.JobStatusCompleted {
 			log.Printf("[SPOOLER] Acknowledging duplicate command for already completed job %s", cmd.JobID)
 			pagesPrinted := existing.PagesPrinted
@@ -786,7 +784,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			if sheetsPrinted <= 0 {
 				sheetsPrinted = existing.Command.TotalSheets
 			}
-			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+			c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       c.cfg.KioskID,
 				Status:        contracts.JobStatusCompleted,
@@ -797,10 +795,10 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			return
 		}
 
-		// Stored, already submitted to printer: Never resubmit; acknowledge durable possession and report current stored progress
+		// Stored, already submitted to printer: Never resubmit; acknowledge durable possession via job_ack only
 		if existing.SubmittedToPrinter || existing.CUPSJobID != "" {
 			log.Printf("[SPOOLER] Acknowledging duplicate command for already submitted job %s (CUPS ID %s, status %s)", cmd.JobID, existing.CUPSJobID, existing.Status)
-			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+			c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       c.cfg.KioskID,
 				Status:        existing.Status,
@@ -812,10 +810,10 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			return
 		}
 
-		// Stored, paused or ambiguous: Never automatically resubmit; preserve recovery requirements
+		// Stored, paused or ambiguous: Never automatically resubmit; preserve recovery requirements via job_ack only
 		if existing.Status == contracts.JobStatusPausedError || existing.Status == contracts.JobStatusFailedRefundable {
 			log.Printf("[SPOOLER] Acknowledging duplicate command for paused/failed job %s (status %s)", cmd.JobID, existing.Status)
-			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+			c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       c.cfg.KioskID,
 				Status:        existing.Status,
@@ -827,7 +825,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			return
 		}
 
-		// Stored, currently active or deferred in memory
+		// Stored, currently active or deferred in memory: acknowledge via job_ack only
 		c.deferredMu.Lock()
 		isDeferred := false
 		for _, dj := range c.deferredJobs {
@@ -848,7 +846,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			if status == "" {
 				status = contracts.JobStatusSpooling
 			}
-			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+			c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       c.cfg.KioskID,
 				Status:        status,
@@ -860,7 +858,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 			return
 		}
 
-		// Stored, queued but not active: acknowledge only if recoverable
+		// Stored, queued but not active: acknowledge only if recoverable via job_ack only
 		isDefinitelyNotSubmitted := !existing.SubmittedToPrinter &&
 			existing.CUPSJobID == "" &&
 			existing.SheetsPrinted == 0 &&
@@ -869,7 +867,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 
 		if !isDefinitelyNotSubmitted {
 			log.Printf("[SPOOLER] Stored job %s has ambiguous submission state; acknowledging without resubmission", cmd.JobID)
-			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+			c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       c.cfg.KioskID,
 				Status:        existing.Status,
@@ -902,7 +900,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		select {
 		case c.jobQueue <- existing.Command:
 			log.Printf("[SPOOLER] Re-admitted unsubmitted stored job %s to queue", cmd.JobID)
-			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+			c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
 				KioskID:       c.cfg.KioskID,
 				Status:        contracts.JobStatusSpooling,
@@ -994,14 +992,30 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 
 	// 5. Send explicit acceptance progress & job_ack back to cloud
-	c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+	ackEvt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
 		Status:        contracts.JobStatusSpooling,
 		PagesPrinted:  0,
 		SheetsPrinted: 0,
 		Timestamp:     time.Now().UTC(),
-	})
+	}
+
+	// Only emit SPOOLING progress if the job has not already advanced in execution
+	if current, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID); err == nil && current != nil {
+		if current.Status == contracts.JobStatusSpooling {
+			c.sendProgress(context.Background(), ackEvt)
+		} else {
+			ackEvt.Status = current.Status
+			ackEvt.PagesPrinted = current.PagesPrinted
+			ackEvt.SheetsPrinted = current.SheetsPrinted
+			ackEvt.ErrorReason = current.ErrorReason
+		}
+	} else {
+		c.sendProgress(context.Background(), ackEvt)
+	}
+
+	c.sendJobAck(context.Background(), ackEvt)
 }
 
 func (c *Client) getSNMPConfig() *printer.SNMPConfig {
