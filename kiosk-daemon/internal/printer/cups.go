@@ -428,8 +428,8 @@ func shouldPreserveCUPSJob(ctx context.Context) bool {
 
 // CUPSPrintHooks provides optional callbacks and SNMP configuration during CUPS submission and lifecycle.
 type CUPSPrintHooks struct {
-	OnSubmitting        func()
-	OnSubmitted         func(cupsJobID string)
+	OnSubmitting        func() error
+	OnSubmitted         func(cupsJobID string) error
 	SNMPConfig          *SNMPConfig
 	TelemetryPoller     func(ctx context.Context) HardwareTelemetry
 	PreserveJobOnCancel func() bool
@@ -515,7 +515,9 @@ func PrintPDFWithCUPSHooksCustom(
 	log.Printf("[CUPS] Submitting print job %s to queue %q: lp %s", cmd.JobID, queue, strings.Join(lpArgs, " "))
 
 	if hooks != nil && hooks.OnSubmitting != nil {
-		hooks.OnSubmitting()
+		if err := hooks.OnSubmitting(); err != nil {
+			return fmt.Errorf("pre-submission hook failed; submission not attempted for job %s: %w", cmd.JobID, err)
+		}
 	}
 
 	// 2. Submit print job via lp
@@ -533,7 +535,9 @@ func PrintPDFWithCUPSHooksCustom(
 	log.Printf("[CUPS] Job %s assigned CUPS request ID: %s", cmd.JobID, cupsJobID)
 
 	if hooks != nil && hooks.OnSubmitted != nil {
-		hooks.OnSubmitted(cupsJobID)
+		if err := hooks.OnSubmitted(cupsJobID); err != nil {
+			return fmt.Errorf("post-submission hook failed for accepted CUPS job %s (job %s): %w", cupsJobID, cmd.JobID, err)
+		}
 	}
 
 	var snmpCfg *SNMPConfig

@@ -128,6 +128,9 @@ type Client struct {
 	snmpPoller   func(ctx context.Context) printer.HardwareTelemetry
 
 	pinController *pin.Controller
+
+	cupsJobsMu sync.Mutex
+	cupsJobIDs map[string]string
 }
 
 // NewClient validates the configuration and initializes a new spooler client.
@@ -278,6 +281,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		healthPoller:          poller,
 		snmpPoller:            cfg.SNMPPoller,
 		requiredRecoveryCount: reqHealthy,
+		cupsJobIDs:            make(map[string]string),
 	}
 
 	if cfg.InputSource != nil {
@@ -324,6 +328,22 @@ func (c *Client) RenderHistory() []ui_ipc.ScreenState {
 	historyCopy := make([]ui_ipc.ScreenState, len(c.renderHistory))
 	copy(historyCopy, c.renderHistory)
 	return historyCopy
+}
+
+// GetCUPSJobID returns the in-memory or persisted CUPS request ID for the specified print job.
+func (c *Client) GetCUPSJobID(jobID string) string {
+	c.cupsJobsMu.Lock()
+	id := c.cupsJobIDs[jobID]
+	c.cupsJobsMu.Unlock()
+	if id != "" {
+		return id
+	}
+	if c.cfg.StateStore != nil {
+		if job, err := c.cfg.StateStore.GetJob(context.Background(), jobID); err == nil && job != nil {
+			return job.CUPSJobID
+		}
+	}
+	return ""
 }
 
 // Run executes the spooler client loops until the context is canceled.
@@ -1053,22 +1073,12 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		preserveCUPSJob.Store(true)
 		c.setHardwareFault(true, reason, "")
 
-		if job.CUPSJobID != "" {
+		if job.CUPSJobID != "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 			holdCtx, holdCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, job.CUPSJobID)
 			holdCancel()
 
-			if holdRes.HoldErr != nil {
-				reason = fmt.Sprintf("%s; hold request failed (%v), CUPS state is %s, unmonitored physical output risk, operator reconciliation required", reason, holdRes.HoldErr, holdRes.State)
-			} else if holdRes.StillProcessing {
-				reason = fmt.Sprintf("%s; CUPS job remains processing after hold request, unmonitored physical output risk, operator reconciliation required", reason)
-			} else if holdRes.AlreadyCompleted {
-				reason = fmt.Sprintf("%s; CUPS job was already completed, physical output uncertain, operator reconciliation required", reason)
-			} else if holdRes.ConfirmedHeld {
-				reason = fmt.Sprintf("%s; CUPS job held (buffered sheets may continue printing), operator reconciliation required", reason)
-			} else {
-				reason = fmt.Sprintf("%s; CUPS job state is %s after hold request, operator reconciliation required", reason, holdRes.State)
-			}
+			reason = formatCUPSHoldOutcomeReason(reason, job.CUPSJobID, holdRes)
 		}
 
 		cancelJob()
@@ -1360,6 +1370,31 @@ func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 	}
 }
 
+func formatCUPSHoldOutcomeReason(baseReason string, cupsJobID string, holdRes printer.HoldResult) string {
+	if holdRes.HoldErr != nil {
+		if holdRes.QueryErr != nil {
+			return fmt.Sprintf("%s; hold request failed for CUPS job %s (%v, query error: %v): possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.HoldErr, holdRes.QueryErr)
+		}
+		return fmt.Sprintf("%s; hold request failed for CUPS job %s (%v), CUPS state is %s: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.HoldErr, holdRes.State)
+	}
+	if holdRes.StillProcessing {
+		return fmt.Sprintf("%s; CUPS job %s remains processing after hold request: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID)
+	}
+	if holdRes.AlreadyCompleted {
+		return fmt.Sprintf("%s; CUPS job %s was already completed: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID)
+	}
+	if holdRes.ConfirmedHeld {
+		return fmt.Sprintf("%s; CUPS job %s held (buffered sheets may continue printing), manual reconciliation required", baseReason, cupsJobID)
+	}
+	if holdRes.IsUnknown || holdRes.QueryErr != nil {
+		if holdRes.QueryErr != nil {
+			return fmt.Sprintf("%s; status is unknown for CUPS job %s (query error: %v, state: %s): possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.QueryErr, holdRes.State)
+		}
+		return fmt.Sprintf("%s; status is unknown for CUPS job %s (state: %s): possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.State)
+	}
+	return fmt.Sprintf("%s; CUPS job %s state is %s: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.State)
+}
+
 func jobPDFPath(downloadDir, jobID string) string {
 	h := sha256.Sum256([]byte(jobID))
 	return filepath.Join(downloadDir, hex.EncodeToString(h[:])+".pdf")
@@ -1546,26 +1581,14 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		cID := activeCUPSJobID
 		cupsJobIDMu.Unlock()
 		if cID == "" {
-			if saved, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID); err == nil && saved != nil && saved.CUPSJobID != "" {
-				cID = saved.CUPSJobID
-			}
+			cID = c.GetCUPSJobID(cmd.JobID)
 		}
-		if cID != "" {
+		if cID != "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 			holdCtx, holdCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cID)
 			holdCancel()
 
-			if holdRes.HoldErr != nil {
-				reason = fmt.Sprintf("%s; hold request failed (%v), CUPS state is %s, unmonitored physical output risk, operator reconciliation required", reason, holdRes.HoldErr, holdRes.State)
-			} else if holdRes.StillProcessing {
-				reason = fmt.Sprintf("%s; CUPS job remains processing after hold request, unmonitored physical output risk, operator reconciliation required", reason)
-			} else if holdRes.AlreadyCompleted {
-				reason = fmt.Sprintf("%s; CUPS job was already completed, physical output uncertain, operator reconciliation required", reason)
-			} else if holdRes.ConfirmedHeld {
-				reason = fmt.Sprintf("%s; CUPS job held (buffered sheets may continue printing), operator reconciliation required", reason)
-			} else {
-				reason = fmt.Sprintf("%s; CUPS job state is %s after hold request, operator reconciliation required", reason, holdRes.State)
-			}
+			reason = formatCUPSHoldOutcomeReason(reason, cID, holdRes)
 		}
 
 		cancelJob() // abort active transmission or monitoring
@@ -1675,18 +1698,29 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 		log.Printf("[SPOOLER] Sending job %s to CUPS queue %s", cmd.JobID, c.cfg.CUPSQueue)
 		if c.cfg.MockCUPSPrint != nil {
-			_ = c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
-			printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
+			if err := c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID); err != nil {
+				printErr = fmt.Errorf("pre-submission persistence failed for mock CUPS print: %w", err)
+			} else {
+				printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
+			}
 		} else {
 			hooks := &printer.CUPSPrintHooks{
-				OnSubmitting: func() {
-					_ = c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
+				OnSubmitting: func() error {
+					return c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
 				},
-				OnSubmitted: func(cupsJobID string) {
+				OnSubmitted: func(cupsJobID string) error {
 					cupsJobIDMu.Lock()
 					activeCUPSJobID = cupsJobID
 					cupsJobIDMu.Unlock()
-					_ = c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
+
+					c.cupsJobsMu.Lock()
+					if c.cupsJobIDs == nil {
+						c.cupsJobIDs = make(map[string]string)
+					}
+					c.cupsJobIDs[cmd.JobID] = cupsJobID
+					c.cupsJobsMu.Unlock()
+
+					return c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
 				},
 				SNMPConfig:          c.getSNMPConfig(),
 				TelemetryPoller:     c.snmpPoller,
@@ -1696,8 +1730,11 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		}
 	} else {
 		log.Printf("[SPOOLER] Streaming job %s to PJL printer %s", cmd.JobID, c.cfg.PrinterAddr)
-		_ = c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
-		printErr = printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage)
+		if err := c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID); err != nil {
+			printErr = fmt.Errorf("pre-submission persistence failed for PJL print: %w", err)
+		} else {
+			printErr = printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage)
+		}
 	}
 
 	cancelJob()
@@ -1717,7 +1754,22 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 			handleJobHardwareInterruption(reason)
 			return
 		}
-		c.handleJobError(ctx, cmd, curPages, curSheets, fmt.Sprintf("printing failed: %v", printErr))
+
+		cupsJobIDMu.Lock()
+		cID := activeCUPSJobID
+		cupsJobIDMu.Unlock()
+		if cID == "" {
+			cID = c.GetCUPSJobID(cmd.JobID)
+		}
+		errReason := fmt.Sprintf("printing failed: %v", printErr)
+		if cID != "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+			holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cID)
+			holdTimeout()
+			errReason = formatCUPSHoldOutcomeReason(errReason, cID, holdRes)
+		}
+
+		c.handleJobError(ctx, cmd, curPages, curSheets, errReason)
 		return
 	}
 
