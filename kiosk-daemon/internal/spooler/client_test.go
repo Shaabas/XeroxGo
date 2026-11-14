@@ -23,6 +23,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 	"xeroxgo/pkg/contracts"
@@ -3287,8 +3288,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 
 		// Simulate an asynchronous worker that instantly picks up the job from the queue
-		// and advances it to PRINTING (in both the store and emitting PRINTING progress)
-		// BEFORE or concurrently with the completion of handleIncomingJob acknowledgment.
+		// and advances it to PRINTING in the store before acknowledgment is sent.
 		workerDone := make(chan struct{})
 		go func() {
 			defer close(workerDone)
@@ -3296,14 +3296,6 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			if queued.JobID == cmd.JobID {
 				ctx := context.Background()
 				_ = store.UpdateProgress(ctx, contracts.JobProgressEvent{
-					JobID:         cmd.JobID,
-					KioskID:       cmd.KioskID,
-					Status:        contracts.JobStatusPrinting,
-					PagesPrinted:  1,
-					SheetsPrinted: 1,
-					Timestamp:     time.Now().UTC(),
-				})
-				client.sendProgress(ctx, contracts.JobProgressEvent{
 					JobID:         cmd.JobID,
 					KioskID:       cmd.KioskID,
 					Status:        contracts.JobStatusPrinting,
@@ -3341,36 +3333,720 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 
 		// Inspect all received messages:
 		// 1. Must receive exactly 1 job_ack
-		// 2. Must NEVER receive a SPOOLING progress event from admission after PRINTING
+		// 2. Must NEVER receive a SPOOLING progress event from admission
 		msgMu.Lock()
 		defer msgMu.Unlock()
 
 		var ackCount int
-		var spoolingProgressCount int
-		var printingProgressCount int
+		var progressCount int
 
 		for _, m := range receivedMessages {
 			if m.Type == "job_ack" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
 				ackCount++
 			}
 			if m.Type == "progress" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
-				if m.Progress.Status == contracts.JobStatusSpooling {
-					spoolingProgressCount++
-				}
-				if m.Progress.Status == contracts.JobStatusPrinting {
-					printingProgressCount++
-				}
+				progressCount++
 			}
 		}
 
 		if ackCount != 1 {
 			t.Fatalf("expected exactly 1 job_ack, got %d", ackCount)
 		}
-		if spoolingProgressCount != 0 {
-			t.Fatalf("admission must not emit synthetic SPOOLING progress; got %d SPOOLING progress events", spoolingProgressCount)
+		if progressCount != 0 {
+			t.Fatalf("admission itself must not emit progress events; got %d progress events", progressCount)
 		}
-		if printingProgressCount != 1 {
-			t.Fatalf("expected 1 PRINTING progress event from worker, got %d", printingProgressCount)
+
+		// Verify job actually advanced to PRINTING in the store
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved.Status != contracts.JobStatusPrinting {
+			t.Fatalf("expected store status PRINTING, got %s", saved.Status)
+		}
+	})
+}
+
+// Test L — TestCUPSSubmissionPersistence
+func TestCUPSSubmissionPersistence(t *testing.T) {
+	makePDFServer := func(t *testing.T) (string, string) {
+		t.Helper()
+		pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+		hasher := sha256.Sum256(pdfContent)
+		pdfChecksum := hex.EncodeToString(hasher[:])
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/pdf")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pdfContent)
+		}))
+		t.Cleanup(server.Close)
+		return server.URL + "/job.pdf", pdfChecksum
+	}
+
+	noopSink := func(img *image.RGBA) error { return nil }
+
+	// A. Pre-submission SQLite failure: Force MarkJobSubmitting() to fail; assert runner is never invoked
+	t.Run("ScenarioA_PreSubmissionSQLiteFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_a.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfURL, pdfChecksum := makePDFServer(t)
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-presub-fail",
+			KioskID:        "kiosk-a",
+			DisplayCode:    "1001",
+			DownloadURL:    pdfURL,
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		// Force MarkJobSubmitting to fail using SQLite trigger
+		rawDB, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("failed to open raw sqlite db: %v", err)
+		}
+		defer rawDB.Close()
+		_, err = rawDB.Exec("CREATE TRIGGER fail_mark_submitting BEFORE UPDATE OF status ON jobs WHEN NEW.status = 'PRINTING' BEGIN SELECT RAISE(ABORT, 'forced MarkJobSubmitting failure'); END;")
+		if err != nil {
+			t.Fatalf("failed to create trigger: %v", err)
+		}
+
+		var lpInvoked atomic.Bool
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				lpInvoked.Store(true)
+				return []byte("request id is DCPT310-101 (1 file(s))\n"), nil
+			}
+			return []byte(""), nil
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-a",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			CUPSRunner:    runner,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-a",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.processJob(context.Background(), cmd)
+
+		if lpInvoked.Load() {
+			t.Fatal("CUPS lp submission command must NOT be invoked when MarkJobSubmitting fails")
+		}
+
+		// Check stored record: submitted_to_printer must remain false and status must be PAUSED_ERROR
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved.SubmittedToPrinter {
+			t.Error("submitted_to_printer must NOT be set when MarkJobSubmitting failed")
+		}
+		if saved.Status != contracts.JobStatusPausedError {
+			t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+		}
+	})
+
+	// B. Successful submission: Verify submission intent persisted before lp, and CUPS job ID recorded afterward
+	t.Run("ScenarioB_SuccessfulSubmission", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_b.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfURL, pdfChecksum := makePDFServer(t)
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-success-sub",
+			KioskID:        "kiosk-b",
+			DisplayCode:    "1002",
+			DownloadURL:    pdfURL,
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		var lpInvoked atomic.Bool
+		var submittedBeforeLP atomic.Bool
+		var pollCount atomic.Int32
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				lpInvoked.Store(true)
+				j, err := store.GetJob(context.Background(), cmd.JobID)
+				if err == nil && j != nil && j.SubmittedToPrinter && j.CUPSJobID == "" {
+					submittedBeforeLP.Store(true)
+				}
+				return []byte("request id is DCPT310-202 (1 file(s))\n"), nil
+			}
+			if name == "ipptool" {
+				p := pollCount.Add(1)
+				if p == 1 {
+					return []byte(`
+job-id (integer) = 202
+job-state (enum) = processing
+job-media-sheets-completed (integer) = 1
+`), nil
+				}
+				return []byte(`
+job-id (integer) = 202
+job-state (enum) = completed
+job-media-sheets-completed (integer) = 1
+`), nil
+			}
+			if name == "lpstat" {
+				return []byte("DCPT310-202 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+			}
+			return []byte(""), nil
+		}
+
+		var odoCalls atomic.Int32
+		snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+			c := odoCalls.Add(1)
+			var life int64 = 1000
+			if c > 1 {
+				life += 1
+			}
+			return printer.HardwareTelemetry{
+				Online:    true,
+				HasLife:   true,
+				LifeCount: life,
+			}
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-b",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			CUPSRunner:    runner,
+			SNMPPoller:    snmpPoller,
+			MockHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{Online: true}
+			},
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-b",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.processJob(context.Background(), cmd)
+
+		if !lpInvoked.Load() {
+			t.Fatal("expected lp to be invoked")
+		}
+		if !submittedBeforeLP.Load() {
+			t.Fatal("expected submitted_to_printer=1 to be durably persisted BEFORE lp is called")
+		}
+
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if !saved.SubmittedToPrinter {
+			t.Error("expected submitted_to_printer to be true")
+		}
+		if saved.CUPSJobID != "DCPT310-202" {
+			t.Errorf("expected CUPSJobID DCPT310-202, got %q", saved.CUPSJobID)
+		}
+		if saved.Status != contracts.JobStatusCompleted {
+			t.Errorf("expected status COMPLETED, got %s", saved.Status)
+		}
+	})
+
+	// C. Post-submission SQLite failure: Simulate successful lp execution followed by failure to persist the CUPS ID
+	t.Run("ScenarioC_PostSubmissionSQLiteFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_c.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfURL, pdfChecksum := makePDFServer(t)
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-postsub-fail",
+			KioskID:        "kiosk-c",
+			DisplayCode:    "1003",
+			DownloadURL:    pdfURL,
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		// Fail RecordJobSubmission by adding trigger on UPDATE OF cups_job_id
+		rawDB, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("failed to open raw sqlite db: %v", err)
+		}
+		defer rawDB.Close()
+		_, err = rawDB.Exec("CREATE TRIGGER fail_record_cups_id BEFORE UPDATE OF cups_job_id ON jobs BEGIN SELECT RAISE(ABORT, 'forced RecordJobSubmission failure'); END;")
+		if err != nil {
+			t.Fatalf("failed to create trigger: %v", err)
+		}
+
+		var lpCalls atomic.Int32
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				// Check if hold request
+				for i, arg := range args {
+					if arg == "-H" && i+1 < len(args) && args[i+1] == "hold" {
+						return []byte(""), nil
+					}
+				}
+				lpCalls.Add(1)
+				return []byte("request id is DCPT310-303 (1 file(s))"), nil
+			}
+			return []byte(""), nil
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-c",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			CUPSRunner:    runner,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-c",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.processJob(context.Background(), cmd)
+
+		// Assert: No second submission occurs
+		if lpCalls.Load() != 1 {
+			t.Errorf("expected exactly 1 lp submission call, got %d", lpCalls.Load())
+		}
+
+		// Assert: The original CUPS ID remains available for reconciliation in memory
+		cupsID := client.GetCUPSJobID(cmd.JobID)
+		if cupsID != "DCPT310-303" {
+			t.Errorf("expected client.GetCUPSJobID to return DCPT310-303, got %q", cupsID)
+		}
+
+		// Assert: Stored record retains submitted_to_printer=1 and is NOT marked COMPLETED
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if !saved.SubmittedToPrinter {
+			t.Error("submitted_to_printer must remain true to preserve ambiguous submission state")
+		}
+		if saved.Status == contracts.JobStatusCompleted {
+			t.Error("job must NOT be marked COMPLETED when post-submission persistence failed")
+		}
+		if saved.Status != contracts.JobStatusPausedError {
+			t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+		}
+	})
+
+	// D. CUPS submission command failure: Simulate an error from lp; verify conservative recovery state and no automatic retry
+	t.Run("ScenarioD_CUPSSubmissionCommandFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_d.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfURL, pdfChecksum := makePDFServer(t)
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-lp-fail",
+			KioskID:        "kiosk-d",
+			DisplayCode:    "1004",
+			DownloadURL:    pdfURL,
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				return []byte("lp: unable to contact CUPS server"), errors.New("exit status 1")
+			}
+			return []byte(""), nil
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-d",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			CUPSRunner:    runner,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-d",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.processJob(context.Background(), cmd)
+
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if !saved.SubmittedToPrinter {
+			t.Error("submitted_to_printer must remain true even after lp error (conservative crash safety)")
+		}
+		if saved.Status != contracts.JobStatusPausedError {
+			t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+		}
+
+		// Verify no automatic retry during recovery
+		inc, err := store.GetIncompleteJob(context.Background())
+		if err != nil {
+			t.Fatalf("GetIncompleteJob failed: %v", err)
+		}
+		if inc == nil {
+			t.Fatal("expected incomplete job to be present in store")
+		}
+		isDefinitelyNotSubmitted := !inc.SubmittedToPrinter && inc.CUPSJobID == "" && inc.SheetsPrinted == 0 && inc.PagesPrinted == 0 && inc.ErrorReason == ""
+		if isDefinitelyNotSubmitted {
+			t.Fatal("job with failed lp must NOT be treated as definitely unsubmitted")
+		}
+	})
+
+	// E. Missing or unparseable CUPS request ID: Verify potentially accepted job treated as ambiguous, not definitely unsubmitted
+	t.Run("ScenarioE_MissingOrUnparseableCUPSRequestID", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_e.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfURL, pdfChecksum := makePDFServer(t)
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-unparseable-id",
+			KioskID:        "kiosk-e",
+			DisplayCode:    "1005",
+			DownloadURL:    pdfURL,
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				return []byte("Job accepted successfully with nonstandard notice"), nil
+			}
+			return []byte(""), nil
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-e",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			CUPSRunner:    runner,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-e",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.processJob(context.Background(), cmd)
+
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if !saved.SubmittedToPrinter {
+			t.Error("submitted_to_printer must remain true when request ID was unparseable")
+		}
+		if saved.CUPSJobID != "" {
+			t.Errorf("CUPSJobID must be empty, got %q", saved.CUPSJobID)
+		}
+		if saved.Status != contracts.JobStatusPausedError {
+			t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+		}
+
+		// Verify treated as ambiguous: cannot be automatically retried
+		inc, err := store.GetIncompleteJob(context.Background())
+		if err != nil || inc == nil {
+			t.Fatalf("GetIncompleteJob failed: %v", err)
+		}
+		isDefinitelyNotSubmitted := !inc.SubmittedToPrinter && inc.CUPSJobID == "" && inc.SheetsPrinted == 0 && inc.PagesPrinted == 0 && inc.ErrorReason == ""
+		if isDefinitelyNotSubmitted {
+			t.Fatal("job with unparseable CUPS ID must NOT be treated as definitely unsubmitted")
+		}
+	})
+
+	// F. Restart after submission-intent persistence: Persist submitted_to_printer=1 without CUPS ID, restart, assert no auto re-submission
+	t.Run("ScenarioF_RestartAfterSubmissionIntentPersistence", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_f.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-crash-after-intent",
+			KioskID:        "kiosk-f",
+			DisplayCode:    "1006",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		ctx := context.Background()
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+		// Simulate crash right after MarkJobSubmitting
+		if err := store.MarkJobSubmitting(ctx, cmd.JobID); err != nil {
+			t.Fatalf("MarkJobSubmitting failed: %v", err)
+		}
+
+		var lpCalled atomic.Bool
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				lpCalled.Store(true)
+			}
+			return []byte(""), nil
+		}
+
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-f",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			CUPSRunner:    runner,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-f",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		runCtx, runCancel := context.WithCancel(context.Background())
+		defer runCancel()
+
+		go func() {
+			_ = client.Run(runCtx)
+		}()
+
+		// Wait briefly with condition check for startup recovery to process the incomplete job
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			saved, err := store.GetJob(context.Background(), cmd.JobID)
+			if err == nil && saved != nil && saved.Status == contracts.JobStatusPausedError {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		if lpCalled.Load() {
+			t.Fatal("startup recovery must NOT automatically invoke lp for potentially submitted job")
+		}
+		if len(client.jobQueue) != 0 {
+			t.Fatalf("expected jobQueue to remain empty, got %d", len(client.jobQueue))
+		}
+
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if saved.Status != contracts.JobStatusPausedError {
+			t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+		}
+		if !saved.SubmittedToPrinter {
+			t.Error("submitted_to_printer must remain true")
+		}
+	})
+
+	// G. Cancellation and existing monitoring: Ensure successful jobs retain behavior and no unmonitored printing path
+	t.Run("ScenarioG_CancellationAndExistingMonitoring", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_g.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:       "job-cancel-test",
+			Copies:      1,
+			TotalPages:  1,
+			TotalSheets: 1,
+			Duplex:      contracts.DuplexSimplex,
+		}
+
+		var cancelInvoked atomic.Bool
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				return []byte("request id is DCPT310-701 (1 file(s))"), nil
+			}
+			if name == "cancel" {
+				cancelInvoked.Store(true)
+				return []byte(""), nil
+			}
+			if name == "lpstat" {
+				return []byte("DCPT310-701 user 1024 Tue Nov 3 14:00:00 2026\n\tprocessing"), nil
+			}
+			return []byte(""), nil
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel after short delay
+		time.AfterFunc(30*time.Millisecond, cancel)
+
+		err = printer.PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, nil)
+		if err == nil {
+			t.Fatal("expected error on context cancellation")
+		}
+
+		if !cancelInvoked.Load() {
+			t.Fatal("expected CUPS cancel to be invoked on context cancellation without job preservation")
+		}
+	})
+
+	// Step 5: Test MockCUPSPrint pre-submission persistence failure prevents mock print
+	t.Run("MockCUPSPrint_PreSubmissionFailure_PreventsPrinting", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_mock.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfURL, pdfChecksum := makePDFServer(t)
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-mock-fail",
+			KioskID:        "kiosk-mock",
+			DisplayCode:    "1007",
+			DownloadURL:    pdfURL,
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling)
+
+		rawDB, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("failed to open raw db: %v", err)
+		}
+		defer rawDB.Close()
+		_, _ = rawDB.Exec("CREATE TRIGGER fail_mock_submitting BEFORE UPDATE OF status ON jobs WHEN NEW.status = 'PRINTING' BEGIN SELECT RAISE(ABORT, 'forced MarkJobSubmitting failure'); END;")
+
+		var mockPrinted atomic.Bool
+		mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+			mockPrinted.Store(true)
+			return nil
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-mock",
+			StateStore:    store,
+			CUPSQueue:     "DCPT310",
+			MockCUPSPrint: mockCUPS,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-mock",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.processJob(context.Background(), cmd)
+
+		if mockPrinted.Load() {
+			t.Fatal("MockCUPSPrint must NOT be called when MarkJobSubmitting fails")
 		}
 	})
 }

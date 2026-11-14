@@ -881,11 +881,13 @@ func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {
 	var submittedJobID string
 
 	hooks := &CUPSPrintHooks{
-		OnSubmitting: func() {
+		OnSubmitting: func() error {
 			submittingCalled = true
+			return nil
 		},
-		OnSubmitted: func(cupsJobID string) {
+		OnSubmitted: func(cupsJobID string) error {
 			submittedJobID = cupsJobID
+			return nil
 		},
 	}
 
@@ -913,6 +915,94 @@ func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {
 	}
 	if submittedJobID != "DCPT310-777" {
 		t.Errorf("expected OnSubmitted hook with DCPT310-777, got %q", submittedJobID)
+	}
+}
+
+func TestPrintPDFWithCUPSHooks_OnSubmittingError_AbortsBeforeLP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-hook-presub-fail",
+		Copies:      1,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	var runnerInvoked bool
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		runnerInvoked = true
+		return []byte("request id is DCPT310-999 (1 file(s))"), nil
+	}
+
+	hooks := &CUPSPrintHooks{
+		OnSubmitting: func() error {
+			return errors.New("simulated store pre-submission error")
+		},
+		OnSubmitted: func(cupsJobID string) error {
+			return nil
+		},
+	}
+
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, hooks)
+	if err == nil {
+		t.Fatal("expected PrintPDFWithCUPSHooksCustom to fail when OnSubmitting returns error")
+	}
+
+	if runnerInvoked {
+		t.Error("command runner must NOT be invoked when OnSubmitting fails")
+	}
+
+	if !strings.Contains(err.Error(), "submission not attempted") {
+		t.Errorf("expected error to indicate submission was not attempted, got: %v", err)
+	}
+}
+
+func TestPrintPDFWithCUPSHooks_OnSubmittedError_IdentifiesAcceptedCUPSJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-hook-postsub-fail",
+		Copies:      1,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Duplex:      contracts.DuplexSimplex,
+	}
+
+	var lpCalls int
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			lpCalls++
+			return []byte("request id is DCPT310-888 (1 file(s))"), nil
+		}
+		return []byte(""), nil
+	}
+
+	hooks := &CUPSPrintHooks{
+		OnSubmitting: func() error {
+			return nil
+		},
+		OnSubmitted: func(cupsJobID string) error {
+			if cupsJobID != "DCPT310-888" {
+				t.Errorf("expected OnSubmitted with DCPT310-888, got %q", cupsJobID)
+			}
+			return errors.New("simulated store post-submission error")
+		},
+	}
+
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, hooks)
+	if err == nil {
+		t.Fatal("expected PrintPDFWithCUPSHooksCustom to fail when OnSubmitted returns error")
+	}
+
+	if lpCalls != 1 {
+		t.Errorf("expected exactly 1 lp call, got %d", lpCalls)
+	}
+
+	if !strings.Contains(err.Error(), "DCPT310-888") {
+		t.Errorf("expected error to identify accepted CUPS job DCPT310-888, got: %v", err)
 	}
 }
 
