@@ -615,7 +615,7 @@
 
     if (btnReviewOrder) {
       btnReviewOrder.innerHTML = `
-        <span>Place Orderr</span>
+        <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
       const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0;
@@ -746,7 +746,7 @@
       let errDetail = '';
       try {
         errDetail = await resp.text();
-      } catch (_) {}
+      } catch (_) { }
 
       if (resp.status === 413) {
         throw new Error('File exceeds server size limit (25 MiB)');
@@ -818,7 +818,7 @@
       }
       if (!pollResp.ok) {
         let pollErrDetail = '';
-        try { pollErrDetail = await pollResp.text(); } catch (_) {}
+        try { pollErrDetail = await pollResp.text(); } catch (_) { }
         throw new Error(`Failed to query conversion progress (HTTP ${pollResp.status}): ${pollErrDetail || pollResp.statusText}`);
       }
 
