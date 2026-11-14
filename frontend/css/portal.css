@@ -1414,7 +1414,7 @@ body {
   gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
-  transition: background-color 0.12s ease, color 0.12s ease, transform 0.08s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 
 .btn-doc-delete svg {
@@ -1429,7 +1429,7 @@ body {
 .btn-doc-delete:active {
   background-color: #fca5a5;
   color: #991b1b;
-  transform: scale(0.97);
+  transform: none;
 }
 
 .btn-doc-delete:focus-visible {
@@ -1600,7 +1600,8 @@ body {
     width: 88px;
     font-size: 12px;
   }
-  .doc-card:has(.btn-doc-edit) .btn-doc-delete {
+  .doc-card:has(.btn-doc-edit) .btn-doc-delete,
+  .btn-doc-retry {
     padding: 5px 10px;
     font-size: 12px;
   }
@@ -1686,15 +1687,15 @@ body {
 }
 
 .btn-doc-retry {
-  color: var(--primary-blue);
+  color: #1d4ed8;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  background: transparent;
+  background: #dbeafe;
   border: none;
-  border-radius: 6px;
-  padding: 6px 8px;
-  margin-right: -8px;
+  border-radius: 9999px;
+  padding: 6px 14px;
+  margin-right: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1704,14 +1705,19 @@ body {
   transition: background-color 0.12s ease, color 0.12s ease;
 }
 
+.btn-doc-retry svg {
+  flex-shrink: 0;
+}
+
 .btn-doc-retry:hover {
-  background-color: var(--primary-blue-light);
-  color: var(--primary-blue-hover);
+  background-color: #bfdbfe;
+  color: #1e40af;
 }
 
 .btn-doc-retry:active {
-  background-color: #dbeafe;
-  color: #1e40af;
+  background-color: #93c5fd;
+  color: #1e3a8a;
+  transform: none;
 }
 
 .btn-doc-retry:focus-visible {
@@ -1725,6 +1731,10 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
   pointer-events: none;
+}
+
+.doc-card button:active {
+  transform: none;
 }
 
 .cart-empty-state {
