@@ -2292,7 +2292,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 
 		receivedAck := make(chan wireMessage, 1)
-		receivedProgress := make(chan wireMessage, 1)
+		receivedProgress := make(chan wireMessage, 5)
+		doneSync := make(chan struct{})
 		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			c, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -2302,6 +2303,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 
 			// Send job command
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+			// Deterministic synchronization: probe with refill message
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
 
 			for {
 				var msg wireMessage
@@ -2323,6 +2326,9 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 						t.Errorf("expected persisted status SPOOLING, got %s", saved.Status)
 					}
 					receivedAck <- msg
+				}
+				if msg.Type == "health" {
+					close(doneSync)
 					return
 				}
 			}
@@ -2357,6 +2363,12 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}()
 
 		select {
+		case <-doneSync:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for sync health message")
+		}
+
+		select {
 		case ack := <-receivedAck:
 			if ack.Progress == nil || ack.Progress.JobID != cmd.JobID {
 				t.Fatalf("unexpected job_ack payload: %+v", ack)
@@ -2364,17 +2376,15 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			if ack.Progress.Status != contracts.JobStatusSpooling {
 				t.Fatalf("expected job_ack status SPOOLING, got %s", ack.Progress.Status)
 			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("timeout waiting for job_ack")
+		default:
+			t.Fatal("expected job_ack message")
 		}
 
+		// Admission itself must emit ONLY job_ack, never synthetic progress
 		select {
 		case prog := <-receivedProgress:
-			if prog.Progress == nil || prog.Progress.JobID != cmd.JobID || prog.Progress.Status != contracts.JobStatusSpooling {
-				t.Fatalf("unexpected progress payload: %+v", prog)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("timeout waiting for SPOOLING progress")
+			t.Fatalf("handleIncomingJob must not send progress event; expected only job_ack, got: %+v", prog)
+		default:
 		}
 
 		// Verify queue admission
@@ -3204,6 +3214,163 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		// Assert: printer received strictly 1 physical print connection
 		if printConnections.Load() != 1 {
 			t.Fatalf("expected exactly 1 physical print connection, got %d", printConnections.Load())
+		}
+	})
+
+	// Scenario I: Admission sends only job_ack even if job advances to PRINTING before acknowledgment is sent
+	t.Run("ScenarioI_AdmissionSendsOnlyAckEvenIfAdvancedToPrinting", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_i.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-i",
+			KioskID:        "kiosk-i",
+			DisplayCode:    "0009",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		var receivedMessages []wireMessage
+		var msgMu sync.Mutex
+		doneSync := make(chan struct{})
+
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			// Send job command
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+			// Probe with refill to confirm handleIncomingJob is completely finished
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				msgMu.Lock()
+				receivedMessages = append(receivedMessages, msg)
+				msgMu.Unlock()
+				if msg.Type == "health" {
+					close(doneSync)
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-i",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-i",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		// Simulate an asynchronous worker that instantly picks up the job from the queue
+		// and advances it to PRINTING (in both the store and emitting PRINTING progress)
+		// BEFORE or concurrently with the completion of handleIncomingJob acknowledgment.
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			queued := <-client.jobQueue
+			if queued.JobID == cmd.JobID {
+				ctx := context.Background()
+				_ = store.UpdateProgress(ctx, contracts.JobProgressEvent{
+					JobID:         cmd.JobID,
+					KioskID:       cmd.KioskID,
+					Status:        contracts.JobStatusPrinting,
+					PagesPrinted:  1,
+					SheetsPrinted: 1,
+					Timestamp:     time.Now().UTC(),
+				})
+				client.sendProgress(ctx, contracts.JobProgressEvent{
+					JobID:         cmd.JobID,
+					KioskID:       cmd.KioskID,
+					Status:        contracts.JobStatusPrinting,
+					PagesPrinted:  1,
+					SheetsPrinted: 1,
+					Timestamp:     time.Now().UTC(),
+				})
+			}
+		}()
+
+		connCtx, connCancel := context.WithCancel(context.Background())
+		defer connCancel()
+
+		conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(connCtx, conn)
+		}()
+
+		select {
+		case <-doneSync:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for sync health message")
+		}
+
+		select {
+		case <-workerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for simulated worker")
+		}
+
+		// Inspect all received messages:
+		// 1. Must receive exactly 1 job_ack
+		// 2. Must NEVER receive a SPOOLING progress event from admission after PRINTING
+		msgMu.Lock()
+		defer msgMu.Unlock()
+
+		var ackCount int
+		var spoolingProgressCount int
+		var printingProgressCount int
+
+		for _, m := range receivedMessages {
+			if m.Type == "job_ack" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				ackCount++
+			}
+			if m.Type == "progress" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				if m.Progress.Status == contracts.JobStatusSpooling {
+					spoolingProgressCount++
+				}
+				if m.Progress.Status == contracts.JobStatusPrinting {
+					printingProgressCount++
+				}
+			}
+		}
+
+		if ackCount != 1 {
+			t.Fatalf("expected exactly 1 job_ack, got %d", ackCount)
+		}
+		if spoolingProgressCount != 0 {
+			t.Fatalf("admission must not emit synthetic SPOOLING progress; got %d SPOOLING progress events", spoolingProgressCount)
+		}
+		if printingProgressCount != 1 {
+			t.Fatalf("expected 1 PRINTING progress event from worker, got %d", printingProgressCount)
 		}
 	})
 }

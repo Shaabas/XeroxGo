@@ -991,31 +991,15 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		return
 	}
 
-	// 5. Send explicit acceptance progress & job_ack back to cloud
-	ackEvt := contracts.JobProgressEvent{
+	// 5. Send explicit job_ack back to cloud (actual SPOOLING progress is reported by processJob)
+	c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
 		Status:        contracts.JobStatusSpooling,
 		PagesPrinted:  0,
 		SheetsPrinted: 0,
 		Timestamp:     time.Now().UTC(),
-	}
-
-	// Only emit SPOOLING progress if the job has not already advanced in execution
-	if current, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID); err == nil && current != nil {
-		if current.Status == contracts.JobStatusSpooling {
-			c.sendProgress(context.Background(), ackEvt)
-		} else {
-			ackEvt.Status = current.Status
-			ackEvt.PagesPrinted = current.PagesPrinted
-			ackEvt.SheetsPrinted = current.SheetsPrinted
-			ackEvt.ErrorReason = current.ErrorReason
-		}
-	} else {
-		c.sendProgress(context.Background(), ackEvt)
-	}
-
-	c.sendJobAck(context.Background(), ackEvt)
+	})
 }
 
 func (c *Client) getSNMPConfig() *printer.SNMPConfig {
