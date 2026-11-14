@@ -476,7 +476,6 @@
                 <span>${escapeHtml(item.errorMessage || 'Failed to process file')}</span>
               </div>
             </div>
-            <div class="doc-price" style="color:#dc2626; font-size:14px; font-weight:600;">Error</div>
           </div>
           <div class="doc-card-bottom">
             <button type="button" class="btn-doc-delete" data-id="${item.id}">
