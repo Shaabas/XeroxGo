@@ -583,3 +583,69 @@ func TestPollCombinedHealthSubsystems(t *testing.T) {
 		}
 	})
 }
+
+func TestPollCombinedHealth_CUPSOnlyWithoutInventingTelemetry(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("cups_only_idle_preserves_queue_status_without_inventing_telemetry", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer XeroxGoSim is idle. enabled since Thu Jan 01 00:00:00 2026"), nil
+		}
+
+		// SNMP target is empty -> CUPS-only path
+		res := PollCombinedHealth(ctx, runner, "XeroxGoSim", SNMPConfig{Target: ""}, 75)
+		if !res.Online {
+			t.Errorf("expected Online = true, got %v", res.Online)
+		}
+		if res.State != "IDLE" {
+			t.Errorf("expected State = IDLE, got %s", res.State)
+		}
+		if res.EstimatedSheets != 75 {
+			t.Errorf("expected EstimatedSheets = 75, got %d", res.EstimatedSheets)
+		}
+		// Telemetry must not be invented
+		if res.TonerLevelPercent != 0 {
+			t.Errorf("expected TonerLevelPercent = 0, got %d", res.TonerLevelPercent)
+		}
+		if res.DrumLifePercent != 0 {
+			t.Errorf("expected DrumLifePercent = 0, got %d", res.DrumLifePercent)
+		}
+		if res.PaperJam || res.CoverOpen || res.OutputBinFull {
+			t.Errorf("unexpected hardware fault flags: jam=%v, cover=%v, bin=%v", res.PaperJam, res.CoverOpen, res.OutputBinFull)
+		}
+	})
+
+	t.Run("cups_only_printing_reports_printing_without_inventing_telemetry", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer XeroxGoSim now printing XeroxGoSim-42. enabled since Thu Jan 01 00:00:00 2026"), nil
+		}
+
+		res := PollCombinedHealth(ctx, runner, "XeroxGoSim", SNMPConfig{Target: ""}, 50)
+		if !res.Online {
+			t.Errorf("expected Online = true, got %v", res.Online)
+		}
+		if res.State != "PRINTING" {
+			t.Errorf("expected State = PRINTING, got %s", res.State)
+		}
+		if res.TonerLevelPercent != 0 || res.DrumLifePercent != 0 {
+			t.Errorf("telemetry should not be invented: toner=%d, drum=%d", res.TonerLevelPercent, res.DrumLifePercent)
+		}
+	})
+
+	t.Run("cups_only_media_jam_reports_error_without_inventing_telemetry", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer XeroxGoSim is stopped. enabled since Thu Jan 01 00:00:00 2026\n\talerts: media-jam-error"), nil
+		}
+
+		res := PollCombinedHealth(ctx, runner, "XeroxGoSim", SNMPConfig{Target: ""}, 50)
+		if res.State != "ERROR" {
+			t.Errorf("expected State = ERROR, got %s", res.State)
+		}
+		if !res.PaperJam {
+			t.Errorf("expected PaperJam = true, got false")
+		}
+		if res.TonerLevelPercent != 0 || res.DrumLifePercent != 0 {
+			t.Errorf("telemetry should not be invented: toner=%d, drum=%d", res.TonerLevelPercent, res.DrumLifePercent)
+		}
+	})
+}

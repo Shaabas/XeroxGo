@@ -11,7 +11,6 @@ import (
 	"image"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -210,35 +209,21 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				}
 			}
 		} else {
-			targetHost := strings.TrimSpace(cfg.SNMPTarget)
-		if targetHost == "" {
-			var candidate string
-			if h, _, err := net.SplitHostPort(cfg.PrinterAddr); err == nil && h != "" {
-				candidate = h
-			} else if strings.TrimSpace(cfg.PrinterAddr) != "" {
-				candidate = strings.TrimSpace(cfg.PrinterAddr)
+			wasExplicit := strings.TrimSpace(cfg.SNMPTarget) != ""
+			targetHost := printer.ResolveSNMPTarget(context.Background(), cfg.CUPSRunner, cfg.SNMPTarget, cfg.CUPSQueue, cfg.PrinterAddr)
+			if !wasExplicit && targetHost != "" && strings.TrimSpace(cfg.CUPSQueue) != "" {
+				log.Printf("[SPOOLER] Auto-discovered printer host %s from CUPS queue %s", targetHost, cfg.CUPSQueue)
 			}
-			if candidate != "" && candidate != "127.0.0.1" && candidate != "localhost" && candidate != "::1" {
-				targetHost = candidate
-			}
-		}
-		if targetHost == "" && strings.TrimSpace(cfg.CUPSQueue) != "" {
-			discovered := printer.DiscoverQueueHost(context.Background(), cfg.CUPSRunner, strings.TrimSpace(cfg.CUPSQueue))
-			if discovered != "" {
-				targetHost = discovered
-				cfg.SNMPTarget = discovered
-				log.Printf("[SPOOLER] Auto-discovered printer host %s from CUPS queue %s", discovered, cfg.CUPSQueue)
-			}
-		}
+			cfg.SNMPTarget = targetHost
 
-		snmpCfg := printer.DefaultSNMPConfig()
-		snmpCfg.Target = targetHost
-		if cfg.SNMPPort > 0 {
-			snmpCfg.Port = cfg.SNMPPort
-		}
-		if cfg.SNMPCommunity != "" {
-			snmpCfg.Community = cfg.SNMPCommunity
-		}
+			snmpCfg := printer.DefaultSNMPConfig()
+			snmpCfg.Target = targetHost
+			if cfg.SNMPPort > 0 {
+				snmpCfg.Port = cfg.SNMPPort
+			}
+			if cfg.SNMPCommunity != "" {
+				snmpCfg.Community = cfg.SNMPCommunity
+			}
 
 		cupsQ := strings.TrimSpace(cfg.CUPSQueue)
 		runner := cfg.CUPSRunner
@@ -845,21 +830,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 }
 
 func (c *Client) getSNMPConfig() *printer.SNMPConfig {
-	targetHost := strings.TrimSpace(c.cfg.SNMPTarget)
-	if targetHost == "" {
-		if h, _, err := net.SplitHostPort(c.cfg.PrinterAddr); err == nil && h != "" {
-			targetHost = h
-		} else if strings.TrimSpace(c.cfg.PrinterAddr) != "" {
-			targetHost = strings.TrimSpace(c.cfg.PrinterAddr)
-		}
-	}
-	if targetHost == "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
-		discovered := printer.DiscoverQueueHost(context.Background(), c.cfg.CUPSRunner, strings.TrimSpace(c.cfg.CUPSQueue))
-		if discovered != "" {
-			targetHost = discovered
-			c.cfg.SNMPTarget = discovered
-		}
-	}
+	targetHost := printer.ResolveSNMPTarget(context.Background(), c.cfg.CUPSRunner, c.cfg.SNMPTarget, c.cfg.CUPSQueue, c.cfg.PrinterAddr)
 	if targetHost == "" {
 		return nil
 	}
