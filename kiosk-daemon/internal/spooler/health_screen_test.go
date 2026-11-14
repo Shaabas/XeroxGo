@@ -2426,3 +2426,489 @@ func TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricate
 		t.Fatalf("CRITICAL INVENTORY LEAK: expected stock to remain 97, but got %d (decremented for unverified sheets!)", stkAfter)
 	}
 }
+
+// TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPausedErrorAndConservesInventory
+// proves that when CUPS completes its queue processing but the hardware odometer only confirms
+// partial progress (e.g. 2 of 4 sheets), the job is NOT marked COMPLETED; it is retained in
+// PAUSED_ERROR with verified physical sheets (2), and remaining paper inventory is CONSERVED (no deduction).
+func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPausedErrorAndConservesInventory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "partial_odo.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.ResetPaperTray(ctx, 100); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	pdfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer pdfServer.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job-partial-odo-01",
+		KioskID:        "kiosk-odo",
+		DisplayCode:    "1234",
+		DownloadURL:    pdfServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     8,
+		TotalSheets:    4,
+		Copies:         1,
+		Duplex:         contracts.DuplexLongEdge,
+		StartFromPage:  1,
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			return []byte("request id is HPTank-part-01 (1 file(s))"), nil
+		}
+		if name == "lpstat" {
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("HPTank-part-01 user 1024 Thu Nov 14 12:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+				if arg == "-p" {
+					return []byte("printer HPTank is idle. enabled"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+
+	// Hardware odometer only confirms 2 sheets (baseline 1000, final 1002)
+	var odoCalls int32
+	poller := func(ctx context.Context) printer.HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 1000
+		if c > 1 {
+			life = 1002 // delta = 2 sheets (out of 4)
+		}
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-odo",
+		StateStore:          store,
+		CUPSQueue:           "HPTank",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://kiosk.test/ready",
+		ScreenSink:          func(*image.RGBA) error { return nil },
+		CUPSRunner:          runner,
+		SNMPPoller:          poller,
+		EnableCloudRecovery: true,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	client.processJob(ctx, cmd)
+
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job to be in PAUSED_ERROR due to incomplete physical output, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 2 {
+		t.Fatalf("expected SheetsPrinted to reflect verified physical progress (2), got %d", saved.SheetsPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "physical output incomplete") || !strings.Contains(saved.ErrorReason, "verified physical: 2/4") {
+		t.Fatalf("expected ErrorReason to detail incomplete physical output (2/4), got %q", saved.ErrorReason)
+	}
+
+	// CRITICAL INVENTORY CONSERVATION: Stock must be 98 (100 - 2 verified sheets).
+	// The 2 unverified sheets must NEVER be deducted!
+	stk, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("GetEstimatedSheets failed: %v", err)
+	}
+	if stk != 98 {
+		t.Fatalf("CRITICAL INVENTORY LEAK: expected stock 98 (conserved for unverified sheets), got %d", stk)
+	}
+
+	// Screen must be ModeError
+	history := client.RenderHistory()
+	if len(history) == 0 {
+		t.Fatal("expected screen frames rendered")
+	}
+	lastScreen := history[len(history)-1]
+	if lastScreen.Mode != ui_ipc.ModeError {
+		t.Fatalf("expected last screen ModeError, got %v", lastScreen.Mode)
+	}
+}
+
+// TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedErrorAndConservesInventory
+// proves that when CUPS completes its queue processing without an SNMP odometer, physical output
+// cannot be verified; the job transitions to PAUSED_ERROR with 0 physical sheets, and paper inventory
+// is completely CONSERVED (0 sheets deducted).
+func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedErrorAndConservesInventory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "missing_odo.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.ResetPaperTray(ctx, 100); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	pdfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer pdfServer.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job-missing-odo-01",
+		KioskID:        "kiosk-noodo",
+		DisplayCode:    "5678",
+		DownloadURL:    pdfServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     6,
+		TotalSheets:    3,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			return []byte("request id is HPTank-noodo-01 (1 file(s))"), nil
+		}
+		if name == "lpstat" {
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("HPTank-noodo-01 user 1024 Thu Nov 14 12:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+				if arg == "-p" {
+					return []byte("printer HPTank is idle. enabled"), nil
+				}
+			}
+		}
+		if name == "ipptool" {
+			// IPP reports 3 sheets completed, but no odometer exists
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 3\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	// No SNMP poller configured: odometer is missing
+	cfg := ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-noodo",
+		StateStore:          store,
+		CUPSQueue:           "HPTank",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://kiosk.test/ready",
+		ScreenSink:          func(*image.RGBA) error { return nil },
+		CUPSRunner:          runner,
+		SNMPPoller:          nil, // MISSING ODONOMETER
+		EnableCloudRecovery: true,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	client.processJob(ctx, cmd)
+
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job to be in PAUSED_ERROR due to missing odometer proof, got %s", saved.Status)
+	}
+	if saved.SheetsPrinted != 0 {
+		t.Fatalf("expected SheetsPrinted to remain 0 (no synthetic physical sheets), got %d", saved.SheetsPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "without physical sheet verification") || !strings.Contains(saved.ErrorReason, "verified physical: 0/3") {
+		t.Fatalf("expected ErrorReason to detail missing physical sheet verification (0/3), got %q", saved.ErrorReason)
+	}
+
+	// CRITICAL INVENTORY CONSERVATION: Stock must remain untouched at 100!
+	stk, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("GetEstimatedSheets failed: %v", err)
+	}
+	if stk != 100 {
+		t.Fatalf("CRITICAL INVENTORY LEAK: expected stock 100 (conserved), got %d", stk)
+	}
+}
+
+// TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPausedErrorAndConservesInventory
+// proves that when the daemon restarts and finds a CUPS job completed, but the local state store
+// only recorded partial progress prior to restart (e.g. 1 of 5 sheets), startup reconciliation
+// NEVER promotes sheets or auto-completes; it preserves PAUSED_ERROR and conserves inventory.
+func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPausedErrorAndConservesInventory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "rec_noproof.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.ResetPaperTray(ctx, 100); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job-rec-noproof-01",
+		KioskID:        "kiosk-rec",
+		DisplayCode:    "9999",
+		DownloadURL:    "https://storage.test/dummy.pdf",
+		SHA256Checksum: strings.Repeat("f", 64),
+		TotalPages:     10,
+		TotalSheets:    5,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Seed job before daemon crash: in PRINTING, 1 sheet verified physically
+	if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	if err := store.RecordJobSubmission(ctx, cmd.JobID, "HPTank-rec-99"); err != nil {
+		t.Fatalf("RecordJobSubmission failed: %v", err)
+	}
+	if err := store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  2,
+		SheetsPrinted: 1,
+		Timestamp:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RecordSheetProgress failed: %v", err)
+	}
+
+	stkBefore, _ := store.GetEstimatedSheets(ctx)
+	if stkBefore != 99 {
+		t.Fatalf("expected stock 99 before restart, got %d", stkBefore)
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("HPTank-rec-99 user 1024 Thu Nov 14 12:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+				if arg == "-p" {
+					return []byte("printer HPTank is idle. enabled"), nil
+				}
+			}
+		}
+		if name == "ipptool" {
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 5\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	cfg := ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-rec",
+		StateStore:          store,
+		CUPSQueue:           "HPTank",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://kiosk.test/ready",
+		ScreenSink:          func(*image.RGBA) error { return nil },
+		CUPSRunner:          runner,
+		EnableCloudRecovery: true,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		job, err := store.GetJob(ctx, cmd.JobID)
+		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
+			paused = true
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if !paused {
+		t.Fatal("expected startup recovery to preserve job in PAUSED_ERROR without physical proof")
+	}
+
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.SheetsPrinted != 1 {
+		t.Fatalf("CRITICAL SAFETY FAILURE: expected SheetsPrinted to remain 1 (verified physical), got %d (promoted unverified sheets)", saved.SheetsPrinted)
+	}
+	if !strings.Contains(saved.ErrorReason, "without physical proof") {
+		t.Fatalf("expected ErrorReason to mention without physical proof, got %q", saved.ErrorReason)
+	}
+
+	// CRITICAL INVENTORY CHECK: Paper inventory must stay at 99 (never deduct 4 unverified sheets)
+	stkAfter, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("GetEstimatedSheets failed: %v", err)
+	}
+	if stkAfter != 99 {
+		t.Fatalf("CRITICAL INVENTORY LEAK: expected stock to remain 99, but got %d", stkAfter)
+	}
+}
+
+// TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeductsInventoryAccurately
+// proves that when the hardware odometer confirms that all sheets were physically ejected (4 of 4 sheets),
+// the job transitions to COMPLETED and paper inventory is accurately decremented by 4 sheets.
+func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeductsInventoryAccurately(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "full_odo.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.ResetPaperTray(ctx, 100); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	pdfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer pdfServer.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job-full-odo-01",
+		KioskID:        "kiosk-full",
+		DisplayCode:    "4321",
+		DownloadURL:    pdfServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     8,
+		TotalSheets:    4,
+		Copies:         1,
+		Duplex:         contracts.DuplexLongEdge,
+		StartFromPage:  1,
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			return []byte("request id is HPTank-full-01 (1 file(s))"), nil
+		}
+		if name == "lpstat" {
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("HPTank-full-01 user 1024 Thu Nov 14 12:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+				if arg == "-p" {
+					return []byte("printer HPTank is idle. enabled"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+
+	// Hardware odometer confirms all 4 sheets (baseline 1000 -> 1004)
+	var odoCalls int32
+	poller := func(ctx context.Context) printer.HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 1000
+		if c > 1 {
+			life = 1004
+		}
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
+	cfg := ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-full",
+		StateStore:          store,
+		CUPSQueue:           "HPTank",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://kiosk.test/ready",
+		ScreenSink:          func(*image.RGBA) error { return nil },
+		CUPSRunner:          runner,
+		SNMPPoller:          poller,
+		EnableCloudRecovery: true,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	client.processJob(ctx, cmd)
+
+	saved, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || saved == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if saved.Status != contracts.JobStatusCompleted {
+		t.Fatalf("expected job to be COMPLETED with full odometer proof, got %s with reason %q", saved.Status, saved.ErrorReason)
+	}
+	if saved.SheetsPrinted != 4 {
+		t.Fatalf("expected SheetsPrinted = 4, got %d", saved.SheetsPrinted)
+	}
+	if saved.PagesPrinted != 8 {
+		t.Fatalf("expected PagesPrinted = 8, got %d", saved.PagesPrinted)
+	}
+
+	// CRITICAL INVENTORY DEDUCTION: Stock must be accurately decremented: 100 - 4 = 96
+	stk, err := store.GetEstimatedSheets(ctx)
+	if err != nil {
+		t.Fatalf("GetEstimatedSheets failed: %v", err)
+	}
+	if stk != 96 {
+		t.Fatalf("expected stock 96 after complete physical printing, got %d", stk)
+	}
+}

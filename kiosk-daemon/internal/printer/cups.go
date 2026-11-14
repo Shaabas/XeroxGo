@@ -430,6 +430,7 @@ type CUPSPrintHooks struct {
 	OnSubmitting        func()
 	OnSubmitted         func(cupsJobID string)
 	SNMPConfig          *SNMPConfig
+	TelemetryPoller     func(ctx context.Context) HardwareTelemetry
 	PreserveJobOnCancel func() bool
 }
 
@@ -535,14 +536,19 @@ func PrintPDFWithCUPSHooksCustom(
 	}
 
 	var snmpCfg *SNMPConfig
+	var telemPoller func(context.Context) HardwareTelemetry
 	if hooks != nil {
 		snmpCfg = hooks.SNMPConfig
+		telemPoller = hooks.TelemetryPoller
 		if hooks.PreserveJobOnCancel != nil {
 			ctx = ContextWithPreserveChecker(ctx, hooks.PreserveJobOnCancel)
 		}
 	}
 
 	// 3. Monitor CUPS job until completed, failed, or context canceled
+	if telemPoller != nil {
+		return MonitorCUPSJobWithTelemetryCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, telemPoller)
+	}
 	return MonitorCUPSJobWithSNMPCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, snmpCfg)
 }
 
@@ -720,14 +726,12 @@ func MonitorCUPSJobWithTelemetryCustom(
 
 			case CUPSJobStateProcessing:
 				consecutiveUnknown = 0
-				// If hardware odometer is available, odometer drives onPage.
-				// Otherwise fall back to CUPS IPP sheets counter.
+				// Physical progress is driven solely by hardware odometer (telem.HasLife && hasOdometer).
+				// Unverified CUPS IPP sheets completed counters must NEVER enter onPage callback.
 				if !hasOdometer {
 					if info.SheetsCompleted > lastSheetsReported && info.SheetsCompleted <= cmd.TotalSheets {
 						lastSheetsReported = info.SheetsCompleted
-						if onPage != nil {
-							onPage(info.SheetsCompleted)
-						}
+						log.Printf("[CUPS] Job %s processing in CUPS queue (CUPS counter: %d/%d sheets, physical output unverified)", cmd.JobID, info.SheetsCompleted, cmd.TotalSheets)
 					}
 				}
 
@@ -737,17 +741,9 @@ func MonitorCUPSJobWithTelemetryCustom(
 				log.Printf("[CUPS] Job %s printer paused/stopped (recoverable): %s. Waiting for printer recovery...", cupsJobID, strings.Join(info.Reasons, ", "))
 
 			case CUPSJobStateCompleted:
-				log.Printf("[CUPS] Job %s (CUPS ID %s) confirmed completed by CUPS", cmd.JobID, cupsJobID)
-				if !hasOdometer {
-					// Fall back to CUPS IPP sheets completed counter if reported,
-					// but NEVER fabricate full cmd.TotalSheets solely from CUPS completion.
-					if info.SheetsCompleted > lastSheetsReported && info.SheetsCompleted <= cmd.TotalSheets {
-						lastSheetsReported = info.SheetsCompleted
-						if onPage != nil {
-							onPage(info.SheetsCompleted)
-						}
-					}
-				}
+				log.Printf("[CUPS] Job %s (CUPS ID %s) confirmed completed by CUPS (CUPS counter: %d sheets)", cmd.JobID, cupsJobID, info.SheetsCompleted)
+				// Do not invoke onPage with unverified CUPS counters. Physical progress
+				// requires hardware odometer proof.
 				return nil
 
 			case CUPSJobStateCanceled:

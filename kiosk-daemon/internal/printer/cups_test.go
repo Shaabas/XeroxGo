@@ -223,9 +223,95 @@ job-media-sheets-completed (integer) = 4
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Verifies real sheet progress (2 then 4)
-	if len(completedSheets) != 2 || completedSheets[0] != 2 || completedSheets[1] != 4 {
-		t.Errorf("expected completed sheets [2, 4], got %v", completedSheets)
+	// Without hardware odometer proof, unverified CUPS IPP sheet counters
+	// must NOT enter the onPage callback.
+	if len(completedSheets) != 0 {
+		t.Errorf("expected no physical sheet progress without hardware odometer proof, got %v", completedSheets)
+	}
+}
+
+func TestPrintPDFWithCUPS_Success_IPP_WithHardwareOdometer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	ippCalls := 0
+	var completedSheets []int
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch name {
+		case "lp":
+			return []byte("request id is HL-L5210DN-102 (1 file(s))\n"), nil
+		case "ipptool":
+			ippCalls++
+			if ippCalls == 1 {
+				return []byte(`
+job-id (integer) = 102
+job-state (enum) = processing
+job-state-reasons (keyword) = none
+job-media-sheets-completed (integer) = 2
+`), nil
+			}
+			return []byte(`
+job-id (integer) = 102
+job-state (enum) = completed
+job-state-reasons (keyword) = job-completed-successfully
+job-media-sheets-completed (integer) = 4
+`), nil
+		default:
+			return nil, errors.New("unexpected command: " + name)
+		}
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID:       "job-ipp-2",
+		Copies:      1,
+		TotalPages:  8,
+		TotalSheets: 4,
+		Duplex:      contracts.DuplexLongEdge,
+	}
+
+	onPage := func(sheets int) {
+		mu.Lock()
+		completedSheets = append(completedSheets, sheets)
+		mu.Unlock()
+	}
+
+	var odoCalls int32
+	poller := func(ctx context.Context) HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 5000
+		if c > 1 {
+			life += int64((c - 1) * 2)
+		}
+		return HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
+	hooks := &CUPSPrintHooks{
+		TelemetryPoller: poller,
+	}
+
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "HL-L5210DN", cmd, "/var/kiosk/job-ipp.pdf", onPage, 10*time.Millisecond, hooks)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(completedSheets) == 0 {
+		t.Fatal("expected physical sheet progress driven by hardware odometer")
+	}
+	last := completedSheets[len(completedSheets)-1]
+	if last != 4 {
+		t.Errorf("expected final completed sheet count 4, got %d (all: %v)", last, completedSheets)
 	}
 }
 

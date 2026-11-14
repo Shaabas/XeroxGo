@@ -67,6 +67,7 @@ type ClientConfig struct {
 	HTTPClient               *http.Client
 	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
+	SNMPPoller               func(ctx context.Context) printer.HardwareTelemetry
 	CUPSRunner               printer.CommandRunner
 	EnableCloudRecovery      bool
 	InputSource              input.Source
@@ -125,6 +126,7 @@ type Client struct {
 	canvas   *image.RGBA
 
 	healthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	snmpPoller   func(ctx context.Context) printer.HardwareTelemetry
 
 	pinController *pin.Controller
 }
@@ -289,6 +291,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		heartbeatInterval:     15 * time.Second,
 		maxDownloadBytes:      250 * 1024 * 1024,
 		healthPoller:          poller,
+		snmpPoller:            cfg.SNMPPoller,
 		requiredRecoveryCount: reqHealthy,
 	}
 
@@ -452,9 +455,28 @@ func (c *Client) Run(ctx context.Context) error {
 						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
 						c.sendProgress(ctx, evt)
 					} else {
-						// Physical printing finished in CUPS while daemon was stopped/restarting and printer is healthy
-						log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) confirmed COMPLETED by CUPS and printer healthy", incomplete.Command.JobID, incomplete.CUPSJobID)
-						c.completeJob(ctx, incomplete.Command)
+						// Physical printing finished in CUPS while daemon was stopped/restarting and printer is healthy.
+						// Only complete if physical output was physically confirmed before restart.
+						if incomplete.SheetsPrinted >= incomplete.Command.TotalSheets {
+							log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) confirmed COMPLETED with physical proof (%d/%d sheets) and printer healthy",
+								incomplete.Command.JobID, incomplete.CUPSJobID, incomplete.SheetsPrinted, incomplete.Command.TotalSheets)
+							c.completeJob(ctx, incomplete.Command)
+						} else {
+							reason := fmt.Sprintf("interrupted by daemon restart; CUPS completed queue without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), physical evidence insufficient, manual reconciliation required",
+								cupsInfo.SheetsCompleted, incomplete.SheetsPrinted, incomplete.Command.TotalSheets)
+							log.Printf("[SPOOLER] Startup reconciliation: preserving job %s (CUPS ID %s) in PAUSED_ERROR: %s", incomplete.Command.JobID, incomplete.CUPSJobID, reason)
+							evt := contracts.JobProgressEvent{
+								JobID:         incomplete.Command.JobID,
+								KioskID:       incomplete.Command.KioskID,
+								Status:        contracts.JobStatusPausedError,
+								PagesPrinted:  incomplete.PagesPrinted,
+								SheetsPrinted: incomplete.SheetsPrinted,
+								ErrorReason:   reason,
+								Timestamp:     time.Now().UTC(),
+							}
+							_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+							c.sendProgress(ctx, evt)
+						}
 					}
 				} else if qErr == nil && (cupsInfo.State == printer.CUPSJobStateProcessing ||
 					cupsInfo.State == printer.CUPSJobStatePending ||
@@ -1001,8 +1023,13 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		}
 	}
 
-	snmpCfg := c.getSNMPConfig()
-	err := printer.MonitorCUPSJobWithSNMPCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, snmpCfg)
+	var err error
+	if c.snmpPoller != nil {
+		err = printer.MonitorCUPSJobWithTelemetryCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, c.snmpPoller)
+	} else {
+		snmpCfg := c.getSNMPConfig()
+		err = printer.MonitorCUPSJobWithSNMPCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, snmpCfg)
+	}
 
 	cancelJob()
 	<-monitorDone
@@ -1031,7 +1058,16 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		return
 	}
 
-	c.completeJob(ctx, cmd)
+	if curSheets >= cmd.TotalSheets {
+		c.completeJob(ctx, cmd)
+	} else {
+		reason := fmt.Sprintf("CUPS completed queue, but physical output incomplete (verified physical: %d/%d); physical evidence insufficient, manual reconciliation required", curSheets, cmd.TotalSheets)
+		if curSheets == 0 {
+			reason = fmt.Sprintf("CUPS completed queue without physical sheet verification (verified physical: 0/%d); physical evidence insufficient, manual reconciliation required", cmd.TotalSheets)
+		}
+		log.Printf("[SPOOLER] Resumed monitoring for job %s: %s", cmd.JobID, reason)
+		c.handleJobError(ctx, cmd, curPages, curSheets, reason)
+	}
 }
 
 func (c *Client) jobWorker(ctx context.Context) {
@@ -1285,7 +1321,12 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 
 	if startPage > cmd.TotalPages {
-		c.completeJob(ctx, cmd)
+		if sheetsPrinted >= cmd.TotalSheets {
+			c.completeJob(ctx, cmd)
+		} else {
+			reason := fmt.Sprintf("pages already printed, but physical sheets incomplete (verified physical: %d/%d); manual reconciliation required", sheetsPrinted, cmd.TotalSheets)
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
+		}
 		return
 	}
 
@@ -1501,6 +1542,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 					_ = c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
 				},
 				SNMPConfig:          c.getSNMPConfig(),
+				TelemetryPoller:     c.snmpPoller,
 				PreserveJobOnCancel: preserveCUPSJob.Load,
 			}
 			printErr = printer.PrintPDFWithCUPSHooksCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, streamCmd, printPath, onPage, 500*time.Millisecond, hooks)
@@ -1539,7 +1581,16 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 
 	// 9. Complete Job
-	c.completeJob(ctx, cmd)
+	if curSheets >= cmd.TotalSheets {
+		c.completeJob(ctx, cmd)
+	} else {
+		reason := fmt.Sprintf("CUPS completed queue, but physical output incomplete (verified physical: %d/%d); physical evidence insufficient, manual reconciliation required", curSheets, cmd.TotalSheets)
+		if curSheets == 0 {
+			reason = fmt.Sprintf("CUPS completed queue without physical sheet verification (verified physical: 0/%d); physical evidence insufficient, manual reconciliation required", cmd.TotalSheets)
+		}
+		log.Printf("[SPOOLER] Job %s: %s", cmd.JobID, reason)
+		c.handleJobError(ctx, cmd, curPages, curSheets, reason)
+	}
 }
 
 func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) {

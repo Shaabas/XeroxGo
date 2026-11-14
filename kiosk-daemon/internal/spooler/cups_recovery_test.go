@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/pkg/contracts"
 )
@@ -57,12 +58,27 @@ func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 		return []byte(""), nil
 	}
 
+	var odoCalls int32
+	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 1000
+		if c > 1 {
+			life += int64(c - 1)
+		}
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-cups",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          snmpPoller,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -254,12 +270,27 @@ func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 		return []byte(""), nil
 	}
 
+	var odoCalls int32
+	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 1000
+		if c > 1 {
+			life += int64((c - 1) * 2)
+		}
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-cups",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          snmpPoller,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -329,6 +360,17 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 	cupsID := "DCPT310-401"
 	if err := store.RecordJobSubmission(context.Background(), cmd.JobID, cupsID); err != nil {
 		t.Fatalf("RecordJobSubmission failed: %v", err)
+	}
+	// Pre-crash: sheets were physically verified before daemon restarted
+	if err := store.RecordSheetProgress(context.Background(), contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  2,
+		SheetsPrinted: 2,
+		Timestamp:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RecordSheetProgress failed: %v", err)
 	}
 
 	var lpCalled atomic.Int32
@@ -612,6 +654,20 @@ func TestCUPS_MultiCopyRecoveryIntegrity(t *testing.T) {
 	}
 
 	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "/ws"
+	var odoCalls int32
+	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 2000
+		if c > 1 {
+			life += int64((c - 1) * 2)
+		}
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            wsURL,
 		KioskID:             "kiosk-test",
@@ -619,6 +675,7 @@ func TestCUPS_MultiCopyRecoveryIntegrity(t *testing.T) {
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          snmpPoller,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -818,27 +875,39 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 		_ = client.Run(runCtx)
 	}()
 
-	// Wait for startup reconciliation
+	// Wait for startup reconciliation: without physical proof for sheets 3-5,
+	// startup recovery must preserve PAUSED_ERROR and conserve paper inventory!
 	deadline := time.Now().Add(2 * time.Second)
-	completed := false
+	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
-		if err == nil && job != nil && job.Status == contracts.JobStatusCompleted {
-			completed = true
+		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
+			paused = true
 			break
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
 
-	if !completed {
-		t.Fatal("expected startup recovery to complete job")
+	if !paused {
+		t.Fatal("expected startup recovery to preserve job in PAUSED_ERROR without physical proof")
 	}
 
-	// Crucial check: stock must be exactly 45 (50 - 5 total sheets)
-	// Remaining 3 sheets must have been deducted, NOT 0 and NOT 5 double-deducted!
+	job, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || job == nil {
+		t.Fatalf("failed to query job: %v", err)
+	}
+	if job.SheetsPrinted != 2 {
+		t.Fatalf("expected SheetsPrinted to remain 2, got %d", job.SheetsPrinted)
+	}
+	if !strings.Contains(job.ErrorReason, "without physical proof") {
+		t.Fatalf("expected ErrorReason to mention without physical proof, got %q", job.ErrorReason)
+	}
+
+	// Crucial check: stock must remain exactly 48 (50 - 2 pre-crash sheets).
+	// Without physical proof, remaining 3 sheets must NOT be fabricated or deducted!
 	stkAfter, _ := store.GetEstimatedSheets(ctx)
-	if stkAfter != 45 {
-		t.Fatalf("expected stock 45 after reconciliation (5 total deducted), got %d", stkAfter)
+	if stkAfter != 48 {
+		t.Fatalf("CRITICAL INVENTORY LEAK: expected stock 48 (conserved), got %d", stkAfter)
 	}
 }
 
@@ -1027,7 +1096,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
 		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
-			if strings.Contains(job.ErrorReason, "insufficient sheets") {
+			if strings.Contains(job.ErrorReason, "insufficient") {
 				paused = true
 				break
 			}
@@ -1106,12 +1175,27 @@ func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 		return []byte(""), nil
 	}
 
+	var odoCalls int32
+	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+		c := atomic.AddInt32(&odoCalls, 1)
+		var life int64 = 1000
+		if c > 1 {
+			life += int64((c - 1) * 2)
+		}
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: life,
+		}
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-cups",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          snmpPoller,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
