@@ -699,6 +699,36 @@ func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEv
 	_ = wsjson.Write(ctx, conn, wireMessage{Type: "progress", Progress: &event})
 }
 
+func (c *Client) sendAckAndProgress(ctx context.Context, event contracts.JobProgressEvent) {
+	c.sendProgress(ctx, event)
+
+	c.connMu.Lock()
+	activeConn := c.conn
+	c.connMu.Unlock()
+	if activeConn != nil {
+		_ = c.sendWire(ctx, activeConn, wireMessage{
+			Type:     "job_ack",
+			Progress: &event,
+		})
+	}
+}
+
+func isConflictingDuplicate(stored, incoming contracts.PrintJobCommand) bool {
+	if incoming.TotalPages != stored.TotalPages ||
+		incoming.TotalSheets != stored.TotalSheets ||
+		incoming.Copies != stored.Copies ||
+		incoming.Duplex != stored.Duplex ||
+		incoming.StartFromPage != stored.StartFromPage ||
+		!strings.EqualFold(incoming.SHA256Checksum, stored.SHA256Checksum) ||
+		incoming.DownloadURL != stored.DownloadURL {
+		return true
+	}
+	if stored.DisplayCode != "" && incoming.DisplayCode != "" && stored.DisplayCode != incoming.DisplayCode {
+		return true
+	}
+	return false
+}
+
 func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	if cmd.KioskID != c.cfg.KioskID {
 		return
@@ -719,37 +749,186 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	if cmd.TotalPages < 1 || cmd.TotalSheets < 1 || cmd.Copies < 1 || cmd.StartFromPage < 1 || cmd.StartFromPage > cmd.TotalPages {
 		return
 	}
+	switch cmd.Duplex {
+	case contracts.DuplexSimplex, contracts.DuplexLongEdge, contracts.DuplexShortEdge:
+	default:
+		return
+	}
 
-	// Durable idempotency check: ignore if job is already marked COMPLETED or submitted to printer in local database
-	if existing, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID); err == nil && existing != nil {
-		if existing.Status == contracts.JobStatusCompleted {
-			log.Printf("[SPOOLER] Ignoring duplicate command for already completed job %s", cmd.JobID)
-			evt := contracts.JobProgressEvent{
-				JobID:         cmd.JobID,
-				KioskID:       cmd.KioskID,
-				Status:        contracts.JobStatusCompleted,
-				PagesPrinted:  cmd.TotalPages,
-				SheetsPrinted: cmd.TotalSheets,
-				Timestamp:     time.Now().UTC(),
-			}
-			c.sendProgress(context.Background(), evt)
+	// 1. Check existing durable state in local store
+	if c.cfg.StateStore == nil {
+		log.Printf("[SPOOLER] Rejecting incoming job %s: StateStore not configured", cmd.JobID)
+		return
+	}
+
+	existing, err := c.cfg.StateStore.GetJob(context.Background(), cmd.JobID)
+	if err != nil {
+		// SQLite lookup fails: fail closed; no acknowledgment
+		log.Printf("[SPOOLER] Failed to query local state store for job %s: %v; failing closed", cmd.JobID, err)
+		return
+	}
+
+	if existing != nil {
+		// Verify that duplicate commands match original stored job identity and immutable print settings.
+		if isConflictingDuplicate(existing.Command, cmd) {
+			log.Printf("[SPOOLER] Rejecting conflicting duplicate command for job %s: payload does not match stored job", cmd.JobID)
 			return
 		}
-		if existing.SubmittedToPrinter || existing.CUPSJobID != "" {
-			log.Printf("[SPOOLER] Ignoring duplicate command for job %s: already submitted to printer (CUPS ID %s, status %s)", cmd.JobID, existing.CUPSJobID, existing.Status)
-			evt := contracts.JobProgressEvent{
+
+		// Stored, completed: Never resubmit; report existing completed state
+		if existing.Status == contracts.JobStatusCompleted {
+			log.Printf("[SPOOLER] Acknowledging duplicate command for already completed job %s", cmd.JobID)
+			pagesPrinted := existing.PagesPrinted
+			if pagesPrinted <= 0 {
+				pagesPrinted = existing.Command.TotalPages
+			}
+			sheetsPrinted := existing.SheetsPrinted
+			if sheetsPrinted <= 0 {
+				sheetsPrinted = existing.Command.TotalSheets
+			}
+			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
 				JobID:         cmd.JobID,
-				KioskID:       cmd.KioskID,
+				KioskID:       c.cfg.KioskID,
+				Status:        contracts.JobStatusCompleted,
+				PagesPrinted:  pagesPrinted,
+				SheetsPrinted: sheetsPrinted,
+				Timestamp:     time.Now().UTC(),
+			})
+			return
+		}
+
+		// Stored, already submitted to printer: Never resubmit; acknowledge durable possession and report current stored progress
+		if existing.SubmittedToPrinter || existing.CUPSJobID != "" {
+			log.Printf("[SPOOLER] Acknowledging duplicate command for already submitted job %s (CUPS ID %s, status %s)", cmd.JobID, existing.CUPSJobID, existing.Status)
+			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       c.cfg.KioskID,
 				Status:        existing.Status,
 				PagesPrinted:  existing.PagesPrinted,
 				SheetsPrinted: existing.SheetsPrinted,
+				ErrorReason:   existing.ErrorReason,
 				Timestamp:     time.Now().UTC(),
+			})
+			return
+		}
+
+		// Stored, paused or ambiguous: Never automatically resubmit; preserve recovery requirements
+		if existing.Status == contracts.JobStatusPausedError || existing.Status == contracts.JobStatusFailedRefundable {
+			log.Printf("[SPOOLER] Acknowledging duplicate command for paused/failed job %s (status %s)", cmd.JobID, existing.Status)
+			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       c.cfg.KioskID,
+				Status:        existing.Status,
+				PagesPrinted:  existing.PagesPrinted,
+				SheetsPrinted: existing.SheetsPrinted,
+				ErrorReason:   existing.ErrorReason,
+				Timestamp:     time.Now().UTC(),
+			})
+			return
+		}
+
+		// Stored, currently active or deferred in memory
+		c.deferredMu.Lock()
+		isDeferred := false
+		for _, dj := range c.deferredJobs {
+			if dj.JobID == cmd.JobID {
+				isDeferred = true
+				break
 			}
-			c.sendProgress(context.Background(), evt)
+		}
+		c.deferredMu.Unlock()
+
+		c.activeMu.Lock()
+		isActive := c.activeJobs[cmd.JobID]
+		c.activeMu.Unlock()
+
+		if isDeferred || isActive {
+			log.Printf("[SPOOLER] Acknowledging duplicate command for in-memory active/deferred job %s", cmd.JobID)
+			status := existing.Status
+			if status == "" {
+				status = contracts.JobStatusSpooling
+			}
+			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       c.cfg.KioskID,
+				Status:        status,
+				PagesPrinted:  existing.PagesPrinted,
+				SheetsPrinted: existing.SheetsPrinted,
+				ErrorReason:   existing.ErrorReason,
+				Timestamp:     time.Now().UTC(),
+			})
+			return
+		}
+
+		// Stored, queued but not active: acknowledge only if recoverable
+		isDefinitelyNotSubmitted := !existing.SubmittedToPrinter &&
+			existing.CUPSJobID == "" &&
+			existing.SheetsPrinted == 0 &&
+			existing.PagesPrinted == 0 &&
+			existing.ErrorReason == ""
+
+		if !isDefinitelyNotSubmitted {
+			log.Printf("[SPOOLER] Stored job %s has ambiguous submission state; acknowledging without resubmission", cmd.JobID)
+			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       c.cfg.KioskID,
+				Status:        existing.Status,
+				PagesPrinted:  existing.PagesPrinted,
+				SheetsPrinted: existing.SheetsPrinted,
+				ErrorReason:   existing.ErrorReason,
+				Timestamp:     time.Now().UTC(),
+			})
+			return
+		}
+
+		// Definitely unsubmitted: safe to admit to queue if kiosk is not busy
+		c.activeMu.Lock()
+		if len(c.activeJobs) > 0 {
+			c.activeMu.Unlock()
+			c.connMu.Lock()
+			conn := c.conn
+			c.connMu.Unlock()
+			if conn != nil {
+				_ = c.sendWire(context.Background(), conn, wireMessage{
+					Type:  "error",
+					Error: "kiosk is busy processing an existing job",
+				})
+			}
+			return
+		}
+		c.activeJobs[cmd.JobID] = true
+		c.activeMu.Unlock()
+
+		select {
+		case c.jobQueue <- existing.Command:
+			log.Printf("[SPOOLER] Re-admitted unsubmitted stored job %s to queue", cmd.JobID)
+			c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       c.cfg.KioskID,
+				Status:        contracts.JobStatusSpooling,
+				PagesPrinted:  0,
+				SheetsPrinted: 0,
+				Timestamp:     time.Now().UTC(),
+			})
+			return
+		default:
+			c.activeMu.Lock()
+			delete(c.activeJobs, cmd.JobID)
+			c.activeMu.Unlock()
+			c.connMu.Lock()
+			conn := c.conn
+			c.connMu.Unlock()
+			if conn != nil {
+				_ = c.sendWire(context.Background(), conn, wireMessage{
+					Type:  "error",
+					Error: "kiosk job queue is full",
+				})
+			}
 			return
 		}
 	}
 
+	// 2. New job acceptance (existing == nil)
 	c.deferredMu.Lock()
 	for _, dj := range c.deferredJobs {
 		if dj.JobID == cmd.JobID {
@@ -778,41 +957,25 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		}
 		return
 	}
+	// Reserve in-memory job ID to prevent concurrent duplicate admission
 	c.activeJobs[cmd.JobID] = true
 	c.activeMu.Unlock()
-	log.Printf("[SPOOLER] Queued print job %s (pages=%d, sheets=%d, copies=%d, duplex=%s)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets, cmd.Copies, cmd.Duplex)
 
-	// Durably record incoming job acceptance in local state store before enqueueing
-	if c.cfg.StateStore != nil {
-		if err := c.cfg.StateStore.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
-			log.Printf("[SPOOLER] Warning: failed to persist initial job %s: %v", cmd.JobID, err)
-		}
+	// 3. Durably persist job in SQLite
+	if err := c.cfg.StateStore.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+		c.activeMu.Lock()
+		delete(c.activeJobs, cmd.JobID)
+		c.activeMu.Unlock()
+		log.Printf("[SPOOLER] Failed to persist initial job %s: %v", cmd.JobID, err)
+		return
 	}
 
-	// Send explicit acceptance / spooling acknowledgement back to cloud
-	ackEvt := contracts.JobProgressEvent{
-		JobID:         cmd.JobID,
-		KioskID:       cmd.KioskID,
-		Status:        contracts.JobStatusSpooling,
-		PagesPrinted:  0,
-		SheetsPrinted: 0,
-		Timestamp:     time.Now().UTC(),
-	}
-	c.sendProgress(context.Background(), ackEvt)
-
-	c.connMu.Lock()
-	activeConn := c.conn
-	c.connMu.Unlock()
-	if activeConn != nil {
-		_ = c.sendWire(context.Background(), activeConn, wireMessage{
-			Type:     "job_ack",
-			Progress: &ackEvt,
-		})
-	}
-
+	// 4. Queue admission (only acknowledge after both durable persistence AND successful queue admission)
 	select {
 	case c.jobQueue <- cmd:
+		log.Printf("[SPOOLER] Queued print job %s (pages=%d, sheets=%d, copies=%d, duplex=%s)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets, cmd.Copies, cmd.Duplex)
 	default:
+		// Queue admission failed: release in-memory reservation, preserve durable record in store
 		c.activeMu.Lock()
 		delete(c.activeJobs, cmd.JobID)
 		c.activeMu.Unlock()
@@ -826,7 +989,19 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 				Error: "kiosk job queue is full",
 			})
 		}
+		log.Printf("[SPOOLER] Failed to admit job %s to queue: queue is full; preserved in state store for recovery", cmd.JobID)
+		return
 	}
+
+	// 5. Send explicit acceptance progress & job_ack back to cloud
+	c.sendAckAndProgress(context.Background(), contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusSpooling,
+		PagesPrinted:  0,
+		SheetsPrinted: 0,
+		Timestamp:     time.Now().UTC(),
+	})
 }
 
 func (c *Client) getSNMPConfig() *printer.SNMPConfig {

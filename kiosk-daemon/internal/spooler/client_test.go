@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"image"
@@ -2124,6 +2125,915 @@ func TestJobPDFCleanup(t *testing.T) {
 		// Verify PDF file was NOT deleted
 		if _, err := os.Stat(pdfPath); err != nil {
 			t.Fatalf("interrupted job PDF must remain on disk for recovery, but got err: %v", err)
+		}
+	})
+}
+
+// Test K — TestDurableJobAcceptanceAndAck
+// Verifies Scenarios A through H from Task B2 specification.
+func TestDurableJobAcceptanceAndAck(t *testing.T) {
+	// Scenario A: SQLite persistence failure
+	t.Run("ScenarioA_PersistenceFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_a.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		// Add SQLite trigger to force SaveJob INSERT to fail
+		rawDB, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("failed to open raw sqlite db: %v", err)
+		}
+		defer rawDB.Close()
+		_, err = rawDB.Exec("CREATE TRIGGER fail_insert BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'forced persistence failure'); END;")
+		if err != nil {
+			t.Fatalf("failed to create trigger: %v", err)
+		}
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-a",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-a",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-a",
+			KioskID:        "kiosk-a",
+			DisplayCode:    "0001",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		client.handleIncomingJob(cmd)
+
+		// Assert: reservation released
+		client.activeMu.Lock()
+		reserved := client.activeJobs[cmd.JobID]
+		client.activeMu.Unlock()
+		if reserved {
+			t.Errorf("expected in-memory reservation for %s to be released on persistence failure", cmd.JobID)
+		}
+
+		// Assert: not submitted to jobQueue
+		if len(client.jobQueue) != 0 {
+			t.Errorf("expected jobQueue to be empty, got %d items", len(client.jobQueue))
+		}
+
+		// Assert: not in store
+		saved, err := store.GetJob(context.Background(), cmd.JobID)
+		if err != nil {
+			t.Fatalf("GetJob error: %v", err)
+		}
+		if saved != nil {
+			t.Errorf("expected job not to be saved in store, got %+v", saved)
+		}
+	})
+
+	// Scenario B: Successful acceptance
+	t.Run("ScenarioB_SuccessfulAcceptance", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_b.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-b",
+			KioskID:        "kiosk-b",
+			DisplayCode:    "0002",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		receivedAck := make(chan wireMessage, 1)
+		receivedProgress := make(chan wireMessage, 1)
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			// Send job command
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				if msg.Type == "progress" {
+					select {
+					case receivedProgress <- msg:
+					default:
+					}
+				}
+				if msg.Type == "job_ack" {
+					// When job_ack is emitted, verify job was ALREADY persisted in store
+					saved, err := store.GetJob(context.Background(), cmd.JobID)
+					if err != nil || saved == nil {
+						t.Errorf("expected job %s to be persisted in store upon job_ack, got saved=%v, err=%v", cmd.JobID, saved, err)
+					} else if saved.Status != contracts.JobStatusSpooling {
+						t.Errorf("expected persisted status SPOOLING, got %s", saved.Status)
+					}
+					receivedAck <- msg
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-b",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-b",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		conn, _, err := websocket.Dial(ctx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(ctx, conn)
+		}()
+
+		select {
+		case ack := <-receivedAck:
+			if ack.Progress == nil || ack.Progress.JobID != cmd.JobID {
+				t.Fatalf("unexpected job_ack payload: %+v", ack)
+			}
+			if ack.Progress.Status != contracts.JobStatusSpooling {
+				t.Fatalf("expected job_ack status SPOOLING, got %s", ack.Progress.Status)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for job_ack")
+		}
+
+		select {
+		case prog := <-receivedProgress:
+			if prog.Progress == nil || prog.Progress.JobID != cmd.JobID || prog.Progress.Status != contracts.JobStatusSpooling {
+				t.Fatalf("unexpected progress payload: %+v", prog)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for SPOOLING progress")
+		}
+
+		// Verify queue admission
+		select {
+		case queued := <-client.jobQueue:
+			if queued.JobID != cmd.JobID {
+				t.Fatalf("expected queued job %s, got %s", cmd.JobID, queued.JobID)
+			}
+		default:
+			t.Fatal("expected job to be present in jobQueue")
+		}
+	})
+
+	// Scenario C: Duplicate before printing
+	t.Run("ScenarioC_DuplicateBeforePrinting", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_c.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+		hasher := sha256.Sum256(pdfContent)
+		pdfChecksum := hex.EncodeToString(hasher[:])
+
+		pdfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/pdf")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pdfContent)
+		}))
+		defer pdfServer.Close()
+
+		printerLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("printer listener failed: %v", err)
+		}
+		defer printerLn.Close()
+
+		var printConnections atomic.Int32
+		holdPrint := make(chan struct{})
+		printerDone := make(chan struct{})
+
+		go func() {
+			for {
+				conn, err := printerLn.Accept()
+				if err != nil {
+					return
+				}
+				printConnections.Add(1)
+				go func(c net.Conn) {
+					defer c.Close()
+					_, _ = io.Copy(io.Discard, c)
+					<-holdPrint
+					_, _ = c.Write([]byte("@PJL USTATUS PAGE\r\n1\r\n@PJL USTATUS JOB\r\nEND\r\n"))
+					close(printerDone)
+				}(conn)
+			}
+		}()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-c",
+			KioskID:        "kiosk-c",
+			DisplayCode:    "0003",
+			DownloadURL:    pdfServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		sendDup := make(chan struct{})
+		var ackCount atomic.Int32
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			// Send first command
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			<-sendDup
+			// Send duplicate command
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				if msg.Type == "job_ack" {
+					ackCount.Add(1)
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-c",
+			StateStore:    store,
+			PrinterAddr:   printerLn.Addr().String(),
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-c",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		go func() {
+			_ = client.Run(ctx)
+		}()
+
+		// Wait for first print connection to be established
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if printConnections.Load() == 1 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if printConnections.Load() != 1 {
+			t.Fatalf("expected 1 print connection, got %d", printConnections.Load())
+		}
+
+		// Trigger duplicate delivery while print is actively streaming
+		close(sendDup)
+
+		// Wait for duplicate ack
+		deadline = time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if ackCount.Load() >= 2 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if ackCount.Load() < 2 {
+			t.Fatalf("expected at least 2 job_ack messages (1 for original, 1 for duplicate), got %d", ackCount.Load())
+		}
+
+		// Ensure printer connections count remains strictly 1
+		if printConnections.Load() != 1 {
+			t.Fatalf("expected strictly 1 printer connection, got %d", printConnections.Load())
+		}
+
+		// Release printer
+		close(holdPrint)
+		select {
+		case <-printerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for print to finish")
+		}
+	})
+
+	// Scenario D: Duplicate after printer submission
+	t.Run("ScenarioD_DuplicateAfterPrinterSubmission", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_d.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-d",
+			KioskID:        "kiosk-d",
+			DisplayCode:    "0004",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     4,
+			TotalSheets:    2,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		ctx := context.Background()
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+		if err := store.RecordJobSubmission(ctx, cmd.JobID, "cups-job-456"); err != nil {
+			t.Fatalf("RecordJobSubmission failed: %v", err)
+		}
+		if err := store.UpdateProgress(ctx, contracts.JobProgressEvent{
+			JobID:         cmd.JobID,
+			Status:        contracts.JobStatusPrinting,
+			PagesPrinted:  2,
+			SheetsPrinted: 1,
+			Timestamp:     time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("UpdateProgress failed: %v", err)
+		}
+
+		receivedAck := make(chan wireMessage, 1)
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			// Send duplicate command for already submitted job
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				if msg.Type == "job_ack" {
+					receivedAck <- msg
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-d",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-d",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		connCtx, connCancel := context.WithCancel(context.Background())
+		defer connCancel()
+
+		conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(connCtx, conn)
+		}()
+
+		select {
+		case ack := <-receivedAck:
+			if ack.Progress == nil {
+				t.Fatalf("expected progress in job_ack, got nil")
+			}
+			if ack.Progress.Status != contracts.JobStatusPrinting {
+				t.Errorf("expected status PRINTING, got %s", ack.Progress.Status)
+			}
+			if ack.Progress.PagesPrinted != 2 || ack.Progress.SheetsPrinted != 1 {
+				t.Errorf("expected 2 pages and 1 sheet printed, got %d pages and %d sheets",
+					ack.Progress.PagesPrinted, ack.Progress.SheetsPrinted)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for job_ack")
+		}
+
+		// Assert: not submitted to jobQueue
+		if len(client.jobQueue) != 0 {
+			t.Errorf("expected jobQueue to remain empty, got %d", len(client.jobQueue))
+		}
+
+		// Assert: store state is preserved
+		stored, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil || stored == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if !stored.SubmittedToPrinter || stored.CUPSJobID != "cups-job-456" || stored.PagesPrinted != 2 || stored.SheetsPrinted != 1 {
+			t.Errorf("stored job altered: %+v", stored)
+		}
+	})
+
+	// Scenario E: Duplicate completed job
+	t.Run("ScenarioE_DuplicateCompletedJob", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_e.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-e",
+			KioskID:        "kiosk-e",
+			DisplayCode:    "0005",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     6,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		ctx := context.Background()
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusCompleted); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+		if err := store.UpdateProgress(ctx, contracts.JobProgressEvent{
+			JobID:         cmd.JobID,
+			Status:        contracts.JobStatusCompleted,
+			PagesPrinted:  6,
+			SheetsPrinted: 3,
+			Timestamp:     time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("UpdateProgress failed: %v", err)
+		}
+
+		receivedAck := make(chan wireMessage, 1)
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				if msg.Type == "job_ack" {
+					receivedAck <- msg
+					return
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-e",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-e",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		connCtx, connCancel := context.WithCancel(context.Background())
+		defer connCancel()
+
+		conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(connCtx, conn)
+		}()
+
+		select {
+		case ack := <-receivedAck:
+			if ack.Progress == nil {
+				t.Fatalf("expected progress in job_ack, got nil")
+			}
+			if ack.Progress.Status != contracts.JobStatusCompleted {
+				t.Errorf("expected status COMPLETED, got %s", ack.Progress.Status)
+			}
+			if ack.Progress.PagesPrinted != 6 || ack.Progress.SheetsPrinted != 3 {
+				t.Errorf("expected 6 pages and 3 sheets, got %d pages and %d sheets",
+					ack.Progress.PagesPrinted, ack.Progress.SheetsPrinted)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for job_ack")
+		}
+
+		// Queue must remain empty
+		if len(client.jobQueue) != 0 {
+			t.Errorf("expected empty jobQueue, got %d", len(client.jobQueue))
+		}
+
+		// Store status must not regress
+		stored, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil || stored == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if stored.Status != contracts.JobStatusCompleted || stored.PagesPrinted != 6 || stored.SheetsPrinted != 3 {
+			t.Errorf("stored job regressed: %+v", stored)
+		}
+	})
+
+	// Scenario F: Conflicting duplicate payload
+	t.Run("ScenarioF_ConflictingDuplicatePayload", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_f.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		originalCmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-f",
+			KioskID:        "kiosk-f",
+			DisplayCode:    "0006",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     5,
+			TotalSheets:    3,
+			Copies:         1,
+			Duplex:         contracts.DuplexLongEdge,
+			StartFromPage:  1,
+		}
+
+		ctx := context.Background()
+		if err := store.SaveJob(ctx, originalCmd, contracts.JobStatusSpooling); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
+		}
+
+		conflictingCmd := originalCmd
+		conflictingCmd.TotalPages = 99                  // Conflict!
+		conflictingCmd.Duplex = contracts.DuplexSimplex // Conflict!
+
+		var gotAck atomic.Bool
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &conflictingCmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				if msg.Type == "job_ack" {
+					gotAck.Store(true)
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-f",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-f",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		connCtx, connCancel := context.WithCancel(context.Background())
+		defer connCancel()
+
+		conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+		if err != nil {
+			t.Fatalf("websocket.Dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+
+		go func() {
+			client.handleConnection(connCtx, conn)
+		}()
+
+		// Wait briefly with polling for potential messages
+		time.Sleep(200 * time.Millisecond)
+
+		if gotAck.Load() {
+			t.Fatal("conflicting command must not be acknowledged")
+		}
+
+		if len(client.jobQueue) != 0 {
+			t.Errorf("conflicting command must not be queued, got %d items", len(client.jobQueue))
+		}
+
+		stored, err := store.GetJob(ctx, originalCmd.JobID)
+		if err != nil || stored == nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if stored.Command.TotalPages != 5 || stored.Command.Duplex != contracts.DuplexLongEdge {
+			t.Errorf("original stored job settings modified: TotalPages=%d, Duplex=%s",
+				stored.Command.TotalPages, stored.Command.Duplex)
+		}
+	})
+
+	// Scenario G: Queue admission failure
+	t.Run("ScenarioG_QueueAdmissionFailure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_g.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      "ws://127.0.0.1:8080/ws",
+			KioskID:       "kiosk-g",
+			StateStore:    store,
+			PrinterAddr:   "127.0.0.1:9100",
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-g",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		// Fill jobQueue to capacity
+		for len(client.jobQueue) < cap(client.jobQueue) {
+			client.jobQueue <- contracts.PrintJobCommand{JobID: "dummy-fill"}
+		}
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-g",
+			KioskID:        "kiosk-g",
+			DisplayCode:    "0007",
+			DownloadURL:    "https://storage.example.com/job.pdf",
+			SHA256Checksum: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		client.handleIncomingJob(cmd)
+
+		// Assert: reservation released
+		client.activeMu.Lock()
+		reserved := client.activeJobs[cmd.JobID]
+		client.activeMu.Unlock()
+		if reserved {
+			t.Errorf("expected in-memory reservation for %s to be released on queue full", cmd.JobID)
+		}
+
+		// Assert: durable record preserved in store for recovery
+		ctx := context.Background()
+		saved, err := store.GetJob(ctx, cmd.JobID)
+		if err != nil || saved == nil {
+			t.Fatalf("expected saved record in store for recovery, got: %v, err: %v", saved, err)
+		}
+		if saved.Status != contracts.JobStatusSpooling {
+			t.Errorf("expected saved status SPOOLING, got %s", saved.Status)
+		}
+
+		// Assert: GetIncompleteJob finds this job for startup recovery
+		incomplete, err := store.GetIncompleteJob(ctx)
+		if err != nil || incomplete == nil {
+			t.Fatalf("expected GetIncompleteJob to find the job for recovery, got: %v, err: %v", incomplete, err)
+		}
+		if incomplete.Command.JobID != cmd.JobID {
+			t.Errorf("expected incomplete job ID %s, got %s", cmd.JobID, incomplete.Command.JobID)
+		}
+	})
+
+	// Scenario H: Reconnect / repeated delivery
+	t.Run("ScenarioH_ReconnectRepeatedDelivery", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "kiosk_h.db")
+		store, err := state.Open(dbPath)
+		if err != nil {
+			t.Fatalf("failed to open store: %v", err)
+		}
+		defer store.Close()
+
+		pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+		hasher := sha256.Sum256(pdfContent)
+		pdfChecksum := hex.EncodeToString(hasher[:])
+
+		pdfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/pdf")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pdfContent)
+		}))
+		defer pdfServer.Close()
+
+		printerLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("printer listener failed: %v", err)
+		}
+		defer printerLn.Close()
+
+		var printConnections atomic.Int32
+		go func() {
+			for {
+				conn, err := printerLn.Accept()
+				if err != nil {
+					return
+				}
+				printConnections.Add(1)
+				go func(c net.Conn) {
+					defer c.Close()
+					_, _ = io.Copy(io.Discard, c)
+					_, _ = c.Write([]byte("@PJL USTATUS PAGE\r\n1\r\n@PJL USTATUS JOB\r\nEND\r\n"))
+				}(conn)
+			}
+		}()
+
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job-scenario-h",
+			KioskID:        "kiosk-h",
+			DisplayCode:    "0008",
+			DownloadURL:    pdfServer.URL + "/doc.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+
+		var connectionCount atomic.Int32
+		reconnectedAck := make(chan wireMessage, 1)
+
+		wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			connNum := connectionCount.Add(1)
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+
+			if connNum == 1 {
+				// First connection: send job, read until spooling job_ack, then close to simulate lost connection
+				_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+				for {
+					var msg wireMessage
+					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+						break
+					}
+					if msg.Type == "job_ack" {
+						_ = c.Close(websocket.StatusGoingAway, "lost connection")
+						return
+					}
+				}
+				return
+			}
+
+			// Reconnected session: re-send same job command (cloud retrying unacknowledged dispatch)
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
+
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					break
+				}
+				if msg.Type == "job_ack" {
+					select {
+					case reconnectedAck <- msg:
+					default:
+					}
+				}
+			}
+		}))
+		defer wsServer.Close()
+
+		wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+		client, err := NewClient(ClientConfig{
+			CloudURL:      wsURL,
+			KioskID:       "kiosk-h",
+			StateStore:    store,
+			PrinterAddr:   printerLn.Addr().String(),
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://kiosk-h",
+			ScreenSink:    noopSink,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		client.minBackoff = 50 * time.Millisecond
+		client.maxBackoff = 100 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		go func() {
+			_ = client.Run(ctx)
+		}()
+
+		select {
+		case ack := <-reconnectedAck:
+			if ack.Progress == nil || ack.Progress.JobID != cmd.JobID {
+				t.Fatalf("unexpected reconnected ack: %+v", ack)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for reconnected job_ack")
+		}
+
+		// Wait briefly for all operations to settle
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if printConnections.Load() == 1 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// Assert: printer received strictly 1 physical print connection
+		if printConnections.Load() != 1 {
+			t.Fatalf("expected exactly 1 physical print connection, got %d", printConnections.Load())
 		}
 	})
 }
