@@ -553,7 +553,6 @@
               <h4 class="doc-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h4>
               <div class="doc-meta">${metaText}</div>
             </div>
-            <div class="doc-price">${priceDisplayHtml}</div>
           </div>
           <div class="doc-card-bottom">
             <button type="button" class="btn-doc-delete" data-id="${item.id}">
@@ -566,6 +565,7 @@
               </svg>
               Delete
             </button>
+            <div class="doc-price">${priceDisplayHtml}</div>
             <div class="doc-actions-right">
               <button type="button" class="btn-doc-edit" data-id="${item.id}">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">

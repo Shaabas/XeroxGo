@@ -1403,28 +1403,33 @@ body {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  background: transparent;
+  background: #fee2e2;
   border: none;
-  border-radius: 6px;
-  padding: 4px 8px;
-  margin-left: -8px;
+  border-radius: 9999px;
+  padding: 6px 14px;
+  margin-left: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 6px;
   line-height: 1.4;
   box-sizing: border-box;
-  transition: background-color 0.12s ease, color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease, transform 0.08s ease;
+}
+
+.btn-doc-delete svg {
+  flex-shrink: 0;
 }
 
 .btn-doc-delete:hover {
-  background-color: #fef2f2;
+  background-color: #fecaca;
   color: #b91c1c;
 }
 
 .btn-doc-delete:active {
-  background-color: #fee2e2;
+  background-color: #fca5a5;
   color: #991b1b;
+  transform: scale(0.97);
 }
 
 .btn-doc-delete:focus-visible {
@@ -1489,43 +1494,59 @@ body {
 
 /* Ready Document Card: Split layout with full-height right blue action panel */
 .doc-card:has(.btn-doc-edit) {
-  padding: 14px 112px 12px 14px;
-  gap: 8px;
+  padding: 16px 122px 16px 16px;
+  gap: 12px;
 }
 
 .doc-card:has(.btn-doc-edit) .doc-card-top {
-  display: grid;
-  grid-template-columns: 38px 1fr;
-  column-gap: 12px;
-  row-gap: 6px;
-  align-items: start;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
 }
 
 .doc-card:has(.btn-doc-edit) .doc-icon-box {
-  grid-column: 1;
-  grid-row: 1;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
   margin-top: 2px;
+  flex-shrink: 0;
 }
 
 .doc-card:has(.btn-doc-edit) .doc-info {
-  grid-column: 2;
-  grid-row: 1;
   min-width: 0;
+  flex: 1;
 }
 
-.doc-card:has(.btn-doc-edit) .doc-price {
-  grid-column: 2;
-  grid-row: 2;
-  justify-self: start;
+.doc-card:has(.btn-doc-edit) .doc-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.doc-card:has(.btn-doc-edit) .doc-meta {
+  font-size: 13.5px;
+  color: #475569;
 }
 
 .doc-card:has(.btn-doc-edit) .doc-card-bottom {
-  padding-top: 2px;
-  justify-content: flex-start;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 4px;
+  gap: 12px;
+}
+
+.doc-card:has(.btn-doc-edit) .doc-price {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.2;
+  margin-left: auto;
+  white-space: nowrap;
 }
 
 .doc-card:has(.btn-doc-edit) .doc-actions-right {
-  position: static;
+  display: contents;
 }
 
 .doc-card:has(.btn-doc-edit) .btn-doc-edit {
@@ -1578,6 +1599,13 @@ body {
   .doc-card:has(.btn-doc-edit) .btn-doc-edit {
     width: 88px;
     font-size: 12px;
+  }
+  .doc-card:has(.btn-doc-edit) .btn-doc-delete {
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+  .doc-card:has(.btn-doc-edit) .doc-price {
+    font-size: 16.5px;
   }
 }
 
