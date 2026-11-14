@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"net"
@@ -3367,21 +3368,23 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	})
 }
 
+func testPDFServer(t *testing.T) (string, string) {
+	t.Helper()
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pdfContent)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/job.pdf", pdfChecksum
+}
+
 // Test L — TestCUPSSubmissionPersistence
 func TestCUPSSubmissionPersistence(t *testing.T) {
-	makePDFServer := func(t *testing.T) (string, string) {
-		t.Helper()
-		pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
-		hasher := sha256.Sum256(pdfContent)
-		pdfChecksum := hex.EncodeToString(hasher[:])
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/pdf")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(pdfContent)
-		}))
-		t.Cleanup(server.Close)
-		return server.URL + "/job.pdf", pdfChecksum
-	}
+	makePDFServer := testPDFServer
 
 	noopSink := func(img *image.RGBA) error { return nil }
 
@@ -4050,3 +4053,327 @@ job-media-sheets-completed (integer) = 1
 		}
 	})
 }
+
+func TestCUPSHoldOutcomeHandling(t *testing.T) {
+	testCases := []struct {
+		name              string
+		cupsJobID         string
+		holdErr           error
+		queryState        string
+		queryReasons      string
+		queryErr          error
+		expectedSubstrs   []string
+		unexpectedSubstrs []string
+	}{
+		{
+			name:         "ConfirmedHold",
+			cupsJobID:    "DCPT310-hold-01",
+			queryState:   "held",
+			queryReasons: "job-held-by-user",
+			expectedSubstrs: []string{
+				"DCPT310-hold-01",
+				"held (buffered sheets may continue printing)",
+				"manual reconciliation required",
+			},
+			unexpectedSubstrs: []string{
+				"possible unmonitored physical output",
+			},
+		},
+		{
+			name:         "FailedHold",
+			cupsJobID:    "DCPT310-hold-02",
+			holdErr:      errors.New("lp: server-error-service-unavailable"),
+			queryState:   "processing",
+			queryReasons: "none",
+			expectedSubstrs: []string{
+				"DCPT310-hold-02",
+				"hold request failed",
+				"possible unmonitored physical output",
+				"manual reconciliation required",
+			},
+		},
+		{
+			name:         "StillProcessing",
+			cupsJobID:    "DCPT310-hold-03",
+			queryState:   "processing",
+			queryReasons: "none",
+			expectedSubstrs: []string{
+				"DCPT310-hold-03",
+				"remains processing after hold request",
+				"possible unmonitored physical output",
+				"manual reconciliation required",
+			},
+		},
+		{
+			name:         "AlreadyCompleted",
+			cupsJobID:    "DCPT310-hold-04",
+			queryState:   "completed",
+			queryReasons: "job-completed-successfully",
+			expectedSubstrs: []string{
+				"DCPT310-hold-04",
+				"was already completed",
+				"possible unmonitored physical output",
+				"manual reconciliation required",
+			},
+		},
+		{
+			name:       "UnknownState",
+			cupsJobID:  "DCPT310-hold-05",
+			queryErr:   errors.New("ipptool: server unreachable"),
+			expectedSubstrs: []string{
+				"DCPT310-hold-05",
+				"status is unknown",
+				"possible unmonitored physical output",
+				"manual reconciliation required",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			dbPath := filepath.Join(tmpDir, "kiosk.db")
+			store, err := state.Open(dbPath)
+			if err != nil {
+				t.Fatalf("failed to open store: %v", err)
+			}
+			defer store.Close()
+
+			pdfURL, pdfChecksum := testPDFServer(t)
+
+			cmd := contracts.PrintJobCommand{
+				JobID:          "job-" + tc.name,
+				KioskID:        "kiosk-hold-test",
+				DisplayCode:    "8888",
+				DownloadURL:    pdfURL,
+				SHA256Checksum: pdfChecksum,
+				TotalPages:     1,
+				TotalSheets:    1,
+				Copies:         1,
+				Duplex:         contracts.DuplexSimplex,
+				StartFromPage:  1,
+			}
+
+			if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+				t.Fatalf("SaveJob failed: %v", err)
+			}
+
+			var holdInvoked atomic.Bool
+			runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if name == "lp" {
+					for i, a := range args {
+						if a == "-H" && i+1 < len(args) && args[i+1] == "hold" {
+							holdInvoked.Store(true)
+							if tc.holdErr != nil {
+								return nil, tc.holdErr
+							}
+							return []byte(""), nil
+						}
+					}
+					return []byte(fmt.Sprintf("request id is %s (1 file(s))\n", tc.cupsJobID)), nil
+				}
+				if name == "ipptool" {
+					if !holdInvoked.Load() {
+						// Trigger monitor failure so processJob enters printErr != nil
+						return []byte("job-state (enum) = canceled\njob-state-reasons (keyword) = job-canceled-at-device\n"), nil
+					}
+					if tc.queryErr != nil {
+						return nil, tc.queryErr
+					}
+					return []byte(fmt.Sprintf("job-state (enum) = %s\njob-state-reasons (keyword) = %s\n", tc.queryState, tc.queryReasons)), nil
+				}
+				if name == "lpstat" {
+					if tc.queryErr != nil && holdInvoked.Load() {
+						return nil, tc.queryErr
+					}
+					if holdInvoked.Load() && tc.queryState == "completed" {
+						return []byte(fmt.Sprintf("%s user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully\n", tc.cupsJobID)), nil
+					}
+					return []byte(""), nil
+				}
+				return []byte(""), nil
+			}
+
+			client, err := NewClient(ClientConfig{
+				CloudURL:      "ws://127.0.0.1:8080/ws",
+				KioskID:       "kiosk-hold-test",
+				StateStore:    store,
+				CUPSQueue:     "DCPT310",
+				CUPSRunner:    runner,
+				DownloadDir:   tmpDir,
+				IdleQRContent: "https://kiosk-hold-test",
+				ScreenSink:    noopSink,
+			})
+			if err != nil {
+				t.Fatalf("NewClient failed: %v", err)
+			}
+
+			client.processJob(context.Background(), cmd)
+
+			if !holdInvoked.Load() {
+				t.Fatal("expected HoldAndVerifyCUPSJob to invoke hold on CUPS runner")
+			}
+
+			saved, err := store.GetJob(context.Background(), cmd.JobID)
+			if err != nil || saved == nil {
+				t.Fatalf("GetJob failed: %v", err)
+			}
+
+			if saved.Status != contracts.JobStatusPausedError {
+				t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+			}
+			if !saved.SubmittedToPrinter {
+				t.Error("expected submitted_to_printer to be true for accepted CUPS job")
+			}
+			if saved.CUPSJobID != tc.cupsJobID {
+				t.Errorf("expected CUPSJobID %s, got %s", tc.cupsJobID, saved.CUPSJobID)
+			}
+
+			for _, expected := range tc.expectedSubstrs {
+				if !strings.Contains(saved.ErrorReason, expected) {
+					t.Errorf("expected ErrorReason to contain %q, but got: %q", expected, saved.ErrorReason)
+				}
+			}
+
+			for _, unexpected := range tc.unexpectedSubstrs {
+				if strings.Contains(saved.ErrorReason, unexpected) {
+					t.Errorf("expected ErrorReason NOT to contain %q, but got: %q", unexpected, saved.ErrorReason)
+				}
+			}
+		})
+	}
+}
+
+func TestFormatCUPSHoldOutcomeReasonDirect(t *testing.T) {
+	baseReason := "printing failed: simulated failure"
+	cID := "TEST-99"
+
+	t.Run("ConfirmedHeld", func(t *testing.T) {
+		res := printer.HoldResult{
+			ConfirmedHeld: true,
+			State:         printer.CUPSJobStateHeld,
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, cID) {
+			t.Errorf("expected cID %s in %q", cID, out)
+		}
+		if !strings.Contains(out, "held (buffered sheets may continue printing)") {
+			t.Errorf("expected held warning in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+		if strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("unexpected unmonitored output warning for confirmed held in %q", out)
+		}
+	})
+
+	t.Run("FailedHoldWithQueryErr", func(t *testing.T) {
+		res := printer.HoldResult{
+			HoldErr:  errors.New("hold failed"),
+			QueryErr: errors.New("query failed"),
+			IsUnknown: true,
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, cID) {
+			t.Errorf("expected cID %s in %q", cID, out)
+		}
+		if !strings.Contains(out, "hold request failed") {
+			t.Errorf("expected hold request failed in %q", out)
+		}
+		if !strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("expected possible unmonitored physical output in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+	})
+
+	t.Run("FailedHoldWithKnownState", func(t *testing.T) {
+		res := printer.HoldResult{
+			HoldErr: errors.New("hold failed"),
+			State:   printer.CUPSJobStateProcessing,
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, "hold request failed") || !strings.Contains(out, "state is processing") {
+			t.Errorf("expected hold request failed with state in %q", out)
+		}
+		if !strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("expected possible unmonitored physical output in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+	})
+
+	t.Run("StillProcessing", func(t *testing.T) {
+		res := printer.HoldResult{
+			StillProcessing: true,
+			State:           printer.CUPSJobStateProcessing,
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, "remains processing after hold request") {
+			t.Errorf("expected remains processing in %q", out)
+		}
+		if !strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("expected possible unmonitored physical output in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+	})
+
+	t.Run("AlreadyCompleted", func(t *testing.T) {
+		res := printer.HoldResult{
+			AlreadyCompleted: true,
+			State:            printer.CUPSJobStateCompleted,
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, "was already completed") {
+			t.Errorf("expected was already completed in %q", out)
+		}
+		if !strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("expected possible unmonitored physical output in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+	})
+
+	t.Run("UnknownStateWithQueryErr", func(t *testing.T) {
+		res := printer.HoldResult{
+			QueryErr:  errors.New("network down"),
+			IsUnknown: true,
+			State:     printer.CUPSJobStateUnknown,
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, "status is unknown") || !strings.Contains(out, "network down") {
+			t.Errorf("expected status is unknown with error in %q", out)
+		}
+		if !strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("expected possible unmonitored physical output in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+	})
+
+	t.Run("UnknownStateWithoutQueryErr", func(t *testing.T) {
+		res := printer.HoldResult{
+			IsUnknown: true,
+			State:     "unrecognized_custom_state",
+		}
+		out := formatCUPSHoldOutcomeReason(baseReason, cID, res)
+		if !strings.Contains(out, "status is unknown") || !strings.Contains(out, "unrecognized_custom_state") {
+			t.Errorf("expected status is unknown with state in %q", out)
+		}
+		if !strings.Contains(out, "possible unmonitored physical output") {
+			t.Errorf("expected possible unmonitored physical output in %q", out)
+		}
+		if !strings.Contains(out, "manual reconciliation required") {
+			t.Errorf("expected manual reconciliation required in %q", out)
+		}
+	})
+}
+

@@ -1073,22 +1073,12 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		preserveCUPSJob.Store(true)
 		c.setHardwareFault(true, reason, "")
 
-		if job.CUPSJobID != "" {
+		if job.CUPSJobID != "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 			holdCtx, holdCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, job.CUPSJobID)
 			holdCancel()
 
-			if holdRes.HoldErr != nil {
-				reason = fmt.Sprintf("%s; hold request failed (%v), CUPS state is %s, unmonitored physical output risk, operator reconciliation required", reason, holdRes.HoldErr, holdRes.State)
-			} else if holdRes.StillProcessing {
-				reason = fmt.Sprintf("%s; CUPS job remains processing after hold request, unmonitored physical output risk, operator reconciliation required", reason)
-			} else if holdRes.AlreadyCompleted {
-				reason = fmt.Sprintf("%s; CUPS job was already completed, physical output uncertain, operator reconciliation required", reason)
-			} else if holdRes.ConfirmedHeld {
-				reason = fmt.Sprintf("%s; CUPS job held (buffered sheets may continue printing), operator reconciliation required", reason)
-			} else {
-				reason = fmt.Sprintf("%s; CUPS job state is %s after hold request, operator reconciliation required", reason, holdRes.State)
-			}
+			reason = formatCUPSHoldOutcomeReason(reason, job.CUPSJobID, holdRes)
 		}
 
 		cancelJob()
@@ -1380,6 +1370,31 @@ func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 	}
 }
 
+func formatCUPSHoldOutcomeReason(baseReason string, cupsJobID string, holdRes printer.HoldResult) string {
+	if holdRes.HoldErr != nil {
+		if holdRes.QueryErr != nil {
+			return fmt.Sprintf("%s; hold request failed for CUPS job %s (%v, query error: %v): possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.HoldErr, holdRes.QueryErr)
+		}
+		return fmt.Sprintf("%s; hold request failed for CUPS job %s (%v), CUPS state is %s: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.HoldErr, holdRes.State)
+	}
+	if holdRes.StillProcessing {
+		return fmt.Sprintf("%s; CUPS job %s remains processing after hold request: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID)
+	}
+	if holdRes.AlreadyCompleted {
+		return fmt.Sprintf("%s; CUPS job %s was already completed: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID)
+	}
+	if holdRes.ConfirmedHeld {
+		return fmt.Sprintf("%s; CUPS job %s held (buffered sheets may continue printing), manual reconciliation required", baseReason, cupsJobID)
+	}
+	if holdRes.IsUnknown || holdRes.QueryErr != nil {
+		if holdRes.QueryErr != nil {
+			return fmt.Sprintf("%s; status is unknown for CUPS job %s (query error: %v, state: %s): possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.QueryErr, holdRes.State)
+		}
+		return fmt.Sprintf("%s; status is unknown for CUPS job %s (state: %s): possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.State)
+	}
+	return fmt.Sprintf("%s; CUPS job %s state is %s: possible unmonitored physical output risk, manual reconciliation required", baseReason, cupsJobID, holdRes.State)
+}
+
 func jobPDFPath(downloadDir, jobID string) string {
 	h := sha256.Sum256([]byte(jobID))
 	return filepath.Join(downloadDir, hex.EncodeToString(h[:])+".pdf")
@@ -1568,22 +1583,12 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		if cID == "" {
 			cID = c.GetCUPSJobID(cmd.JobID)
 		}
-		if cID != "" {
+		if cID != "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 			holdCtx, holdCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cID)
 			holdCancel()
 
-			if holdRes.HoldErr != nil {
-				reason = fmt.Sprintf("%s; hold request failed (%v), CUPS state is %s, unmonitored physical output risk, operator reconciliation required", reason, holdRes.HoldErr, holdRes.State)
-			} else if holdRes.StillProcessing {
-				reason = fmt.Sprintf("%s; CUPS job remains processing after hold request, unmonitored physical output risk, operator reconciliation required", reason)
-			} else if holdRes.AlreadyCompleted {
-				reason = fmt.Sprintf("%s; CUPS job was already completed, physical output uncertain, operator reconciliation required", reason)
-			} else if holdRes.ConfirmedHeld {
-				reason = fmt.Sprintf("%s; CUPS job held (buffered sheets may continue printing), operator reconciliation required", reason)
-			} else {
-				reason = fmt.Sprintf("%s; CUPS job state is %s after hold request, operator reconciliation required", reason, holdRes.State)
-			}
+			reason = formatCUPSHoldOutcomeReason(reason, cID, holdRes)
 		}
 
 		cancelJob() // abort active transmission or monitoring
@@ -1756,16 +1761,15 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		if cID == "" {
 			cID = c.GetCUPSJobID(cmd.JobID)
 		}
+		errReason := fmt.Sprintf("printing failed: %v", printErr)
 		if cID != "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 			holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
 			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cID)
 			holdTimeout()
-			if holdRes.HoldErr != nil {
-				log.Printf("[SPOOLER] Warning: failed to hold CUPS job %s on error: %v", cID, holdRes.HoldErr)
-			}
+			errReason = formatCUPSHoldOutcomeReason(errReason, cID, holdRes)
 		}
 
-		c.handleJobError(ctx, cmd, curPages, curSheets, fmt.Sprintf("printing failed: %v", printErr))
+		c.handleJobError(ctx, cmd, curPages, curSheets, errReason)
 		return
 	}
 
