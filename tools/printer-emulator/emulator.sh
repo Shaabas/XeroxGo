@@ -567,9 +567,16 @@ cmd_stop() {
     fi
 
     # If process is paused in kernel via SIGSTOP (e.g. offline fault), resume it so it can handle SIGTERM
-    if is_process_paused "$pid" || [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
-        kill -CONT "$pid" 2>/dev/null || true
+    if [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
+        while read -r p_id; do
+            if [[ -n "$p_id" ]] && [[ "$p_id" =~ ^[0-9]+$ ]] && kill -0 "$p_id" 2>/dev/null; then
+                kill -CONT "$p_id" 2>/dev/null || true
+            fi
+        done < "$EMU_IPP_PAUSED_FILE"
         rm -f "$EMU_IPP_PAUSED_FILE"
+    fi
+    if is_process_paused "$pid"; then
+        kill -CONT "$pid" 2>/dev/null || true
     fi
 
     echo "Stopping IPP printer emulator (PID: ${pid})..."
@@ -1224,7 +1231,7 @@ verify_ipp_attributes() {
 
         case "$scenario" in
             healthy|recovery|clear)
-                if [[ "$cur_reasons" == "none" ]] && [[ "$cur_state" == "idle" || "$cur_state" == "3" ]]; then
+                if [[ "$cur_reasons" == "none" || "$cur_reasons" == "job-printing" ]] && [[ "$cur_state" == "idle" || "$cur_state" == "3" || "$cur_state" == "processing" || "$cur_state" == "4" ]]; then
                     matched=true
                     break
                 fi
@@ -1568,14 +1575,34 @@ cmd_fault_set() {
                     kill -STOP "$pid" 2>/dev/null || true
                     echo "$pid" > "$EMU_IPP_PAUSED_FILE"
                 fi
+                # Also pause active processor if running
+                if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ -f "$EMU_JOB_ACTIVE_FILE" ]]; then
+                    local proc_pid
+                    proc_pid=$(sed -n 's/^PID=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                    if [[ -n "$proc_pid" ]] && [[ "$proc_pid" =~ ^[0-9]+$ ]] && kill -0 "$proc_pid" 2>/dev/null; then
+                        local p_cmd
+                        p_cmd=$(tr '\0' ' ' < "/proc/${proc_pid}/cmdline" 2>/dev/null || true)
+                        if [[ "$p_cmd" =~ processor\.sh ]]; then
+                            kill -STOP "$proc_pid" 2>/dev/null || true
+                            echo "$proc_pid" >> "$EMU_IPP_PAUSED_FILE"
+                        fi
+                    fi
+                fi
             fi
         else
             # Unpause if process was previously paused (offline recovery)
             if is_running; then
                 local pid
                 pid=$(get_pid)
-                if [[ -n "$pid" ]] && (is_process_paused "$pid" || [[ -f "$EMU_IPP_PAUSED_FILE" ]]); then
+                if [[ -n "$pid" ]] && is_process_paused "$pid"; then
                     kill -CONT "$pid" 2>/dev/null || true
+                fi
+                if [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
+                    while read -r p_id; do
+                        if [[ -n "$p_id" ]] && [[ "$p_id" =~ ^[0-9]+$ ]] && kill -0 "$p_id" 2>/dev/null; then
+                            kill -CONT "$p_id" 2>/dev/null || true
+                        fi
+                    done < "$EMU_IPP_PAUSED_FILE"
                     rm -f "$EMU_IPP_PAUSED_FILE"
                 fi
             fi
