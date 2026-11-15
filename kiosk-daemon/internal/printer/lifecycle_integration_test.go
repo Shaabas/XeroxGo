@@ -53,6 +53,20 @@ func findSamplePDF(t *testing.T) string {
 	return ""
 }
 
+// parseCUPSJobIDsFromLPStat extracts all job request IDs for the target queue from lpstat output.
+func parseCUPSJobIDsFromLPStat(output string, queue string) []string {
+	prefix := queue + "-"
+	var ids []string
+	lines := strings.Split(output, "\n")
+	for _, l := range lines {
+		fields := strings.Fields(l)
+		if len(fields) > 0 && strings.HasPrefix(fields[0], prefix) {
+			ids = append(ids, fields[0])
+		}
+	}
+	return ids
+}
+
 // TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking exercises the complete
 // real-world XeroxGo print lifecycle against the live D1 IPP and D2 SNMP emulators:
 //  1. Dedicated driverless CUPS queue backed by live ippeveprinter.
@@ -61,11 +75,12 @@ func findSamplePDF(t *testing.T) string {
 //  4. Durable pre- and post-submission hooks writing to SQLite state.Store.
 //  5. Capture and verification of real CUPS request ID (queue-jobNum).
 //  6. Live job monitoring transitioning to CUPSJobStateCompleted.
-//  7. Assertion of exactly one submission attempt per job.
-//  8. Verification of genuine spool artifact receipt in emulator spool directory.
+//  7. Assertion of exactly one submission attempt per job (hooks, CUPS records, spool sequence).
+//  8. Spool evidence distinguishing one submission with multiple artifacts (.pdf, .prn) from multiple submissions.
 //  9. Verification that physical sheets delivered is NOT incremented solely by CUPS completion.
 // 10. Querying real SNMP hardware telemetry via PollHardwareTelemetry.
 // 11. Preserving system queue isolation and 3-way URI ownership protections.
+// 12. Preserving recoverable ownership metadata outside t.TempDir() if queue deletion fails.
 func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 	checkCUPSAndIPPDependencies(t)
 
@@ -83,7 +98,11 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 	emuName := fmt.Sprintf("XeroxGoLifeEmu_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
 	queueName := fmt.Sprintf("XeroxGoLife_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
 
-	metaFile := filepath.Join(tempDir, "cups.meta")
+	// Requirement 4: Place ownership metadata file outside t.TempDir() so that if queue deletion
+	// fails during teardown, recoverable ownership evidence is preserved on disk and not wiped out by Go's test runner.
+	metaFile := filepath.Join(os.TempDir(), fmt.Sprintf("xeroxgo_cups_meta_%s.meta", queueName))
+	_ = os.Remove(metaFile)
+
 	ippPIDFile := filepath.Join(tempDir, "ipp.pid")
 	ippLogFile := filepath.Join(tempDir, "ipp.log")
 	snmpPIDFile := filepath.Join(tempDir, "snmp.pid")
@@ -120,19 +139,27 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 		t.Fatalf("failed to start SNMP emulator: %v (output: %s)", err, out)
 	}
 
-	// Register guaranteed teardown
+	// Register guaranteed teardown:
+	// Requirements 2, 4, 5: Verify queue ownership and never delete ownership metadata if queue deletion fails.
 	t.Cleanup(func() {
-		// Clean up CUPS test queue with verified 3-way URI check
-		if _, err := runEmu(t, emuScript, emuEnv, "remove-cups"); err != nil {
-			t.Logf("cleanup warning: remove-cups: %v", err)
+		// Attempt verified removal of the test CUPS queue
+		out, err := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+		if err != nil {
+			// Queue deletion failed: preserve ownership metadata outside tempDir and report error
+			t.Errorf("cleanup failure: remove-cups failed for queue %q: %v (%s). Ownership metadata preserved at %s.",
+				queueName, err, strings.TrimSpace(out), metaFile)
+		} else {
+			// Verified removal succeeded; ensure metadata file is removed
+			_ = os.Remove(metaFile)
 		}
+
 		// Clean up IPP emulator and verified spool files
-		if _, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
-			t.Logf("cleanup warning: IPP cleanup: %v", err)
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Logf("cleanup warning: IPP cleanup: %v (%s)", err, out)
 		}
 		// Clean up SNMP emulator
-		if _, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
-			t.Logf("cleanup warning: SNMP cleanup: %v", err)
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Logf("cleanup warning: SNMP cleanup: %v (%s)", err, out)
 		}
 	})
 
@@ -180,8 +207,11 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 	}
 	defer store.Close()
 
+	// Requirement 7: Use a unique test job identity
+	uniqueJobID := fmt.Sprintf("job-live-lifecycle-%d-%d", os.Getpid(), time.Now().UnixNano()%1000000)
+
 	cmd := contracts.PrintJobCommand{
-		JobID:          "job-live-lifecycle-001",
+		JobID:          uniqueJobID,
 		KioskID:        "kiosk-live-01",
 		DisplayCode:    "X742",
 		DownloadURL:    "https://example.local/doc.pdf",
@@ -230,7 +260,7 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 		t.Fatalf("PrintPDFWithCUPSHooksCustom failed: %v", printErr)
 	}
 
-	// Requirement 11: Assert exactly one submission per accepted test job
+	// Requirement 6 & 11: Assert exactly one submission attempt via hooks
 	if submittingCalls != 1 {
 		t.Errorf("OnSubmitting called %d times, want exactly 1", submittingCalls)
 	}
@@ -260,6 +290,65 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 		t.Errorf("expected stored job CUPSJobID = %q, got %q", capturedCUPSJobID, storedJob.CUPSJobID)
 	}
 
+	// Requirement 7 & 9: Inspect actual CUPS job records to strengthen exactly-once assertion
+	lpstatJobsCmd := exec.Command("lpstat", "-W", "all", queueName)
+	lpstatJobsOut, _ := lpstatJobsCmd.CombinedOutput()
+	cupsJobRecords := parseCUPSJobIDsFromLPStat(string(lpstatJobsOut), queueName)
+
+	if len(cupsJobRecords) > 0 {
+		// CUPS job history is retained on this host: verify exactly one job record was created
+		if len(cupsJobRecords) != 1 {
+			t.Errorf("CUPS job records indicate multiple submissions for queue %s: %v (want exactly 1: %s)",
+				queueName, cupsJobRecords, capturedCUPSJobID)
+		} else if cupsJobRecords[0] != capturedCUPSJobID {
+			t.Errorf("CUPS job record %q does not match captured CUPS job ID %q", cupsJobRecords[0], capturedCUPSJobID)
+		} else {
+			t.Logf("CUPS job history confirms exactly one job (%s) was dispatched to queue %s", cupsJobRecords[0], queueName)
+		}
+	} else {
+		// Requirement 9: CUPS job history not retained by cupsd; report limitation truthfully rather than claiming verification
+		t.Logf("Notice: CUPS job history was empty for queue %s (PreserveJobHistory may be disabled in cupsd); exactly-once verification relies on atomic submission hooks, SQLite persistence record, and emulator spool artifact sequence rather than CUPS job history.", queueName)
+	}
+
+	// Requirement 7 & 8: Inspect emulator spool artifacts to distinguish one submission with
+	// multiple artifacts (.pdf and .prn) from multiple independent submissions.
+	spoolEntries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("failed to read spool directory %s: %v", spoolDir, err)
+	}
+
+	sequenceMap := make(map[string][]string)
+	for _, entry := range spoolEntries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Match artifacts associated with this print job
+		if strings.Contains(name, uniqueJobID) && (strings.HasSuffix(name, ".pdf") || strings.HasSuffix(name, ".prn")) {
+			parts := strings.SplitN(name, "-", 2)
+			if len(parts) == 2 {
+				seq := parts[0]
+				sequenceMap[seq] = append(sequenceMap[seq], name)
+			}
+		}
+	}
+
+	if len(sequenceMap) == 0 {
+		t.Fatalf("no spool artifacts found matching unique test job %s in %s", uniqueJobID, spoolDir)
+	}
+
+	// In a single submission, multiple artifact files (such as .pdf and .prn) share the SAME sequence prefix ("1-").
+	// Multiple independent submissions would produce distinct sequence IDs ("1-", "2-", etc.).
+	if len(sequenceMap) != 1 {
+		t.Errorf("expected spool artifacts from exactly 1 submission sequence, got %d sequences: %v",
+			len(sequenceMap), sequenceMap)
+	} else {
+		for seq, files := range sequenceMap {
+			t.Logf("Spool evidence verified single submission (sequence %s) produced %d artifact file(s): %v",
+				seq, len(files), files)
+		}
+	}
+
 	// Requirement 7: Verify completion using CUPS job state query
 	jobInfo, queryErr := QueryCUPSJobInfo(ctx, nil, queueName, capturedCUPSJobID)
 	if queryErr != nil {
@@ -269,17 +358,13 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 		t.Errorf("CUPS job %s state = %q, want %q", capturedCUPSJobID, jobInfo.State, CUPSJobStateCompleted)
 	}
 
-	// Requirement 13 & 9: Physical sheet delivery is decoupled from CUPS completion.
-	// Since ippeveprinter writes the file directly without advancing physical hardware odometer,
+	// Requirement 11: Assert physical sheet delivery decoupling.
+	// In XeroxGo architecture, physical sheet delivery is driven solely by hardware telemetry (odometer deltas).
+	// CUPS completion alone must NEVER mark physical sheets delivered.
+	// Since ippeveprinter writes the file directly without advancing physical hardware gears,
 	// hardware odometer remains unchanged and onPage must NEVER be called solely because CUPS completed.
 	if len(onPageCalls) != 0 {
 		t.Errorf("physical sheets marked delivered (%v) solely due to CUPS completion; physical delivery must require hardware odometer proof", onPageCalls)
-	}
-
-	// Verify genuine spool artifact receipt in emulator spool directory
-	spoolArtifacts, err := filepath.Glob(filepath.Join(spoolDir, "1-*"))
-	if err != nil || len(spoolArtifacts) == 0 {
-		t.Errorf("expected spool artifacts in %s matching '1-*', got %v (err: %v)", spoolDir, spoolArtifacts, err)
 	}
 
 	// Requirement 8: Query actual SNMP emulator through XeroxGo telemetry client
@@ -306,6 +391,10 @@ func TestCUPSPrintLifecycle_SyntheticOdometerAdvancement(t *testing.T) {
 	checkCUPSAndIPPDependencies(t)
 
 	binPath := buildOrFindSNMPResponder(t)
+	if binPath == "" {
+		t.Skip("snmp_responder binary not found or build skipped; skipping synthetic odometer test")
+	}
+
 	tempDir := t.TempDir()
 
 	stateFile := filepath.Join(tempDir, "snmp_state.json")
@@ -399,7 +488,10 @@ func TestCUPSJobQuery_LiveTransitions(t *testing.T) {
 	emuName := fmt.Sprintf("XeroxGoQueryEmu_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
 	queueName := fmt.Sprintf("XeroxGoQuery_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
 
-	metaFile := filepath.Join(tempDir, "cups.meta")
+	// Place metadata file outside t.TempDir() to preserve evidence on deletion failure
+	metaFile := filepath.Join(os.TempDir(), fmt.Sprintf("xeroxgo_cups_meta_%s.meta", queueName))
+	_ = os.Remove(metaFile)
+
 	emuEnv := append(os.Environ(),
 		fmt.Sprintf("EMU_PORT=%d", ippPort),
 		fmt.Sprintf("SNMP_PORT=%d", snmpPort),
@@ -424,7 +516,13 @@ func TestCUPSJobQuery_LiveTransitions(t *testing.T) {
 		t.Fatalf("failed to start emulator: %v (%s)", err, out)
 	}
 	t.Cleanup(func() {
-		_, _ = runEmu(t, emuScript, emuEnv, "remove-cups")
+		out, err := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+		if err != nil {
+			t.Errorf("cleanup failure: remove-cups failed for queue %q: %v (%s). Metadata preserved at %s.",
+				queueName, err, strings.TrimSpace(out), metaFile)
+		} else {
+			_ = os.Remove(metaFile)
+		}
 		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
 	})
 
@@ -469,5 +567,97 @@ func TestCUPSJobQuery_LiveTransitions(t *testing.T) {
 
 	if lastInfo.State != CUPSJobStateCompleted {
 		t.Errorf("expected final state CUPSJobStateCompleted, got %s", lastInfo.State)
+	}
+}
+
+// TestCUPSQueueDeletion_FailurePreservesOwnershipMetadata verifies that if verified CUPS queue
+// deletion fails (or is refused due to URI mismatch), ownership metadata is strictly preserved
+// and not deleted, preventing orphaned unmanaged queues.
+func TestCUPSQueueDeletion_FailurePreservesOwnershipMetadata(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	ippPort := getFreePort(t, "tcp")
+	emuName := fmt.Sprintf("XeroxGoPreserveEmu_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	queueName := fmt.Sprintf("XeroxGoPreserve_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+
+	metaFile := filepath.Join(os.TempDir(), fmt.Sprintf("xeroxgo_cups_meta_%s.meta", queueName))
+	_ = os.Remove(metaFile)
+
+	emuEnv := append(os.Environ(),
+		fmt.Sprintf("EMU_PORT=%d", ippPort),
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_NAME=%s", emuName),
+		fmt.Sprintf("EMU_CUPS_QUEUE=%s", queueName),
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", filepath.Join(tempDir, "ipp.pid")),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_LOCK_DIR=%s", filepath.Join(tempDir, ".ipp_lock")),
+		fmt.Sprintf("EMU_META_FILE=%s", metaFile),
+	)
+	_ = os.MkdirAll(filepath.Join(tempDir, "spool"), 0755)
+
+	if out, err := runEmu(t, emuScript, emuEnv, "start"); err != nil {
+		t.Fatalf("failed to start emulator: %v (%s)", err, out)
+	}
+	t.Cleanup(func() {
+		// Guaranteed final cleanup with matching URI
+		_, _ = runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+		_ = os.Remove(metaFile)
+		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
+	})
+
+	// Setup driverless CUPS queue
+	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
+		t.Fatalf("failed to setup CUPS queue: %v (%s)", err, out)
+	}
+
+	// Verify metadata file was created
+	if _, err := os.Stat(metaFile); err != nil {
+		t.Fatalf("expected metadata file %s to exist after setup-cups", metaFile)
+	}
+
+	// Corrupt metadata URI to point to an unrelated printer, simulating ownership mismatch
+	originalMeta, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+	corruptedMeta := strings.Replace(string(originalMeta), fmt.Sprintf(":%d/", ippPort), ":9999/", 1)
+	if err := os.WriteFile(metaFile, []byte(corruptedMeta), 0644); err != nil {
+		t.Fatalf("failed to corrupt metadata: %v", err)
+	}
+
+	// Attempt remove-cups: must fail due to 3-way URI mismatch
+	removeOut, removeErr := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+	if removeErr == nil {
+		t.Errorf("expected remove-cups to fail on corrupted metadata URI, but succeeded: %s", removeOut)
+	}
+
+	// Requirement 2: Verify ownership metadata was NOT deleted and is still present
+	if _, err := os.Stat(metaFile); os.IsNotExist(err) {
+		t.Errorf("ownership metadata %s was deleted despite failed queue removal", metaFile)
+	}
+
+	// Verify queue was preserved in CUPS
+	if lpstatOut, err := exec.Command("lpstat", "-p", queueName).CombinedOutput(); err != nil {
+		t.Errorf("expected queue %s to still exist in CUPS after failed removal, got error: %v (%s)",
+			queueName, err, strings.TrimSpace(string(lpstatOut)))
+	}
+
+	// Restore original valid metadata
+	if err := os.WriteFile(metaFile, originalMeta, 0644); err != nil {
+		t.Fatalf("failed to restore original metadata: %v", err)
+	}
+
+	// Verified removal should now succeed
+	if cleanOut, cleanErr := runEmu(t, emuScript, emuEnv, "remove-cups", queueName); cleanErr != nil {
+		t.Fatalf("remove-cups failed after restoring valid metadata: %v (%s)", cleanErr, cleanOut)
+	}
+
+	// Verify metadata file is deleted after successful removal
+	if _, err := os.Stat(metaFile); !os.IsNotExist(err) {
+		t.Errorf("expected metadata file %s to be deleted after successful remove-cups", metaFile)
 	}
 }
