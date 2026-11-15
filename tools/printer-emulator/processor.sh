@@ -76,11 +76,28 @@ fi
 
 # Test-only job execution controls (D4b-1)
 # Allows tests to synchronize fault injection with a confirmed active job rather than fixed sleep assumptions.
+IPP_JOB_NUM="${IPP_JOB_ID:-unknown}"
+
+cleanup_active_marker() {
+    if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ "$JOB_NAME" != "XeroxGoFaultSync" ]] && [[ "$USER_NAME" != "XeroxGoFaultSync" ]]; then
+        cat << STATE_EOF > "$EMU_JOB_ACTIVE_FILE"
+JOB_NAME=${JOB_NAME}
+IPP_JOB_ID=${IPP_JOB_NUM}
+USER_NAME=${USER_NAME}
+PID=$$
+STATE=completed
+TIMESTAMP=$(date +%s%N)
+STATE_EOF
+    fi
+}
+trap cleanup_active_marker EXIT INT TERM
+
 if [[ "$JOB_NAME" != "XeroxGoFaultSync" ]] && [[ "$USER_NAME" != "XeroxGoFaultSync" ]]; then
-    # 1. Announce active job processing
+    # 1. Announce active job processing with authoritative job-specific marker
     if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]]; then
         cat << STATE_EOF > "$EMU_JOB_ACTIVE_FILE"
 JOB_NAME=${JOB_NAME}
+IPP_JOB_ID=${IPP_JOB_NUM}
 USER_NAME=${USER_NAME}
 PID=$$
 STATE=processing
@@ -110,8 +127,6 @@ fi
 
 # Log completion details to stderr (captured by ippeveprinter log)
 echo "[PRINT-PROCESSOR] Job completed successfully: name='${JOB_NAME}' user='${USER_NAME}' format='${CONTENT_TYPE}'" >&2
-if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]]; then
-    echo "STATE=completed" >> "$EMU_JOB_ACTIVE_FILE" 2>/dev/null || true
-fi
+cleanup_active_marker
 
 exit 0

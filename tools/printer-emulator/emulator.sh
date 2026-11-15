@@ -1600,8 +1600,15 @@ cmd_fault_set() {
 
             local active_in_processor=false
             if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ -f "$EMU_JOB_ACTIVE_FILE" ]]; then
-                if grep -q "STATE=processing" "$EMU_JOB_ACTIVE_FILE" 2>/dev/null; then
-                    active_in_processor=true
+                local marker_state marker_pid
+                marker_state=$(sed -n 's/^STATE=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                marker_pid=$(sed -n 's/^PID=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                if [[ "$marker_state" == "processing" ]] && [[ -n "$marker_pid" ]] && kill -0 "$marker_pid" 2>/dev/null; then
+                    local pid_comm
+                    pid_comm=$(cat "/proc/${marker_pid}/comm" 2>/dev/null || ps -p "$marker_pid" -o comm= 2>/dev/null || true)
+                    if [[ "$pid_comm" =~ bash|sh|processor ]]; then
+                        active_in_processor=true
+                    fi
                 fi
             fi
 

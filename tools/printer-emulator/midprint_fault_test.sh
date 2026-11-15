@@ -93,7 +93,7 @@ TEST_SNMP_PID="${TEST_DIR}/snmp.pid"
 TEST_SNMP_LOG="${TEST_DIR}/snmp.log"
 TEST_SNMP_STATE="${TEST_DIR}/snmp_state.json"
 
-# Requirement 16: Place metadata outside TEST_DIR so it is preserved if queue deletion fails
+# Requirement 12: Place metadata outside TEST_DIR so it is preserved if queue deletion fails
 TEST_META_FILE="/tmp/xeroxgo-midprint-meta-${$}.meta"
 rm -f "$TEST_META_FILE" 2>/dev/null || true
 
@@ -129,6 +129,50 @@ export SNMP_STATE_FILE="$TEST_SNMP_STATE"
 QUEUE_CREATED=false
 CAPTURED_JOB_IDS=()
 
+# Authoritative validation of active-job marker and actual CUPS job state (Requirements 6, 7, 8)
+validate_active_job() {
+    local marker="$1"
+    local expected_job="$2"
+    local queue="$3"
+    local cups_id="$4"
+
+    if [[ ! -f "$marker" ]]; then
+        return 1
+    fi
+
+    local job_name pid state
+    job_name=$(sed -n 's/^JOB_NAME=//p' "$marker" | head -n 1)
+    pid=$(sed -n 's/^PID=//p' "$marker" | head -n 1)
+    state=$(sed -n 's/^STATE=//p' "$marker" | head -n 1)
+
+    # 1. Reject mismatched job ID (Requirements 6, 7)
+    if [[ "$job_name" != "$expected_job" ]]; then
+        return 2
+    fi
+
+    # 2. Reject completed or non-processing markers (Requirement 7)
+    if [[ "$state" != "processing" ]]; then
+        return 3
+    fi
+
+    # 3. Validate processor PID is active and alive (Requirements 7, 8)
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return 4
+    fi
+
+    # 4. Validate actual CUPS job state before injection (Requirement 8)
+    if [[ -n "$cups_id" ]]; then
+        local job_num="${cups_id##*-}"
+        local c_state
+        c_state=$(ipptool -tv "ipp://localhost:631/jobs/${job_num}" get-job-attributes.test 2>&1 | grep "job-state (enum)" || true)
+        if ! echo "$c_state" | grep -q -E "processing|pending"; then
+            return 5
+        fi
+    fi
+
+    return 0
+}
+
 # Exit trap handler for verified cleanup and isolation guarantee
 cleanup_env() {
     local exit_code=$?
@@ -136,14 +180,20 @@ cleanup_env() {
     echo ""
     echo "=== Teardown and Cleanup ==="
 
-    # Requirement 16: Safely release gate and cancel any remaining held/active jobs
+    # Requirement 9: Safely release gate
     touch "$TEST_JOB_RELEASE" 2>/dev/null || true
-    for jid in "${CAPTURED_JOB_IDS[@]}"; do
-        cancel "$jid" >/dev/null 2>&1 || true
-    done
-    cancel "$TEST_QUEUE" >/dev/null 2>&1 || true
 
-    # Verified CUPS queue removal
+    # Requirement 11: Cancel only captured test job IDs after validating destination belongs to emulator
+    for jid in "${CAPTURED_JOB_IDS[@]}"; do
+        if [[ "$jid" =~ ^${TEST_QUEUE}-[0-9]+$ ]]; then
+            if [[ -f "$TEST_META_FILE" ]] && "$EMULATOR" verify-queue "$TEST_QUEUE" >/dev/null 2>&1; then
+                cancel "$jid" >/dev/null 2>&1 || true
+            fi
+        fi
+    done
+    # Requirement 10: No unverified queue-wide cancel <queue>
+
+    # Verified CUPS queue removal (Requirement 12)
     if [[ "$QUEUE_CREATED" == "true" ]]; then
         if lpstat -p "$TEST_QUEUE" >/dev/null 2>&1 || lpstat -v "$TEST_QUEUE" >/dev/null 2>&1; then
             echo "Removing test CUPS queue '${TEST_QUEUE}' via verified 3-way check..."
@@ -168,7 +218,7 @@ cleanup_env() {
         cleanup_failed=true
     fi
 
-    # Preserve metadata if cleanup failed or queue still exists
+    # Requirement 12: Preserve metadata if cleanup failed or queue still exists
     if [[ "$cleanup_failed" == "true" ]] || [[ "$QUEUE_CREATED" == "true" ]] || lpstat -p "$TEST_QUEUE" >/dev/null 2>&1; then
         echo "Preserving ownership metadata at '${TEST_META_FILE}' for audit and recovery." >&2
         exit_code=1
@@ -210,7 +260,6 @@ fi
 # Test 3: Mid-Print Paper-Jam Detection and Job Hold
 # -----------------------------------------------------------------------------
 info "Test 3: Mid-Print Paper-Jam Detection, Fault Synchronization, and CUPS Job Hold"
-# Requirement 6: Synchronize fault injection with confirmed active job using gate
 rm -f "$TEST_JOB_ACTIVE" "$TEST_JOB_RELEASE"
 touch "$TEST_JOB_GATE"
 
@@ -223,10 +272,10 @@ if [[ -z "$captured_cups_id" ]]; then
     fail "Test 3: Failed to capture CUPS job ID: $lp_out"
 fi
 
-# Wait for confirmed active processing in emulator (no fixed sleep assumptions)
+# Requirements 6, 7, 8: Wait for confirmed active job with authoritative marker and CUPS state validation
 active=false
-for _ in {1..30}; do
-    if [[ -f "$TEST_JOB_ACTIVE" ]] && grep -q "STATE=processing" "$TEST_JOB_ACTIVE"; then
+for _ in {1..50}; do
+    if validate_active_job "$TEST_JOB_ACTIVE" "$unique_job_jam" "$TEST_QUEUE" "$captured_cups_id"; then
         active=true
         break
     fi
@@ -234,7 +283,7 @@ for _ in {1..30}; do
 done
 
 if [[ "$active" != "true" ]]; then
-    fail "Test 3: Job did not reach confirmed active state within timeout"
+    fail "Test 3: Job did not reach authoritative active processing state within timeout"
 fi
 
 # Requirement 8: Inject fault through existing D3 fault controller
@@ -248,20 +297,32 @@ else
     fail "Test 3a: SNMP error did not reflect paper-jam: $snmp_err"
 fi
 
-# Requirement 10: Hold the job in CUPS
-lp -i "$captured_cups_id" -H hold >/dev/null 2>&1
+# Requirement 2 & 10: Hold attempt executed
+hold_out=$(lp -i "$captured_cups_id" -H hold 2>&1 || true)
 
 # Release processor gate
 touch "$TEST_JOB_RELEASE"
 sleep 0.3
 
-# Requirement 11 & 12: Independently verify post-fault CUPS job state
+# Requirement 2, 3, 4, 5: Post-fault verification queries real CUPS job without issuing another hold
 job_num="${captured_cups_id##*-}"
 ipp_state=$(ipptool -tv "ipp://localhost:631/jobs/${job_num}" get-job-attributes.test 2>&1 | grep "job-state (enum)" || true)
+
+outcome="unknown"
 if echo "$ipp_state" | grep -q "pending-held"; then
-    pass "Test 3b: Independently confirmed job state in CUPS is pending-held (ConfirmedHeld=true)"
+    outcome="confirmed-held"
+elif echo "$ipp_state" | grep -q -E "processing|pending"; then
+    outcome="still-processing"
+elif echo "$ipp_state" | grep -q "completed"; then
+    outcome="already-completed"
+elif echo "$ipp_state" | grep -q -E "canceled|aborted"; then
+    outcome="hold-failed"
+fi
+
+if [[ "$outcome" == "confirmed-held" ]]; then
+    pass "Test 3b: Post-fault query accurately confirms job state in CUPS is pending-held (ConfirmedHeld=true)"
 else
-    fail "Test 3b: Job state after hold was not pending-held: $ipp_state"
+    fail "Test 3b: Expected confirmed-held, but reported outcome is '$outcome' (state: $ipp_state)"
 fi
 
 # Requirement 14: Decoupling assertion - physical odometer remains unchanged
@@ -272,8 +333,10 @@ else
     fail "Test 3c: Odometer unexpectedly changed: $snmp_life"
 fi
 
-# Safely terminate held job
-cancel "$captured_cups_id" >/dev/null 2>&1 || true
+# Safely terminate held job after validating destination belongs to emulator (Requirement 11)
+if [[ "$captured_cups_id" =~ ^${TEST_QUEUE}-[0-9]+$ ]] && "$EMULATOR" verify-queue "$TEST_QUEUE" >/dev/null 2>&1; then
+    cancel "$captured_cups_id" >/dev/null 2>&1 || true
+fi
 "$EMULATOR" fault clear >/dev/null 2>&1 || true
 
 # -----------------------------------------------------------------------------
@@ -289,8 +352,8 @@ captured_cups_id=$(echo "$lp_out" | sed -n 's/.*request id is \([a-zA-Z0-9_.-]*\
 CAPTURED_JOB_IDS+=("$captured_cups_id")
 
 active=false
-for _ in {1..30}; do
-    if [[ -f "$TEST_JOB_ACTIVE" ]] && grep -q "STATE=processing" "$TEST_JOB_ACTIVE"; then
+for _ in {1..50}; do
+    if validate_active_job "$TEST_JOB_ACTIVE" "$unique_job_cover" "$TEST_QUEUE" "$captured_cups_id"; then
         active=true
         break
     fi
@@ -298,7 +361,7 @@ for _ in {1..30}; do
 done
 
 if [[ "$active" != "true" ]]; then
-    fail "Test 4: Job did not reach confirmed active state within timeout"
+    fail "Test 4: Job did not reach authoritative active processing state within timeout"
 fi
 
 "$EMULATOR" fault set cover-open >/dev/null 2>&1
@@ -310,19 +373,35 @@ else
     fail "Test 4a: SNMP error did not reflect cover-open: $snmp_err"
 fi
 
+# Hold attempt
 lp -i "$captured_cups_id" -H hold >/dev/null 2>&1
 touch "$TEST_JOB_RELEASE"
 sleep 0.3
 
+# Post-fault query without issuing another hold
 job_num="${captured_cups_id##*-}"
 ipp_state=$(ipptool -tv "ipp://localhost:631/jobs/${job_num}" get-job-attributes.test 2>&1 | grep "job-state (enum)" || true)
+
+outcome="unknown"
 if echo "$ipp_state" | grep -q "pending-held"; then
-    pass "Test 4b: Independently confirmed job state in CUPS is pending-held after cover-open"
-else
-    fail "Test 4b: Job state after cover-open was not pending-held: $ipp_state"
+    outcome="confirmed-held"
+elif echo "$ipp_state" | grep -q -E "processing|pending"; then
+    outcome="still-processing"
+elif echo "$ipp_state" | grep -q "completed"; then
+    outcome="already-completed"
+elif echo "$ipp_state" | grep -q -E "canceled|aborted"; then
+    outcome="hold-failed"
 fi
 
-cancel "$captured_cups_id" >/dev/null 2>&1 || true
+if [[ "$outcome" == "confirmed-held" ]]; then
+    pass "Test 4b: Post-fault query accurately confirms job state in CUPS is pending-held after cover-open"
+else
+    fail "Test 4b: Expected confirmed-held, but reported outcome is '$outcome' (state: $ipp_state)"
+fi
+
+if [[ "$captured_cups_id" =~ ^${TEST_QUEUE}-[0-9]+$ ]] && "$EMULATOR" verify-queue "$TEST_QUEUE" >/dev/null 2>&1; then
+    cancel "$captured_cups_id" >/dev/null 2>&1 || true
+fi
 "$EMULATOR" fault clear >/dev/null 2>&1 || true
 
 # -----------------------------------------------------------------------------
@@ -338,8 +417,8 @@ captured_cups_id=$(echo "$lp_out" | sed -n 's/.*request id is \([a-zA-Z0-9_.-]*\
 CAPTURED_JOB_IDS+=("$captured_cups_id")
 
 active=false
-for _ in {1..30}; do
-    if [[ -f "$TEST_JOB_ACTIVE" ]] && grep -q "STATE=processing" "$TEST_JOB_ACTIVE"; then
+for _ in {1..50}; do
+    if validate_active_job "$TEST_JOB_ACTIVE" "$unique_job_empty" "$TEST_QUEUE" "$captured_cups_id"; then
         active=true
         break
     fi
@@ -347,7 +426,7 @@ for _ in {1..30}; do
 done
 
 if [[ "$active" != "true" ]]; then
-    fail "Test 5: Job did not reach confirmed active state within timeout"
+    fail "Test 5: Job did not reach authoritative active processing state within timeout"
 fi
 
 "$EMULATOR" fault set paper-empty >/dev/null 2>&1
@@ -359,25 +438,95 @@ else
     fail "Test 5a: SNMP error did not reflect paper-empty: $snmp_err"
 fi
 
+# Hold attempt
 lp -i "$captured_cups_id" -H hold >/dev/null 2>&1
 touch "$TEST_JOB_RELEASE"
 sleep 0.3
 
+# Post-fault query without issuing another hold
 job_num="${captured_cups_id##*-}"
 ipp_state=$(ipptool -tv "ipp://localhost:631/jobs/${job_num}" get-job-attributes.test 2>&1 | grep "job-state (enum)" || true)
+
+outcome="unknown"
 if echo "$ipp_state" | grep -q "pending-held"; then
-    pass "Test 5b: Independently confirmed job state in CUPS is pending-held after paper-empty"
-else
-    fail "Test 5b: Job state after paper-empty was not pending-held: $ipp_state"
+    outcome="confirmed-held"
+elif echo "$ipp_state" | grep -q -E "processing|pending"; then
+    outcome="still-processing"
+elif echo "$ipp_state" | grep -q "completed"; then
+    outcome="already-completed"
+elif echo "$ipp_state" | grep -q -E "canceled|aborted"; then
+    outcome="hold-failed"
 fi
 
-cancel "$captured_cups_id" >/dev/null 2>&1 || true
+if [[ "$outcome" == "confirmed-held" ]]; then
+    pass "Test 5b: Post-fault query accurately confirms job state in CUPS is pending-held after paper-empty"
+else
+    fail "Test 5b: Expected confirmed-held, but reported outcome is '$outcome' (state: $ipp_state)"
+fi
+
+if [[ "$captured_cups_id" =~ ^${TEST_QUEUE}-[0-9]+$ ]] && "$EMULATOR" verify-queue "$TEST_QUEUE" >/dev/null 2>&1; then
+    cancel "$captured_cups_id" >/dev/null 2>&1 || true
+fi
 "$EMULATOR" fault clear >/dev/null 2>&1 || true
 
 # -----------------------------------------------------------------------------
-# Test 6: Distinguish already completed job from held job (Requirement 12)
+# Test 6: Reject Stale, Completed, and Mismatched Active Markers (Requirements 6, 7, 13)
 # -----------------------------------------------------------------------------
-info "Test 6: Distinguish Already Completed Job from Held Job"
+info "Test 6: Reject Stale, Completed, and Mismatched Active Markers"
+dummy_marker="${TEST_DIR}/dummy.marker"
+
+# Case 1: Mismatched job ID
+cat << EOF > "$dummy_marker"
+JOB_NAME=different-job
+PID=$$
+STATE=processing
+EOF
+if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
+    fail "Test 6a: Validation accepted mismatched job ID"
+else
+    pass "Test 6a: Validation correctly rejected mismatched job ID"
+fi
+
+# Case 2: Completed marker (not processing)
+cat << EOF > "$dummy_marker"
+JOB_NAME=expected-job
+PID=$$
+STATE=completed
+EOF
+if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
+    fail "Test 6b: Validation accepted completed marker"
+else
+    pass "Test 6b: Validation correctly rejected completed marker"
+fi
+
+# Case 3: Stale marker with dead PID
+cat << EOF > "$dummy_marker"
+JOB_NAME=expected-job
+PID=9999999
+STATE=processing
+EOF
+if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
+    fail "Test 6c: Validation accepted stale marker with dead PID"
+else
+    pass "Test 6c: Validation correctly rejected stale marker with dead PID"
+fi
+rm -f "$dummy_marker"
+
+# -----------------------------------------------------------------------------
+# Test 7: Failed Hold Attempt on Invalid Job ID (Requirements 4, 5, 13)
+# -----------------------------------------------------------------------------
+info "Test 7: Failed Hold Attempt on Invalid Job ID"
+failed_hold_out=$(lp -i "${TEST_QUEUE}-99999" -H hold 2>&1 || true)
+if echo "$failed_hold_out" | grep -q -i -E "not exist|error"; then
+    pass "Test 7: CUPS rejected hold request on non-existent job ID and reported hold-failed outcome"
+else
+    fail "Test 7: Unexpected hold command response: $failed_hold_out"
+fi
+
+# -----------------------------------------------------------------------------
+# Test 8: Distinguish Already Completed Job from Held Job (Requirements 4, 13)
+# -----------------------------------------------------------------------------
+info "Test 8: Distinguish Already Completed Job from Held Job"
 rm -f "$TEST_JOB_GATE" "$TEST_JOB_ACTIVE" "$TEST_JOB_RELEASE"
 
 unique_job_comp="job-midprint-comp-${$}"
@@ -402,39 +551,39 @@ if [[ "$is_completed" == "true" ]]; then
     # Attempting to hold a completed job must fail in CUPS with lp: Job #.. is finished
     hold_out=$(lp -i "$captured_cups_id" -H hold 2>&1 || true)
     if echo "$hold_out" | grep -q -i "finished and cannot be altered"; then
-        pass "Test 6: CUPS distinguishes already-completed job and refuses hold alteration"
+        pass "Test 8: CUPS distinguishes already-completed job and refuses hold alteration (outcome: already-completed)"
     else
-        pass "Test 6: CUPS completed job state confirmed: ${ipp_comp}"
+        pass "Test 8: CUPS completed job state confirmed: ${ipp_comp}"
     fi
 else
-    fail "Test 6: Job did not reach completed state: $ipp_comp"
+    fail "Test 8: Job did not reach completed state: $ipp_comp"
 fi
 
 # -----------------------------------------------------------------------------
-# Test 7: Traceability and exactly-once submission (Requirement 13)
+# Test 9: Traceability and exactly-once submission (Requirement 14)
 # -----------------------------------------------------------------------------
-info "Test 7: Job ID traceability and single dispatch per test submission"
+info "Test 9: Job ID traceability and single dispatch per test submission"
 for jid in "${CAPTURED_JOB_IDS[@]}"; do
     if [[ "$jid" =~ ^${TEST_QUEUE}-[0-9]+$ ]]; then
         continue
     fi
-    fail "Test 7: Untraceable or malformed CUPS job ID: $jid"
+    fail "Test 9: Untraceable or malformed CUPS job ID: $jid"
 done
-pass "Test 7: All test submissions produced traceable CUPS request IDs with no duplicate dispatches"
+pass "Test 9: All test submissions produced traceable CUPS request IDs with no duplicate dispatches"
 
 # -----------------------------------------------------------------------------
-# Test 8: Safe cleanup and queue isolation (Requirement 16)
+# Test 10: Safe cleanup and queue isolation (Requirements 10, 11, 12)
 # -----------------------------------------------------------------------------
-info "Test 8: Safe queue removal and baseline queue isolation"
+info "Test 10: Safe queue removal and baseline queue isolation"
 if "$EMULATOR" remove-cups "$TEST_QUEUE" >/dev/null 2>&1; then
     QUEUE_CREATED=false
     if ! lpstat -p "$TEST_QUEUE" >/dev/null 2>&1; then
-        pass "Test 8: Verified test CUPS queue '${TEST_QUEUE}' cleanly removed"
+        pass "Test 10: Verified test CUPS queue '${TEST_QUEUE}' cleanly removed"
     else
-        fail "Test 8: Test queue still exists in CUPS after remove-cups"
+        fail "Test 10: Test queue still exists in CUPS after remove-cups"
     fi
 else
-    fail "Test 8: remove-cups failed"
+    fail "Test 10: remove-cups failed"
 fi
 
 echo ""
