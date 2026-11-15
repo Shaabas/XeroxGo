@@ -878,15 +878,21 @@ func PollCUPSHealth(ctx context.Context, queue string, estimatedSheets int) cont
 	return PollCUPSHealthCustom(ctx, defaultCommandRunner, queue, estimatedSheets)
 }
 
-// PollCUPSHealthCustom allows injection of a custom command runner for testing CUPS health checks.
-// It queries CUPS using 'lpstat -l -p' to inspect extended printer status and state reasons (e.g. media-jam-error),
-// falling back to 'lpstat -p' if extended status is unavailable.
-func PollCUPSHealthCustom(
+// QueryCUPSHealth queries CUPS for printer health using defaultCommandRunner, returning health and query error.
+func QueryCUPSHealth(ctx context.Context, queue string, estimatedSheets int) (contracts.PrinterHealth, error) {
+	return QueryCUPSHealthDiagnostic(ctx, defaultCommandRunner, queue, estimatedSheets)
+}
+
+// QueryCUPSHealthDiagnostic queries CUPS health for a queue using 'lpstat -l -p' with fallback to 'lpstat -p'.
+// It returns both the parsed PrinterHealth and an explicit query error/status,
+// allowing callers (such as shadow health mode) to distinguish command execution failures from
+// successful CUPS responses that report a disabled, stopped, or offline queue.
+func QueryCUPSHealthDiagnostic(
 	ctx context.Context,
 	runner CommandRunner,
 	queue string,
 	estimatedSheets int,
-) contracts.PrinterHealth {
+) (contracts.PrinterHealth, error) {
 	now := time.Now().UTC()
 	if strings.TrimSpace(queue) == "" {
 		return contracts.PrinterHealth{
@@ -895,7 +901,7 @@ func PollCUPSHealthCustom(
 			PaperTrayStatus: "UNKNOWN",
 			EstimatedSheets: estimatedSheets,
 			UpdatedAt:       now,
-		}
+		}, errors.New("CUPS queue name is empty")
 	}
 
 	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -916,9 +922,27 @@ func PollCUPSHealthCustom(
 			PaperTrayStatus: "UNKNOWN",
 			EstimatedSheets: estimatedSheets,
 			UpdatedAt:       now,
-		}
+		}, fmt.Errorf("lpstat query failed for queue %q: %w", queue, err)
 	}
 
+	return parseCUPSHealthOutput(out, estimatedSheets, now), nil
+}
+
+// PollCUPSHealthCustom allows injection of a custom command runner for testing CUPS health checks.
+// It queries CUPS using 'lpstat -l -p' to inspect extended printer status and state reasons (e.g. media-jam-error),
+// falling back to 'lpstat -p' if extended status is unavailable.
+func PollCUPSHealthCustom(
+	ctx context.Context,
+	runner CommandRunner,
+	queue string,
+	estimatedSheets int,
+) contracts.PrinterHealth {
+	health, _ := QueryCUPSHealthDiagnostic(ctx, runner, queue, estimatedSheets)
+	return health
+}
+
+// parseCUPSHealthOutput parses the raw stdout of lpstat into normalized contracts.PrinterHealth.
+func parseCUPSHealthOutput(out []byte, estimatedSheets int, now time.Time) contracts.PrinterHealth {
 	raw := strings.ToLower(string(out))
 
 	// Hardware fault indicators from printer status line and IPP printer-state-reasons

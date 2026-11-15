@@ -248,12 +248,15 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 	// 1. Independent CUPS query
 	cupsCtx, cupsCancel := context.WithTimeout(ctx, queryTimeout)
 	var rawCUPS contracts.PrinterHealth
-	if c.cfg.MockCUPSHealth != nil {
+	var cupsExecErr error
+	if c.cfg.MockCUPSHealthDiag != nil {
+		rawCUPS, cupsExecErr = c.cfg.MockCUPSHealthDiag(cupsCtx, sheets)
+	} else if c.cfg.MockCUPSHealth != nil {
 		rawCUPS = c.cfg.MockCUPSHealth(cupsCtx, sheets)
 	} else if c.cfg.CUPSRunner != nil {
-		rawCUPS = printer.PollCUPSHealthCustom(cupsCtx, c.cfg.CUPSRunner, cupsQ, sheets)
+		rawCUPS, cupsExecErr = printer.QueryCUPSHealthDiagnostic(cupsCtx, c.cfg.CUPSRunner, cupsQ, sheets)
 	} else {
-		rawCUPS = printer.PollCUPSHealth(cupsCtx, cupsQ, sheets)
+		rawCUPS, cupsExecErr = printer.QueryCUPSHealthDiagnostic(cupsCtx, nil, cupsQ, sheets)
 	}
 	cupsCtxErr := cupsCtx.Err() // Capture context error BEFORE calling cancel()
 	cupsCancel()
@@ -267,6 +270,8 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 		} else {
 			cupsErr = fmt.Errorf("CUPS query context error: %w", cupsCtxErr)
 		}
+	} else if cupsExecErr != nil {
+		cupsErr = fmt.Errorf("CUPS query error: %w", cupsExecErr)
 	} else if rawCUPS.State == "UNKNOWN" && rawCUPS.ErrorMessage != "" {
 		cupsErr = fmt.Errorf("CUPS query error: %s", rawCUPS.ErrorMessage)
 	} else if isTransportOrCommandError(rawCUPS.ErrorMessage) {

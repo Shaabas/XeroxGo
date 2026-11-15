@@ -1439,3 +1439,260 @@ func TestShadowHealth_SNMPFailuresAndStaleness(t *testing.T) {
 		}
 	})
 }
+
+func TestShadowHealth_CUPSCommandFailureVsDisabledContrasts(t *testing.T) {
+	now := time.Now().UTC()
+
+	mockIPP := func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+		return printer.IPPPrinterStateResult{
+			Source:            printer.CapabilitySourceCUPSQueue,
+			Queue:             queue,
+			State:             printer.IPPPrinterStateIdle,
+			AcceptingJobs:     printer.AcceptingJobsAccepting,
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        now,
+		}, nil
+	}
+
+	t.Run("missing_lpstat_yields_unknown_never_offline", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return nil, errors.New("exec: \"lpstat\": executable file not found in $PATH")
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Available {
+			t.Error("expected missing lpstat to set CUPSSample.Available=false")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Fatal("expected QueryErrors to capture command failure")
+		}
+		hasErr := false
+		for _, qe := range report.QueryErrors {
+			if strings.Contains(qe, "executable file not found") {
+				hasErr = true
+				break
+			}
+		}
+		if !hasErr {
+			t.Errorf("expected executable file not found in QueryErrors, got %v", report.QueryErrors)
+		}
+
+		// Critical check: command failure MUST NOT be diagnosed as QUEUE_OFFLINE!
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN when lpstat is missing", report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false")
+		}
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") {
+				t.Errorf("CRITICAL: missing lpstat must NOT produce queue-offline blocking fault, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+		for _, d := range report.Reconciled.DiagnosticDetails {
+			if d.Code == printer.FaultQueueOffline {
+				t.Errorf("CRITICAL: missing lpstat must NOT emit FaultQueueOffline diagnostic item")
+			}
+		}
+	})
+
+	t.Run("both_commands_fail_yields_unknown_never_offline", func(t *testing.T) {
+		var shadowCalls atomic.Int32
+		var activeCheck atomic.Bool
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if activeCheck.Load() {
+					shadowCalls.Add(1)
+				}
+				return nil, errors.New("lpstat: cannot connect to server: Connection refused")
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		activeCheck.Store(true)
+		report := client.RunShadowHealthCheck(context.Background())
+		activeCheck.Store(false)
+
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if shadowCalls.Load() != 2 {
+			t.Errorf("expected exactly 2 command attempts (-l -p then fallback -p), got %d", shadowCalls.Load())
+		}
+		if report.CUPSSample.Available {
+			t.Error("expected command failure to set CUPSSample.Available=false")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Fatal("expected QueryErrors to capture command failure")
+		}
+		hasErr := false
+		for _, qe := range report.QueryErrors {
+			if strings.Contains(qe, "Connection refused") {
+				hasErr = true
+				break
+			}
+		}
+		if !hasErr {
+			t.Errorf("expected Connection refused in QueryErrors, got %v", report.QueryErrors)
+		}
+
+		// Critical check: command failure MUST NOT be diagnosed as QUEUE_OFFLINE!
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN when both commands fail, got %q", report.Reconciled.EffectiveState, report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false")
+		}
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") {
+				t.Errorf("CRITICAL: command failure must NOT produce queue-offline blocking fault, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+		for _, d := range report.Reconciled.DiagnosticDetails {
+			if d.Code == printer.FaultQueueOffline {
+				t.Errorf("CRITICAL: command failure must NOT emit FaultQueueOffline diagnostic item")
+			}
+		}
+	})
+
+	t.Run("extended_query_failing_with_successful_fallback", func(t *testing.T) {
+		var shadowCalls atomic.Int32
+		var activeCheck atomic.Bool
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if activeCheck.Load() {
+					shadowCalls.Add(1)
+				}
+				for _, arg := range args {
+					if arg == "-l" {
+						return nil, errors.New("lpstat: illegal option -- l")
+					}
+				}
+				return []byte("printer BrotherDCP is idle. enabled since Sun Nov 15 10:00:00 2026\n"), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		activeCheck.Store(true)
+		report := client.RunShadowHealthCheck(context.Background())
+		activeCheck.Store(false)
+
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if shadowCalls.Load() != 2 {
+			t.Errorf("expected 2 command attempts, got %d", shadowCalls.Load())
+		}
+		if !report.CUPSSample.Available {
+			t.Error("expected successful fallback to set CUPSSample.Available=true")
+		}
+		if len(report.QueryErrors) != 0 {
+			t.Errorf("expected 0 QueryErrors on successful fallback, got %v", report.QueryErrors)
+		}
+		if report.Reconciled.EffectiveState != "IDLE" {
+			t.Errorf("EffectiveState = %q, want IDLE on successful fallback", report.Reconciled.EffectiveState)
+		}
+		if !report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=true")
+		}
+		if len(report.Reconciled.BlockingFaults) > 0 {
+			t.Errorf("expected no blocking faults, got %v", report.Reconciled.BlockingFaults)
+		}
+	})
+
+	t.Run("genuinely_disabled_queue_preserves_fault_classification", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return []byte("printer BrotherDCP disabled since Sun Nov 15 10:00:00 2026 - printer is stopped or disabled\n"), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if !report.CUPSSample.Available {
+			t.Error("expected successful disabled-queue query to set CUPSSample.Available=true")
+		}
+		if len(report.QueryErrors) != 0 {
+			t.Errorf("expected 0 QueryErrors for successful disabled query, got %v", report.QueryErrors)
+		}
+		if report.Reconciled.EffectiveState != "ERROR" && report.Reconciled.EffectiveState != "OFFLINE" {
+			t.Errorf("expected EffectiveState ERROR or OFFLINE for disabled queue, got %q", report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false for disabled queue")
+		}
+		if !report.Reconciled.HasBlockingFaults() {
+			t.Error("expected blocking faults for disabled queue")
+		}
+
+		hasOfflineOrErrorFault := false
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") || strings.Contains(strings.ToLower(bf), "disabled") || strings.Contains(strings.ToLower(bf), "stopped") {
+				hasOfflineOrErrorFault = true
+				break
+			}
+		}
+		if !hasOfflineOrErrorFault {
+			t.Errorf("expected queue offline/disabled fault in BlockingFaults, got %v", report.Reconciled.BlockingFaults)
+		}
+	})
+
+	t.Run("healthy_queue_preserves_idle_classification", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return []byte("printer BrotherDCP is idle. enabled since Sun Nov 15 10:00:00 2026\n"), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if !report.CUPSSample.Available {
+			t.Error("expected CUPSSample.Available=true for healthy queue")
+		}
+		if len(report.QueryErrors) != 0 {
+			t.Errorf("expected 0 QueryErrors for healthy queue, got %v", report.QueryErrors)
+		}
+		if report.Reconciled.EffectiveState != "IDLE" {
+			t.Errorf("EffectiveState = %q, want IDLE for healthy queue", report.Reconciled.EffectiveState)
+		}
+		if !report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=true for healthy queue")
+		}
+		if len(report.Reconciled.BlockingFaults) > 0 {
+			t.Errorf("expected 0 BlockingFaults for healthy queue, got %v", report.Reconciled.BlockingFaults)
+		}
+	})
+}

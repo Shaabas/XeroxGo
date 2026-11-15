@@ -80,6 +80,7 @@ type ClientConfig struct {
 	EnableShadowHealth       bool
 	ShadowHealthInterval     time.Duration
 	MockCUPSHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockCUPSHealthDiag       func(ctx context.Context, estimatedSheets int) (contracts.PrinterHealth, error)
 	MockSNMPHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockIPPState             func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error)
 }
