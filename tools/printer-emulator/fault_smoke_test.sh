@@ -54,9 +54,64 @@ FAULT_TEST_QUEUE=""
 FAULT_TEST_QUEUE_META=""
 FAULT_TEST_QUEUE_CREATED=false
 
+COLLISION_FIXTURE_QUEUE=""
+COLLISION_FIXTURE_CREATED=false
+COLLISION_EXPECTED_URI="file:///dev/null"
+
+# Helper for verified, safe removal of the collision fixture queue
+cleanup_collision_fixture() {
+    # Requirement 4, 5, 6: Only clean up if explicitly recorded as created by current test
+    if [[ "${COLLISION_FIXTURE_CREATED:-false}" != "true" || -z "${COLLISION_FIXTURE_QUEUE:-}" ]]; then
+        return 0
+    fi
+
+    if ! command -v lpadmin >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local target_queue="$COLLISION_FIXTURE_QUEUE"
+
+    # Requirement 7: Verify its actual CUPS URI still matches the expected fixture URI before deleting
+    local actual_uri
+    actual_uri=$(lpstat -v "$target_queue" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+    if [[ -z "$actual_uri" || "$actual_uri" != "${COLLISION_EXPECTED_URI:-}" ]]; then
+        echo "ERROR: Fixture queue '${target_queue}' URI ('${actual_uri}') does not match expected URI ('${COLLISION_EXPECTED_URI:-}')." >&2
+        echo "Ownership uncertain; preserving queue '${target_queue}' for safety." >&2
+        return 1
+    fi
+
+    # Verify queue still exists before attempting removal
+    if ! lpstat -p "$target_queue" >/dev/null 2>&1; then
+        COLLISION_FIXTURE_CREATED=false
+        return 0
+    fi
+
+    # Requirement 5 & 8: Never execute unconditional deletion; preserve queue and report failure if deletion fails
+    if ! lpadmin -x "$target_queue" 2>/dev/null; then
+        echo "ERROR: Failed to delete fixture queue '${target_queue}' via lpadmin -x." >&2
+        echo "Preserving queue '${target_queue}' for safety." >&2
+        return 1
+    fi
+
+    # Verify queue ceases to exist in CUPS
+    if lpstat -p "$target_queue" >/dev/null 2>&1 || lpstat -v "$target_queue" >/dev/null 2>&1; then
+        echo "ERROR: Fixture queue '${target_queue}' still exists in CUPS after deletion attempt." >&2
+        echo "Preserving queue reference for safety." >&2
+        return 1
+    fi
+
+    COLLISION_FIXTURE_CREATED=false
+    return 0
+}
+
 cleanup_test_env() {
     echo ""
     echo "--- Cleaning up fault test environment ---"
+
+    # Requirement 9: Ensure the EXIT trap handles interrupted tests without modifying unrelated queues
+    if [[ "${COLLISION_FIXTURE_CREATED:-false}" == "true" && -n "${COLLISION_FIXTURE_QUEUE:-}" ]]; then
+        cleanup_collision_fixture >/dev/null 2>&1 || true
+    fi
 
     # Only delete test CUPS queue if it was explicitly recorded as created by this harness
     # Requirement 2: The EXIT trap must never execute unverified lpadmin -x.
@@ -552,114 +607,179 @@ fi
 echo ""
 echo "--- Test 17: Regression — Queue-name collision followed by EXIT cleanup preserves existing queue ---"
 if command -v lpadmin >/dev/null 2>&1 && lpstat -r >/dev/null 2>&1; then
-    COLLISION_QUEUE="XeroxGoCollision_${$}"
-    # Create pre-existing queue not owned by emulator
-    lpadmin -p "$COLLISION_QUEUE" -v "file:///dev/null" -E
-    pre_uri=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+    COLLISION_FIXTURE_QUEUE=""
+    COLLISION_FIXTURE_CREATED=false
+    COLLISION_EXPECTED_URI=""
 
-    assert_test "Test 17: Pre-existing collision queue registered" 'lpstat -p "$COLLISION_QUEUE" >/dev/null 2>&1'
+    # Requirement 2 & 3: Before calling lpadmin -p, verify proposed fixture name does not already exist.
+    # If occupied, choose another unique name or fail safely without modifying it.
+    candidate_base="XeroxGoCollision_${$}"
+    candidate_queue="${candidate_base}"
+    attempt=1
+    while lpstat -p "$candidate_queue" >/dev/null 2>&1 || lpstat -v "$candidate_queue" >/dev/null 2>&1; do
+        attempt=$((attempt + 1))
+        candidate_queue="${candidate_base}_${attempt}"
+        if [[ $attempt -gt 10 ]]; then
+            break
+        fi
+    done
 
-    # Sub-case 1: setup-cups fails due to collision; EXIT trap must preserve the colliding queue
-    collision_subshell_out=$(
-        bash -c '
-            set -euo pipefail
-            COLLISION_Q="'"$COLLISION_QUEUE"'"
-            EMULATOR="'"$EMULATOR"'"
-            TEST_DIR=$(mktemp -d /tmp/xeroxgo-coll-test-XXXXXX)
+    # Verify candidate is genuinely unused
+    candidate_available=false
+    if ! lpstat -p "$candidate_queue" >/dev/null 2>&1 && ! lpstat -v "$candidate_queue" >/dev/null 2>&1; then
+        candidate_available=true
+    fi
+    assert_test "Test 17: Candidate fixture queue name verified unused before creation" '$candidate_available'
 
-            FAULT_TEST_QUEUE="$COLLISION_Q"
-            FAULT_TEST_QUEUE_META="${TEST_DIR}/collision_queue.meta"
-            FAULT_TEST_QUEUE_CREATED=false
+    if [[ "$candidate_available" == "true" ]]; then
+        COLLISION_FIXTURE_QUEUE="$candidate_queue"
 
-            export EMU_HOST="localhost"
-            export EMU_PORT="'"$TEST_IPP_PORT"'"
-            export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
-            export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
+        # Create pre-existing fixture queue
+        if lpadmin -p "$COLLISION_FIXTURE_QUEUE" -v "file:///dev/null" -E 2>/dev/null; then
+            pre_uri=$(lpstat -v "$COLLISION_FIXTURE_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+            if [[ -n "$pre_uri" && ( "$pre_uri" == "file:///dev/null" || "$pre_uri" == "///dev/null" ) ]] && lpstat -p "$COLLISION_FIXTURE_QUEUE" >/dev/null 2>&1; then
+                # Requirement 4: Record explicit successful creation of fixture queue and expected URI
+                COLLISION_EXPECTED_URI="$pre_uri"
+                COLLISION_FIXTURE_CREATED=true
+            fi
+        fi
 
-            cleanup_subshell() {
-                if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
-                    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
-                        EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1 || true
-                        if ! lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1; then
-                            FAULT_TEST_QUEUE_CREATED=false
+        assert_test "Test 17: Pre-existing collision fixture queue recorded created" '[[ "$COLLISION_FIXTURE_CREATED" == "true" ]]'
+
+        # Sub-case 1: setup-cups fails due to collision; EXIT trap must preserve the colliding queue
+        collision_subshell_out=$(
+            bash -c '
+                set -euo pipefail
+                COLLISION_Q="'"$COLLISION_FIXTURE_QUEUE"'"
+                EMULATOR="'"$EMULATOR"'"
+                TEST_DIR=$(mktemp -d /tmp/xeroxgo-coll-test-XXXXXX)
+
+                FAULT_TEST_QUEUE="$COLLISION_Q"
+                FAULT_TEST_QUEUE_META="${TEST_DIR}/collision_queue.meta"
+                FAULT_TEST_QUEUE_CREATED=false
+
+                export EMU_HOST="localhost"
+                export EMU_PORT="'"$TEST_IPP_PORT"'"
+                export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
+                export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
+
+                cleanup_subshell() {
+                    if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
+                        if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                            EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1 || true
+                            if ! lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1; then
+                                FAULT_TEST_QUEUE_CREATED=false
+                            fi
                         fi
                     fi
-                fi
-                if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
-                    find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
-                else
-                    rm -rf "$TEST_DIR" 2>/dev/null || true
-                fi
-            }
-            trap cleanup_subshell EXIT
+                    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                        find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
+                    else
+                        rm -rf "$TEST_DIR" 2>/dev/null || true
+                    fi
+                }
+                trap cleanup_subshell EXIT
 
-            # setup-cups must fail because queue already exists
-            if "$EMULATOR" setup-cups 2>&1; then
+                # setup-cups must fail because queue already exists
+                if "$EMULATOR" setup-cups 2>&1; then
+                    FAULT_TEST_QUEUE_CREATED=true
+                    echo "UNEXPECTED_SETUP_SUCCESS"
+                    exit 1
+                fi
+
+                echo "SETUP_FAILED_AS_EXPECTED"
+                exit 0
+            ' 2>&1
+        )
+
+        post_uri=$(lpstat -v "$COLLISION_FIXTURE_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+
+        assert_test "Test 17: setup-cups refused existing queue collision" '[[ "$collision_subshell_out" =~ "SETUP_FAILED_AS_EXPECTED" ]]'
+        assert_test "Test 17: Colliding CUPS queue preserved after subshell EXIT cleanup" 'lpstat -p "$COLLISION_FIXTURE_QUEUE" >/dev/null 2>&1'
+        assert_test "Test 17: Colliding CUPS queue URI unchanged after subshell EXIT cleanup" '[[ "$pre_uri" == "$post_uri" && -n "$post_uri" ]]'
+
+        # Sub-case 2: Unverified queue deletion refusal during cleanup:
+        # Even if FAULT_TEST_QUEUE_CREATED=true were mistakenly set with forged metadata, EXIT cleanup refuses unverified queue deletion
+        unverified_trap_out=$(
+            bash -c '
+                set -euo pipefail
+                COLLISION_Q="'"$COLLISION_FIXTURE_QUEUE"'"
+                EMULATOR="'"$EMULATOR"'"
+                TEST_DIR=$(mktemp -d /tmp/xeroxgo-unver-test-XXXXXX)
+
+                FAULT_TEST_QUEUE="$COLLISION_Q"
+                FAULT_TEST_QUEUE_META="${TEST_DIR}/unver_queue.meta"
                 FAULT_TEST_QUEUE_CREATED=true
-                echo "UNEXPECTED_SETUP_SUCCESS"
-                exit 1
-            fi
 
-            echo "SETUP_FAILED_AS_EXPECTED"
-            exit 0
-        ' 2>&1
-    )
+                export EMU_HOST="localhost"
+                export EMU_PORT="'"$TEST_IPP_PORT"'"
+                export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
+                export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
 
-    post_uri=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
-
-    assert_test "Test 17: setup-cups refused existing queue collision" '[[ "$collision_subshell_out" =~ "SETUP_FAILED_AS_EXPECTED" ]]'
-    assert_test "Test 17: Colliding CUPS queue preserved after subshell EXIT cleanup" 'lpstat -p "$COLLISION_QUEUE" >/dev/null 2>&1'
-    assert_test "Test 17: Colliding CUPS queue URI unchanged after subshell EXIT cleanup" '[[ "$pre_uri" == "$post_uri" && -n "$post_uri" ]]'
-
-    # Sub-case 2: Unverified queue deletion refusal during cleanup:
-    # Even if FAULT_TEST_QUEUE_CREATED=true were mistakenly set with forged metadata, EXIT cleanup refuses unverified queue deletion
-    unverified_trap_out=$(
-        bash -c '
-            set -euo pipefail
-            COLLISION_Q="'"$COLLISION_QUEUE"'"
-            EMULATOR="'"$EMULATOR"'"
-            TEST_DIR=$(mktemp -d /tmp/xeroxgo-unver-test-XXXXXX)
-
-            FAULT_TEST_QUEUE="$COLLISION_Q"
-            FAULT_TEST_QUEUE_META="${TEST_DIR}/unver_queue.meta"
-            FAULT_TEST_QUEUE_CREATED=true
-
-            export EMU_HOST="localhost"
-            export EMU_PORT="'"$TEST_IPP_PORT"'"
-            export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
-            export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
-
-            # Create metadata pointing to emulator URI, but actual CUPS queue points to file:///dev/null
-            cat > "$FAULT_TEST_QUEUE_META" << EOF
+                # Create metadata pointing to emulator URI, but actual CUPS queue points to file:///dev/null
+                cat > "$FAULT_TEST_QUEUE_META" << EOF
 QUEUE_NAME=${COLLISION_Q}
 DEVICE_URI=ipp://localhost:'"$TEST_IPP_PORT"'/ipp/print
 EOF
 
-            cleanup_subshell() {
-                if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
-                    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
-                        EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" 2>&1 || true
+                cleanup_subshell() {
+                    if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
+                        if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                            EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" 2>&1 || true
+                        fi
                     fi
-                fi
-                if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
-                    find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
-                else
-                    rm -rf "$TEST_DIR" 2>/dev/null || true
-                fi
-            }
-            trap cleanup_subshell EXIT
-            exit 0
-        ' 2>&1
-    )
+                    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                        find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
+                    else
+                        rm -rf "$TEST_DIR" 2>/dev/null || true
+                    fi
+                }
+                trap cleanup_subshell EXIT
+                exit 0
+            ' 2>&1
+        )
 
-    post_uri2=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+        post_uri2=$(lpstat -v "$COLLISION_FIXTURE_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
 
-    assert_test "Test 17: EXIT cleanup refused unverified queue deletion" '[[ "$unverified_trap_out" =~ "Refusing deletion of unverified CUPS queue" ]]'
-    assert_test "Test 17: Colliding CUPS queue preserved after unverified EXIT cleanup" 'lpstat -p "$COLLISION_QUEUE" >/dev/null 2>&1'
-    assert_test "Test 17: Colliding CUPS queue URI still unchanged" '[[ "$pre_uri" == "$post_uri2" && -n "$post_uri2" ]]'
+        assert_test "Test 17: EXIT cleanup refused unverified queue deletion" '[[ "$unverified_trap_out" =~ "Refusing deletion of unverified CUPS queue" ]]'
+        assert_test "Test 17: Colliding CUPS queue preserved after unverified EXIT cleanup" 'lpstat -p "$COLLISION_FIXTURE_QUEUE" >/dev/null 2>&1'
+        assert_test "Test 17: Colliding CUPS queue URI still unchanged" '[[ "$pre_uri" == "$post_uri2" && -n "$post_uri2" ]]'
 
-    # Safely remove pre-existing test queue
-    lpadmin -x "$COLLISION_QUEUE" 2>/dev/null || true
+        # Sub-case 3: Requirement 7 & 8: Verify actual CUPS URI matches expected fixture URI before deleting; if mismatched, refuse and preserve
+        mismatch_refused=false
+        saved_expected_uri="$COLLISION_EXPECTED_URI"
+        COLLISION_EXPECTED_URI="file:///unrelated/path"
+        if ! cleanup_collision_fixture >/dev/null 2>&1; then
+            mismatch_refused=true
+        fi
+        COLLISION_EXPECTED_URI="$saved_expected_uri"
+
+        assert_test "Test 17: cleanup_collision_fixture refuses deletion on expected URI mismatch" '$mismatch_refused'
+        assert_test "Test 17: Queue preserved when expected URI mismatch occurs" 'lpstat -p "$COLLISION_FIXTURE_QUEUE" >/dev/null 2>&1'
+
+        # Sub-case 4: Requirement 5: Never execute unconditional lpadmin -x for an unverified fixture
+        # Test that cleanup_collision_fixture does nothing if COLLISION_FIXTURE_CREATED is false
+        unverified_clean_noop=false
+        saved_created="$COLLISION_FIXTURE_CREATED"
+        COLLISION_FIXTURE_CREATED=false
+        if cleanup_collision_fixture >/dev/null 2>&1; then
+            if lpstat -p "$COLLISION_FIXTURE_QUEUE" >/dev/null 2>&1; then
+                unverified_clean_noop=true
+            fi
+        fi
+        COLLISION_FIXTURE_CREATED="$saved_created"
+        assert_test "Test 17: cleanup_collision_fixture refuses deletion when unverified (CREATED=false)" '$unverified_clean_noop'
+
+        # Sub-case 5: Requirement 6 & 7: Clean up only the exact queue successfully created by the current test
+        # after verifying its actual CUPS URI matches the expected fixture URI
+        fixture_cleaned=false
+        if cleanup_collision_fixture >/dev/null 2>&1; then
+            fixture_cleaned=true
+        fi
+        assert_test "Test 17: Fixture cleanup succeeds on verified matching URI" '$fixture_cleaned'
+        assert_test "Test 17: Fixture queue verified deleted after clean removal" '! lpstat -p "$COLLISION_FIXTURE_QUEUE" >/dev/null 2>&1'
+        assert_test "Test 17: Fixture creation status reset to false" '[[ "$COLLISION_FIXTURE_CREATED" == "false" ]]'
+    fi
 fi
 
 # -------------------------------------------------------------
