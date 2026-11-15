@@ -387,7 +387,9 @@ func (c *Client) DiscoverStartupCapabilities(ctx context.Context) printer.Printe
 
 	caps, err := printer.DiscoverCUPSPrinterCapabilities(diagCtx, c.cfg.CUPSRunner, cupsQ)
 	c.capsMu.Lock()
-	c.capabilities = caps
+	if err == nil {
+		c.capabilities = caps
+	}
 	c.capsMu.Unlock()
 
 	if err != nil {
@@ -396,7 +398,7 @@ func (c *Client) DiscoverStartupCapabilities(ctx context.Context) printer.Printe
 		log.Printf("[SPOOLER] Discovered CUPS queue %q capabilities: PDF=%s, A4=%s, Simplex=%s, DuplexLong=%s, DuplexShort=%s, Color=%s, Mono=%s (source: %s)",
 			cupsQ, caps.PDFSupport, caps.A4Support, caps.SimplexSupport, caps.DuplexLongEdgeSupport, caps.DuplexShortEdgeSupport, caps.ColorSupport, caps.MonochromeSupport, caps.Source)
 	}
-	return caps
+	return c.Capabilities()
 }
 
 // Run executes the spooler client loops until the context is canceled.

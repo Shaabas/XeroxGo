@@ -172,6 +172,75 @@ func TestStartupCapabilityDiscovery_ToleratesFailure(t *testing.T) {
 	}
 }
 
+func TestStartupCapabilityDiscovery_ToleratesIPPErrorStatus(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	if err != nil {
+		t.Fatalf("failed to create state store: %v", err)
+	}
+	defer store.Close()
+
+	var ipptoolCalled atomic.Bool
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			ipptoolCalled.Store(true)
+			// Runner succeeds with exit 0, but response has IPP client-error status
+			return []byte(`
+status-code = client-error-not-found (The printer or class does not exist.)
+printer-name (nameWithoutLanguage) = DisappearedQueue
+document-format-supported (1setOf mimeMediaType) = application/pdf
+`), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      "ws://127.0.0.1:8080/ws",
+		KioskID:       "kiosk-ipperr-caps",
+		StateStore:    store,
+		CUPSQueue:     "DisappearedQueue",
+		CUPSRunner:    runner,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://kiosk-ipperr",
+		ScreenSink:    noopSink,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- client.Run(ctx)
+	}()
+
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(20 * time.Millisecond) {
+		if ipptoolCalled.Load() {
+			break
+		}
+	}
+
+	if !ipptoolCalled.Load() {
+		t.Fatal("expected ipptool to be attempted")
+	}
+
+	// Daemon continues running and does NOT adopt failed response as authoritative
+	caps := client.Capabilities()
+	if caps.PDFSupport != printer.CapabilityUnknown {
+		t.Errorf("expected PDFSupport UNKNOWN after IPP error status, got %v", caps.PDFSupport)
+	}
+
+	cancel()
+	select {
+	case err := <-runErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected Run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for client.Run to terminate")
+	}
+}
+
 func TestStartupCapabilityDiscovery_ToleratesTimeout(t *testing.T) {
 	tmpDir := t.TempDir()
 	store, err := state.Open(filepath.Join(tmpDir, "state.db"))

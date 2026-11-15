@@ -3,50 +3,63 @@ package printer
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestParsePrinterCapabilities_TableDriven(t *testing.T) {
 	tests := []struct {
-		name       string
-		queue      string
-		output     string
-		checkCaps  func(t *testing.T, caps PrinterCapabilities)
+		name      string
+		queue     string
+		output    string
+		checkCaps func(t *testing.T, caps PrinterCapabilities)
 	}{
 		{
-			name:  "full capabilities with color and duplex",
-			queue: "OfficePrinter",
-			output: `
-printer-name (nameWithoutLanguage) = OfficePrinter
-printer-make-and-model (textWithoutLanguage) = HP LaserJet Enterprise M608
-printer-info (textWithoutLanguage) = 2nd Floor Main Office
-printer-state (enum) = idle
-document-format-supported (1setOf mimeMediaType) = application/pdf,application/postscript,application/octet-stream
-document-format-default (mimeMediaType) = application/pdf
-sides-supported (1setOf keyword) = one-sided,two-sided-long-edge,two-sided-short-edge
-sides-default (keyword) = two-sided-long-edge
-print-color-mode-supported (1setOf keyword) = monochrome,color
-print-color-mode-default (keyword) = monochrome
-color-supported (boolean) = true
-media-supported (1setOf keyword) = iso_a4_210x297mm,na_letter_8.5x11in
-media-default (keyword) = iso_a4_210x297mm
+			name:  "successful real-style ipptool -tv output with full capabilities",
+			queue: "DCPT310",
+			output: `"/usr/share/cups/ipptool/get-printer-attributes.test":
+    Get-Printer-Attributes:
+        attributes-charset (charset) = utf-8
+        attributes-natural-language (naturalLanguage) = en
+        printer-uri (uri) = ipp://localhost:631/printers/DCPT310
+        requested-attributes (1setOf keyword) = all,media-col-database
+    Get printer attributes using get-printer-attributes                  [PASS]
+        RECEIVED: 17460 bytes in response
+        status-code = successful-ok
+        printer-name (nameWithoutLanguage) = DCPT310
+        printer-make-and-model (textWithoutLanguage) = Brother DCP-T310 CUPS
+        printer-info (textWithoutLanguage) = DCPT310 Front Desk
+        printer-state (enum) = idle
+        printer-is-accepting-jobs (boolean) = true
+        document-format-supported (1setOf mimeMediaType) = application/octet-stream,application/pdf,application/postscript
+        document-format-default (mimeMediaType) = application/pdf
+        sides-supported (1setOf keyword) = one-sided,two-sided-long-edge
+        sides-default (keyword) = one-sided
+        print-color-mode-supported (1setOf keyword) = monochrome,color
+        print-color-mode-default (keyword) = color
+        color-supported (boolean) = true
+        media-supported (1setOf keyword) = iso_a4_210x297mm,na_letter_8.5x11in
+        media-default (keyword) = iso_a4_210x297mm
 `,
 			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
 				if caps.Source != CapabilitySourceCUPSQueue {
 					t.Errorf("expected Source %q, got %q", CapabilitySourceCUPSQueue, caps.Source)
 				}
-				if caps.Queue != "OfficePrinter" {
-					t.Errorf("expected Queue OfficePrinter, got %q", caps.Queue)
+				if caps.Queue != "DCPT310" {
+					t.Errorf("expected Queue DCPT310, got %q", caps.Queue)
 				}
-				if caps.PrinterName != "OfficePrinter" {
-					t.Errorf("expected PrinterName OfficePrinter, got %q", caps.PrinterName)
+				if caps.StatusCode != "successful-ok" {
+					t.Errorf("expected StatusCode successful-ok, got %q", caps.StatusCode)
 				}
-				if caps.PrinterMakeAndModel != "HP LaserJet Enterprise M608" {
-					t.Errorf("expected MakeAndModel 'HP LaserJet Enterprise M608', got %q", caps.PrinterMakeAndModel)
+				if caps.PrinterName != "DCPT310" {
+					t.Errorf("expected PrinterName DCPT310, got %q", caps.PrinterName)
 				}
-				if caps.PrinterInfo != "2nd Floor Main Office" {
-					t.Errorf("expected PrinterInfo '2nd Floor Main Office', got %q", caps.PrinterInfo)
+				if caps.PrinterMakeAndModel != "Brother DCP-T310 CUPS" {
+					t.Errorf("expected MakeAndModel 'Brother DCP-T310 CUPS', got %q", caps.PrinterMakeAndModel)
+				}
+				if caps.PrinterInfo != "DCPT310 Front Desk" {
+					t.Errorf("expected PrinterInfo 'DCPT310 Front Desk', got %q", caps.PrinterInfo)
 				}
 				if caps.PrinterState != "idle" {
 					t.Errorf("expected PrinterState idle, got %q", caps.PrinterState)
@@ -63,8 +76,8 @@ media-default (keyword) = iso_a4_210x297mm
 				if caps.DuplexLongEdgeSupport != CapabilitySupported {
 					t.Errorf("expected DuplexLongEdgeSupport SUPPORTED, got %v", caps.DuplexLongEdgeSupport)
 				}
-				if caps.DuplexShortEdgeSupport != CapabilitySupported {
-					t.Errorf("expected DuplexShortEdgeSupport SUPPORTED, got %v", caps.DuplexShortEdgeSupport)
+				if caps.DuplexShortEdgeSupport != CapabilityUnsupported {
+					t.Errorf("expected DuplexShortEdgeSupport UNSUPPORTED, got %v", caps.DuplexShortEdgeSupport)
 				}
 				if caps.ColorSupport != CapabilitySupported {
 					t.Errorf("expected ColorSupport SUPPORTED, got %v", caps.ColorSupport)
@@ -75,11 +88,11 @@ media-default (keyword) = iso_a4_210x297mm
 				if caps.DocumentFormatDefault != "application/pdf" {
 					t.Errorf("expected DocumentFormatDefault application/pdf, got %q", caps.DocumentFormatDefault)
 				}
-				if caps.SidesDefault != "two-sided-long-edge" {
-					t.Errorf("expected SidesDefault two-sided-long-edge, got %q", caps.SidesDefault)
+				if caps.SidesDefault != "one-sided" {
+					t.Errorf("expected SidesDefault one-sided, got %q", caps.SidesDefault)
 				}
-				if caps.PrintColorModeDefault != "monochrome" {
-					t.Errorf("expected PrintColorModeDefault monochrome, got %q", caps.PrintColorModeDefault)
+				if caps.PrintColorModeDefault != "color" {
+					t.Errorf("expected PrintColorModeDefault color, got %q", caps.PrintColorModeDefault)
 				}
 				if caps.MediaDefault != "iso_a4_210x297mm" {
 					t.Errorf("expected MediaDefault iso_a4_210x297mm, got %q", caps.MediaDefault)
@@ -87,9 +100,80 @@ media-default (keyword) = iso_a4_210x297mm
 			},
 		},
 		{
+			name:  "empty supported lists leave capabilities UNKNOWN not UNSUPPORTED",
+			queue: "EmptyListsPrinter",
+			output: `
+status-code = successful-ok
+printer-name (nameWithoutLanguage) = EmptyListsPrinter
+document-format-supported = 
+sides-supported = ,,,
+media-supported = 
+print-color-mode-supported =
+`,
+			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
+				if caps.PDFSupport != CapabilityUnknown {
+					t.Errorf("expected PDFSupport UNKNOWN for empty list, got %v", caps.PDFSupport)
+				}
+				if caps.A4Support != CapabilityUnknown {
+					t.Errorf("expected A4Support UNKNOWN for empty list, got %v", caps.A4Support)
+				}
+				if caps.SimplexSupport != CapabilityUnknown {
+					t.Errorf("expected SimplexSupport UNKNOWN for empty list, got %v", caps.SimplexSupport)
+				}
+				if caps.DuplexLongEdgeSupport != CapabilityUnknown {
+					t.Errorf("expected DuplexLongEdgeSupport UNKNOWN for empty list, got %v", caps.DuplexLongEdgeSupport)
+				}
+				if caps.DuplexShortEdgeSupport != CapabilityUnknown {
+					t.Errorf("expected DuplexShortEdgeSupport UNKNOWN for empty list, got %v", caps.DuplexShortEdgeSupport)
+				}
+				if caps.ColorSupport != CapabilityUnknown {
+					t.Errorf("expected ColorSupport UNKNOWN for empty list, got %v", caps.ColorSupport)
+				}
+				if caps.MonochromeSupport != CapabilityUnknown {
+					t.Errorf("expected MonochromeSupport UNKNOWN for empty list, got %v", caps.MonochromeSupport)
+				}
+			},
+		},
+		{
+			name:  "valid lists explicitly excluding features yield UNSUPPORTED",
+			queue: "RestrictedPrinter",
+			output: `
+status-code = successful-ok
+printer-name (nameWithoutLanguage) = RestrictedPrinter
+document-format-supported (1setOf mimeMediaType) = text/plain,application/postscript
+sides-supported (keyword) = one-sided
+media-supported (1setOf keyword) = na_letter_8.5x11in,na_legal_8.5x14in
+print-color-mode-supported (1setOf keyword) = monochrome
+`,
+			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
+				if caps.PDFSupport != CapabilityUnsupported {
+					t.Errorf("expected PDFSupport UNSUPPORTED when list excludes PDF, got %v", caps.PDFSupport)
+				}
+				if caps.A4Support != CapabilityUnsupported {
+					t.Errorf("expected A4Support UNSUPPORTED when list excludes A4, got %v", caps.A4Support)
+				}
+				if caps.SimplexSupport != CapabilitySupported {
+					t.Errorf("expected SimplexSupport SUPPORTED, got %v", caps.SimplexSupport)
+				}
+				if caps.DuplexLongEdgeSupport != CapabilityUnsupported {
+					t.Errorf("expected DuplexLongEdgeSupport UNSUPPORTED when list excludes duplex, got %v", caps.DuplexLongEdgeSupport)
+				}
+				if caps.DuplexShortEdgeSupport != CapabilityUnsupported {
+					t.Errorf("expected DuplexShortEdgeSupport UNSUPPORTED when list excludes tumble, got %v", caps.DuplexShortEdgeSupport)
+				}
+				if caps.ColorSupport != CapabilityUnsupported {
+					t.Errorf("expected ColorSupport UNSUPPORTED when list excludes color, got %v", caps.ColorSupport)
+				}
+				if caps.MonochromeSupport != CapabilitySupported {
+					t.Errorf("expected MonochromeSupport SUPPORTED, got %v", caps.MonochromeSupport)
+				}
+			},
+		},
+		{
 			name:  "monochrome only printer with color-supported false",
 			queue: "BWPrinter",
 			output: `
+status-code = successful-ok
 printer-name (nameWithoutLanguage) = BWPrinter
 document-format-supported (1setOf mimeMediaType) = application/pdf
 sides-supported (1setOf keyword) = one-sided,two-sided-long-edge
@@ -116,57 +200,10 @@ color-supported (boolean) = false
 			},
 		},
 		{
-			name:  "monochrome only without color-supported boolean",
-			queue: "MonoOnly",
-			output: `
-printer-name (nameWithoutLanguage) = MonoOnly
-print-color-mode-supported (1setOf keyword) = monochrome
-media-supported (1setOf keyword) = iso_a4_210x297mm
-`,
-			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
-				if caps.ColorSupport != CapabilityUnsupported {
-					t.Errorf("expected ColorSupport UNSUPPORTED, got %v", caps.ColorSupport)
-				}
-				if caps.MonochromeSupport != CapabilitySupported {
-					t.Errorf("expected MonochromeSupport SUPPORTED, got %v", caps.MonochromeSupport)
-				}
-				if caps.SimplexSupport != CapabilityUnknown {
-					t.Errorf("expected SimplexSupport UNKNOWN, got %v", caps.SimplexSupport)
-				}
-			},
-		},
-		{
-			name:  "simplex only printer without duplex",
-			queue: "DeskjetSimplex",
-			output: `
-printer-name (nameWithoutLanguage) = DeskjetSimplex
-document-format-supported (1setOf mimeMediaType) = application/pdf
-sides-supported (keyword) = one-sided
-media-supported (1setOf keyword) = na_letter_8.5x11in
-print-color-mode-supported (1setOf keyword) = color
-`,
-			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
-				if caps.SimplexSupport != CapabilitySupported {
-					t.Errorf("expected SimplexSupport SUPPORTED, got %v", caps.SimplexSupport)
-				}
-				if caps.DuplexLongEdgeSupport != CapabilityUnsupported {
-					t.Errorf("expected DuplexLongEdgeSupport UNSUPPORTED, got %v", caps.DuplexLongEdgeSupport)
-				}
-				if caps.DuplexShortEdgeSupport != CapabilityUnsupported {
-					t.Errorf("expected DuplexShortEdgeSupport UNSUPPORTED, got %v", caps.DuplexShortEdgeSupport)
-				}
-				if caps.A4Support != CapabilityUnsupported {
-					t.Errorf("expected A4Support UNSUPPORTED (only Letter supported), got %v", caps.A4Support)
-				}
-				if caps.PDFSupport != CapabilitySupported {
-					t.Errorf("expected PDFSupport SUPPORTED, got %v", caps.PDFSupport)
-				}
-			},
-		},
-		{
 			name:  "missing attributes returns UNKNOWN not false",
 			queue: "MinimalPrinter",
 			output: `
+status-code = successful-ok
 printer-name (nameWithoutLanguage) = MinimalPrinter
 printer-state (enum) = idle
 `,
@@ -195,7 +232,7 @@ printer-state (enum) = idle
 			},
 		},
 		{
-			name:   "empty output returns all UNKNOWN without error",
+			name:   "empty output returns all UNKNOWN",
 			queue:  "EmptyQueue",
 			output: "",
 			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
@@ -221,6 +258,9 @@ media-supported (1setOf keyword) = ,,iso_a4,,na_letter,,
 document-format-supported = text/plain,application/octet-stream
 `,
 			checkCaps: func(t *testing.T, caps PrinterCapabilities) {
+				if caps.StatusCode != "client-error-bad-request" {
+					t.Errorf("expected StatusCode client-error-bad-request, got %q", caps.StatusCode)
+				}
 				if caps.A4Support != CapabilitySupported {
 					t.Errorf("expected A4Support SUPPORTED from iso_a4 keyword, got %v", caps.A4Support)
 				}
@@ -250,6 +290,87 @@ func TestDiscoverCUPSPrinterCapabilities_RunnerCases(t *testing.T) {
 		}
 		if caps.PDFSupport != CapabilityUnknown {
 			t.Errorf("expected PDFSupport UNKNOWN, got %v", caps.PDFSupport)
+		}
+	})
+
+	t.Run("empty output returns error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("   \n\t  "), nil
+		}
+
+		caps, err := DiscoverCUPSPrinterCapabilities(context.Background(), runner, "EmptyQueue")
+		if err == nil {
+			t.Fatal("expected error when output has no recognizable attributes")
+		}
+		if !strings.Contains(err.Error(), "no recognizable printer attributes") {
+			t.Errorf("expected error message about missing attributes, got: %v", err)
+		}
+		if caps.PDFSupport != CapabilityUnknown {
+			t.Errorf("expected PDFSupport UNKNOWN, got %v", caps.PDFSupport)
+		}
+	})
+
+	t.Run("diagnostic noise without attributes returns error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte(`
+Get printer attributes using get-printer-attributes                  [FAIL]
+connecting to localhost:631...
+HTTP/1.1 500 Internal Server Error
+`), nil
+		}
+
+		caps, err := DiscoverCUPSPrinterCapabilities(context.Background(), runner, "NoiseQueue")
+		if err == nil {
+			t.Fatal("expected error when output contains only diagnostic noise")
+		}
+		if caps.PDFSupport != CapabilityUnknown {
+			t.Errorf("expected PDFSupport UNKNOWN, got %v", caps.PDFSupport)
+		}
+	})
+
+	t.Run("explicit IPP client-error status returns error even with nil runner error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			output := `
+status-code = client-error-not-found (The printer or class does not exist.)
+printer-name (nameWithoutLanguage) = GhostQueue
+`
+			return []byte(output), nil
+		}
+
+		caps, err := DiscoverCUPSPrinterCapabilities(context.Background(), runner, "GhostQueue")
+		if err == nil {
+			t.Fatal("expected error for explicit client-error-not-found status")
+		}
+		if !strings.Contains(err.Error(), "client-error-not-found") {
+			t.Errorf("expected error mentioning status code, got: %v", err)
+		}
+		// Partial parsed attributes preserved
+		if caps.PrinterName != "GhostQueue" {
+			t.Errorf("expected PrinterName GhostQueue preserved, got %q", caps.PrinterName)
+		}
+		if caps.StatusCode != "client-error-not-found" {
+			t.Errorf("expected StatusCode client-error-not-found, got %q", caps.StatusCode)
+		}
+	})
+
+	t.Run("explicit IPP server-error status returns error even with nil runner error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			output := `
+status-code = server-error-internal-error
+printer-name (nameWithoutLanguage) = BrokenServerQueue
+`
+			return []byte(output), nil
+		}
+
+		caps, err := DiscoverCUPSPrinterCapabilities(context.Background(), runner, "BrokenServerQueue")
+		if err == nil {
+			t.Fatal("expected error for explicit server-error status")
+		}
+		if !strings.Contains(err.Error(), "server-error-internal-error") {
+			t.Errorf("expected error mentioning status code, got: %v", err)
+		}
+		if caps.PrinterName != "BrokenServerQueue" {
+			t.Errorf("expected PrinterName preserved, got %q", caps.PrinterName)
 		}
 	})
 
@@ -313,18 +434,12 @@ status-code = client-error-bad-request
 		if err == nil {
 			t.Fatal("expected timeout error")
 		}
-		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-			// check if string contains context deadline
-			if !errors.Is(errors.Unwrap(err), context.DeadlineExceeded) {
-				t.Logf("got error: %v", err)
-			}
-		}
 		if caps.Source != CapabilitySourceCUPSQueue {
 			t.Errorf("expected Source %q, got %q", CapabilitySourceCUPSQueue, caps.Source)
 		}
 	})
 
-	t.Run("successful discovery constructs correct URI and args", func(t *testing.T) {
+	t.Run("successful real-style discovery constructs correct URI and args", func(t *testing.T) {
 		var invokedName string
 		var invokedArgs []string
 
@@ -332,6 +447,7 @@ status-code = client-error-bad-request
 			invokedName = name
 			invokedArgs = args
 			return []byte(`
+status-code = successful-ok
 printer-name (nameWithoutLanguage) = MyQueue
 document-format-supported (1setOf mimeMediaType) = application/pdf
 media-supported (1setOf keyword) = iso_a4_210x297mm

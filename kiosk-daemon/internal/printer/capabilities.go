@@ -38,6 +38,9 @@ type PrinterCapabilities struct {
 	// Queue is the name of the CUPS queue queried.
 	Queue string `json:"queue"`
 
+	// StatusCode is the IPP status code from the response (e.g. "successful-ok", "client-error-not-found").
+	StatusCode string `json:"status_code,omitempty"`
+
 	// Normalized capabilities (tri-state: SUPPORTED, UNSUPPORTED, UNKNOWN)
 	PDFSupport             CapabilityStatus `json:"pdf_support"`
 	A4Support              CapabilityStatus `json:"a4_support"`
@@ -69,11 +72,32 @@ type PrinterCapabilities struct {
 	RawAttributes map[string][]string `json:"raw_attributes,omitempty"`
 }
 
-var ippAttributeRegex = regexp.MustCompile(`^\s*([a-zA-Z0-9_\-]+)(?:\s*\([^\)]*\))?\s*=\s*(.*)$`)
+// HasRecognizedAttributes returns true if at least one meaningful printer attribute was parsed.
+func (c PrinterCapabilities) HasRecognizedAttributes() bool {
+	return c.PrinterName != "" ||
+		c.PrinterMakeAndModel != "" ||
+		c.PrinterInfo != "" ||
+		c.PrinterState != "" ||
+		len(c.DocumentFormatSupported) > 0 ||
+		len(c.SidesSupported) > 0 ||
+		len(c.PrintColorModeSupported) > 0 ||
+		len(c.MediaSupported) > 0 ||
+		c.DocumentFormatDefault != "" ||
+		c.SidesDefault != "" ||
+		c.PrintColorModeDefault != "" ||
+		c.MediaDefault != ""
+}
+
+var (
+	ippAttributeRegex   = regexp.MustCompile(`^\s*([a-zA-Z0-9_\-]+)(?:\s*\([^\)]*\))?\s*=\s*(.*)$`)
+	statusCodeTokenRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-]+`)
+)
 
 // ParsePrinterCapabilities parses the output of `ipptool -tv ... get-printer-attributes.test`
 // and returns normalized printer capabilities.
 // Unknown or missing attributes are kept distinct from unsupported attributes (never assumed false).
+// Empty or unusable lists leave their normalized capabilities UNKNOWN, not UNSUPPORTED.
+// UNSUPPORTED is assigned only when a valid, nonempty supported list explicitly excludes a feature.
 func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 	caps := PrinterCapabilities{
 		Source:                 CapabilitySourceCUPSQueue,
@@ -92,7 +116,6 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 		return caps
 	}
 
-	presentAttrs := make(map[string]bool)
 	singleAttrs := make(map[string]string)
 
 	scanner := bufio.NewScanner(bytes.NewReader(out))
@@ -106,7 +129,6 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 		attrName := strings.ToLower(strings.TrimSpace(m[1]))
 		val := strings.TrimSpace(m[2])
 
-		presentAttrs[attrName] = true
 		if _, exists := singleAttrs[attrName]; !exists {
 			singleAttrs[attrName] = val
 		}
@@ -114,6 +136,15 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 		parts := splitIPPValues(val)
 		if len(parts) > 0 {
 			caps.RawAttributes[attrName] = append(caps.RawAttributes[attrName], parts...)
+		}
+	}
+
+	// 0. Status code
+	if v, ok := singleAttrs["status-code"]; ok {
+		if token := statusCodeTokenRegex.FindString(strings.TrimSpace(v)); token != "" {
+			caps.StatusCode = strings.ToLower(token)
+		} else {
+			caps.StatusCode = strings.ToLower(strings.TrimSpace(v))
 		}
 	}
 
@@ -152,7 +183,9 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 	caps.MediaSupported = caps.RawAttributes["media-supported"]
 
 	// 4. Normalized: PDF support
-	if presentAttrs["document-format-supported"] {
+	// An empty or unusable list leaves capability UNKNOWN.
+	// UNSUPPORTED is assigned only when a valid, nonempty list explicitly excludes PDF.
+	if len(caps.DocumentFormatSupported) > 0 {
 		if containsCaseInsensitive(caps.DocumentFormatSupported, "application/pdf") {
 			caps.PDFSupport = CapabilitySupported
 		} else {
@@ -161,7 +194,9 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 	}
 
 	// 5. Normalized: A4 support
-	if presentAttrs["media-supported"] {
+	// An empty or unusable list leaves capability UNKNOWN.
+	// UNSUPPORTED is assigned only when a valid, nonempty list explicitly excludes A4.
+	if len(caps.MediaSupported) > 0 {
 		if hasA4Media(caps.MediaSupported) {
 			caps.A4Support = CapabilitySupported
 		} else {
@@ -170,7 +205,9 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 	}
 
 	// 6. Normalized: Sides / Duplex support
-	if presentAttrs["sides-supported"] {
+	// An empty or unusable list leaves capabilities UNKNOWN.
+	// UNSUPPORTED is assigned only when a valid, nonempty list explicitly excludes the feature.
+	if len(caps.SidesSupported) > 0 {
 		if containsCaseInsensitive(caps.SidesSupported, "one-sided") || containsCaseInsensitive(caps.SidesSupported, "simplex") {
 			caps.SimplexSupport = CapabilitySupported
 		} else {
@@ -191,35 +228,33 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 	}
 
 	// 7. Normalized: Color and Monochrome support
-	hasColorAttr := presentAttrs["print-color-mode-supported"] || presentAttrs["color-supported"]
-	if hasColorAttr {
-		colorSupportedVal := singleAttrs["color-supported"]
-		if strings.EqualFold(colorSupportedVal, "false") {
-			caps.ColorSupport = CapabilityUnsupported
-			caps.MonochromeSupport = CapabilitySupported
-		} else if strings.EqualFold(colorSupportedVal, "true") {
-			caps.ColorSupport = CapabilitySupported
-			if presentAttrs["print-color-mode-supported"] {
-				if containsAnyCaseInsensitive(caps.PrintColorModeSupported, "monochrome", "process-monochrome", "auto", "bi-level", "monochrome-only") {
-					caps.MonochromeSupport = CapabilitySupported
-				} else {
-					caps.MonochromeSupport = CapabilityUnsupported
-				}
-			} else {
-				caps.MonochromeSupport = CapabilityUnknown
-			}
-		} else if presentAttrs["print-color-mode-supported"] {
-			if containsCaseInsensitive(caps.PrintColorModeSupported, "color") {
-				caps.ColorSupport = CapabilitySupported
-			} else {
-				caps.ColorSupport = CapabilityUnsupported
-			}
+	// Empty or unusable lists leave capabilities UNKNOWN.
+	colorSupportedVal := strings.ToLower(strings.TrimSpace(singleAttrs["color-supported"]))
+	hasValidModes := len(caps.PrintColorModeSupported) > 0
 
+	if colorSupportedVal == "false" {
+		caps.ColorSupport = CapabilityUnsupported
+		caps.MonochromeSupport = CapabilitySupported
+	} else if colorSupportedVal == "true" {
+		caps.ColorSupport = CapabilitySupported
+		if hasValidModes {
 			if containsAnyCaseInsensitive(caps.PrintColorModeSupported, "monochrome", "process-monochrome", "auto", "bi-level", "monochrome-only") {
 				caps.MonochromeSupport = CapabilitySupported
 			} else {
 				caps.MonochromeSupport = CapabilityUnsupported
 			}
+		}
+	} else if hasValidModes {
+		if containsCaseInsensitive(caps.PrintColorModeSupported, "color") {
+			caps.ColorSupport = CapabilitySupported
+		} else {
+			caps.ColorSupport = CapabilityUnsupported
+		}
+
+		if containsAnyCaseInsensitive(caps.PrintColorModeSupported, "monochrome", "process-monochrome", "auto", "bi-level", "monochrome-only") {
+			caps.MonochromeSupport = CapabilitySupported
+		} else {
+			caps.MonochromeSupport = CapabilityUnsupported
 		}
 	}
 
@@ -228,8 +263,9 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 
 // DiscoverCUPSPrinterCapabilities queries Get-Printer-Attributes via ipptool for the given CUPS queue.
 // It parses the response into normalized and raw capabilities.
-// If ipptool is missing, times out, or returns an error, an error is returned along with
-// any partial capabilities that could be parsed from the output.
+// If ipptool is missing, times out, returns an execution error, returns an IPP failure status,
+// or returns output lacking recognizable printer attributes, an error is returned along with
+// any partial capabilities parsed from the response.
 func DiscoverCUPSPrinterCapabilities(ctx context.Context, runner CommandRunner, queue string) (PrinterCapabilities, error) {
 	queue = strings.TrimSpace(queue)
 	if queue == "" {
@@ -253,17 +289,41 @@ func DiscoverCUPSPrinterCapabilities(ctx context.Context, runner CommandRunner, 
 	}
 
 	ippURI := fmt.Sprintf("ipp://localhost:631/printers/%s", queue)
-	out, err := runner(ctx, "ipptool", "-tv", ippURI, "get-printer-attributes.test")
+	out, runnerErr := runner(ctx, "ipptool", "-tv", ippURI, "get-printer-attributes.test")
 
-	// Even if runner returned an error (e.g. exit status 1 due to IPP validation warning),
-	// parse whatever attributes were received in output to preserve partial data.
+	// Parse whatever attributes were received in output to preserve partial data
 	caps := ParsePrinterCapabilities(out, queue)
 
-	if err != nil {
-		return caps, fmt.Errorf("ipptool query failed for CUPS queue %q: %w", queue, err)
+	// 1. Runner execution error (e.g. absent ipptool, exit error, timeout)
+	if runnerErr != nil {
+		return caps, fmt.Errorf("ipptool query failed for CUPS queue %q: %w", queue, runnerErr)
+	}
+
+	// 2. Explicit IPP failure status (e.g. client-error-not-found, server-error-internal-error)
+	if isIPPFailureStatus(caps.StatusCode) {
+		return caps, fmt.Errorf("IPP query returned failure status %q for CUPS queue %q", caps.StatusCode, queue)
+	}
+
+	// 3. Lack of recognizable printer attributes (diagnostic noise or empty output)
+	if !caps.HasRecognizedAttributes() {
+		return caps, fmt.Errorf("no recognizable printer attributes found in IPP response for CUPS queue %q", queue)
 	}
 
 	return caps, nil
+}
+
+func isIPPFailureStatus(statusCode string) bool {
+	sc := strings.ToLower(strings.TrimSpace(statusCode))
+	if sc == "" {
+		return false
+	}
+	if strings.HasPrefix(sc, "client-error-") || strings.HasPrefix(sc, "server-error-") {
+		return true
+	}
+	if !strings.HasPrefix(sc, "successful-") && !strings.HasPrefix(sc, "informational-") {
+		return true
+	}
+	return false
 }
 
 func splitIPPValues(val string) []string {
