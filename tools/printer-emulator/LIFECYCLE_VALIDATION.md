@@ -57,8 +57,8 @@ The validation exercises:
 - **Durable Persistence**: SQLite state store atomically records the submission (`submitted_to_printer = 1` and `cups_job_id = <capturedID>`), ensuring a single record per job.
 - **Actual CUPS Job Records**:
   - The test queries `lpstat -W all <queue>` to inspect CUPS job records.
-  - When CUPS job history retention (`PreserveJobHistory`) is active, the test asserts that exactly one job was dispatched to the queue.
-  - **Limitation Reporting**: If CUPS job history is purged or disabled on a host, the test explicitly logs this limitation rather than fabricating verification, relying on atomic submission hooks, SQLite persistence, and emulator spool manifest sequence.
+  - When CUPS job history retention (`PreserveJobHistory`) is active and returns the target job record, the test asserts that exactly one job was dispatched to the queue.
+  - **Limitation & Truthful Status Reporting**: When CUPS job history is purged, disabled, or unavailable on a host, the test harness reports CUPS history verification as `SKIP/UNVERIFIED` rather than falsely claiming history-based verification passed. Exactly-once submission remains verified through atomic pre/post hooks, SQLite persistence, and emulator spool manifest sequence grouping.
 - **Distinguishing One Submission with Multiple Artifacts from Multiple Submissions**:
   - A single submission to `ippeveprinter` and `processor.sh` produces multiple artifact files (e.g. `1-<job>.pdf` and `1-<job>.prn`).
   - Both artifact files share the same sequence ID prefix (`1-`).
@@ -91,7 +91,10 @@ The validation exercises:
 - **Problem**: When temporary files are stored in `t.TempDir()`, Go's test runner unconditionally deletes `t.TempDir()` upon test completion. If CUPS queue deletion fails during teardown, the ownership metadata is destroyed, leaving orphaned unmanaged queues without audit evidence.
 - **Solution**:
   - Ownership metadata files are stored outside `t.TempDir()` (in `/tmp/xeroxgo_cups_meta_<queue>.meta`).
-  - If `remove-cups` fails or is refused, the metadata file is strictly preserved on disk, and teardown logs an error with the preserved path.
+  - Unified teardown helper `teardownCUPSQueue` is enforced across all D4a Go tests:
+    - Never unconditionally deletes ownership metadata.
+    - Preserves metadata on disk if verified `remove-cups` fails or is refused.
+    - Reports teardown failures as test failures via `t.Errorf`, not ignored errors or warnings.
   - When `remove-cups` succeeds, `emulator.sh` cleanly removes the metadata file.
   - In `lifecycle_test.sh`, the EXIT trap preserves metadata and reports a non-zero exit code if cleanup fails.
 

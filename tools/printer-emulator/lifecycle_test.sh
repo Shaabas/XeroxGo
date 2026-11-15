@@ -280,13 +280,14 @@ if [[ -n "$cups_records" ]]; then
     elif [[ $job_count -gt 1 ]]; then
         fail "Test 5b: CUPS job records show multiple submissions (${job_count}) on queue '${TEST_QUEUE}'"
     else
-        echo "  Notice: CUPS job record format differed; captured request ID was ${captured_cups_id}"
-        pass "Test 5b: Submission verified via lp execution and request ID capture"
+        echo "  Notice: CUPS job record format differed or target job not listed in history (captured request ID: ${captured_cups_id})"
+        skip "Test 5b: Target job record missing in CUPS history; history-based exactly-once verification SKIP/UNVERIFIED (hook and spool-sequence assertions retained)"
     fi
 else
-    # Requirement 9: CUPS job history not retained; report limitation rather than claiming verification
+    # Requirements 7 & 8: When CUPS history is unavailable, do not claim history-based exactly-once verification passed.
+    # Report CUPS history verification as SKIP/UNVERIFIED while retaining hook and spool-sequence assertions.
     echo "  Notice: CUPS job history not retained by cupsd configuration (PreserveJobHistory); cannot prove historical exactly-once dispatch from CUPS history alone."
-    pass "Test 5b: Exactly-once submission verified via lp execution and request ID capture (CUPS history retention limitation noted)"
+    skip "Test 5b: CUPS job history unavailable (PreserveJobHistory disabled or purged); history-based exactly-once verification SKIP/UNVERIFIED (hook and spool-sequence assertions retained)"
 fi
 
 # -----------------------------------------------------------------------------

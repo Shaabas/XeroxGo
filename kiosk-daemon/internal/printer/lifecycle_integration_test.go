@@ -67,6 +67,41 @@ func parseCUPSJobIDsFromLPStat(output string, queue string) []string {
 	return ids
 }
 
+// cupsQueueOrMetadataExists returns true if either the ownership metadata file exists on disk
+// or the named queue exists in CUPS (via lpstat -p or lpstat -v).
+func cupsQueueOrMetadataExists(queue string, metaPath string) bool {
+	if _, err := os.Stat(metaPath); err == nil {
+		return true
+	}
+	cmdP := exec.Command("lpstat", "-p", queue)
+	if cmdP.Run() == nil {
+		return true
+	}
+	cmdV := exec.Command("lpstat", "-v", queue)
+	return cmdV.Run() == nil
+}
+
+// teardownCUPSQueue performs verified queue deletion during test teardown:
+//  - Never unconditionally deletes ownership metadata.
+//  - Preserves ownership metadata on disk if verified remove-cups fails.
+//  - Reports teardown failures as test failures via t.Errorf, not ignored errors or warnings.
+func teardownCUPSQueue(t *testing.T, emuScript string, emuEnv []string, queueName string, metaFile string) {
+	t.Helper()
+	if !cupsQueueOrMetadataExists(queueName, metaFile) {
+		return
+	}
+	out, err := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+	if err != nil {
+		// Requirements 2, 3, 4: Never delete metadata unconditionally.
+		// Preserve metadata if verified remove-cups fails, and report teardown failure.
+		t.Errorf("cleanup failure: remove-cups failed for queue %q: %v (%s). Ownership metadata preserved at %s.",
+			queueName, err, strings.TrimSpace(out), metaFile)
+	} else {
+		// Verified removal succeeded; ensure metadata file is removed
+		_ = os.Remove(metaFile)
+	}
+}
+
 // TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking exercises the complete
 // real-world XeroxGo print lifecycle against the live D1 IPP and D2 SNMP emulators:
 //  1. Dedicated driverless CUPS queue backed by live ippeveprinter.
@@ -140,26 +175,18 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 	}
 
 	// Register guaranteed teardown:
-	// Requirements 2, 4, 5: Verify queue ownership and never delete ownership metadata if queue deletion fails.
+	// Requirements 2, 3, 4, 5: Verify queue ownership, never delete metadata unconditionally,
+	// preserve metadata on remove-cups failure, and report teardown failures via t.Errorf.
 	t.Cleanup(func() {
-		// Attempt verified removal of the test CUPS queue
-		out, err := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
-		if err != nil {
-			// Queue deletion failed: preserve ownership metadata outside tempDir and report error
-			t.Errorf("cleanup failure: remove-cups failed for queue %q: %v (%s). Ownership metadata preserved at %s.",
-				queueName, err, strings.TrimSpace(out), metaFile)
-		} else {
-			// Verified removal succeeded; ensure metadata file is removed
-			_ = os.Remove(metaFile)
-		}
+		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
 
 		// Clean up IPP emulator and verified spool files
 		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
-			t.Logf("cleanup warning: IPP cleanup: %v (%s)", err, out)
+			t.Errorf("cleanup failure: IPP cleanup failed: %v (%s)", err, strings.TrimSpace(out))
 		}
 		// Clean up SNMP emulator
 		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
-			t.Logf("cleanup warning: SNMP cleanup: %v (%s)", err, out)
+			t.Errorf("cleanup failure: SNMP cleanup failed: %v (%s)", err, strings.TrimSpace(out))
 		}
 	})
 
@@ -412,12 +439,12 @@ func TestCUPSPrintLifecycle_SyntheticOdometerAdvancement(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed to start snmp_responder: %v", err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(os.Interrupt)
 			_ = cmd.Wait()
 		}
-	}()
+	})
 
 	var boundPort int
 	deadline := time.Now().Add(5 * time.Second)
@@ -516,14 +543,10 @@ func TestCUPSJobQuery_LiveTransitions(t *testing.T) {
 		t.Fatalf("failed to start emulator: %v (%s)", err, out)
 	}
 	t.Cleanup(func() {
-		out, err := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
-		if err != nil {
-			t.Errorf("cleanup failure: remove-cups failed for queue %q: %v (%s). Metadata preserved at %s.",
-				queueName, err, strings.TrimSpace(out), metaFile)
-		} else {
-			_ = os.Remove(metaFile)
+		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP cleanup failed: %v (%s)", err, strings.TrimSpace(out))
 		}
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -603,10 +626,10 @@ func TestCUPSQueueDeletion_FailurePreservesOwnershipMetadata(t *testing.T) {
 		t.Fatalf("failed to start emulator: %v (%s)", err, out)
 	}
 	t.Cleanup(func() {
-		// Guaranteed final cleanup with matching URI
-		_, _ = runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
-		_ = os.Remove(metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
+		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	// Setup driverless CUPS queue
