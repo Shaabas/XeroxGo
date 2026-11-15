@@ -2,6 +2,7 @@ package printer
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -529,8 +530,8 @@ func TestReconcilePrinterHealth_ConfirmedFaultOverridesPrintingState(t *testing.
 		t.Errorf("expected HasBlockingFaults = true")
 	}
 
-	// Contradiction must be documented: CUPS reports PRINTING while physical fault present
-	if !sliceHasItemContaining(res.Contradictions, "PRINTING while physical hardware fault is present") {
+	// Contradiction must be documented: CUPS reports PRINTING while physical fault confirmed
+	if !sliceHasItemContaining(res.Contradictions, "PRINTING while physical hardware fault is confirmed") {
 		t.Errorf("expected contradiction regarding PRINTING with hardware fault, got %v", res.Contradictions)
 	}
 }
@@ -1011,7 +1012,7 @@ func TestReconcilePrinterHealth_CrossSubsystemContradictions(t *testing.T) {
 		if res.EffectiveState != "PRINTING" {
 			t.Errorf("EffectiveState = %q, want PRINTING", res.EffectiveState)
 		}
-		if !sliceHasItemContaining(res.Contradictions, "CUPS reports queue PRINTING while IPP reports printer-state \"idle\"") {
+		if !sliceHasItemContaining(res.Contradictions, "CUPS reports queue PRINTING while IPP explicitly reports printer-state \"idle\"") {
 			t.Errorf("expected job state contradiction, got %v", res.Contradictions)
 		}
 	})
@@ -1062,8 +1063,8 @@ func TestReconcilePrinterHealth_CrossSubsystemContradictions(t *testing.T) {
 		if !sliceHasItemContaining(res.BlockingFaults, "paper jam") {
 			t.Errorf("expected paper jam in BlockingFaults, got %v", res.BlockingFaults)
 		}
-		if !sliceHasItemContaining(res.Contradictions, "IPP reports paper jam while SNMP reports no paper jam") {
-			t.Errorf("expected contradiction regarding IPP jam vs SNMP normal, got %v", res.Contradictions)
+		if !sliceHasItemContaining(res.Contradictions, "observation mismatch: IPP reports paper jam fault, but SNMP telemetry does not observe a jam condition") {
+			t.Errorf("expected observation mismatch regarding IPP jam vs SNMP normal, got %v", res.Contradictions)
 		}
 	})
 
@@ -1104,8 +1105,8 @@ func TestReconcilePrinterHealth_CrossSubsystemContradictions(t *testing.T) {
 		if !res.PaperJam {
 			t.Errorf("expected PaperJam = true")
 		}
-		if !sliceHasItemContaining(res.Contradictions, "SNMP reports paper jam while IPP reports no paper jam") {
-			t.Errorf("expected contradiction regarding SNMP jam vs IPP normal, got %v", res.Contradictions)
+		if !sliceHasItemContaining(res.Contradictions, "observation mismatch: SNMP reports paper jam fault, but IPP state reasons do not list a jam condition") {
+			t.Errorf("expected observation mismatch regarding SNMP jam vs IPP normal, got %v", res.Contradictions)
 		}
 	})
 
@@ -1143,7 +1144,7 @@ func TestReconcilePrinterHealth_CrossSubsystemContradictions(t *testing.T) {
 		if res.PaperTrayStatus != "EMPTY" {
 			t.Errorf("PaperTrayStatus = %q, want EMPTY", res.PaperTrayStatus)
 		}
-		if !sliceHasItemContaining(res.Contradictions, "CUPS reports paper tray EMPTY while SNMP reports paper tray OK") {
+		if !sliceHasItemContaining(res.Contradictions, "contradiction: CUPS reports paper tray EMPTY while SNMP explicitly reports paper tray OK") {
 			t.Errorf("expected paper tray contradiction, got %v", res.Contradictions)
 		}
 	})
@@ -1254,3 +1255,352 @@ func TestReconcilePrinterHealth_InputImmutability(t *testing.T) {
 		t.Errorf("snmp input was mutated by ReconcilePrinterHealth")
 	}
 }
+
+func TestReconcilePrinterHealth_ZeroEvaluationTimeRegression(t *testing.T) {
+	// Rule 1, 2, 3: Keep pure, remove time.Now fallback, return deterministic UNKNOWN/invalid-time
+	// diagnostics for zero evalTime without accepting time-dependent IPP fault evidence.
+	cups := contracts.PrinterHealth{
+		Online:          true,
+		State:           "IDLE",
+		PaperTrayStatus: "OK",
+		EstimatedSheets: 100,
+	}
+	ipp := IPPPrinterStateResult{
+		Source:            CapabilitySourceCUPSQueue,
+		Queue:             "BrotherQueue",
+		State:             IPPPrinterStateStopped,
+		RawReasons:        []string{"media-jam-error"},
+		ParsedReasons: []IPPPrinterReason{
+			{Raw: "media-jam-error", Keyword: "media-jam", Severity: SeverityError},
+		},
+		PaperJam:          true,
+		HasHardwareFault:  true,
+		EndpointReachable: true,
+		QueueAccessible:   true,
+		ObservedAt:        time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC),
+	}
+	snmp := contracts.PrinterHealth{
+		Online:            true,
+		State:             "IDLE",
+		PaperTrayStatus:   "OK",
+		EstimatedSheets:   100,
+		TonerLevelPercent: 80,
+		DrumLifePercent:   90,
+	}
+
+	res := ReconcilePrinterHealth(cups, ipp, snmp, time.Time{})
+
+	if res.EffectiveState != "UNKNOWN" {
+		t.Errorf("EffectiveState = %q, want UNKNOWN for zero evalTime", res.EffectiveState)
+	}
+	if res.Online {
+		t.Errorf("Online = %v, want false for zero evalTime", res.Online)
+	}
+	if !res.EvaluatedAt.IsZero() {
+		t.Errorf("EvaluatedAt must be zero time.Time, got %v", res.EvaluatedAt)
+	}
+	if !sliceHasItemContaining(res.UnknownConditions, "evaluation time is zero") {
+		t.Errorf("expected zero evaluation time in UnknownConditions, got %v", res.UnknownConditions)
+	}
+	// Time-dependent IPP fault evidence must NOT be accepted into BlockingFaults
+	if sliceHasItemContaining(res.BlockingFaults, "paper jam") {
+		t.Errorf("IPP paper jam should not be accepted when evalTime is zero: %v", res.BlockingFaults)
+	}
+	if res.SourceAttribution.IPP.Available {
+		t.Errorf("IPP Available must be false when evalTime is zero")
+	}
+
+	// Assert repeated evaluation on zero evalTime is 100% deterministic
+	for i := 0; i < 20; i++ {
+		repeat := ReconcilePrinterHealth(cups, ipp, snmp, time.Time{})
+		if !reflect.DeepEqual(res, repeat) {
+			t.Fatalf("repeated zero evalTime evaluation differed at iteration %d", i)
+		}
+	}
+}
+
+func TestReconcilePrinterHealth_InaccessibleIPPQueueRegression(t *testing.T) {
+	// Rule 4, 5, 6: Require QueueAccessible=true; reject observations with QueueAccessible=false
+	evalTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	freshTime := evalTime.Add(-2 * time.Second)
+
+	cups := contracts.PrinterHealth{
+		Online:          true,
+		State:           "IDLE",
+		PaperTrayStatus: "OK",
+		EstimatedSheets: 100,
+		UpdatedAt:       freshTime,
+	}
+	ipp := IPPPrinterStateResult{
+		Source:            CapabilitySourceCUPSQueue,
+		Queue:             "NonExistentQueue",
+		State:             IPPPrinterStateStopped,
+		RawReasons:        []string{"media-jam-error"},
+		ParsedReasons: []IPPPrinterReason{
+			{Raw: "media-jam-error", Keyword: "media-jam", Severity: SeverityError},
+		},
+		PaperJam:          true,
+		HasHardwareFault:  true,
+		EndpointReachable: true,
+		QueueAccessible:   false, // queue does not exist / inaccessible on server
+		StatusCode:        "client-error-not-found",
+		ObservedAt:        freshTime,
+	}
+	snmp := contracts.PrinterHealth{
+		Online:            true,
+		State:             "IDLE",
+		PaperTrayStatus:   "OK",
+		EstimatedSheets:   100,
+		TonerLevelPercent: 80,
+		DrumLifePercent:   90,
+		UpdatedAt:         freshTime,
+	}
+
+	res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime)
+
+	// Since IPP QueueAccessible is false, IPP data is rejected from establishing active blocking faults
+	if res.EffectiveState != "IDLE" {
+		t.Errorf("EffectiveState = %q, want IDLE (inaccessible IPP queue must be rejected)", res.EffectiveState)
+	}
+	if res.PaperJam {
+		t.Errorf("PaperJam must be false when IPP queue is inaccessible")
+	}
+	if sliceHasItemContaining(res.BlockingFaults, "paper jam") {
+		t.Errorf("BlockingFaults must not contain paper jam from inaccessible IPP: %v", res.BlockingFaults)
+	}
+	if res.SourceAttribution.IPP.Available {
+		t.Errorf("IPP attribution Available must be false for inaccessible queue")
+	}
+	if !sliceHasItemContaining(res.UnknownConditions, "inaccessible on CUPS server") {
+		t.Errorf("expected inaccessible queue note in UnknownConditions, got %v", res.UnknownConditions)
+	}
+	// Raw diagnostics must still be preserved for auditing (Rule 6)
+	if !sliceHasItemContaining(res.RawIPPReasons, "media-jam-error") {
+		t.Errorf("RawIPPReasons must preserve raw tokens even when rejected: %v", res.RawIPPReasons)
+	}
+}
+
+func TestReconcilePrinterHealth_FailedIPPStatusAndQueryErrorRegression(t *testing.T) {
+	// Rule 5: Reject IPP observations with explicit IPP failure status or nonempty query error
+	evalTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	freshTime := evalTime.Add(-2 * time.Second)
+
+	cups := contracts.PrinterHealth{
+		Online:          true,
+		State:           "IDLE",
+		PaperTrayStatus: "OK",
+		EstimatedSheets: 100,
+		UpdatedAt:       freshTime,
+	}
+	snmp := contracts.PrinterHealth{
+		Online:            true,
+		State:             "IDLE",
+		PaperTrayStatus:   "OK",
+		EstimatedSheets:   100,
+		TonerLevelPercent: 80,
+		DrumLifePercent:   90,
+		UpdatedAt:         freshTime,
+	}
+
+	t.Run("server_error_status_rejected", func(t *testing.T) {
+		ipp := IPPPrinterStateResult{
+			Source:            CapabilitySourceCUPSQueue,
+			Queue:             "FaultyQueue",
+			State:             IPPPrinterStateStopped,
+			RawReasons:        []string{"media-jam-error"},
+			ParsedReasons: []IPPPrinterReason{
+				{Raw: "media-jam-error", Keyword: "media-jam", Severity: SeverityError},
+			},
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			StatusCode:        "server-error-internal-error",
+			ObservedAt:        freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime)
+		if res.EffectiveState != "IDLE" {
+			t.Errorf("EffectiveState = %q, want IDLE", res.EffectiveState)
+		}
+		if res.SourceAttribution.IPP.Available {
+			t.Errorf("IPP Available must be false on IPP failure status")
+		}
+		if !sliceHasItemContaining(res.UnknownConditions, "failure status \"server-error-internal-error\"") {
+			t.Errorf("expected failure status in UnknownConditions, got %v", res.UnknownConditions)
+		}
+	})
+
+	t.Run("query_error_rejected", func(t *testing.T) {
+		ipp := IPPPrinterStateResult{
+			Source:            CapabilitySourceCUPSQueue,
+			Queue:             "CrashingQueue",
+			State:             IPPPrinterStateStopped,
+			RawReasons:        []string{"media-jam-error"},
+			ParsedReasons: []IPPPrinterReason{
+				{Raw: "media-jam-error", Keyword: "media-jam", Severity: SeverityError},
+			},
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			Error:             "ipptool crashed: signal 11",
+			ObservedAt:        freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime)
+		if res.EffectiveState != "IDLE" {
+			t.Errorf("EffectiveState = %q, want IDLE", res.EffectiveState)
+		}
+		if res.SourceAttribution.IPP.Available {
+			t.Errorf("IPP Available must be false on query error")
+		}
+		if !sliceHasItemContaining(res.UnknownConditions, "IPP state query failed: ipptool crashed: signal 11") {
+			t.Errorf("expected query error in UnknownConditions, got %v", res.UnknownConditions)
+		}
+	})
+}
+
+func TestReconcilePrinterHealth_MissingVsExplicitlyHealthyObservations(t *testing.T) {
+	// Rule 7, 8, 9: Missing fault flags must not be described as confirmed healthy sensor readings.
+	// Only report a definite contradiction when the other source explicitly reports a relevant healthy condition.
+	// Otherwise report a weaker observation mismatch.
+	evalTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	freshTime := evalTime.Add(-2 * time.Second)
+
+	cups := contracts.PrinterHealth{
+		Online:          true,
+		State:           "IDLE",
+		PaperTrayStatus: "OK",
+		EstimatedSheets: 100,
+		UpdatedAt:       freshTime,
+	}
+
+	t.Run("definite_contradiction_for_explicit_paper_tray_status_ok", func(t *testing.T) {
+		ipp := IPPPrinterStateResult{
+			Source:            CapabilitySourceCUPSQueue,
+			Queue:             "BrotherQueue",
+			State:             IPPPrinterStateStopped,
+			RawReasons:        []string{"media-empty-error"},
+			ParsedReasons: []IPPPrinterReason{
+				{Raw: "media-empty-error", Keyword: "media-empty", Severity: SeverityError},
+			},
+			MediaEmpty:        true,
+			HasHardwareFault:  true,
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        freshTime,
+		}
+		snmp := contracts.PrinterHealth{
+			Online:            true,
+			State:             "IDLE",
+			PaperTrayStatus:   "OK", // Explicitly reported OK
+			EstimatedSheets:   100,
+			TonerLevelPercent: 80,
+			DrumLifePercent:   90,
+			UpdatedAt:         freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime)
+
+		// Must report definite contradiction because SNMP explicitly reported "OK"
+		if !sliceHasItemContaining(res.Contradictions, "contradiction: IPP reports media empty while SNMP explicitly reports paper tray OK") {
+			t.Errorf("expected definite contradiction for explicit OK, got %v", res.Contradictions)
+		}
+		// Fault must not be suppressed
+		if res.EffectiveState != "ERROR" {
+			t.Errorf("EffectiveState = %q, want ERROR", res.EffectiveState)
+		}
+		if res.PaperTrayStatus != "EMPTY" {
+			t.Errorf("PaperTrayStatus = %q, want EMPTY", res.PaperTrayStatus)
+		}
+	})
+
+	t.Run("observation_mismatch_for_missing_jam_flag", func(t *testing.T) {
+		ipp := IPPPrinterStateResult{
+			Source:            CapabilitySourceCUPSQueue,
+			Queue:             "BrotherQueue",
+			State:             IPPPrinterStateStopped,
+			RawReasons:        []string{"media-jam-error"},
+			ParsedReasons: []IPPPrinterReason{
+				{Raw: "media-jam-error", Keyword: "media-jam", Severity: SeverityError},
+			},
+			PaperJam:          true,
+			HasHardwareFault:  true,
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        freshTime,
+		}
+		snmp := contracts.PrinterHealth{
+			Online:            true,
+			State:             "IDLE",
+			PaperJam:          false, // Absent flag, not explicit "no jam" sensor
+			CoverOpen:         false,
+			PaperTrayStatus:   "OK",
+			EstimatedSheets:   100,
+			TonerLevelPercent: 80,
+			DrumLifePercent:   90,
+			UpdatedAt:         freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime)
+
+		// Must report observation mismatch, NOT describe SNMP as "no paper jam" or "healthy sensor reading"
+		if !sliceHasItemContaining(res.Contradictions, "observation mismatch: IPP reports paper jam fault, but SNMP telemetry does not observe a jam condition") {
+			t.Errorf("expected weaker observation mismatch, got %v", res.Contradictions)
+		}
+		for _, c := range res.Contradictions {
+			if strings.Contains(c, "reports no paper jam") {
+				t.Errorf("contradiction must not describe missing flag as confirmed healthy: %q", c)
+			}
+			if strings.Contains(c, "healthy sensor reading") {
+				t.Errorf("contradiction must not describe missing flag as confirmed healthy reading: %q", c)
+			}
+		}
+		// Confirmed fault must NEVER be suppressed
+		if res.EffectiveState != "ERROR" {
+			t.Errorf("EffectiveState = %q, want ERROR", res.EffectiveState)
+		}
+		if !res.PaperJam {
+			t.Errorf("PaperJam must remain true")
+		}
+	})
+
+	t.Run("observation_mismatch_for_missing_cover_flag_in_reverse", func(t *testing.T) {
+		ipp := IPPPrinterStateResult{
+			Source:            CapabilitySourceCUPSQueue,
+			Queue:             "BrotherQueue",
+			State:             IPPPrinterStateIdle,
+			RawReasons:        []string{"none"},
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        freshTime,
+		}
+		snmp := contracts.PrinterHealth{
+			Online:            true,
+			State:             "ERROR",
+			CoverOpen:         true,
+			PaperTrayStatus:   "OK",
+			EstimatedSheets:   100,
+			TonerLevelPercent: 80,
+			DrumLifePercent:   90,
+			UpdatedAt:         freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime)
+
+		// Must report observation mismatch, NOT describe IPP as "cover closed"
+		if !sliceHasItemContaining(res.Contradictions, "observation mismatch: SNMP reports cover open fault, but IPP state reasons do not list cover open") {
+			t.Errorf("expected weaker observation mismatch, got %v", res.Contradictions)
+		}
+		for _, c := range res.Contradictions {
+			if strings.Contains(c, "cover closed") {
+				t.Errorf("contradiction must not describe absent IPP reason as 'cover closed': %q", c)
+			}
+		}
+		// Confirmed fault must NEVER be suppressed
+		if res.EffectiveState != "ERROR" {
+			t.Errorf("EffectiveState = %q, want ERROR", res.EffectiveState)
+		}
+		if !res.CoverOpen {
+			t.Errorf("CoverOpen must remain true")
+		}
+	})
+}
+

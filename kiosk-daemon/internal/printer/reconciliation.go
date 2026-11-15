@@ -49,10 +49,12 @@ const (
 	UnknownIPP         = "IPP_TELEMETRY_UNAVAILABLE"
 	UnknownPaperTray   = "PAPER_TRAY_UNKNOWN"
 	UnknownQueueState  = "QUEUE_STATE_UNKNOWN"
+	UnknownEvalTime    = "EVAL_TIME_INVALID"
 
 	ContradictionJobState     = "CONTRADICTION_JOB_STATE"
 	ContradictionHardwareFault = "CONTRADICTION_HARDWARE_FAULT"
 	ContradictionOnlineStatus = "CONTRADICTION_ONLINE_STATUS"
+	ObservationMismatchHardware = "OBSERVATION_MISMATCH_HARDWARE"
 )
 
 // SubsystemAttribution records the diagnostic findings and operational state
@@ -167,9 +169,13 @@ func (r ReconciledHealthResult) IsReady() bool {
 //  7. Unknown/missing data is kept strictly distinct from confirmed healthy.
 //  8. Stale IPP observations (age > MaxIPPObservationAge), zero timestamps, and future timestamps
 //     are rejected from authoritative fault evaluation.
-//  9. IPP EndpointReachable alone is never interpreted as printer readiness.
-// 10. Contradictions between subsystems are explicitly detected and reported, and never resolved
-//     by suppressing confirmed critical fault evidence.
+//  9. IPP EndpointReachable alone is never interpreted as printer readiness. A successful,
+//     accessible IPP queue observation (QueueAccessible=true, no query error, no IPP failure status)
+//     is required before treating IPP data as authoritative.
+// 10. Contradictions between subsystems are explicitly detected and reported, distinguishing
+//     definite contradictions (where another source explicitly reports a healthy condition)
+//     from weaker observation mismatches (where a fault flag is simply absent in another source).
+//     Confirmed faults are never suppressed.
 // 11. Deterministic output: evaluation of identical inputs always produces identical results.
 func ReconcilePrinterHealth(
 	cups contracts.PrinterHealth,
@@ -177,10 +183,6 @@ func ReconcilePrinterHealth(
 	snmp contracts.PrinterHealth,
 	evalTime time.Time,
 ) ReconciledHealthResult {
-	if evalTime.IsZero() {
-		evalTime = time.Now().UTC()
-	}
-
 	blockingFaults := make([]string, 0)
 	nonblockingWarnings := make([]string, 0)
 	unknownConditions := make([]string, 0)
@@ -201,76 +203,105 @@ func ReconcilePrinterHealth(
 	}
 
 	// ---------------------------------------------------------
-	// 1. IPP Freshness & Transport Validation
+	// 1. IPP Freshness, Transport & Queue Accessibility Validation
 	// ---------------------------------------------------------
 	var ippValid bool
-	var ippFreshnessIssue string
+	var ippRejectionReason string
 
-	if ipp.ObservedAt.IsZero() {
-		ippFreshnessIssue = "IPP observation timestamp is zero (missing or uninitialized)"
-		unknownConditions = append(unknownConditions, ippFreshnessIssue)
+	if evalTime.IsZero() {
+		ippRejectionReason = "evaluation time is zero (invalid or unspecified); time-dependent evaluation rejected"
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
+		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+			Category: CategoryUnknown,
+			Code:     UnknownEvalTime,
+			Message:  ippRejectionReason,
+			Source:   SourceReconciler,
+			Severity: "INFO",
+		})
+	} else if ipp.ObservedAt.IsZero() {
+		ippRejectionReason = "IPP observation timestamp is zero (missing or uninitialized)"
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryUnknown,
 			Code:     UnknownIPP,
-			Message:  ippFreshnessIssue,
+			Message:  ippRejectionReason,
 			Source:   SourceIPP,
 			Severity: "INFO",
 		})
 	} else if ipp.ObservedAt.After(evalTime.Add(FutureTimestampTolerance)) {
 		skew := ipp.ObservedAt.Sub(evalTime).Round(time.Millisecond)
-		ippFreshnessIssue = fmt.Sprintf("IPP observation timestamp is in the future (skew: %s)", skew)
-		unknownConditions = append(unknownConditions, ippFreshnessIssue)
+		ippRejectionReason = fmt.Sprintf("IPP observation timestamp is in the future (skew: %s)", skew)
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryUnknown,
 			Code:     UnknownIPP,
-			Message:  ippFreshnessIssue,
+			Message:  ippRejectionReason,
 			Source:   SourceIPP,
 			Severity: "INFO",
 		})
 	} else if evalTime.Sub(ipp.ObservedAt) > MaxIPPObservationAge {
 		age := evalTime.Sub(ipp.ObservedAt).Round(time.Millisecond)
-		ippFreshnessIssue = fmt.Sprintf("IPP observation is stale (age %s exceeds max %s)", age, MaxIPPObservationAge)
-		nonblockingWarnings = append(nonblockingWarnings, ippFreshnessIssue)
-		unknownConditions = append(unknownConditions, fmt.Sprintf("stale IPP observation (age %s); fresh state unknown", age))
+		ippRejectionReason = fmt.Sprintf("IPP observation is stale (age %s exceeds max %s)", age, MaxIPPObservationAge)
+		nonblockingWarnings = appendUnique(nonblockingWarnings, ippRejectionReason)
+		unknownConditions = appendUnique(unknownConditions, fmt.Sprintf("stale IPP observation (age %s); fresh state unknown", age))
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryWarning,
 			Code:     WarningStaleIPP,
-			Message:  ippFreshnessIssue,
+			Message:  ippRejectionReason,
 			Source:   SourceIPP,
 			Severity: "NONBLOCKING",
 		})
-	}
-
-	if ippFreshnessIssue != "" {
-		ippValid = false
-	} else if ipp.Error != "" {
-		ippValid = false
-		msg := fmt.Sprintf("IPP state query failed: %s", ipp.Error)
-		unknownConditions = append(unknownConditions, msg)
+	} else if !ipp.EndpointReachable {
+		ippRejectionReason = "IPP endpoint unreachable"
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryUnknown,
 			Code:     UnknownIPP,
-			Message:  msg,
+			Message:  ippRejectionReason,
 			Source:   SourceIPP,
 			Severity: "INFO",
 		})
-	} else if !ipp.EndpointReachable {
-		ippValid = false
-		unknownConditions = append(unknownConditions, "IPP endpoint unreachable")
+	} else if !ipp.QueueAccessible {
+		if ipp.StatusCode != "" {
+			ippRejectionReason = fmt.Sprintf("IPP queue is inaccessible on CUPS server (status: %s)", ipp.StatusCode)
+		} else {
+			ippRejectionReason = "IPP queue is inaccessible on CUPS server"
+		}
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryUnknown,
 			Code:     UnknownIPP,
-			Message:  "IPP endpoint unreachable",
+			Message:  ippRejectionReason,
+			Source:   SourceIPP,
+			Severity: "INFO",
+		})
+	} else if isIPPFailureStatus(ipp.StatusCode) {
+		ippRejectionReason = fmt.Sprintf("IPP query returned failure status %q", ipp.StatusCode)
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
+		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+			Category: CategoryUnknown,
+			Code:     UnknownIPP,
+			Message:  ippRejectionReason,
+			Source:   SourceIPP,
+			Severity: "INFO",
+		})
+	} else if ipp.Error != "" {
+		ippRejectionReason = fmt.Sprintf("IPP state query failed: %s", ipp.Error)
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
+		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+			Category: CategoryUnknown,
+			Code:     UnknownIPP,
+			Message:  ippRejectionReason,
 			Source:   SourceIPP,
 			Severity: "INFO",
 		})
 	} else if !ipp.HasRecognizedStateAttributes() {
-		ippValid = false
-		unknownConditions = append(unknownConditions, "IPP response contains no recognized printer state attributes")
+		ippRejectionReason = "IPP response contains no recognized printer state attributes"
+		unknownConditions = appendUnique(unknownConditions, ippRejectionReason)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryUnknown,
 			Code:     UnknownIPP,
-			Message:  "IPP response contains no recognized printer state attributes",
+			Message:  ippRejectionReason,
 			Source:   SourceIPP,
 			Severity: "INFO",
 		})
@@ -765,12 +796,12 @@ func ReconcilePrinterHealth(
 	}
 
 	// ---------------------------------------------------------
-	// 6. Cross-Subsystem Contradiction Detection
+	// 6. Cross-Subsystem Contradictions & Observation Mismatches
 	// ---------------------------------------------------------
 	if ippValid {
-		// CUPS PRINTING vs IPP idle/stopped
+		// Definite contradiction: CUPS PRINTING vs IPP explicitly reporting idle/stopped
 		if cups.State == "PRINTING" && (ipp.State == IPPPrinterStateIdle || ipp.State == IPPPrinterStateStopped) {
-			cMsg := fmt.Sprintf("CUPS reports queue PRINTING while IPP reports printer-state %q", ipp.State)
+			cMsg := fmt.Sprintf("contradiction: CUPS reports queue PRINTING while IPP explicitly reports printer-state %q", ipp.State)
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -780,9 +811,9 @@ func ReconcilePrinterHealth(
 				Severity: "NONBLOCKING",
 			})
 		}
-		// CUPS IDLE/READY vs IPP processing
+		// Definite contradiction: CUPS IDLE/READY vs IPP explicitly reporting processing
 		if (cups.State == "IDLE" || cups.State == "READY") && ipp.State == IPPPrinterStateProcessing {
-			cMsg := "CUPS reports queue IDLE/READY while IPP reports printer-state processing"
+			cMsg := "contradiction: CUPS reports queue IDLE/READY while IPP explicitly reports printer-state processing"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -792,9 +823,9 @@ func ReconcilePrinterHealth(
 				Severity: "NONBLOCKING",
 			})
 		}
-		// CUPS Online vs IPP stopped
+		// Definite contradiction: CUPS Online vs IPP explicitly reporting stopped
 		if cups.Online && ipp.State == IPPPrinterStateStopped {
-			cMsg := "CUPS reports queue online while IPP reports printer-state stopped"
+			cMsg := "contradiction: CUPS reports queue online while IPP explicitly reports printer-state stopped"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -804,9 +835,9 @@ func ReconcilePrinterHealth(
 				Severity: "NONBLOCKING",
 			})
 		}
-		// CUPS Online vs IPP not accepting
+		// Definite contradiction: CUPS Online vs IPP explicitly reporting not accepting
 		if cups.Online && ipp.AcceptingJobs == AcceptingJobsNotAccepting {
-			cMsg := "CUPS reports queue online while IPP reports printer-is-accepting-jobs false"
+			cMsg := "contradiction: CUPS reports queue online while IPP explicitly reports printer-is-accepting-jobs false"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -818,9 +849,9 @@ func ReconcilePrinterHealth(
 		}
 	}
 
-	// CUPS PRINTING vs confirmed physical hardware faults
+	// Definite contradiction: CUPS PRINTING vs confirmed physical hardware faults
 	if cups.State == "PRINTING" && (paperJam || coverOpen || outputBinFull || paperEmpty) {
-		cMsg := "CUPS reports queue PRINTING while physical hardware fault is present"
+		cMsg := "contradiction: CUPS reports queue PRINTING while physical hardware fault is confirmed"
 		contradictions = appendUnique(contradictions, cMsg)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 			Category: CategoryContradiction,
@@ -831,56 +862,11 @@ func ReconcilePrinterHealth(
 		})
 	}
 
-	// IPP Faults vs Normal SNMP Data (and vice-versa)
+	// Discrepancies between IPP and SNMP
 	if ippValid && snmp.Online {
-		if ippJam && !snmpJam {
-			cMsg := "IPP reports paper jam while SNMP reports no paper jam"
-			contradictions = appendUnique(contradictions, cMsg)
-			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
-				Message:  cMsg,
-				Source:   SourceReconciler,
-				Severity: "NONBLOCKING",
-			})
-		}
-		if snmpJam && !ippJam {
-			cMsg := "SNMP reports paper jam while IPP reports no paper jam"
-			contradictions = appendUnique(contradictions, cMsg)
-			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
-				Message:  cMsg,
-				Source:   SourceReconciler,
-				Severity: "NONBLOCKING",
-			})
-		}
-
-		if ippCover && !snmpCover {
-			cMsg := "IPP reports cover open while SNMP reports cover closed"
-			contradictions = appendUnique(contradictions, cMsg)
-			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
-				Message:  cMsg,
-				Source:   SourceReconciler,
-				Severity: "NONBLOCKING",
-			})
-		}
-		if snmpCover && !ippCover {
-			cMsg := "SNMP reports cover open while IPP reports cover closed"
-			contradictions = appendUnique(contradictions, cMsg)
-			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
-				Message:  cMsg,
-				Source:   SourceReconciler,
-				Severity: "NONBLOCKING",
-			})
-		}
-
+		// Definite contradiction: explicit PaperTrayStatus == "OK" vs media-empty
 		if ippPaperEmpty && snmp.PaperTrayStatus == "OK" {
-			cMsg := "IPP reports media empty while SNMP reports paper tray OK"
+			cMsg := "contradiction: IPP reports media empty while SNMP explicitly reports paper tray OK"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -889,36 +875,82 @@ func ReconcilePrinterHealth(
 				Source:   SourceReconciler,
 				Severity: "NONBLOCKING",
 			})
-		}
-		if snmpPaperEmpty && !ippPaperEmpty && ipp.State == IPPPrinterStateIdle {
-			cMsg := "SNMP reports paper tray EMPTY while IPP reports media not empty"
+		} else if snmpPaperEmpty && !ippPaperEmpty && ipp.State == IPPPrinterStateIdle {
+			// SNMP reports empty, but IPP state reasons do not list media empty (weaker mismatch)
+			cMsg := "observation mismatch: SNMP reports paper tray EMPTY, but IPP state reasons do not list media empty"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
+				Code:     ObservationMismatchHardware,
 				Message:  cMsg,
 				Source:   SourceReconciler,
 				Severity: "NONBLOCKING",
 			})
 		}
 
-		if ippOutputFull && !snmpOutputFull {
-			cMsg := "IPP reports output bin full while SNMP reports output bin not full"
+		// Paper Jam: one source flags jam, the other does not flag jam (weaker mismatch)
+		if ippJam && !snmpJam {
+			cMsg := "observation mismatch: IPP reports paper jam fault, but SNMP telemetry does not observe a jam condition"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
+				Code:     ObservationMismatchHardware,
+				Message:  cMsg,
+				Source:   SourceReconciler,
+				Severity: "NONBLOCKING",
+			})
+		} else if snmpJam && !ippJam {
+			cMsg := "observation mismatch: SNMP reports paper jam fault, but IPP state reasons do not list a jam condition"
+			contradictions = appendUnique(contradictions, cMsg)
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryContradiction,
+				Code:     ObservationMismatchHardware,
 				Message:  cMsg,
 				Source:   SourceReconciler,
 				Severity: "NONBLOCKING",
 			})
 		}
-		if snmpOutputFull && !ippOutputFull {
-			cMsg := "SNMP reports output bin full while IPP reports output bin not full"
+
+		// Cover Open: one source flags cover open, the other does not (weaker mismatch)
+		if ippCover && !snmpCover {
+			cMsg := "observation mismatch: IPP reports cover open fault, but SNMP telemetry does not observe cover open"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
+				Code:     ObservationMismatchHardware,
+				Message:  cMsg,
+				Source:   SourceReconciler,
+				Severity: "NONBLOCKING",
+			})
+		} else if snmpCover && !ippCover {
+			cMsg := "observation mismatch: SNMP reports cover open fault, but IPP state reasons do not list cover open"
+			contradictions = appendUnique(contradictions, cMsg)
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryContradiction,
+				Code:     ObservationMismatchHardware,
+				Message:  cMsg,
+				Source:   SourceReconciler,
+				Severity: "NONBLOCKING",
+			})
+		}
+
+		// Output Bin Full: one source flags bin full, the other does not (weaker mismatch)
+		if ippOutputFull && !snmpOutputFull {
+			cMsg := "observation mismatch: IPP reports output bin full fault, but SNMP telemetry does not observe output bin full"
+			contradictions = appendUnique(contradictions, cMsg)
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryContradiction,
+				Code:     ObservationMismatchHardware,
+				Message:  cMsg,
+				Source:   SourceReconciler,
+				Severity: "NONBLOCKING",
+			})
+		} else if snmpOutputFull && !ippOutputFull {
+			cMsg := "observation mismatch: SNMP reports output bin full fault, but IPP state reasons do not list output bin full"
+			contradictions = appendUnique(contradictions, cMsg)
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryContradiction,
+				Code:     ObservationMismatchHardware,
 				Message:  cMsg,
 				Source:   SourceReconciler,
 				Severity: "NONBLOCKING",
@@ -926,10 +958,21 @@ func ReconcilePrinterHealth(
 		}
 	}
 
-	// CUPS vs SNMP Contradictions
+	// Discrepancies between CUPS and SNMP
 	if snmp.Online {
+		// Definite contradiction: explicit PaperTrayStatus == "OK" vs EMPTY
 		if cupsPaperEmpty && snmp.PaperTrayStatus == "OK" {
-			cMsg := "CUPS reports paper tray EMPTY while SNMP reports paper tray OK"
+			cMsg := "contradiction: CUPS reports paper tray EMPTY while SNMP explicitly reports paper tray OK"
+			contradictions = appendUnique(contradictions, cMsg)
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryContradiction,
+				Code:     ContradictionHardwareFault,
+				Message:  cMsg,
+				Source:   SourceReconciler,
+				Severity: "NONBLOCKING",
+			})
+		} else if snmpPaperEmpty && cups.PaperTrayStatus == "OK" {
+			cMsg := "contradiction: SNMP reports paper tray EMPTY while CUPS explicitly reports paper tray OK"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -939,30 +982,23 @@ func ReconcilePrinterHealth(
 				Severity: "NONBLOCKING",
 			})
 		}
-		if snmpPaperEmpty && cups.PaperTrayStatus == "OK" {
-			cMsg := "SNMP reports paper tray EMPTY while CUPS reports paper tray OK"
-			contradictions = appendUnique(contradictions, cMsg)
-			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
-				Message:  cMsg,
-				Source:   SourceReconciler,
-				Severity: "NONBLOCKING",
-			})
-		}
+
+		// CUPS reports paper jam, but SNMP telemetry does not observe jam
 		if cupsJam && !snmpJam {
-			cMsg := "CUPS reports paper jam while SNMP reports no paper jam"
+			cMsg := "observation mismatch: CUPS reports paper jam, but SNMP telemetry does not observe a jam condition"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
-				Code:     ContradictionHardwareFault,
+				Code:     ObservationMismatchHardware,
 				Message:  cMsg,
 				Source:   SourceReconciler,
 				Severity: "NONBLOCKING",
 			})
 		}
+
+		// CUPS queue offline while SNMP device communication is online
 		if !cups.Online && snmp.Online {
-			cMsg := "CUPS reports queue offline while SNMP reports device online"
+			cMsg := "observation mismatch: CUPS reports queue offline while SNMP device communication is online"
 			contradictions = appendUnique(contradictions, cMsg)
 			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
 				Category: CategoryContradiction,
@@ -978,36 +1014,50 @@ func ReconcilePrinterHealth(
 	// 7. Effective Operational State Determination
 	// ---------------------------------------------------------
 	var effectiveState string
+	var online bool
 
 	hasHardwareFault := paperJam || coverOpen || outputBinFull || paperEmpty ||
 		(snmp.Online && (snmp.State == "ERROR" || snmpJam || snmpCover || snmpOutputFull || snmpPaperEmpty)) ||
 		(ippValid && (ipp.HasHardwareFault || ippJam || ippCover || ippOutputFull || ippPaperEmpty)) ||
 		(cups.State == "ERROR")
 
-	if hasHardwareFault {
+	if evalTime.IsZero() {
+		// Rule 3: For zero evalTime, return deterministic UNKNOWN/invalid-time diagnostics
+		// without accepting time-dependent IPP fault evidence.
+		effectiveState = "UNKNOWN"
+		online = false
+	} else if hasHardwareFault {
 		// Confirmed critical hardware fault takes precedence over all execution states
 		effectiveState = "ERROR"
+		online = false
 	} else if !cups.Online || cups.State == "OFFLINE" {
 		effectiveState = "OFFLINE"
+		online = false
 	} else if len(blockingFaults) > 0 {
 		effectiveState = "ERROR"
+		online = false
 	} else if cups.State == "PRINTING" {
 		effectiveState = "PRINTING"
+		online = true
 	} else if snmp.Online && snmp.State == "WARMING_UP" {
 		effectiveState = "WARMING_UP"
+		online = true
 	} else if cups.State == "READY" || cups.State == "IDLE" {
 		effectiveState = "IDLE"
+		online = true
 	} else if cups.State != "" && cups.State != "UNKNOWN" {
 		effectiveState = cups.State
+		online = cups.Online
 	} else if snmp.Online && snmp.State == "IDLE" {
 		effectiveState = "IDLE"
+		online = cups.Online
 	} else if ippValid && ipp.State == IPPPrinterStateIdle {
 		effectiveState = "IDLE"
+		online = cups.Online
 	} else {
 		effectiveState = "UNKNOWN"
+		online = false
 	}
-
-	online := cups.Online && len(blockingFaults) == 0 && cups.State != "OFFLINE"
 
 	// ---------------------------------------------------------
 	// 8. Consumables & Physical Telemetry
