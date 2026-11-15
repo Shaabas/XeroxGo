@@ -92,6 +92,26 @@ func copyIPPReasons(src []printer.IPPPrinterReason) []printer.IPPPrinterReason {
 	return dst
 }
 
+func isTransportOrCommandError(msg string) bool {
+	if msg == "" {
+		return false
+	}
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "command not found") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "cannot connect") ||
+		strings.Contains(lower, "failed to connect") ||
+		strings.Contains(lower, "no such file") ||
+		strings.Contains(lower, "server unreachable") ||
+		strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "failed to query") ||
+		strings.Contains(lower, "query error") ||
+		strings.Contains(lower, "internal-error") ||
+		strings.HasPrefix(lower, "lpstat:") ||
+		strings.HasPrefix(lower, "snmp:")
+}
+
 // DeepCopy returns an independent, defensive deep copy of the ShadowHealthReport.
 func (r *ShadowHealthReport) DeepCopy() *ShadowHealthReport {
 	if r == nil {
@@ -247,7 +267,9 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 		} else {
 			cupsErr = fmt.Errorf("CUPS query context error: %w", cupsCtxErr)
 		}
-	} else if !rawCUPS.Online && rawCUPS.ErrorMessage != "" {
+	} else if rawCUPS.State == "UNKNOWN" && rawCUPS.ErrorMessage != "" {
+		cupsErr = fmt.Errorf("CUPS query error: %s", rawCUPS.ErrorMessage)
+	} else if isTransportOrCommandError(rawCUPS.ErrorMessage) {
 		cupsErr = fmt.Errorf("CUPS query error: %s", rawCUPS.ErrorMessage)
 	}
 	if cupsErr != nil {
@@ -341,6 +363,14 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 	}
 	reconciledCUPS := rawCUPS
 
+	cupsAge := time.Duration(0)
+	if !rawCUPS.UpdatedAt.IsZero() {
+		cupsAge = evalTime.Sub(rawCUPS.UpdatedAt)
+		cupsSample.SampleAge = cupsAge
+	}
+	cupsStale := rawCUPS.UpdatedAt.IsZero() || cupsAge > printer.MaxIPPObservationAge || cupsAge < -printer.FutureTimestampTolerance
+	cupsValid := cupsErr == nil && !cupsStale
+
 	if rawCUPS.UpdatedAt.IsZero() {
 		cupsSample.Stale = true
 		cupsSample.Available = false
@@ -354,29 +384,35 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 			PaperTrayStatus: "UNKNOWN",
 			ErrorMessage:     "CUPS observation missing timestamp; unverified",
 		}
-	} else {
-		cupsAge := evalTime.Sub(rawCUPS.UpdatedAt)
-		cupsSample.SampleAge = cupsAge
-		if cupsAge > printer.MaxIPPObservationAge || cupsAge < -printer.FutureTimestampTolerance {
-			cupsSample.Stale = true
-			cupsSample.Available = false
-			cupsSample.Error = fmt.Sprintf("stale observation: age %v exceeds limit %v", cupsAge.Round(time.Millisecond), printer.MaxIPPObservationAge)
+	} else if cupsAge > printer.MaxIPPObservationAge || cupsAge < -printer.FutureTimestampTolerance {
+		cupsSample.Stale = true
+		cupsSample.Available = false
+		cupsSample.Error = fmt.Sprintf("stale observation: age %v exceeds limit %v", cupsAge.Round(time.Millisecond), printer.MaxIPPObservationAge)
 
-			// Reject stale observation from active reconciliation evidence:
-			// Strip all fault flags, paper status, and error text fault inference.
-			reconciledCUPS = contracts.PrinterHealth{
-				Online:          false,
-				State:           "UNKNOWN",
-				PaperTrayStatus: "UNKNOWN",
-				ErrorMessage:     fmt.Sprintf("CUPS observation stale (age %v); unverified", cupsAge.Round(time.Millisecond)),
-				UpdatedAt:        rawCUPS.UpdatedAt,
-			}
-		} else {
-			cupsSample.Available = rawCUPS.Online
-			if cupsErr != nil && cupsSample.Error == "" {
-				cupsSample.Error = cupsErr.Error()
-			}
+		// Reject stale observation from active reconciliation evidence:
+		// Strip all fault flags, paper status, and error text fault inference.
+		reconciledCUPS = contracts.PrinterHealth{
+			Online:          false,
+			State:           "UNKNOWN",
+			PaperTrayStatus: "UNKNOWN",
+			ErrorMessage:     fmt.Sprintf("CUPS observation stale (age %v); unverified", cupsAge.Round(time.Millisecond)),
+			UpdatedAt:        rawCUPS.UpdatedAt,
 		}
+	} else if cupsErr != nil {
+		cupsSample.Available = false
+		cupsSample.Error = cupsErr.Error()
+
+		// Reject failed CUPS from active reconciliation evidence:
+		// Strip all fault flags, paper status, and error text fault inference.
+		reconciledCUPS = contracts.PrinterHealth{
+			Online:          false,
+			State:           "UNKNOWN",
+			PaperTrayStatus: "UNKNOWN",
+			ErrorMessage:     cupsErr.Error(),
+			UpdatedAt:        rawCUPS.UpdatedAt,
+		}
+	} else {
+		cupsSample.Available = true
 	}
 
 	// Analyze SNMP sample and prepare active evidence
@@ -386,6 +422,14 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 		State:     rawSNMP.State,
 	}
 	reconciledSNMP := rawSNMP
+
+	snmpAge := time.Duration(0)
+	if !rawSNMP.UpdatedAt.IsZero() {
+		snmpAge = evalTime.Sub(rawSNMP.UpdatedAt)
+		snmpSample.SampleAge = snmpAge
+	}
+	snmpStale := rawSNMP.UpdatedAt.IsZero() || snmpAge > printer.MaxIPPObservationAge || snmpAge < -printer.FutureTimestampTolerance
+	snmpValid := snmpQueried && snmpErr == nil && !snmpStale
 
 	if !snmpQueried {
 		snmpSample.Available = false
@@ -409,29 +453,35 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 			PaperTrayStatus: "UNKNOWN",
 			ErrorMessage:     "SNMP observation missing timestamp; unverified",
 		}
-	} else {
-		snmpAge := evalTime.Sub(rawSNMP.UpdatedAt)
-		snmpSample.SampleAge = snmpAge
-		if snmpAge > printer.MaxIPPObservationAge || snmpAge < -printer.FutureTimestampTolerance {
-			snmpSample.Stale = true
-			snmpSample.Available = false
-			snmpSample.Error = fmt.Sprintf("stale observation: age %v exceeds limit %v", snmpAge.Round(time.Millisecond), printer.MaxIPPObservationAge)
+	} else if snmpAge > printer.MaxIPPObservationAge || snmpAge < -printer.FutureTimestampTolerance {
+		snmpSample.Stale = true
+		snmpSample.Available = false
+		snmpSample.Error = fmt.Sprintf("stale observation: age %v exceeds limit %v", snmpAge.Round(time.Millisecond), printer.MaxIPPObservationAge)
 
-			// Reject stale observation from active reconciliation evidence:
-			// Strip all fault flags, paper status, consumable levels, and error text fault inference.
-			reconciledSNMP = contracts.PrinterHealth{
-				Online:          false,
-				State:           "UNKNOWN",
-				PaperTrayStatus: "UNKNOWN",
-				ErrorMessage:     fmt.Sprintf("SNMP observation stale (age %v); unverified", snmpAge.Round(time.Millisecond)),
-				UpdatedAt:        rawSNMP.UpdatedAt,
-			}
-		} else {
-			snmpSample.Available = rawSNMP.Online
-			if snmpErr != nil && snmpSample.Error == "" {
-				snmpSample.Error = snmpErr.Error()
-			}
+		// Reject stale observation from active reconciliation evidence:
+		// Strip all fault flags, paper status, consumable levels, and error text fault inference.
+		reconciledSNMP = contracts.PrinterHealth{
+			Online:          false,
+			State:           "UNKNOWN",
+			PaperTrayStatus: "UNKNOWN",
+			ErrorMessage:     fmt.Sprintf("SNMP observation stale (age %v); unverified", snmpAge.Round(time.Millisecond)),
+			UpdatedAt:        rawSNMP.UpdatedAt,
 		}
+	} else if snmpErr != nil {
+		snmpSample.Available = false
+		snmpSample.Error = snmpErr.Error()
+
+		// Reject failed SNMP query from active reconciliation evidence:
+		// Strip all fault flags, paper status, consumable levels, and error text fault inference.
+		reconciledSNMP = contracts.PrinterHealth{
+			Online:          false,
+			State:           "UNKNOWN",
+			PaperTrayStatus: "UNKNOWN",
+			ErrorMessage:     snmpErr.Error(),
+			UpdatedAt:        rawSNMP.UpdatedAt,
+		}
+	} else {
+		snmpSample.Available = rawSNMP.Online
 	}
 
 	// Analyze IPP sample
@@ -462,10 +512,15 @@ func (c *Client) RunShadowHealthCheck(ctx context.Context) *ShadowHealthReport {
 		}
 	}
 
-	// 5. Reconcile observations using explicit evaluation timestamp
+	// 5. Reconcile observations using explicit evaluation timestamp and source validity
 	// Stale CUPS/SNMP observations have been sanitized of fault flags and active health claims.
 	// Raw observations are preserved separately in rawCUPS/rawSNMP/rawIPP for diagnostics.
-	reconciled := printer.ReconcilePrinterHealth(reconciledCUPS, rawIPP, reconciledSNMP, evalTime)
+	validity := printer.SourceValidity{
+		CUPSValid:   cupsValid,
+		SNMPValid:   snmpValid,
+		SNMPQueried: snmpQueried,
+	}
+	reconciled := printer.ReconcilePrinterHealth(reconciledCUPS, rawIPP, reconciledSNMP, evalTime, validity)
 
 	// 6. Compare against cached production health baseline ONLY
 	// Do NOT call c.healthPoller(); compare only against c.LatestProductionHealth().

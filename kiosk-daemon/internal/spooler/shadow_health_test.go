@@ -1035,3 +1035,407 @@ func TestShadowHealth_ReportImmutability(t *testing.T) {
 		}
 	}
 }
+
+func TestShadowHealth_CUPSUnknownVsOfflineContrasts(t *testing.T) {
+	evalTime := time.Now().UTC()
+	staleTimestamp := evalTime.Add(-50 * time.Second)
+	freshTimestamp := evalTime.Add(-1 * time.Second)
+
+	mockIPP := func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+		return printer.IPPPrinterStateResult{
+			Source:            printer.CapabilitySourceCUPSQueue,
+			Queue:             queue,
+			State:             printer.IPPPrinterStateIdle,
+			AcceptingJobs:     printer.AcceptingJobsAccepting,
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        freshTimestamp,
+		}, nil
+	}
+
+	t.Run("stale_cups_yields_unknown_not_offline", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "OFFLINE",
+					ErrorMessage:    "printer disabled",
+					PaperTrayStatus: "UNKNOWN",
+					UpdatedAt:       staleTimestamp,
+				}
+			},
+			MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "UNKNOWN",
+					PaperTrayStatus: "UNKNOWN",
+				}
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if !report.CUPSSample.Stale {
+			t.Error("expected CUPS sample to be marked stale")
+		}
+		if report.CUPSSample.Available {
+			t.Error("expected stale CUPS sample to have Available=false")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("CRITICAL: stale CUPS must mean UNKNOWN, got %q", report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false for stale CUPS")
+		}
+		for _, f := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(f), "offline") {
+				t.Errorf("CRITICAL: stale CUPS must not create queue-offline blocking fault, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+		for _, d := range report.Reconciled.DiagnosticDetails {
+			if d.Code == printer.FaultQueueOffline {
+				t.Errorf("CRITICAL: stale CUPS must not emit FaultQueueOffline diagnostic item")
+			}
+		}
+		if report.RawCUPS.State != "OFFLINE" || report.RawCUPS.UpdatedAt != staleTimestamp {
+			t.Errorf("expected RawCUPS to preserve original raw observation, got %+v", report.RawCUPS)
+		}
+	})
+
+	t.Run("missing_cups_yields_unknown_not_offline", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "UNKNOWN",
+					PaperTrayStatus: "UNKNOWN",
+					UpdatedAt:       time.Time{}, // zero timestamp = missing
+				}
+			},
+			MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "UNKNOWN",
+					PaperTrayStatus: "UNKNOWN",
+				}
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if !report.CUPSSample.Stale {
+			t.Error("expected missing CUPS timestamp to be marked stale")
+		}
+		if report.CUPSSample.Available {
+			t.Error("expected missing CUPS timestamp to have Available=false")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("CRITICAL: missing CUPS must mean UNKNOWN, got %q", report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false for missing CUPS")
+		}
+		for _, f := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(f), "offline") {
+				t.Errorf("CRITICAL: missing CUPS must not create queue-offline blocking fault, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+		for _, d := range report.Reconciled.DiagnosticDetails {
+			if d.Code == printer.FaultQueueOffline {
+				t.Errorf("CRITICAL: missing CUPS must not emit FaultQueueOffline diagnostic item")
+			}
+		}
+	})
+
+	t.Run("failed_cups_yields_unknown_not_offline", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "UNKNOWN",
+					ErrorMessage:    "lpstat: command not found",
+					PaperTrayStatus: "UNKNOWN",
+					UpdatedAt:       freshTimestamp, // fresh timestamp, but query failed!
+				}
+			},
+			MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "UNKNOWN",
+					PaperTrayStatus: "UNKNOWN",
+				}
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Available {
+			t.Error("expected failed CUPS query to have Available=false")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Error("expected query error to be recorded for failed CUPS")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("CRITICAL: failed CUPS query must mean UNKNOWN, got %q", report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false for failed CUPS query")
+		}
+		for _, f := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(f), "offline") {
+				t.Errorf("CRITICAL: failed CUPS query must not create queue-offline blocking fault, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+		for _, d := range report.Reconciled.DiagnosticDetails {
+			if d.Code == printer.FaultQueueOffline {
+				t.Errorf("CRITICAL: failed CUPS query must not emit FaultQueueOffline diagnostic item")
+			}
+		}
+		if report.RawCUPS.ErrorMessage != "lpstat: command not found" {
+			t.Errorf("expected RawCUPS to preserve original error message, got %+v", report.RawCUPS)
+		}
+	})
+
+	t.Run("genuinely_offline_cups_preserves_offline_fault", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "OFFLINE",
+					ErrorMessage:    "printer disabled",
+					PaperTrayStatus: "UNKNOWN",
+					UpdatedAt:       freshTimestamp, // fresh timestamp, successful observation
+				}
+			},
+			MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:          false,
+					State:           "UNKNOWN",
+					PaperTrayStatus: "UNKNOWN",
+				}
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Stale {
+			t.Error("expected fresh CUPS offline observation to NOT be stale")
+		}
+		if !report.CUPSSample.Available {
+			t.Error("expected fresh CUPS offline observation to be Available=true")
+		}
+		if len(report.QueryErrors) != 0 {
+			t.Errorf("expected no query errors for successful offline query, got %v", report.QueryErrors)
+		}
+		if report.Reconciled.EffectiveState != "OFFLINE" {
+			t.Errorf("CRITICAL: genuine fresh CUPS offline observation must yield EffectiveState OFFLINE, got %q", report.Reconciled.EffectiveState)
+		}
+		if report.Reconciled.Online {
+			t.Error("expected Reconciled.Online=false for genuine offline CUPS")
+		}
+
+		hasOfflineFault := false
+		for _, f := range report.Reconciled.BlockingFaults {
+			if f == "CUPS queue offline" || strings.Contains(strings.ToLower(f), "offline") {
+				hasOfflineFault = true
+				break
+			}
+		}
+		if !hasOfflineFault {
+			t.Errorf("CRITICAL: genuine fresh CUPS offline observation must have queue-offline blocking fault, got %v", report.Reconciled.BlockingFaults)
+		}
+
+		hasOfflineDiag := false
+		for _, d := range report.Reconciled.DiagnosticDetails {
+			if d.Code == printer.FaultQueueOffline {
+				hasOfflineDiag = true
+				if d.Severity != "BLOCKING" {
+					t.Errorf("expected FaultQueueOffline to be BLOCKING, got %s", d.Severity)
+				}
+				break
+			}
+		}
+		if !hasOfflineDiag {
+			t.Errorf("CRITICAL: genuine fresh CUPS offline observation must emit FaultQueueOffline diagnostic item")
+		}
+		if report.RawCUPS.State != "OFFLINE" || report.RawCUPS.ErrorMessage != "printer disabled" {
+			t.Errorf("expected RawCUPS to preserve original raw observation, got %+v", report.RawCUPS)
+		}
+	})
+}
+
+func TestShadowHealth_SNMPFailuresAndStaleness(t *testing.T) {
+	evalTime := time.Now().UTC()
+	staleTimestamp := evalTime.Add(-50 * time.Second)
+	freshTimestamp := evalTime.Add(-1 * time.Second)
+
+	mockCUPS := func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+		return contracts.PrinterHealth{
+			Online:          true,
+			State:           "IDLE",
+			PaperTrayStatus: "OK",
+			UpdatedAt:       freshTimestamp,
+		}
+	}
+
+	mockIPP := func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+		return printer.IPPPrinterStateResult{
+			Source:            printer.CapabilitySourceCUPSQueue,
+			Queue:             queue,
+			State:             printer.IPPPrinterStateIdle,
+			AcceptingJobs:     printer.AcceptingJobsAccepting,
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        freshTimestamp,
+		}, nil
+	}
+
+	t.Run("failed_snmp_with_fresh_timestamp_suppresses_fault_flags", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			MockCUPSHealth:     mockCUPS,
+			MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:            false,
+					State:             "UNKNOWN",
+					ErrorMessage:      "snmp: connection refused",
+					PaperJam:          true, // fresh timestamp and fault flag, but query failed!
+					CoverOpen:         true,
+					OutputBinFull:     true,
+					PaperTrayStatus:   "EMPTY",
+					TonerLevelPercent: 5,
+					DrumLifePercent:   10,
+					UpdatedAt:         freshTimestamp,
+				}
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.SNMPSample.Available {
+			t.Error("expected failed SNMP query to have Available=false")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Error("expected query error to be recorded for failed SNMP")
+		}
+
+		// Reconciled health MUST NOT accept fault flags from failed SNMP query
+		if report.Reconciled.PaperJam {
+			t.Error("CRITICAL: failed SNMP query contributed paper jam flag!")
+		}
+		if report.Reconciled.CoverOpen {
+			t.Error("CRITICAL: failed SNMP query contributed cover open flag!")
+		}
+		if report.Reconciled.OutputBinFull {
+			t.Error("CRITICAL: failed SNMP query contributed output bin full flag!")
+		}
+		if report.Reconciled.TonerLevelPercent != 0 {
+			t.Errorf("CRITICAL: failed SNMP query contributed toner level %d", report.Reconciled.TonerLevelPercent)
+		}
+		if len(report.Reconciled.BlockingFaults) > 0 {
+			t.Errorf("expected no blocking faults from failed SNMP query, got %v", report.Reconciled.BlockingFaults)
+		}
+		if report.Reconciled.EffectiveState != "IDLE" {
+			t.Errorf("expected EffectiveState IDLE from healthy CUPS/IPP, got %q", report.Reconciled.EffectiveState)
+		}
+
+		// Raw SNMP must preserve original observation for diagnostics
+		if !report.RawSNMP.PaperJam || report.RawSNMP.ErrorMessage != "snmp: connection refused" {
+			t.Errorf("expected RawSNMP to preserve original raw flags and error, got %+v", report.RawSNMP)
+		}
+	})
+
+	t.Run("stale_snmp_fault_flags_suppressed", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			MockCUPSHealth:     mockCUPS,
+			MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				return contracts.PrinterHealth{
+					Online:            true,
+					State:             "ERROR",
+					PaperJam:          true, // stale fault flag
+					CoverOpen:         true,
+					OutputBinFull:     true,
+					PaperTrayStatus:   "EMPTY",
+					TonerLevelPercent: 12,
+					DrumLifePercent:   15,
+					UpdatedAt:         staleTimestamp,
+				}
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if !report.SNMPSample.Stale {
+			t.Error("expected SNMP sample to be marked stale")
+		}
+		if report.SNMPSample.Available {
+			t.Error("expected stale SNMP sample to have Available=false")
+		}
+
+		// Reconciled health MUST NOT accept stale fault flags
+		if report.Reconciled.PaperJam {
+			t.Error("CRITICAL: stale SNMP sample contributed paper jam flag!")
+		}
+		if report.Reconciled.CoverOpen {
+			t.Error("CRITICAL: stale SNMP sample contributed cover open flag!")
+		}
+		if report.Reconciled.OutputBinFull {
+			t.Error("CRITICAL: stale SNMP sample contributed output bin full flag!")
+		}
+		if report.Reconciled.TonerLevelPercent != 0 {
+			t.Errorf("CRITICAL: stale SNMP sample contributed toner level %d", report.Reconciled.TonerLevelPercent)
+		}
+		if len(report.Reconciled.BlockingFaults) > 0 {
+			t.Errorf("expected no blocking faults from stale SNMP sample, got %v", report.Reconciled.BlockingFaults)
+		}
+		if report.Reconciled.EffectiveState != "IDLE" {
+			t.Errorf("expected EffectiveState IDLE from healthy CUPS/IPP, got %q", report.Reconciled.EffectiveState)
+		}
+
+		// Raw SNMP must preserve original observation for diagnostics
+		if !report.RawSNMP.PaperJam || report.RawSNMP.UpdatedAt != staleTimestamp {
+			t.Errorf("expected RawSNMP to preserve original raw flags and timestamp, got %+v", report.RawSNMP)
+		}
+	})
+}

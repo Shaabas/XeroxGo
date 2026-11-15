@@ -150,6 +150,15 @@ func (r ReconciledHealthResult) IsReady() bool {
 	return r.Online && len(r.BlockingFaults) == 0 && (r.EffectiveState == "IDLE" || r.EffectiveState == "READY")
 }
 
+// SourceValidity specifies explicit validity and availability for CUPS and SNMP observations.
+// When specified, invalid sources are treated as UNKNOWN and rejected from authoritative
+// evidence (preventing failed, missing or stale queries from creating queue-offline or hardware faults).
+type SourceValidity struct {
+	CUPSValid   bool `json:"cups_valid"`
+	SNMPValid   bool `json:"snmp_valid"`
+	SNMPQueried bool `json:"snmp_queried,omitempty"`
+}
+
 // ReconcilePrinterHealth performs a pure, multi-source health reconciliation across
 // CUPS queue health, IPP printer-state attributes, and SNMP hardware telemetry.
 //
@@ -182,12 +191,37 @@ func ReconcilePrinterHealth(
 	ipp IPPPrinterStateResult,
 	snmp contracts.PrinterHealth,
 	evalTime time.Time,
+	validity ...SourceValidity,
 ) ReconciledHealthResult {
 	blockingFaults := make([]string, 0)
 	nonblockingWarnings := make([]string, 0)
 	unknownConditions := make([]string, 0)
 	contradictions := make([]string, 0)
 	diagnosticDetails := make([]DiagnosticItem, 0)
+
+	cupsValid := true
+	snmpValid := snmp.Online
+
+	if len(validity) > 0 {
+		cupsValid = validity[0].CUPSValid
+		snmpValid = validity[0].SNMPValid
+	} else {
+		// When validity is not explicitly passed, infer from observation timestamps and state:
+		if !evalTime.IsZero() && !cups.UpdatedAt.IsZero() {
+			age := evalTime.Sub(cups.UpdatedAt)
+			if age > MaxIPPObservationAge || age < -FutureTimestampTolerance {
+				cupsValid = false
+			}
+		} else if cups.UpdatedAt.IsZero() && (cups.State == "UNKNOWN" || cups.State == "") {
+			cupsValid = false
+		}
+		if !evalTime.IsZero() && !snmp.UpdatedAt.IsZero() {
+			age := evalTime.Sub(snmp.UpdatedAt)
+			if age > MaxIPPObservationAge || age < -FutureTimestampTolerance {
+				snmpValid = false
+			}
+		}
+	}
 
 	// Preserve raw IPP reasons for auditing
 	rawIPPReasons := make([]string, 0)
@@ -314,87 +348,100 @@ func ReconcilePrinterHealth(
 	// ---------------------------------------------------------
 	cupsFaults := make([]string, 0)
 	cupsWarnings := make([]string, 0)
-	cupsLowerErr := strings.ToLower(cups.ErrorMessage)
+	var cupsJam, cupsCover, cupsOutputFull, cupsPaperEmpty, cupsPaperLow bool
 
-	cupsJam := cups.PaperJam || strings.Contains(cupsLowerErr, "jam")
-	cupsCover := cups.CoverOpen || strings.Contains(cupsLowerErr, "door open") || strings.Contains(cupsLowerErr, "cover open")
-	cupsOutputFull := cups.OutputBinFull || strings.Contains(cupsLowerErr, "output bin full")
-	cupsPaperEmpty := cups.PaperTrayStatus == "EMPTY" ||
-		strings.Contains(cupsLowerErr, "out of paper") ||
-		strings.Contains(cupsLowerErr, "media-empty") ||
-		strings.Contains(cupsLowerErr, "no paper")
-	cupsPaperLow := cups.PaperTrayStatus == "LOW" || strings.Contains(cupsLowerErr, "paper low")
+	if !cupsValid {
+		unknownConditions = appendUnique(unknownConditions, "CUPS telemetry unavailable or unverified")
+		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+			Category: CategoryUnknown,
+			Code:     UnknownQueueState,
+			Message:  "CUPS queue telemetry is unavailable, stale, or unverified",
+			Source:   SourceCUPS,
+			Severity: "INFO",
+		})
+	} else {
+		cupsLowerErr := strings.ToLower(cups.ErrorMessage)
 
-	if cupsJam {
-		cupsFaults = append(cupsFaults, "paper jam")
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryFault,
-			Code:     FaultPaperJam,
-			Message:  "Paper jam detected via CUPS queue",
-			Source:   SourceCUPS,
-			Severity: "BLOCKING",
-		})
-	}
-	if cupsCover {
-		cupsFaults = append(cupsFaults, "cover or door open")
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryFault,
-			Code:     FaultCoverOpen,
-			Message:  "Cover or door open detected via CUPS queue",
-			Source:   SourceCUPS,
-			Severity: "BLOCKING",
-		})
-	}
-	if cupsOutputFull {
-		cupsFaults = append(cupsFaults, "output bin full")
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryFault,
-			Code:     FaultOutputBinFull,
-			Message:  "Output bin full detected via CUPS queue",
-			Source:   SourceCUPS,
-			Severity: "BLOCKING",
-		})
-	}
-	if cupsPaperEmpty {
-		cupsFaults = append(cupsFaults, "out of paper / media empty")
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryFault,
-			Code:     FaultMediaEmpty,
-			Message:  "Out of paper detected via CUPS queue",
-			Source:   SourceCUPS,
-			Severity: "BLOCKING",
-		})
-	}
-	if cupsPaperLow {
-		cupsWarnings = append(cupsWarnings, "paper tray low")
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryWarning,
-			Code:     WarningLowPaper,
-			Message:  "Paper tray low reported via CUPS queue",
-			Source:   SourceCUPS,
-			Severity: "NONBLOCKING",
-		})
-	}
-	if cups.State == "ERROR" && len(cupsFaults) == 0 {
-		errDesc := fmt.Sprintf("CUPS queue error: %s", cups.ErrorMessage)
-		cupsFaults = append(cupsFaults, errDesc)
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryFault,
-			Code:     FaultHardwareError,
-			Message:  errDesc,
-			Source:   SourceCUPS,
-			Severity: "BLOCKING",
-		})
-	}
-	if !cups.Online {
-		cupsFaults = append(cupsFaults, "CUPS queue offline")
-		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
-			Category: CategoryFault,
-			Code:     FaultQueueOffline,
-			Message:  "CUPS queue is offline",
-			Source:   SourceCUPS,
-			Severity: "BLOCKING",
-		})
+		cupsJam = cups.PaperJam || strings.Contains(cupsLowerErr, "jam")
+		cupsCover = cups.CoverOpen || strings.Contains(cupsLowerErr, "door open") || strings.Contains(cupsLowerErr, "cover open")
+		cupsOutputFull = cups.OutputBinFull || strings.Contains(cupsLowerErr, "output bin full")
+		cupsPaperEmpty = cups.PaperTrayStatus == "EMPTY" ||
+			strings.Contains(cupsLowerErr, "out of paper") ||
+			strings.Contains(cupsLowerErr, "media-empty") ||
+			strings.Contains(cupsLowerErr, "no paper")
+		cupsPaperLow = cups.PaperTrayStatus == "LOW" || strings.Contains(cupsLowerErr, "paper low")
+
+		if cupsJam {
+			cupsFaults = append(cupsFaults, "paper jam")
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryFault,
+				Code:     FaultPaperJam,
+				Message:  "Paper jam detected via CUPS queue",
+				Source:   SourceCUPS,
+				Severity: "BLOCKING",
+			})
+		}
+		if cupsCover {
+			cupsFaults = append(cupsFaults, "cover or door open")
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryFault,
+				Code:     FaultCoverOpen,
+				Message:  "Cover or door open detected via CUPS queue",
+				Source:   SourceCUPS,
+				Severity: "BLOCKING",
+			})
+		}
+		if cupsOutputFull {
+			cupsFaults = append(cupsFaults, "output bin full")
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryFault,
+				Code:     FaultOutputBinFull,
+				Message:  "Output bin full detected via CUPS queue",
+				Source:   SourceCUPS,
+				Severity: "BLOCKING",
+			})
+		}
+		if cupsPaperEmpty {
+			cupsFaults = append(cupsFaults, "out of paper / media empty")
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryFault,
+				Code:     FaultMediaEmpty,
+				Message:  "Out of paper detected via CUPS queue",
+				Source:   SourceCUPS,
+				Severity: "BLOCKING",
+			})
+		}
+		if cupsPaperLow {
+			cupsWarnings = append(cupsWarnings, "paper tray low")
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryWarning,
+				Code:     WarningLowPaper,
+				Message:  "Paper tray low reported via CUPS queue",
+				Source:   SourceCUPS,
+				Severity: "NONBLOCKING",
+			})
+		}
+		if cups.State == "ERROR" && len(cupsFaults) == 0 {
+			errDesc := fmt.Sprintf("CUPS queue error: %s", cups.ErrorMessage)
+			cupsFaults = append(cupsFaults, errDesc)
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryFault,
+				Code:     FaultHardwareError,
+				Message:  errDesc,
+				Source:   SourceCUPS,
+				Severity: "BLOCKING",
+			})
+		}
+		if !cups.Online {
+			cupsFaults = append(cupsFaults, "CUPS queue offline")
+			diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+				Category: CategoryFault,
+				Code:     FaultQueueOffline,
+				Message:  "CUPS queue is offline",
+				Source:   SourceCUPS,
+				Severity: "BLOCKING",
+			})
+		}
 	}
 
 	// ---------------------------------------------------------
@@ -404,7 +451,16 @@ func ReconcilePrinterHealth(
 	snmpWarnings := make([]string, 0)
 	var snmpJam, snmpCover, snmpOutputFull, snmpPaperEmpty, snmpPaperLow bool
 
-	if snmp.Online {
+	if !snmpValid {
+		unknownConditions = appendUnique(unknownConditions, "SNMP telemetry unavailable or unverified")
+		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
+			Category: CategoryUnknown,
+			Code:     UnknownSNMP,
+			Message:  "SNMP hardware telemetry is unavailable, stale, or unverified",
+			Source:   SourceSNMP,
+			Severity: "INFO",
+		})
+	} else if snmp.Online {
 		snmpLowerErr := strings.ToLower(snmp.ErrorMessage)
 		snmpJam = snmp.PaperJam || strings.Contains(snmpLowerErr, "jam")
 		snmpCover = snmp.CoverOpen || strings.Contains(snmpLowerErr, "door open") || strings.Contains(snmpLowerErr, "cover open")
@@ -705,11 +761,11 @@ func ReconcilePrinterHealth(
 	// ---------------------------------------------------------
 	// 5. Synthesize Canonical Physical Flags & Faults
 	// ---------------------------------------------------------
-	paperJam := cupsJam || (snmp.Online && snmpJam) || ippJam
-	coverOpen := cupsCover || (snmp.Online && snmpCover) || ippCover
-	outputBinFull := cupsOutputFull || (snmp.Online && snmpOutputFull) || ippOutputFull
-	paperEmpty := cupsPaperEmpty || (snmp.Online && snmpPaperEmpty) || ippPaperEmpty
-	paperLow := !paperEmpty && (cupsPaperLow || (snmp.Online && snmpPaperLow) || ippPaperLow)
+	paperJam := cupsJam || (snmpValid && snmp.Online && snmpJam) || ippJam
+	coverOpen := cupsCover || (snmpValid && snmp.Online && snmpCover) || ippCover
+	outputBinFull := cupsOutputFull || (snmpValid && snmp.Online && snmpOutputFull) || ippOutputFull
+	paperEmpty := cupsPaperEmpty || (snmpValid && snmp.Online && snmpPaperEmpty) || ippPaperEmpty
+	paperLow := !paperEmpty && (cupsPaperLow || (snmpValid && snmp.Online && snmpPaperLow) || ippPaperLow)
 
 	// PaperTrayStatus resolution
 	var paperTrayStatus string
@@ -717,9 +773,9 @@ func ReconcilePrinterHealth(
 		paperTrayStatus = "EMPTY"
 	} else if paperLow {
 		paperTrayStatus = "LOW"
-	} else if snmp.Online && snmp.PaperTrayStatus == "OK" {
+	} else if snmpValid && snmp.Online && snmp.PaperTrayStatus == "OK" {
 		paperTrayStatus = "OK"
-	} else if cups.PaperTrayStatus == "OK" {
+	} else if cupsValid && cups.PaperTrayStatus == "OK" {
 		paperTrayStatus = "OK"
 	} else {
 		paperTrayStatus = "UNKNOWN"
@@ -798,7 +854,7 @@ func ReconcilePrinterHealth(
 	// ---------------------------------------------------------
 	// 6. Cross-Subsystem Contradictions & Observation Mismatches
 	// ---------------------------------------------------------
-	if ippValid {
+	if ippValid && cupsValid {
 		// Definite contradiction: CUPS PRINTING vs IPP explicitly reporting idle/stopped
 		if cups.State == "PRINTING" && (ipp.State == IPPPrinterStateIdle || ipp.State == IPPPrinterStateStopped) {
 			cMsg := fmt.Sprintf("contradiction: CUPS reports queue PRINTING while IPP explicitly reports printer-state %q", ipp.State)
@@ -850,7 +906,7 @@ func ReconcilePrinterHealth(
 	}
 
 	// Definite contradiction: CUPS PRINTING vs confirmed physical hardware faults
-	if cups.State == "PRINTING" && (paperJam || coverOpen || outputBinFull || paperEmpty) {
+	if cupsValid && cups.State == "PRINTING" && (paperJam || coverOpen || outputBinFull || paperEmpty) {
 		cMsg := "contradiction: CUPS reports queue PRINTING while physical hardware fault is confirmed"
 		contradictions = appendUnique(contradictions, cMsg)
 		diagnosticDetails = append(diagnosticDetails, DiagnosticItem{
@@ -863,7 +919,7 @@ func ReconcilePrinterHealth(
 	}
 
 	// Discrepancies between IPP and SNMP
-	if ippValid && snmp.Online {
+	if ippValid && snmpValid && snmp.Online {
 		// Definite contradiction: explicit PaperTrayStatus == "OK" vs media-empty
 		if ippPaperEmpty && snmp.PaperTrayStatus == "OK" {
 			cMsg := "contradiction: IPP reports media empty while SNMP explicitly reports paper tray OK"
@@ -959,7 +1015,7 @@ func ReconcilePrinterHealth(
 	}
 
 	// Discrepancies between CUPS and SNMP
-	if snmp.Online {
+	if cupsValid && snmpValid && snmp.Online {
 		// Definite contradiction: explicit PaperTrayStatus == "OK" vs EMPTY
 		if cupsPaperEmpty && snmp.PaperTrayStatus == "OK" {
 			cMsg := "contradiction: CUPS reports paper tray EMPTY while SNMP explicitly reports paper tray OK"
@@ -1017,9 +1073,9 @@ func ReconcilePrinterHealth(
 	var online bool
 
 	hasHardwareFault := paperJam || coverOpen || outputBinFull || paperEmpty ||
-		(snmp.Online && (snmp.State == "ERROR" || snmpJam || snmpCover || snmpOutputFull || snmpPaperEmpty)) ||
+		(snmpValid && snmp.Online && (snmp.State == "ERROR" || snmpJam || snmpCover || snmpOutputFull || snmpPaperEmpty)) ||
 		(ippValid && (ipp.HasHardwareFault || ippJam || ippCover || ippOutputFull || ippPaperEmpty)) ||
-		(cups.State == "ERROR")
+		(cupsValid && cups.State == "ERROR")
 
 	if evalTime.IsZero() {
 		// Rule 3: For zero evalTime, return deterministic UNKNOWN/invalid-time diagnostics
@@ -1030,25 +1086,30 @@ func ReconcilePrinterHealth(
 		// Confirmed critical hardware fault takes precedence over all execution states
 		effectiveState = "ERROR"
 		online = false
-	} else if !cups.Online || cups.State == "OFFLINE" {
+	} else if cupsValid && (!cups.Online || cups.State == "OFFLINE") {
+		// Genuine, verified CUPS offline observation
 		effectiveState = "OFFLINE"
 		online = false
 	} else if len(blockingFaults) > 0 {
 		effectiveState = "ERROR"
 		online = false
-	} else if cups.State == "PRINTING" {
+	} else if cupsValid && cups.State == "PRINTING" {
 		effectiveState = "PRINTING"
 		online = true
-	} else if snmp.Online && snmp.State == "WARMING_UP" {
+	} else if cupsValid && snmpValid && snmp.Online && snmp.State == "WARMING_UP" {
 		effectiveState = "WARMING_UP"
 		online = true
-	} else if cups.State == "READY" || cups.State == "IDLE" {
+	} else if cupsValid && (cups.State == "READY" || cups.State == "IDLE") {
 		effectiveState = "IDLE"
 		online = true
-	} else if cups.State != "" && cups.State != "UNKNOWN" {
+	} else if cupsValid && cups.State != "" && cups.State != "UNKNOWN" {
 		effectiveState = cups.State
 		online = cups.Online
-	} else if snmp.Online && snmp.State == "IDLE" {
+	} else if !cupsValid {
+		// Unavailable, stale, missing or failed CUPS observation means UNKNOWN, not confirmed QUEUE_OFFLINE
+		effectiveState = "UNKNOWN"
+		online = false
+	} else if snmpValid && snmp.Online && snmp.State == "IDLE" {
 		effectiveState = "IDLE"
 		online = cups.Online
 	} else if ippValid && ipp.State == IPPPrinterStateIdle {
@@ -1062,13 +1123,16 @@ func ReconcilePrinterHealth(
 	// ---------------------------------------------------------
 	// 8. Consumables & Physical Telemetry
 	// ---------------------------------------------------------
-	estimatedSheets := cups.EstimatedSheets
-	if estimatedSheets == 0 && snmp.EstimatedSheets > 0 {
+	estimatedSheets := 0
+	if cupsValid {
+		estimatedSheets = cups.EstimatedSheets
+	}
+	if estimatedSheets == 0 && snmpValid && snmp.Online && snmp.EstimatedSheets > 0 {
 		estimatedSheets = snmp.EstimatedSheets
 	}
 
 	var tonerPct, drumPct int
-	if snmp.Online {
+	if snmpValid && snmp.Online {
 		tonerPct = snmp.TonerLevelPercent
 		drumPct = snmp.DrumLifePercent
 	}
@@ -1076,10 +1140,15 @@ func ReconcilePrinterHealth(
 	// ---------------------------------------------------------
 	// 9. Source Attribution
 	// ---------------------------------------------------------
+	snmpQueried := snmp.Online || snmp.ErrorMessage != "" || !snmp.UpdatedAt.IsZero()
+	if len(validity) > 0 && validity[0].SNMPQueried {
+		snmpQueried = true
+	}
+
 	attribution := SourceAttribution{
 		CUPS: SubsystemAttribution{
 			Queried:    true,
-			Available:  cups.Online,
+			Available:  cupsValid,
 			State:      cups.State,
 			Faults:     cupsFaults,
 			Warnings:   cupsWarnings,
@@ -1094,8 +1163,8 @@ func ReconcilePrinterHealth(
 			RawDetails: ipp.Error,
 		},
 		SNMP: SubsystemAttribution{
-			Queried:    snmp.Online || snmp.ErrorMessage != "",
-			Available:  snmp.Online,
+			Queried:    snmpQueried,
+			Available:  snmpValid && snmp.Online,
 			State:      snmp.State,
 			Faults:     snmpFaults,
 			Warnings:   snmpWarnings,
