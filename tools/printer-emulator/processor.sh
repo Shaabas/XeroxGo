@@ -78,32 +78,34 @@ fi
 # Allows tests to synchronize fault injection with a confirmed active job rather than fixed sleep assumptions.
 IPP_JOB_NUM="${IPP_JOB_ID:-unknown}"
 
-cleanup_active_marker() {
+write_active_marker() {
+    local target_state="$1"
     if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ "$JOB_NAME" != "XeroxGoFaultSync" ]] && [[ "$USER_NAME" != "XeroxGoFaultSync" ]]; then
-        cat << STATE_EOF > "$EMU_JOB_ACTIVE_FILE"
+        local marker_dir tmp_marker
+        marker_dir="$(dirname "$EMU_JOB_ACTIVE_FILE")"
+        if [[ -d "$marker_dir" ]]; then
+            tmp_marker="${marker_dir}/.job_active_tmp_${$}_${RANDOM}"
+            cat << STATE_EOF > "$tmp_marker"
 JOB_NAME=${JOB_NAME}
 IPP_JOB_ID=${IPP_JOB_NUM}
 USER_NAME=${USER_NAME}
 PID=$$
-STATE=completed
+STATE=${target_state}
 TIMESTAMP=$(date +%s%N)
 STATE_EOF
+            mv -f "$tmp_marker" "$EMU_JOB_ACTIVE_FILE"
+        fi
     fi
+}
+
+cleanup_active_marker() {
+    write_active_marker "completed"
 }
 trap cleanup_active_marker EXIT INT TERM
 
 if [[ "$JOB_NAME" != "XeroxGoFaultSync" ]] && [[ "$USER_NAME" != "XeroxGoFaultSync" ]]; then
-    # 1. Announce active job processing with authoritative job-specific marker
-    if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]]; then
-        cat << STATE_EOF > "$EMU_JOB_ACTIVE_FILE"
-JOB_NAME=${JOB_NAME}
-IPP_JOB_ID=${IPP_JOB_NUM}
-USER_NAME=${USER_NAME}
-PID=$$
-STATE=processing
-TIMESTAMP=$(date +%s%N)
-STATE_EOF
-    fi
+    # 1. Announce active job processing with authoritative job-specific marker written atomically
+    write_active_marker "processing"
 
     # 2. If a gate file is set and exists, hold execution until release file is created (with safety timeout)
     if [[ -n "${EMU_JOB_GATE_FILE:-}" ]] && [[ -f "$EMU_JOB_GATE_FILE" ]]; then

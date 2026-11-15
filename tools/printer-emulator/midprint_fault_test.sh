@@ -129,7 +129,7 @@ export SNMP_STATE_FILE="$TEST_SNMP_STATE"
 QUEUE_CREATED=false
 CAPTURED_JOB_IDS=()
 
-# Authoritative validation of active-job marker and actual CUPS job state (Requirements 6, 7, 8)
+# Authoritative validation of active-job marker and actual CUPS job state (Requirements 5, 6, 7, 8)
 validate_active_job() {
     local marker="$1"
     local expected_job="$2"
@@ -140,33 +140,54 @@ validate_active_job() {
         return 1
     fi
 
-    local job_name pid state
+    local job_name pid state ipp_id
     job_name=$(sed -n 's/^JOB_NAME=//p' "$marker" | head -n 1)
+    ipp_id=$(sed -n 's/^IPP_JOB_ID=//p' "$marker" | head -n 1)
     pid=$(sed -n 's/^PID=//p' "$marker" | head -n 1)
     state=$(sed -n 's/^STATE=//p' "$marker" | head -n 1)
 
-    # 1. Reject mismatched job ID (Requirements 6, 7)
+    # 1. Reject incomplete marker (Requirement 10)
+    if [[ -z "$job_name" ]] || [[ -z "$pid" ]] || [[ -z "$state" ]]; then
+        return 1
+    fi
+
+    # 2. Reject mismatched job ID (Requirements 6, 7)
     if [[ "$job_name" != "$expected_job" ]]; then
         return 2
     fi
 
-    # 2. Reject completed or non-processing markers (Requirement 7)
+    # 3. Reject completed or non-processing markers (Requirement 7)
     if [[ "$state" != "processing" ]]; then
         return 3
     fi
 
-    # 3. Validate processor PID is active and alive (Requirements 7, 8)
-    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    # 4. Validate processor PID is active and alive (Requirements 7, 8)
+    if ! kill -0 "$pid" 2>/dev/null; then
         return 4
     fi
 
-    # 4. Validate actual CUPS job state before injection (Requirement 8)
+    # 5. Validate PID belongs to expected processor process, rejecting unrelated live processes (Requirements 5, 10)
+    local pid_cmdline pid_comm
+    pid_cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+    pid_comm=$(cat "/proc/${pid}/comm" 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null || true)
+    if [[ ! "$pid_cmdline" =~ processor\.sh ]] && [[ ! "$pid_comm" =~ processor ]]; then
+        return 5
+    fi
+
+    # 6. Validate IPP job identity where reliably available (Requirement 7)
+    if [[ -n "$ipp_id" ]] && [[ "$ipp_id" != "unknown" ]]; then
+        if ! [[ "$ipp_id" =~ ^[0-9]+$ ]] || [[ "$ipp_id" -le 0 ]]; then
+            return 6
+        fi
+    fi
+
+    # 7. Require corresponding CUPS job to be strictly processing before injection (Requirements 8, 10)
     if [[ -n "$cups_id" ]]; then
         local job_num="${cups_id##*-}"
         local c_state
         c_state=$(ipptool -tv "ipp://localhost:631/jobs/${job_num}" get-job-attributes.test 2>&1 | grep "job-state (enum)" || true)
-        if ! echo "$c_state" | grep -q -E "processing|pending"; then
-            return 5
+        if ! echo "$c_state" | grep -q "processing"; then
+            return 7
         fi
     fi
 
@@ -272,7 +293,7 @@ if [[ -z "$captured_cups_id" ]]; then
     fail "Test 3: Failed to capture CUPS job ID: $lp_out"
 fi
 
-# Requirements 6, 7, 8: Wait for confirmed active job with authoritative marker and CUPS state validation
+# Requirements 5, 6, 7, 8: Wait for confirmed active job with authoritative marker, processor PID, and CUPS state validation
 active=false
 for _ in {1..50}; do
     if validate_active_job "$TEST_JOB_ACTIVE" "$unique_job_jam" "$TEST_QUEUE" "$captured_cups_id"; then
@@ -470,14 +491,15 @@ fi
 "$EMULATOR" fault clear >/dev/null 2>&1 || true
 
 # -----------------------------------------------------------------------------
-# Test 6: Reject Stale, Completed, and Mismatched Active Markers (Requirements 6, 7, 13)
+# Test 6: Reject Stale, Completed, and Mismatched Active Markers (Requirements 5, 6, 7, 10)
 # -----------------------------------------------------------------------------
-info "Test 6: Reject Stale, Completed, and Mismatched Active Markers"
+info "Test 6: Reject Incomplete, Stale, Completed, and Mismatched Active Markers"
 dummy_marker="${TEST_DIR}/dummy.marker"
 
 # Case 1: Mismatched job ID
 cat << EOF > "$dummy_marker"
 JOB_NAME=different-job
+IPP_JOB_ID=1
 PID=$$
 STATE=processing
 EOF
@@ -490,6 +512,7 @@ fi
 # Case 2: Completed marker (not processing)
 cat << EOF > "$dummy_marker"
 JOB_NAME=expected-job
+IPP_JOB_ID=1
 PID=$$
 STATE=completed
 EOF
@@ -502,6 +525,7 @@ fi
 # Case 3: Stale marker with dead PID
 cat << EOF > "$dummy_marker"
 JOB_NAME=expected-job
+IPP_JOB_ID=1
 PID=9999999
 STATE=processing
 EOF
@@ -509,6 +533,44 @@ if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
     fail "Test 6c: Validation accepted stale marker with dead PID"
 else
     pass "Test 6c: Validation correctly rejected stale marker with dead PID"
+fi
+
+# Case 4: Incomplete marker (missing required PID)
+cat << EOF > "$dummy_marker"
+JOB_NAME=expected-job
+STATE=processing
+EOF
+if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
+    fail "Test 6d: Validation accepted incomplete marker"
+else
+    pass "Test 6d: Validation correctly rejected incomplete marker"
+fi
+
+# Case 5: PID reuse / unrelated live process (Requirement 5, 10)
+# $$ is the test harness script, not processor.sh
+cat << EOF > "$dummy_marker"
+JOB_NAME=expected-job
+IPP_JOB_ID=1
+PID=$$
+STATE=processing
+EOF
+if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
+    fail "Test 6e: Validation accepted unrelated live process PID ($$)"
+else
+    pass "Test 6e: Validation correctly rejected unrelated live process PID ($$)"
+fi
+
+# Case 6: Invalid IPP job ID (Requirement 7)
+cat << EOF > "$dummy_marker"
+JOB_NAME=expected-job
+IPP_JOB_ID=-5
+PID=$$
+STATE=processing
+EOF
+if validate_active_job "$dummy_marker" "expected-job" "$TEST_QUEUE" ""; then
+    fail "Test 6f: Validation accepted invalid IPP job identity"
+else
+    pass "Test 6f: Validation correctly rejected invalid IPP job identity"
 fi
 rm -f "$dummy_marker"
 
@@ -548,12 +610,27 @@ for _ in {1..50}; do
 done
 
 if [[ "$is_completed" == "true" ]]; then
+    # Negative test for CUPS state: completed job must be rejected by validate_active_job (Requirements 8, 10)
+    dummy_comp_marker="${TEST_DIR}/comp.marker"
+    cat << EOF > "$dummy_comp_marker"
+JOB_NAME=${unique_job_comp}
+IPP_JOB_ID=1
+PID=$$
+STATE=processing
+EOF
+    if validate_active_job "$dummy_comp_marker" "$unique_job_comp" "$TEST_QUEUE" "$captured_cups_id"; then
+        fail "Test 8a: validate_active_job accepted a completed CUPS job"
+    else
+        pass "Test 8a: validate_active_job correctly rejected a completed CUPS job"
+    fi
+    rm -f "$dummy_comp_marker"
+
     # Attempting to hold a completed job must fail in CUPS with lp: Job #.. is finished
     hold_out=$(lp -i "$captured_cups_id" -H hold 2>&1 || true)
     if echo "$hold_out" | grep -q -i "finished and cannot be altered"; then
-        pass "Test 8: CUPS distinguishes already-completed job and refuses hold alteration (outcome: already-completed)"
+        pass "Test 8b: CUPS distinguishes already-completed job and refuses hold alteration (outcome: already-completed)"
     else
-        pass "Test 8: CUPS completed job state confirmed: ${ipp_comp}"
+        pass "Test 8b: CUPS completed job state confirmed: ${ipp_comp}"
     fi
 else
     fail "Test 8: Job did not reach completed state: $ipp_comp"

@@ -1600,13 +1600,18 @@ cmd_fault_set() {
 
             local active_in_processor=false
             if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ -f "$EMU_JOB_ACTIVE_FILE" ]]; then
-                local marker_state marker_pid
+                local marker_state marker_pid marker_job
                 marker_state=$(sed -n 's/^STATE=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
                 marker_pid=$(sed -n 's/^PID=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                marker_job=$(sed -n 's/^JOB_NAME=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+
+                # Strictly reject stale markers (STATE != processing) and dead PIDs (Requirement 9)
                 if [[ "$marker_state" == "processing" ]] && [[ -n "$marker_pid" ]] && kill -0 "$marker_pid" 2>/dev/null; then
-                    local pid_comm
+                    local pid_cmdline pid_comm
+                    pid_cmdline=$(tr '\0' ' ' < "/proc/${marker_pid}/cmdline" 2>/dev/null || true)
                     pid_comm=$(cat "/proc/${marker_pid}/comm" 2>/dev/null || ps -p "$marker_pid" -o comm= 2>/dev/null || true)
-                    if [[ "$pid_comm" =~ bash|sh|processor ]]; then
+                    # Strictly reject unrelated shell processes or reused PIDs: cmdline must reference processor.sh
+                    if [[ "$pid_cmdline" =~ processor\.sh ]] || [[ "$pid_comm" =~ processor ]]; then
                         active_in_processor=true
                     fi
                 fi

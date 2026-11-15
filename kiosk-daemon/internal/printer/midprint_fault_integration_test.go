@@ -30,6 +30,22 @@ func isProcessAlive(pid int) bool {
 	return process.Signal(syscall.Signal(0)) == nil
 }
 
+// isProcessorProcess verifies that the PID is alive AND belongs to the expected processor.sh script (Requirement 5).
+func isProcessorProcess(pid int) bool {
+	if !isProcessAlive(pid) {
+		return false
+	}
+	cmdlineBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	cmdline := strings.ReplaceAll(string(cmdlineBytes), "\x00", " ")
+	commBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	comm := strings.TrimSpace(string(commBytes))
+
+	return strings.Contains(cmdline, "processor.sh") || strings.Contains(comm, "processor")
+}
+
 // ActiveJobMarker contains parsed fields from EMU_JOB_ACTIVE_FILE.
 type ActiveJobMarker struct {
 	JobName   string
@@ -46,31 +62,46 @@ func parseActiveJobMarker(filePath string) (ActiveJobMarker, error) {
 		return ActiveJobMarker{}, err
 	}
 	marker := ActiveJobMarker{}
+	hasJobName := false
+	hasPID := false
+	hasState := false
+
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "JOB_NAME=") {
 			marker.JobName = strings.TrimPrefix(line, "JOB_NAME=")
+			if marker.JobName != "" {
+				hasJobName = true
+			}
 		} else if strings.HasPrefix(line, "IPP_JOB_ID=") {
 			marker.IPPJobID = strings.TrimPrefix(line, "IPP_JOB_ID=")
 		} else if strings.HasPrefix(line, "PID=") {
-			marker.PID, _ = strconv.Atoi(strings.TrimPrefix(line, "PID="))
+			pidVal, pErr := strconv.Atoi(strings.TrimPrefix(line, "PID="))
+			if pErr == nil && pidVal > 0 {
+				marker.PID = pidVal
+				hasPID = true
+			}
 		} else if strings.HasPrefix(line, "STATE=") {
 			marker.State = strings.TrimPrefix(line, "STATE=")
+			if marker.State != "" {
+				hasState = true
+			}
 		} else if strings.HasPrefix(line, "TIMESTAMP=") {
 			marker.Timestamp = strings.TrimPrefix(line, "TIMESTAMP=")
 		}
 	}
-	if marker.JobName == "" || marker.PID <= 0 || marker.State == "" {
-		return marker, errors.New("incomplete active job marker")
+	if !hasJobName || !hasPID || !hasState {
+		return marker, errors.New("incomplete active job marker (missing required fields)")
 	}
 	return marker, nil
 }
 
-// validateActiveJob validates that the active-job marker is authoritative, job-specific,
+// validateActiveJobCustom validates that the active-job marker is authoritative, job-specific,
 // not stale, not completed, matching the expected job ID, with an active processor PID,
-// and that CUPS confirms the job is actively processing (Requirements 6, 7, 8).
-func validateActiveJob(
+// valid IPP job identity, and that CUPS confirms the job is actively processing (Requirements 5, 6, 7, 8).
+func validateActiveJobCustom(
 	ctx context.Context,
+	runner CommandRunner,
 	markerPath string,
 	expectedJobID string,
 	queueName string,
@@ -91,23 +122,44 @@ func validateActiveJob(
 		return fmt.Errorf("marker state is not processing (got %q)", marker.State)
 	}
 
-	// 3. Validate processor PID is active and alive (Requirements 7, 8)
+	// 3. Validate processor PID is active, alive, and belongs to expected processor process (Requirements 5, 8, 10)
 	if !isProcessAlive(marker.PID) {
 		return fmt.Errorf("processor PID %d is not running (stale marker)", marker.PID)
 	}
+	if !isProcessorProcess(marker.PID) {
+		return fmt.Errorf("PID %d does not belong to expected processor process (unrelated live PID)", marker.PID)
+	}
 
-	// 4. Validate actual CUPS job state before injection (Requirement 8)
+	// 4. Validate IPP job identity where reliably available (Requirement 7)
+	if marker.IPPJobID != "" && marker.IPPJobID != "unknown" {
+		ippID, err := strconv.Atoi(marker.IPPJobID)
+		if err != nil || ippID <= 0 {
+			return fmt.Errorf("invalid IPP job identity in marker: %q", marker.IPPJobID)
+		}
+	}
+
+	// 5. Require corresponding CUPS job to be strictly processing before injection (Requirements 8, 10)
 	if cupsJobID != "" && queueName != "" {
-		info, qErr := QueryCUPSJobInfo(ctx, nil, queueName, cupsJobID)
+		info, qErr := QueryCUPSJobInfo(ctx, runner, queueName, cupsJobID)
 		if qErr != nil {
 			return fmt.Errorf("failed to query CUPS job state for %s: %w", cupsJobID, qErr)
 		}
-		if info.State != CUPSJobStateProcessing && info.State != CUPSJobStatePending {
-			return fmt.Errorf("CUPS job %s is not in active state (got %s)", cupsJobID, info.State)
+		if info.State != CUPSJobStateProcessing {
+			return fmt.Errorf("CUPS job %s is not in processing state (got %s)", cupsJobID, info.State)
 		}
 	}
 
 	return nil
+}
+
+func validateActiveJob(
+	ctx context.Context,
+	markerPath string,
+	expectedJobID string,
+	queueName string,
+	cupsJobID string,
+) error {
+	return validateActiveJobCustom(ctx, nil, markerPath, expectedJobID, queueName, cupsJobID)
 }
 
 // runMidPrintFaultScenario verifies that XeroxGo detects hardware faults during real
@@ -285,7 +337,7 @@ func runMidPrintFaultScenario(t *testing.T, scenario string, expectedErrMsg stri
 	// Channel to signal injector status
 	faultInjectedCh := make(chan error, 1)
 
-	// Goroutine: Synchronize fault injection with confirmed active job (Requirements 6, 7, 8)
+	// Goroutine: Synchronize fault injection with confirmed active job (Requirements 5, 6, 7, 8)
 	go func() {
 		// Wait for job to be captured and processor to reach authoritative active state
 		activeDeadline := time.Now().Add(5 * time.Second)
@@ -455,7 +507,8 @@ func TestMidPrintHardwareFault_CoverOpen(t *testing.T) {
 }
 
 // TestMidPrintFault_RejectStaleAndMismatchedMarkers verifies that active-job validation
-// strictly rejects stale markers, completed markers, dead PIDs, and mismatched job IDs (Requirements 6, 7).
+// strictly rejects incomplete markers, mismatched job IDs, completed markers, dead PIDs,
+// unrelated live processes (PID reuse), invalid IPP job IDs, and non-processing CUPS jobs (Requirements 5, 6, 7, 8, 10).
 func TestMidPrintFault_RejectStaleAndMismatchedMarkers(t *testing.T) {
 	tempDir := t.TempDir()
 	markerFile := filepath.Join(tempDir, "job_active.marker")
@@ -463,32 +516,51 @@ func TestMidPrintFault_RejectStaleAndMismatchedMarkers(t *testing.T) {
 	ctx := context.Background()
 	expectedJob := "job-midprint-expected"
 
+	// Start a genuine mock processor.sh process to test positive verification
+	mockProcPath := filepath.Join(tempDir, "processor.sh")
+	_ = os.WriteFile(mockProcPath, []byte("#!/usr/bin/env bash\nsleep 10\n"), 0755)
+	mockCmd := exec.Command("bash", mockProcPath)
+	if err := mockCmd.Start(); err != nil {
+		t.Fatalf("failed to start mock processor.sh: %v", err)
+	}
+	defer func() {
+		_ = mockCmd.Process.Kill()
+		_ = mockCmd.Wait()
+	}()
+	validProcPID := mockCmd.Process.Pid
+
 	// Subtest 1: Missing marker file
 	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil {
 		t.Errorf("expected error for non-existent marker file, got nil")
 	}
 
-	// Subtest 2: Incomplete/malformed marker
+	// Subtest 2: Incomplete/malformed marker (missing fields)
 	_ = os.WriteFile(markerFile, []byte("JUNK_CONTENT=true\n"), 0644)
 	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil {
 		t.Errorf("expected error for malformed marker, got nil")
 	}
 
-	// Subtest 3: Mismatched job ID
-	mismatchedContent := fmt.Sprintf("JOB_NAME=job-other-123\nIPP_JOB_ID=1\nPID=%d\nSTATE=processing\n", os.Getpid())
+	// Subtest 3: Incomplete marker missing PID
+	_ = os.WriteFile(markerFile, []byte(fmt.Sprintf("JOB_NAME=%s\nSTATE=processing\n", expectedJob)), 0644)
+	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Errorf("expected incomplete marker error (missing PID), got: %v", err)
+	}
+
+	// Subtest 4: Mismatched job ID
+	mismatchedContent := fmt.Sprintf("JOB_NAME=job-other-123\nIPP_JOB_ID=1\nPID=%d\nSTATE=processing\n", validProcPID)
 	_ = os.WriteFile(markerFile, []byte(mismatchedContent), 0644)
 	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil || !strings.Contains(err.Error(), "mismatch") {
 		t.Errorf("expected job ID mismatch error, got: %v", err)
 	}
 
-	// Subtest 4: Completed marker (not processing)
-	completedContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=1\nPID=%d\nSTATE=completed\n", expectedJob, os.Getpid())
+	// Subtest 5: Completed marker (not processing)
+	completedContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=1\nPID=%d\nSTATE=completed\n", expectedJob, validProcPID)
 	_ = os.WriteFile(markerFile, []byte(completedContent), 0644)
 	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil || !strings.Contains(err.Error(), "not processing") {
 		t.Errorf("expected completed marker rejection error, got: %v", err)
 	}
 
-	// Subtest 5: Stale marker with dead PID
+	// Subtest 6: Stale marker with dead PID
 	deadPID := 9999999 // Very unlikely to exist
 	staleContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=1\nPID=%d\nSTATE=processing\n", expectedJob, deadPID)
 	_ = os.WriteFile(markerFile, []byte(staleContent), 0644)
@@ -496,11 +568,46 @@ func TestMidPrintFault_RejectStaleAndMismatchedMarkers(t *testing.T) {
 		t.Errorf("expected dead PID stale marker rejection error, got: %v", err)
 	}
 
-	// Subtest 6: Authoritative marker with live PID passes marker-level validation (no CUPS queue check)
-	validContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=1\nPID=%d\nSTATE=processing\n", expectedJob, os.Getpid())
+	// Subtest 7: PID reuse / unrelated live process (Requirements 5, 10)
+	// os.Getpid() is alive (current test process), but is NOT processor.sh
+	unrelatedPID := os.Getpid()
+	unrelatedContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=1\nPID=%d\nSTATE=processing\n", expectedJob, unrelatedPID)
+	_ = os.WriteFile(markerFile, []byte(unrelatedContent), 0644)
+	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil || !strings.Contains(err.Error(), "unrelated live PID") {
+		t.Errorf("expected rejection of unrelated live process PID, got: %v", err)
+	}
+
+	// Subtest 8: Invalid IPP job identity (Requirement 7)
+	invalidIPPContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=invalid\nPID=%d\nSTATE=processing\n", expectedJob, validProcPID)
+	_ = os.WriteFile(markerFile, []byte(invalidIPPContent), 0644)
+	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err == nil || !strings.Contains(err.Error(), "invalid IPP job identity") {
+		t.Errorf("expected invalid IPP job identity error, got: %v", err)
+	}
+
+	// Subtest 9: Pending CUPS job state rejected (Requirements 8, 10)
+	validContent := fmt.Sprintf("JOB_NAME=%s\nIPP_JOB_ID=1\nPID=%d\nSTATE=processing\n", expectedJob, validProcPID)
 	_ = os.WriteFile(markerFile, []byte(validContent), 0644)
-	if err := validateActiveJob(ctx, markerFile, expectedJob, "", ""); err != nil {
-		t.Errorf("expected valid marker to pass without CUPS check, got: %v", err)
+	mockPendingRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("job-id (integer) = 101\njob-state (enum) = pending\njob-state-reasons (keyword) = none\n"), nil
+	}
+	if err := validateActiveJobCustom(ctx, mockPendingRunner, markerFile, expectedJob, "test-q", "test-q-101"); err == nil || !strings.Contains(err.Error(), "not in processing state (got pending)") {
+		t.Errorf("expected pending CUPS job rejection error, got: %v", err)
+	}
+
+	// Subtest 10: Completed CUPS job state rejected (Requirements 8, 10)
+	mockCompletedRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("job-id (integer) = 101\njob-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\n"), nil
+	}
+	if err := validateActiveJobCustom(ctx, mockCompletedRunner, markerFile, expectedJob, "test-q", "test-q-101"); err == nil || !strings.Contains(err.Error(), "not in processing state (got completed)") {
+		t.Errorf("expected completed CUPS job rejection error, got: %v", err)
+	}
+
+	// Subtest 11: Authoritative marker with genuine processor PID and processing CUPS state passes (Requirements 5, 8)
+	mockProcessingRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("job-id (integer) = 101\njob-state (enum) = processing\njob-state-reasons (keyword) = job-printing\n"), nil
+	}
+	if err := validateActiveJobCustom(ctx, mockProcessingRunner, markerFile, expectedJob, "test-q", "test-q-101"); err != nil {
+		t.Errorf("expected valid marker and processing CUPS state to pass, got: %v", err)
 	}
 }
 
