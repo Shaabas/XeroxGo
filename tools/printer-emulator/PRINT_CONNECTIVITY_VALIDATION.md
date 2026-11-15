@@ -36,9 +36,29 @@ To ensure fault injection targets only a confirmed in-flight print job, the harn
 3. **CUPS Processing State Requirement**: `QueryCUPSJobInfo` must report `CUPSJobStateProcessing` before fault injection is permitted.
 4. **Execution Gate**: `processor.sh` waits on `EMU_JOB_GATE_FILE` until `EMU_JOB_RELEASE_FILE` is touched (with a bounded safety timeout).
 
-### 2.3 Safe Outage Injection
+### 2.4 Process Identity & PID Reuse Safety (Requirement 2–7)
 
-Outages are injected purely through emulator process and responder control (`emulator.sh fault set offline --target <snmp|ipp|both>`); system networking, iptables, and loopback interfaces are never modified.
+To prevent signaling unrelated system processes or reused PIDs:
+1. **Immutable Process Start Time Tracking**: On Linux, `/proc/<pid>/stat` field 22 contains the start time of the process measured in clock ticks since boot. This value is assigned by the kernel and never changes throughout the life of that specific process instance.
+2. **Structured Identity Record**: When pausing processes (`record_and_pause_process`), the identity is recorded in `EMU_IPP_PAUSED_FILE` formatted as `ROLE:PID:STARTTIME:COMM`.
+3. **Strict Pre-Signal Verification**: Before issuing `kill -CONT`, `verify_paused_process_identity` enforces four mandatory criteria:
+   - PID is alive (`kill -0 "$pid"`).
+   - Current process start time matches the recorded start time exactly (guaranteeing immunity against PID recycling).
+   - Process base name (`/proc/<pid>/comm`) matches the recorded command.
+   - Role-specific validation:
+     - For `ipp`: Process must be `ippeveprinter` bound to `$EMU_PORT`.
+     - For `processor`: Process command line must invoke `processor.sh`.
+4. **Diagnostic Preservation on Mismatch**: If any entry fails validation, signaling is refused immediately. The paused file is preserved as `${EMU_IPP_PAUSED_FILE}.diag_<timestamp>` for forensic analysis, and the operation fails with a non-zero exit code.
+
+### 2.5 Three-Way Queue Ownership Verification for CUPS Control (Requirement 10–12)
+
+1. **Verified Cancel and Resume**: Direct execution of unverified `cancel` or `lp -H resume` is prohibited. All job operations route through `emulator.sh cancel-job <queue> <jobID>` and `emulator.sh resume-job <queue> <jobID>`, requiring:
+   - Target queue name prefix matches the job ID.
+   - Current 3-way queue ownership verification (`configured URI == metadata URI == actual CUPS Device URI`).
+2. **Safe Queue Deletion & Absence Verification**:
+   - `remove-cups` executes `lpadmin -x <queue>` only after 3-way ownership verification.
+   - Post-removal, actual absence from CUPS is verified via `lpstat -p <queue>` and `lpstat -v <queue>`.
+   - If removal fails or queue presence persists, the `.meta` file is strictly preserved, and cleanup fails non-zero.
 
 ---
 
@@ -110,12 +130,18 @@ Executed with `go test -v -race -timeout 180s ./kiosk-daemon/internal/printer -r
 
 | Test Name | Duration | Result |
 | :--- | :--- | :--- |
-| `TestConnectivityFault_SNMPOnlyOutage_ContinuedMonitoringAndCompletion` | 13.13s | **PASS** |
-| `TestConnectivityFault_IPPOnlyOutage_TimeoutPreservationAndRecovery` | 10.28s | **PASS** |
-| `TestConnectivityFault_CombinedOutage_RestoreAndComplete` | 14.27s | **PASS** |
-| `TestConnectivityFault_FailedRestoration_PreservesUncertainJob` | 7.50s | **PASS** |
-| `TestConnectivityFault_CancellationWithoutPreservation_DeletesJob` | 6.74s | **PASS** |
-| `TestConnectivityFault_ReachabilitySeparation` | 11.55s | **PASS** |
+| `TestConnectivityFault_SNMPOnlyOutage_ContinuedMonitoringAndCompletion` | 15.14s | **PASS** |
+| `TestConnectivityFault_IPPOnlyOutage_TimeoutPreservationAndRecovery` | 12.41s | **PASS** |
+| `TestConnectivityFault_CombinedOutage_RestoreAndComplete` | 16.29s | **PASS** |
+| `TestConnectivityFault_FailedRestoration_PreservesUncertainJob` | 9.59s | **PASS** |
+| `TestConnectivityFault_CancellationWithoutPreservation_DeletesJob` | 8.79s | **PASS** |
+| `TestConnectivityFault_ReachabilitySeparation` | 13.65s | **PASS** |
+| `TestConnectivityFault_Negative_StalePIDPausedEntryRejected` | 0.40s | **PASS** |
+| `TestConnectivityFault_Negative_PIDReuseUnrelatedLiveProcessRejected` | 0.39s | **PASS** |
+| `TestConnectivityFault_Negative_UnverifiedQueueCancelAndResumeRefused` | 0.03s | **PASS** |
+| `TestConnectivityFault_Negative_FailedQueueCleanupPreservesMetadata` | 6.64s | **PASS** |
+
+**Summary**: 10 passed, 0 failed, 0 skipped.
 
 ### 4.2 Shell Integration Suite (`connectivity_fault_test.sh`)
 Executed with `./tools/printer-emulator/connectivity_fault_test.sh`:
@@ -135,10 +161,15 @@ Executed with `./tools/printer-emulator/connectivity_fault_test.sh`:
 | **Test 7b** | Negative verification: unpreserved cancellation removes job | **PASS** |
 | **Test 8a** | Failed restoration: job is NOT reported completed | **PASS** |
 | **Test 9** | Traceable CUPS request IDs with no duplicate dispatches | **PASS** |
-| **Test 10a** | Verified test CUPS queue cleanly removed | **PASS** |
+| **Test 10a** | Verified test CUPS queue cleanly removed and confirmed absent | **PASS** |
 | **Test 10b** | Host printer `DCPT310` remained completely isolated | **PASS** |
+| **Test 11** | Negative regression: Stale PID rejected without signaling; diagnostics preserved | **PASS** |
+| **Test 12** | Negative regression: PID reuse / start time mismatch strictly rejected | **PASS** |
+| **Test 13a** | Negative regression: cancel-job refused on unverified queue | **PASS** |
+| **Test 13b** | Negative regression: resume-job refused on unverified queue | **PASS** |
+| **Test 14** | Negative regression: Failed CUPS queue removal preserves ownership metadata | **PASS** |
 
-**Summary**: 15 passed, 0 failed, 0 skipped.
+**Summary**: 20 passed, 0 failed, 0 skipped.
 
 ---
 

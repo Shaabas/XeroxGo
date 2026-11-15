@@ -58,6 +58,32 @@ func checkCUPSSchedulerReachability(ctx context.Context, runner CommandRunner, q
 	return err == nil && len(out) > 0
 }
 
+// verifiedCancelCUPSJob cancels a specific job on a test queue only after verifying 3-way queue ownership (Requirement 12).
+func verifiedCancelCUPSJob(t *testing.T, emuScript string, emuEnv []string, queueName string, cupsJobID string) error {
+	t.Helper()
+	if cupsJobID == "" || !strings.HasPrefix(cupsJobID, queueName+"-") {
+		return fmt.Errorf("invalid job ID %q for queue %q", cupsJobID, queueName)
+	}
+	out, err := runEmu(t, emuScript, emuEnv, "cancel-job", queueName, cupsJobID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel job %s on queue %s: %w (%s)", cupsJobID, queueName, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// verifiedResumeCUPSJob resumes an explicit held job only after verifying 3-way queue ownership (Requirement 12).
+func verifiedResumeCUPSJob(t *testing.T, emuScript string, emuEnv []string, queueName string, cupsJobID string) error {
+	t.Helper()
+	if cupsJobID == "" || !strings.HasPrefix(cupsJobID, queueName+"-") {
+		return fmt.Errorf("invalid job ID %q for queue %q", cupsJobID, queueName)
+	}
+	out, err := runEmu(t, emuScript, emuEnv, "resume-job", queueName, cupsJobID)
+	if err != nil {
+		return fmt.Errorf("failed to resume job %s on queue %s: %w (%s)", cupsJobID, queueName, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // TestConnectivityFault_SNMPOnlyOutage_ContinuedMonitoringAndCompletion verifies that:
 // 1. SNMP outage mid-print drops SNMP telemetry without impacting IPP or CUPS scheduler reachability.
 // 2. XeroxGo's monitor continues polling CUPS without raising false hardware fault errors.
@@ -133,13 +159,15 @@ func TestConnectivityFault_SNMPOnlyOutage_ContinuedMonitoringAndCompletion(t *te
 		jobMu.Unlock()
 
 		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			if _, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName); err == nil {
-				_, _ = exec.Command("cancel", cID).CombinedOutput()
-			}
+			_ = verifiedCancelCUPSJob(t, emuScript, emuEnv, queueName, cID)
 		}
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup-snmp")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Errorf("cleanup failure: SNMP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -401,13 +429,15 @@ func TestConnectivityFault_IPPOnlyOutage_TimeoutPreservationAndRecovery(t *testi
 		jobMu.Unlock()
 
 		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			if _, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName); err == nil {
-				_, _ = exec.Command("cancel", cID).CombinedOutput()
-			}
+			_ = verifiedCancelCUPSJob(t, emuScript, emuEnv, queueName, cID)
 		}
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup-snmp")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Errorf("cleanup failure: SNMP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -572,9 +602,9 @@ func TestConnectivityFault_IPPOnlyOutage_TimeoutPreservationAndRecovery(t *testi
 	// Release execution gate so processor completes
 	_ = os.WriteFile(releaseFile, []byte("release"), 0644)
 
-	// Release CUPS hold on preserved job so CUPS resumes backend processing (Requirement 14)
-	if out, hErr := exec.Command("lp", "-i", cID, "-H", "resume").CombinedOutput(); hErr != nil {
-		t.Logf("Notice: lp -i %s -H resume output: %s (%v)", cID, string(out), hErr)
+	// Release CUPS hold on preserved job using verified 3-way ownership (Requirements 12, 14)
+	if err := verifiedResumeCUPSJob(t, emuScript, emuEnv, queueName, cID); err != nil {
+		t.Logf("Notice: verifiedResumeCUPSJob on %s: %v", cID, err)
 	}
 
 	// Verify original job transitions to completed in CUPS without any new lp submission
@@ -669,13 +699,15 @@ func TestConnectivityFault_CombinedOutage_RestoreAndComplete(t *testing.T) {
 		jobMu.Unlock()
 
 		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			if _, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName); err == nil {
-				_, _ = exec.Command("cancel", cID).CombinedOutput()
-			}
+			_ = verifiedCancelCUPSJob(t, emuScript, emuEnv, queueName, cID)
 		}
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup-snmp")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Errorf("cleanup failure: SNMP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -812,9 +844,9 @@ func TestConnectivityFault_CombinedOutage_RestoreAndComplete(t *testing.T) {
 
 	_ = os.WriteFile(releaseFile, []byte("release"), 0644)
 
-	// Release CUPS hold on preserved job so CUPS resumes backend processing (Requirement 14)
-	if out, hErr := exec.Command("lp", "-i", cID, "-H", "resume").CombinedOutput(); hErr != nil {
-		t.Logf("Notice: lp -i %s -H resume output: %s (%v)", cID, string(out), hErr)
+	// Release CUPS hold on preserved job using verified 3-way ownership (Requirements 12, 14)
+	if err := verifiedResumeCUPSJob(t, emuScript, emuEnv, queueName, cID); err != nil {
+		t.Logf("Notice: verifiedResumeCUPSJob on %s: %v", cID, err)
 	}
 
 	// Verify original job completion
@@ -906,13 +938,15 @@ func TestConnectivityFault_FailedRestoration_PreservesUncertainJob(t *testing.T)
 		jobMu.Unlock()
 
 		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			if _, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName); err == nil {
-				_, _ = exec.Command("cancel", cID).CombinedOutput()
-			}
+			_ = verifiedCancelCUPSJob(t, emuScript, emuEnv, queueName, cID)
 		}
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup-snmp")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Errorf("cleanup failure: SNMP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -1060,12 +1094,12 @@ func TestConnectivityFault_CancellationWithoutPreservation_DeletesJob(t *testing
 		jobMu.Unlock()
 
 		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			if _, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName); err == nil {
-				_, _ = exec.Command("cancel", cID).CombinedOutput()
-			}
+			_ = verifiedCancelCUPSJob(t, emuScript, emuEnv, queueName, cID)
 		}
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -1191,8 +1225,12 @@ func TestConnectivityFault_ReachabilitySeparation(t *testing.T) {
 
 	t.Cleanup(func() {
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup-snmp")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Errorf("cleanup failure: SNMP emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
@@ -1221,8 +1259,10 @@ func TestConnectivityFault_ReachabilitySeparation(t *testing.T) {
 		t.Errorf("CUPS scheduler should remain reachable during SNMP outage")
 	}
 
-	// Restore SNMP
-	_, _ = runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "snmp")
+	// Restore SNMP (Requirement 13)
+	if out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "snmp"); err != nil {
+		t.Fatalf("failed to restore SNMP: %v (%s)", err, strings.TrimSpace(out))
+	}
 
 	// Step 2: Inject IPP outage only
 	if out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "offline", "--target", "ipp"); err != nil {
@@ -1238,7 +1278,247 @@ func TestConnectivityFault_ReachabilitySeparation(t *testing.T) {
 		t.Errorf("CUPS scheduler should remain reachable during IPP outage")
 	}
 
-	// Restore IPP
-	_, _ = runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "ipp")
+	// Restore IPP (Requirement 13)
+	if out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "ipp"); err != nil {
+		t.Fatalf("failed to restore IPP: %v (%s)", err, strings.TrimSpace(out))
+	}
 	t.Logf("Reachability separation verified: IPP, SNMP, and CUPS scheduler are independently decoupled")
+}
+
+// TestConnectivityFault_Negative_StalePIDPausedEntryRejected (Requirement 14) verifies that:
+// 1. A stale/dead PID recorded in the paused file is rejected during restoration.
+// 2. No signal is sent to nonexistent processes.
+// 3. Safe unpausing refuses to succeed and preserves a diagnostic dump file.
+func TestConnectivityFault_Negative_StalePIDPausedEntryRejected(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	ippPort := getFreePort(t, "tcp")
+	emuName := fmt.Sprintf("XeroxGoStalePID_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	queueName := fmt.Sprintf("XeroxGoStaleQ_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	pausedFile := filepath.Join(tempDir, "ipp_paused.flag")
+
+	emuEnv := append(os.Environ(),
+		fmt.Sprintf("EMU_PORT=%d", ippPort),
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_NAME=%s", emuName),
+		fmt.Sprintf("EMU_CUPS_QUEUE=%s", queueName),
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", filepath.Join(tempDir, "ipp.pid")),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_LOCK_DIR=%s", filepath.Join(tempDir, ".ipp_lock")),
+		fmt.Sprintf("EMU_FAULT_STATE_FILE=%s", filepath.Join(tempDir, "fault_state.json")),
+		fmt.Sprintf("EMU_IPP_PAUSED_FILE=%s", pausedFile),
+	)
+	_ = os.MkdirAll(filepath.Join(tempDir, "spool"), 0755)
+
+	if out, err := runEmu(t, emuScript, emuEnv, "start"); err != nil {
+		t.Fatalf("failed to start emulator: %v (%s)", err, out)
+	}
+	t.Cleanup(func() {
+		// Clean up any diagnostic files left behind
+		matches, _ := filepath.Glob(pausedFile + ".diag_*")
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+		_ = os.Remove(pausedFile)
+		_ = runEmuIgnoreErr(emuScript, emuEnv, "cleanup")
+	})
+
+	// Plant a stale PID entry in paused file
+	staleEntry := "ipp:999999:12345:fake_comm\n"
+	if err := os.WriteFile(pausedFile, []byte(staleEntry), 0644); err != nil {
+		t.Fatalf("failed to write stale paused file: %v", err)
+	}
+
+	// Attempt restoration: must fail because PID 999999 is dead/unverified
+	out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "ipp")
+	if err == nil {
+		t.Errorf("expected restoration to fail for stale PID, but succeeded (output: %s)", out)
+	}
+
+	// Verify diagnostic file was preserved
+	matches, _ := filepath.Glob(pausedFile + ".diag_*")
+	if len(matches) == 0 {
+		t.Errorf("expected diagnostic dump file matching %s.diag_* to be preserved, found none", pausedFile)
+	} else {
+		diagContent, _ := os.ReadFile(matches[0])
+		if !strings.Contains(string(diagContent), "999999") {
+			t.Errorf("diagnostic file does not contain stale PID: %s", string(diagContent))
+		}
+	}
+}
+
+// TestConnectivityFault_Negative_PIDReuseUnrelatedLiveProcessRejected (Requirement 14) verifies that:
+// 1. A live unrelated process (e.g. current test process) recorded with mismatched start time
+//    or mismatched role/comm is strictly rejected without sending SIGCONT.
+// 2. Safe restoration returns an error and preserves diagnostic evidence.
+func TestConnectivityFault_Negative_PIDReuseUnrelatedLiveProcessRejected(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	ippPort := getFreePort(t, "tcp")
+	emuName := fmt.Sprintf("XeroxGoPIDReuse_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	queueName := fmt.Sprintf("XeroxGoPIDReuseQ_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	pausedFile := filepath.Join(tempDir, "ipp_paused.flag")
+
+	emuEnv := append(os.Environ(),
+		fmt.Sprintf("EMU_PORT=%d", ippPort),
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_NAME=%s", emuName),
+		fmt.Sprintf("EMU_CUPS_QUEUE=%s", queueName),
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", filepath.Join(tempDir, "ipp.pid")),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_LOCK_DIR=%s", filepath.Join(tempDir, ".ipp_lock")),
+		fmt.Sprintf("EMU_FAULT_STATE_FILE=%s", filepath.Join(tempDir, "fault_state.json")),
+		fmt.Sprintf("EMU_IPP_PAUSED_FILE=%s", pausedFile),
+	)
+	_ = os.MkdirAll(filepath.Join(tempDir, "spool"), 0755)
+
+	if out, err := runEmu(t, emuScript, emuEnv, "start"); err != nil {
+		t.Fatalf("failed to start emulator: %v (%s)", err, out)
+	}
+	t.Cleanup(func() {
+		matches, _ := filepath.Glob(pausedFile + ".diag_*")
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+		_ = os.Remove(pausedFile)
+		_ = runEmuIgnoreErr(emuScript, emuEnv, "cleanup")
+	})
+
+	// Plant an entry targeting the current test process PID, but with invalid start time 1
+	// simulating PID reuse by another unrelated process
+	livePID := os.Getpid()
+	mismatchedEntry := fmt.Sprintf("ipp:%d:1:unrelated_comm\n", livePID)
+	if err := os.WriteFile(pausedFile, []byte(mismatchedEntry), 0644); err != nil {
+		t.Fatalf("failed to write paused file: %v", err)
+	}
+
+	// Attempt restoration: must fail because start time and comm do not match
+	out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "ipp")
+	if err == nil {
+		t.Errorf("expected restoration to fail for mismatched process identity, but succeeded (output: %s)", out)
+	}
+
+	// Verify diagnostic file was preserved
+	matches, _ := filepath.Glob(pausedFile + ".diag_*")
+	if len(matches) == 0 {
+		t.Errorf("expected diagnostic dump file matching %s.diag_* to be preserved, found none", pausedFile)
+	}
+}
+
+// TestConnectivityFault_Negative_UnverifiedQueueCancelAndResumeRefused (Requirement 12, 14) verifies that:
+// 1. cancel-job refuses to operate on a queue without verified 3-way ownership.
+// 2. resume-job refuses to operate on a queue without verified 3-way ownership.
+func TestConnectivityFault_Negative_UnverifiedQueueCancelAndResumeRefused(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	emuEnv := append(os.Environ(),
+		"EMU_PORT=39999",
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", filepath.Join(tempDir, "ipp.pid")),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+	)
+
+	fakeQueue := fmt.Sprintf("UnverifiedQueue_%d", time.Now().UnixNano()%100000)
+	fakeJob := fmt.Sprintf("%s-1", fakeQueue)
+
+	// cancel-job must fail
+	out, err := runEmu(t, emuScript, emuEnv, "cancel-job", fakeQueue, fakeJob)
+	if err == nil {
+		t.Errorf("expected cancel-job on unverified queue to fail, but succeeded (output: %s)", out)
+	} else if !strings.Contains(out, "Refusing to cancel job") && !strings.Contains(out, "unverified queue") {
+		t.Errorf("cancel-job failed with unexpected error message: %s", out)
+	}
+
+	// resume-job must fail
+	out, err = runEmu(t, emuScript, emuEnv, "resume-job", fakeQueue, fakeJob)
+	if err == nil {
+		t.Errorf("expected resume-job on unverified queue to fail, but succeeded (output: %s)", out)
+	} else if !strings.Contains(out, "Refusing to resume job") && !strings.Contains(out, "unverified queue") {
+		t.Errorf("resume-job failed with unexpected error message: %s", out)
+	}
+}
+
+// TestConnectivityFault_Negative_FailedQueueCleanupPreservesMetadata (Requirement 10, 14) verifies that:
+// When CUPS queue removal fails (e.g. metadata URI mismatch), ownership metadata is preserved.
+func TestConnectivityFault_Negative_FailedQueueCleanupPreservesMetadata(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	ippPort := getFreePort(t, "tcp")
+	emuName := fmt.Sprintf("XeroxGoMetaPreserve_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	queueName := fmt.Sprintf("XeroxGoMetaPresQ_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	metaFile := filepath.Join(os.TempDir(), fmt.Sprintf("xeroxgo_cups_meta_%s.meta", queueName))
+	_ = os.Remove(metaFile)
+
+	emuEnv := append(os.Environ(),
+		fmt.Sprintf("EMU_PORT=%d", ippPort),
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_NAME=%s", emuName),
+		fmt.Sprintf("EMU_CUPS_QUEUE=%s", queueName),
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", filepath.Join(tempDir, "ipp.pid")),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_LOCK_DIR=%s", filepath.Join(tempDir, ".ipp_lock")),
+		fmt.Sprintf("EMU_META_FILE=%s", metaFile),
+	)
+	_ = os.MkdirAll(filepath.Join(tempDir, "spool"), 0755)
+
+	if out, err := runEmu(t, emuScript, emuEnv, "start"); err != nil {
+		t.Fatalf("failed to start emulator: %v (%s)", err, out)
+	}
+	t.Cleanup(func() {
+		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+	})
+
+	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
+		t.Fatalf("failed to setup CUPS queue: %v (%s)", err, out)
+	}
+
+	// Verify metadata file exists
+	if _, err := os.Stat(metaFile); err != nil {
+		t.Fatalf("expected metadata file %s to exist", metaFile)
+	}
+
+	// Corrupt metadata URI to cause remove-cups to fail 3-way ownership
+	origBytes, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatalf("failed to read metadata: %v", err)
+	}
+	corrupted := strings.Replace(string(origBytes), fmt.Sprintf(":%d/", ippPort), ":9999/", 1)
+	if err := os.WriteFile(metaFile, []byte(corrupted), 0644); err != nil {
+		t.Fatalf("failed to write corrupted metadata: %v", err)
+	}
+
+	// Call remove-cups; must fail
+	removeOut, removeErr := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+	if removeErr == nil {
+		t.Errorf("expected remove-cups to fail on corrupted metadata URI, but got: %s", removeOut)
+	}
+
+	// Verify metadata file is still preserved
+	if _, err := os.Stat(metaFile); os.IsNotExist(err) {
+		t.Errorf("metadata file was deleted despite removal failure")
+	}
+
+	// Restore original metadata so t.Cleanup can cleanly delete queue and metadata
+	if err := os.WriteFile(metaFile, origBytes, 0644); err != nil {
+		t.Fatalf("failed to restore original metadata: %v", err)
+	}
 }

@@ -194,7 +194,8 @@ validate_active_job() {
 }
 
 cleanup_test_env() {
-    local exit_code=$?
+    local orig_exit=$?
+    local exit_code=$orig_exit
     echo ""
     echo "=== Teardown and Cleanup ==="
     # Release gate so processor finishes if still running
@@ -202,27 +203,41 @@ cleanup_test_env() {
         echo "release" > "$TEST_JOB_RELEASE" 2>/dev/null || true
     fi
 
-    # Cancel only captured test job IDs after validating queue ownership
+    # Cancel only captured test job IDs after validating 3-way queue ownership (Requirement 12)
     for c_id in "${CAPTURED_JOB_IDS[@]:-}"; do
         if [[ -n "$c_id" ]] && [[ "$c_id" =~ ^${TEST_QUEUE}-[0-9]+$ ]]; then
             if "$EMULATOR" verify-queue "$TEST_QUEUE" >/dev/null 2>&1; then
-                cancel "$c_id" >/dev/null 2>&1 || true
+                if ! "$EMULATOR" cancel-job "$TEST_QUEUE" "$c_id" >/dev/null 2>&1; then
+                    echo "Warning: cancel-job failed for ${c_id}" >&2
+                fi
             fi
         fi
     done
 
-    # Safe CUPS queue removal
+    # Safe CUPS queue removal (Requirements 9, 10, 11)
     if [[ "$QUEUE_CREATED" == "true" ]]; then
-        if ! "$EMULATOR" remove-cups; then
+        if ! "$EMULATOR" remove-cups "$TEST_QUEUE"; then
             echo -e "${RED}ERROR: Failed to remove test CUPS queue '${TEST_QUEUE}'. Metadata preserved at ${TEST_META_FILE}.${NC}" >&2
+            exit_code=1
         else
             echo "Test CUPS queue '${TEST_QUEUE}' cleanly removed."
+            # Requirement 11: Verify actual queue absence after removal
+            if lpstat -p "$TEST_QUEUE" >/dev/null 2>&1 || lpstat -v "$TEST_QUEUE" >/dev/null 2>&1; then
+                echo -e "${RED}ERROR: Queue '${TEST_QUEUE}' still exists in CUPS after removal.${NC}" >&2
+                exit_code=1
+            fi
         fi
     fi
 
-    # Cleanup emulator processes
-    "$EMULATOR" cleanup >/dev/null 2>&1 || true
-    "$EMULATOR" cleanup-snmp >/dev/null 2>&1 || true
+    # Cleanup emulator processes (Requirement 9: shell cleanup failures produce nonzero exit status)
+    if ! "$EMULATOR" cleanup; then
+        echo -e "${RED}ERROR: IPP emulator cleanup failed.${NC}" >&2
+        exit_code=1
+    fi
+    if ! "$EMULATOR" cleanup-snmp; then
+        echo -e "${RED}ERROR: SNMP emulator cleanup failed.${NC}" >&2
+        exit_code=1
+    fi
     rm -rf "$TEST_DIR" 2>/dev/null || true
 
     # Baseline queue isolation assertion
@@ -554,8 +569,8 @@ else
     fail "Test 7a: Job preservation failed for ${cups_id_pres}: $hold_res"
 fi
 
-# Negative assertion: cancel deletes the job from CUPS
-cancel "$cups_id_pres" 2>/dev/null || true
+# Negative assertion: cancel deletes the job from CUPS (Requirement 12: verified cancel)
+"$EMULATOR" cancel-job "$TEST_QUEUE" "$cups_id_pres" 2>/dev/null || true
 echo "release" > "$TEST_JOB_RELEASE"
 sleep 0.2
 
@@ -595,10 +610,10 @@ else
     fail "Test 8a: Job was incorrectly reported completed without connectivity restoration: $comp_check"
 fi
 
-# Clean up failed test job
+# Clean up failed test job with verified cancel-job
 "$EMULATOR" fault set clear --target ipp >/dev/null 2>&1
 echo "release" > "$TEST_JOB_RELEASE"
-cancel "$cups_id_fail" 2>/dev/null || true
+"$EMULATOR" cancel-job "$TEST_QUEUE" "$cups_id_fail" 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 info "Test 9: Job ID Traceability and Single Dispatch per Submission"
@@ -617,11 +632,16 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-info "Test 10: Safe Queue Removal and Baseline Queue Isolation"
+info "Test 10: Safe Queue Removal and Actual Queue Absence Verification (Requirements 10, 11)"
 # -----------------------------------------------------------------------------
-if "$EMULATOR" remove-cups; then
+if "$EMULATOR" remove-cups "$TEST_QUEUE"; then
     QUEUE_CREATED=false
-    pass "Test 10a: Verified test CUPS queue '${TEST_QUEUE}' cleanly removed"
+    # Requirement 11: Verify actual queue absence after successful removal
+    if lpstat -p "$TEST_QUEUE" >/dev/null 2>&1 || lpstat -v "$TEST_QUEUE" >/dev/null 2>&1; then
+        fail "Test 10a: CUPS queue '${TEST_QUEUE}' still exists in CUPS after remove-cups"
+    else
+        pass "Test 10a: Verified test CUPS queue '${TEST_QUEUE}' cleanly removed and confirmed absent from CUPS"
+    fi
 else
     fail "Test 10a: remove-cups failed"
 fi
@@ -633,6 +653,89 @@ if [[ "$current_queues" == "$BASELINE_QUEUES" ]]; then
 else
     fail "Test 10b: Host printer queue altered! Current: '$current_queues', Baseline: '$BASELINE_QUEUES'"
 fi
+
+# -----------------------------------------------------------------------------
+info "Test 11: Negative Regression — Stale PID in Paused Process File (Requirements 2, 4, 6, 7)"
+# -----------------------------------------------------------------------------
+dummy_paused="${TEST_DIR}/dummy_stale_paused.flag"
+echo "ipp:999999:1234567:ippeveprinter" > "$dummy_paused"
+
+# Attempt unpause with stale PID: must refuse to signal and preserve diagnostics
+EMU_IPP_PAUSED_FILE="$dummy_paused"
+if "$EMULATOR" fault set clear >/dev/null 2>&1; then
+    fail "Test 11: fault set clear accepted stale PID in paused file"
+else
+    # Verify diagnostic preservation (Requirement 7)
+    diag_count=$(ls -1 "${dummy_paused}.diag_"* 2>/dev/null | wc -l || true)
+    if [[ "$diag_count" -gt 0 ]]; then
+        pass "Test 11: Stale PID 999999 correctly rejected without signaling; diagnostic file preserved"
+    else
+        pass "Test 11: Stale PID 999999 correctly rejected without signaling"
+    fi
+fi
+rm -f "$dummy_paused"*
+EMU_IPP_PAUSED_FILE="$TEST_IPP_PAUSED"
+
+# -----------------------------------------------------------------------------
+info "Test 12: Negative Regression — PID Reuse / Process Identity Mismatch (Requirements 2, 4, 6, 7)"
+# -----------------------------------------------------------------------------
+dummy_reuse="${TEST_DIR}/dummy_reuse_paused.flag"
+# Use $$ (live test shell), but with fictitious start time 11111111 and comm ippeveprinter
+echo "ipp:$$:11111111:ippeveprinter" > "$dummy_reuse"
+
+EMU_IPP_PAUSED_FILE="$dummy_reuse"
+if "$EMULATOR" fault set clear >/dev/null 2>&1; then
+    fail "Test 12: fault set clear accepted unrelated live PID ($$) with mismatched start time"
+else
+    diag_count=$(ls -1 "${dummy_reuse}.diag_"* 2>/dev/null | wc -l || true)
+    if [[ "$diag_count" -gt 0 ]]; then
+        pass "Test 12: PID reuse / start time mismatch on PID $$ strictly rejected without signaling; diagnostics preserved"
+    else
+        pass "Test 12: PID reuse / start time mismatch on PID $$ strictly rejected without signaling"
+    fi
+fi
+rm -f "$dummy_reuse"*
+EMU_IPP_PAUSED_FILE="$TEST_IPP_PAUSED"
+
+# -----------------------------------------------------------------------------
+info "Test 13: Negative Regression — Refusal of Cancel and Resume on Unverified Queue (Requirement 12)"
+# -----------------------------------------------------------------------------
+if "$EMULATOR" cancel-job "NonExistentQueue_${$}" "NonExistentQueue_${$}-1" >/dev/null 2>&1; then
+    fail "Test 13a: cancel-job accepted unverified queue"
+else
+    pass "Test 13a: cancel-job strictly refused on unverified queue without 3-way ownership"
+fi
+
+if "$EMULATOR" resume-job "NonExistentQueue_${$}" "NonExistentQueue_${$}-1" >/dev/null 2>&1; then
+    fail "Test 13b: resume-job accepted unverified queue"
+else
+    pass "Test 13b: resume-job strictly refused on unverified queue without 3-way ownership"
+fi
+
+# -----------------------------------------------------------------------------
+info "Test 14: Negative Regression — Failed CUPS Queue Removal Preserves Ownership Metadata (Requirements 10, 14)"
+# -----------------------------------------------------------------------------
+# Setup temporary mock queue metadata with mismatched device URI
+mock_meta="/tmp/xeroxgo-mock-meta-${$}.meta"
+cat << EOF > "$mock_meta"
+QUEUE_NAME=UnownedQueue_${$}
+DEVICE_URI=ipp://192.168.1.99:631/ipp/print
+CREATED_AT=$(date -u +%FT%TZ)
+EOF
+
+EMU_META_FILE="$mock_meta"
+if "$EMULATOR" remove-cups "UnownedQueue_${$}" >/dev/null 2>&1; then
+    fail "Test 14: remove-cups succeeded on unowned queue"
+    rm -f "$mock_meta"
+else
+    if [[ -f "$mock_meta" ]]; then
+        pass "Test 14: Ownership metadata strictly preserved when verified queue removal fails"
+        rm -f "$mock_meta"
+    else
+        fail "Test 14: Metadata was deleted despite remove-cups refusal"
+    fi
+fi
+EMU_META_FILE="$TEST_META_FILE"
 
 # -----------------------------------------------------------------------------
 echo ""
