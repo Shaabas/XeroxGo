@@ -50,12 +50,31 @@ export SNMP_STATE_FILE="$TEST_SNMP_STATE"
 PASSED_COUNT=0
 FAILED_COUNT=0
 
+FAULT_TEST_QUEUE=""
+FAULT_TEST_QUEUE_META=""
+FAULT_TEST_QUEUE_CREATED=false
+
 cleanup_test_env() {
     echo ""
     echo "--- Cleaning up fault test environment ---"
-    # Remove any test CUPS queue created during tests
-    if [[ -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
-        lpadmin -x "$FAULT_TEST_QUEUE" 2>/dev/null || true
+
+    # Only delete test CUPS queue if it was explicitly recorded as created by this harness
+    # Requirement 2: The EXIT trap must never execute unverified lpadmin -x.
+    # Requirement 3: A generated queue name does not establish ownership.
+    # Requirement 4: If setup-cups fails because a queue already exists, cleanup must preserve that queue.
+    # Requirement 5: Delete test queues only through verified ownership checks (configured, metadata, and actual URIs).
+    # Requirement 6: Record successful test queue creation explicitly (FAULT_TEST_QUEUE_CREATED).
+    if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
+        if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+            echo "Attempting verified removal of harness test queue '${FAULT_TEST_QUEUE}'..."
+            if EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1; then
+                FAULT_TEST_QUEUE_CREATED=false
+            else
+                echo "WARNING: Verified removal of test queue '${FAULT_TEST_QUEUE}' failed or was refused. Preserving metadata '${FAULT_TEST_QUEUE_META}'." >&2
+            fi
+        else
+            echo "WARNING: Test queue '${FAULT_TEST_QUEUE}' marked created but metadata is missing. Refusing unverified deletion." >&2
+        fi
     fi
 
     # Ensure abnormal test termination does not leave IPP process suspended by SIGSTOP
@@ -75,7 +94,13 @@ cleanup_test_env() {
         "$EMULATOR" stop >/dev/null 2>&1 || true
         "$EMULATOR" stop-snmp >/dev/null 2>&1 || true
     }
-    rm -rf "$TEST_DIR" 2>/dev/null || true
+
+    # Requirement 7: Preserve ownership metadata if verified deletion fails
+    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+        find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
+    else
+        rm -rf "$TEST_DIR" 2>/dev/null || true
+    fi
 }
 trap cleanup_test_env EXIT
 
@@ -475,12 +500,15 @@ echo ""
 echo "--- Test 16: Regression — Failed CUPS queue deletion preserves metadata ---"
 if command -v lpadmin >/dev/null 2>&1 && lpstat -r >/dev/null 2>&1; then
     FAULT_TEST_QUEUE="XeroxGoFaultQ_${$}"
-    test_queue_meta="${TEST_DIR}/fault_queue.meta"
+    FAULT_TEST_QUEUE_META="${TEST_DIR}/fault_queue.meta"
+    FAULT_TEST_QUEUE_CREATED=false
     export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
-    export EMU_META_FILE="$test_queue_meta"
+    export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
 
     # Create temporary verified driverless CUPS queue targeting emulator
     if "$EMULATOR" setup-cups >/dev/null 2>&1; then
+        # Requirement 6: Record successful test queue creation explicitly
+        FAULT_TEST_QUEUE_CREATED=true
         assert_test "Test 16: Setup temporary driverless test queue succeeded" 'lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
         assert_test "Test 16: Verification succeeds on matching configured, metadata, and actual URIs" '"$EMULATOR" verify-queue "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
 
@@ -498,7 +526,7 @@ MOCK_EOF
         PATH="${mock_bin_dir}:${PATH}" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1 || simulated_del_failed=true
 
         assert_test "Test 16: remove-cups propagates lpadmin -x failure (non-zero return code)" '$simulated_del_failed'
-        assert_test "Test 16: Ownership metadata preserved when deletion fails" '[[ -f "$test_queue_meta" ]]'
+        assert_test "Test 16: Ownership metadata preserved when deletion fails" '[[ -f "$FAULT_TEST_QUEUE_META" ]]'
         assert_test "Test 16: Queue still exists in CUPS when deletion fails" 'lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
 
         rm -rf "$mock_bin_dir"
@@ -507,26 +535,141 @@ MOCK_EOF
         real_del_succeeded=false
         if "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1; then
             real_del_succeeded=true
+            FAULT_TEST_QUEUE_CREATED=false
         fi
 
         assert_test "Test 16: remove-cups succeeds with real lpadmin" '$real_del_succeeded'
-        assert_test "Test 16: Metadata removed only after queue verified deleted from CUPS" '[[ ! -f "$test_queue_meta" ]]'
+        assert_test "Test 16: Metadata removed only after queue verified deleted from CUPS" '[[ ! -f "$FAULT_TEST_QUEUE_META" ]]'
         assert_test "Test 16: Queue verified deleted from CUPS" '! lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
     fi
 
-    rm -f "$test_queue_meta"
+    # Reset environment variables
     export EMU_CUPS_QUEUE="XeroxGoFaultEmu"
     export EMU_META_FILE="${TEST_DIR}/cups_queue.meta"
 fi
 
 # -------------------------------------------------------------
 echo ""
-echo "--- Test 17: Safe cleanup of all emulator resources ---"
+echo "--- Test 17: Regression — Queue-name collision followed by EXIT cleanup preserves existing queue ---"
+if command -v lpadmin >/dev/null 2>&1 && lpstat -r >/dev/null 2>&1; then
+    COLLISION_QUEUE="XeroxGoCollision_${$}"
+    # Create pre-existing queue not owned by emulator
+    lpadmin -p "$COLLISION_QUEUE" -v "file:///dev/null" -E
+    pre_uri=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+
+    assert_test "Test 17: Pre-existing collision queue registered" 'lpstat -p "$COLLISION_QUEUE" >/dev/null 2>&1'
+
+    # Sub-case 1: setup-cups fails due to collision; EXIT trap must preserve the colliding queue
+    collision_subshell_out=$(
+        bash -c '
+            set -euo pipefail
+            COLLISION_Q="'"$COLLISION_QUEUE"'"
+            EMULATOR="'"$EMULATOR"'"
+            TEST_DIR=$(mktemp -d /tmp/xeroxgo-coll-test-XXXXXX)
+
+            FAULT_TEST_QUEUE="$COLLISION_Q"
+            FAULT_TEST_QUEUE_META="${TEST_DIR}/collision_queue.meta"
+            FAULT_TEST_QUEUE_CREATED=false
+
+            export EMU_HOST="localhost"
+            export EMU_PORT="'"$TEST_IPP_PORT"'"
+            export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
+            export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
+
+            cleanup_subshell() {
+                if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
+                    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                        EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1 || true
+                        if ! lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1; then
+                            FAULT_TEST_QUEUE_CREATED=false
+                        fi
+                    fi
+                fi
+                if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                    find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
+                else
+                    rm -rf "$TEST_DIR" 2>/dev/null || true
+                fi
+            }
+            trap cleanup_subshell EXIT
+
+            # setup-cups must fail because queue already exists
+            if "$EMULATOR" setup-cups 2>&1; then
+                FAULT_TEST_QUEUE_CREATED=true
+                echo "UNEXPECTED_SETUP_SUCCESS"
+                exit 1
+            fi
+
+            echo "SETUP_FAILED_AS_EXPECTED"
+            exit 0
+        ' 2>&1
+    )
+
+    post_uri=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+
+    assert_test "Test 17: setup-cups refused existing queue collision" '[[ "$collision_subshell_out" =~ "SETUP_FAILED_AS_EXPECTED" ]]'
+    assert_test "Test 17: Colliding CUPS queue preserved after subshell EXIT cleanup" 'lpstat -p "$COLLISION_QUEUE" >/dev/null 2>&1'
+    assert_test "Test 17: Colliding CUPS queue URI unchanged after subshell EXIT cleanup" '[[ "$pre_uri" == "$post_uri" && -n "$post_uri" ]]'
+
+    # Sub-case 2: Unverified queue deletion refusal during cleanup:
+    # Even if FAULT_TEST_QUEUE_CREATED=true were mistakenly set with forged metadata, EXIT cleanup refuses unverified queue deletion
+    unverified_trap_out=$(
+        bash -c '
+            set -euo pipefail
+            COLLISION_Q="'"$COLLISION_QUEUE"'"
+            EMULATOR="'"$EMULATOR"'"
+            TEST_DIR=$(mktemp -d /tmp/xeroxgo-unver-test-XXXXXX)
+
+            FAULT_TEST_QUEUE="$COLLISION_Q"
+            FAULT_TEST_QUEUE_META="${TEST_DIR}/unver_queue.meta"
+            FAULT_TEST_QUEUE_CREATED=true
+
+            export EMU_HOST="localhost"
+            export EMU_PORT="'"$TEST_IPP_PORT"'"
+            export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
+            export EMU_META_FILE="$FAULT_TEST_QUEUE_META"
+
+            # Create metadata pointing to emulator URI, but actual CUPS queue points to file:///dev/null
+            cat > "$FAULT_TEST_QUEUE_META" << EOF
+QUEUE_NAME=${COLLISION_Q}
+DEVICE_URI=ipp://localhost:'"$TEST_IPP_PORT"'/ipp/print
+EOF
+
+            cleanup_subshell() {
+                if [[ "${FAULT_TEST_QUEUE_CREATED:-false}" == "true" && -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
+                    if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                        EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE" EMU_META_FILE="$FAULT_TEST_QUEUE_META" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" 2>&1 || true
+                    fi
+                fi
+                if [[ -n "${FAULT_TEST_QUEUE_META:-}" && -f "$FAULT_TEST_QUEUE_META" ]]; then
+                    find "$TEST_DIR" -mindepth 1 -not -path "$FAULT_TEST_QUEUE_META" -delete 2>/dev/null || true
+                else
+                    rm -rf "$TEST_DIR" 2>/dev/null || true
+                fi
+            }
+            trap cleanup_subshell EXIT
+            exit 0
+        ' 2>&1
+    )
+
+    post_uri2=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+
+    assert_test "Test 17: EXIT cleanup refused unverified queue deletion" '[[ "$unverified_trap_out" =~ "Refusing deletion of unverified CUPS queue" ]]'
+    assert_test "Test 17: Colliding CUPS queue preserved after unverified EXIT cleanup" 'lpstat -p "$COLLISION_QUEUE" >/dev/null 2>&1'
+    assert_test "Test 17: Colliding CUPS queue URI still unchanged" '[[ "$pre_uri" == "$post_uri2" && -n "$post_uri2" ]]'
+
+    # Safely remove pre-existing test queue
+    lpadmin -x "$COLLISION_QUEUE" 2>/dev/null || true
+fi
+
+# -------------------------------------------------------------
+echo ""
+echo "--- Test 18: Safe cleanup of all emulator resources ---"
 "$EMULATOR" cleanup
 
-assert_test "Test 17: IPP PID file deleted" '[[ ! -f "$TEST_IPP_PID" ]]'
-assert_test "Test 17: SNMP PID file deleted" '[[ ! -f "$TEST_SNMP_PID" ]]'
-assert_test "Test 17: Fault state file deleted" '[[ ! -f "$TEST_FAULT_STATE" ]]'
+assert_test "Test 18: IPP PID file deleted" '[[ ! -f "$TEST_IPP_PID" ]]'
+assert_test "Test 18: SNMP PID file deleted" '[[ ! -f "$TEST_SNMP_PID" ]]'
+assert_test "Test 18: Fault state file deleted" '[[ ! -f "$TEST_FAULT_STATE" ]]'
 
 echo ""
 echo "============================================================"
