@@ -6,6 +6,13 @@ cups_queue.meta
 .xeroxgo_emulator_manifest
 .xeroxgo_emulator_spool
 
+# Ignore SNMP emulator binaries and runtime state
+snmp_responder
+snmp_responder.pid
+snmp_responder.log
+snmp_state.json
+.snmp_startup.lock
+
 # Ignore job artifacts generated in spool directory
 spool/*
 !spool/.gitkeep
