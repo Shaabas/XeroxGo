@@ -134,6 +134,9 @@ type Client struct {
 
 	capsMu       sync.RWMutex
 	capabilities printer.PrinterCapabilities
+
+	ippStateMu sync.RWMutex
+	ippState   printer.IPPPrinterStateResult
 }
 
 // NewClient validates the configuration and initializes a new spooler client.
@@ -273,6 +276,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 	cupsQ := strings.TrimSpace(cfg.CUPSQueue)
 	var initialCaps printer.PrinterCapabilities
+	var initialIPPState printer.IPPPrinterStateResult
 	if cupsQ != "" {
 		initialCaps = printer.PrinterCapabilities{
 			Source:                 printer.CapabilitySourceCUPSQueue,
@@ -284,6 +288,12 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			DuplexShortEdgeSupport: printer.CapabilityUnknown,
 			ColorSupport:           printer.CapabilityUnknown,
 			MonochromeSupport:      printer.CapabilityUnknown,
+		}
+		initialIPPState = printer.IPPPrinterStateResult{
+			Source:        printer.CapabilitySourceCUPSQueue,
+			Queue:         cupsQ,
+			State:         printer.IPPPrinterStateUnknown,
+			AcceptingJobs: printer.AcceptingJobsUnknown,
 		}
 	}
 
@@ -302,6 +312,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		requiredRecoveryCount: reqHealthy,
 		cupsJobIDs:            make(map[string]string),
 		capabilities:          initialCaps,
+		ippState:              initialIPPState,
 	}
 
 	if cfg.InputSource != nil {
@@ -401,6 +412,42 @@ func (c *Client) DiscoverStartupCapabilities(ctx context.Context) printer.Printe
 	return c.Capabilities()
 }
 
+// IPPPrinterState returns the latest discovered IPP printer state.
+func (c *Client) IPPPrinterState() printer.IPPPrinterStateResult {
+	c.ippStateMu.RLock()
+	defer c.ippStateMu.RUnlock()
+	return c.ippState
+}
+
+// DiscoverStartupPrinterState performs a bounded read-only IPP printer-state query
+// against the configured CUPS queue. Discovery errors are logged as warnings and do NOT
+// prevent startup, alter PollCombinedHealth(), or mark any active jobs failed.
+// If raw PJL mode is configured (empty CUPS queue), IPP is not queried.
+func (c *Client) DiscoverStartupPrinterState(ctx context.Context) printer.IPPPrinterStateResult {
+	cupsQ := strings.TrimSpace(c.cfg.CUPSQueue)
+	if cupsQ == "" {
+		return printer.IPPPrinterStateResult{}
+	}
+
+	diagCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	st, err := printer.QueryIPPPrinterState(diagCtx, c.cfg.CUPSRunner, cupsQ)
+	c.ippStateMu.Lock()
+	if err == nil {
+		c.ippState = st
+	}
+	c.ippStateMu.Unlock()
+
+	if err != nil {
+		log.Printf("[SPOOLER] Warning: startup IPP printer-state discovery failed for CUPS queue %q: %v (continuing startup)", cupsQ, err)
+	} else {
+		log.Printf("[SPOOLER] Discovered CUPS queue %q IPP state: state=%s (raw=%s), accepting=%s, reasons=%v, jam=%v, empty=%v, cover=%v (source: %s)",
+			cupsQ, st.State, st.RawState, st.AcceptingJobs, st.RawReasons, st.PaperJam, st.MediaEmpty, st.CoverOpen, st.Source)
+	}
+	return c.IPPPrinterState()
+}
+
 // Run executes the spooler client loops until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
 	defer func() {
@@ -424,8 +471,9 @@ func (c *Client) Run(ctx context.Context) error {
 		Message:   "Ready to print",
 	})
 
-	// 2. Read-only startup diagnostics: discover CUPS printer capabilities if configured
+	// 2. Read-only startup diagnostics: discover CUPS printer capabilities and state if configured
 	c.DiscoverStartupCapabilities(ctx)
+	c.DiscoverStartupPrinterState(ctx)
 
 	// 3. Startup recovery check
 	incomplete, err := c.cfg.StateStore.GetIncompleteJob(ctx)
