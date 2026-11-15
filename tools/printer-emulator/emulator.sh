@@ -690,6 +690,11 @@ EOF
 # Verify queue ownership using metadata, queue name and actual device URI
 verify_cups_queue_ownership() {
     local target_queue="$1"
+    if [[ -z "$target_queue" ]]; then
+        echo "ERROR: Target queue name cannot be empty." >&2
+        return 1
+    fi
+
     if [[ ! -f "$EMU_META_FILE" ]]; then
         echo "ERROR: Ownership metadata not found (${EMU_META_FILE})." >&2
         echo "Cannot verify that CUPS queue '${target_queue}' was created by this harness." >&2
@@ -705,6 +710,19 @@ verify_cups_queue_ownership() {
         return 1
     fi
 
+    if [[ -z "$meta_uri" ]]; then
+        echo "ERROR: Metadata DEVICE_URI is missing or empty in ${EMU_META_FILE}." >&2
+        return 1
+    fi
+
+    local configured_uri="ipp://${EMU_HOST}:${EMU_PORT}/ipp/print"
+
+    # Requirement 2 & 3: Reject metadata pointing to an unrelated printer or endpoint
+    if [[ "$meta_uri" != "$configured_uri" ]]; then
+        echo "ERROR: Metadata device URI ('${meta_uri}') does not match configured emulator URI ('${configured_uri}'). Rejecting metadata pointing to unrelated printer or endpoint." >&2
+        return 1
+    fi
+
     # Check actual URI in CUPS
     local actual_uri
     actual_uri=$(lpstat -v "$target_queue" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
@@ -713,8 +731,14 @@ verify_cups_queue_ownership() {
         return 1
     fi
 
+    # Requirement 2: All three URIs must match (configured URI, metadata URI, actual CUPS URI)
+    if [[ "$actual_uri" != "$configured_uri" ]]; then
+        echo "ERROR: CUPS queue '${target_queue}' device URI ('${actual_uri}') does not match configured emulator URI ('${configured_uri}')." >&2
+        return 1
+    fi
+
     if [[ "$actual_uri" != "$meta_uri" ]]; then
-        echo "ERROR: CUPS queue '${target_queue}' device URI ('${actual_uri}') does not match expected emulator URI ('${meta_uri}')." >&2
+        echo "ERROR: CUPS queue '${target_queue}' device URI ('${actual_uri}') does not match metadata URI ('${meta_uri}')." >&2
         return 1
     fi
 
@@ -737,21 +761,28 @@ cmd_remove_cups() {
         return 1
     fi
 
-    # If queue does not exist in CUPS, clean metadata and return
-    if ! lpstat -p "$target_queue" >/dev/null 2>&1 && ! lpstat -v "$target_queue" >/dev/null 2>&1; then
-        echo "CUPS queue '${target_queue}' does not exist in CUPS (already removed)."
-        rm -f "$EMU_META_FILE"
-        return 0
-    fi
-
-    # Verify ownership and expected URI before deletion; refuse if cannot be verified
+    # Requirement 4: Never modify, enable, disable or delete a queue when ownership verification fails
     if ! verify_cups_queue_ownership "$target_queue"; then
         echo "Refusing deletion of unverified CUPS queue '${target_queue}'." >&2
         return 1
     fi
 
     echo "Removing verified emulator-owned CUPS queue '${target_queue}'..."
-    lpadmin -x "$target_queue" 2>/dev/null || true
+    # Requirement 5: Do not suppress lpadmin -x failures
+    if ! lpadmin -x "$target_queue"; then
+        echo "ERROR: Failed to delete CUPS queue '${target_queue}' via lpadmin -x." >&2
+        echo "Preserving ownership metadata (${EMU_META_FILE}) for safety." >&2
+        return 1
+    fi
+
+    # Requirement 7: Remove metadata only after verifying the queue no longer exists
+    if lpstat -p "$target_queue" >/dev/null 2>&1 || lpstat -v "$target_queue" >/dev/null 2>&1; then
+        echo "ERROR: CUPS queue '${target_queue}' still exists in CUPS after deletion attempt." >&2
+        echo "Preserving ownership metadata (${EMU_META_FILE}) for safety." >&2
+        return 1
+    fi
+
+    # Requirement 6 & 7: Remove metadata only after verifying successful queue removal
     rm -f "$EMU_META_FILE"
     echo "CUPS queue '${target_queue}' removed."
     return 0

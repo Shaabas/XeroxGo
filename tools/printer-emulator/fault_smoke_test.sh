@@ -53,6 +53,11 @@ FAILED_COUNT=0
 cleanup_test_env() {
     echo ""
     echo "--- Cleaning up fault test environment ---"
+    # Remove any test CUPS queue created during tests
+    if [[ -n "${FAULT_TEST_QUEUE:-}" ]] && command -v lpadmin >/dev/null 2>&1; then
+        lpadmin -x "$FAULT_TEST_QUEUE" 2>/dev/null || true
+    fi
+
     # Ensure abnormal test termination does not leave IPP process suspended by SIGSTOP
     # Never signal a PID without verifying the expected emulator process identity
     if [[ -f "$TEST_IPP_PID" ]]; then
@@ -412,7 +417,7 @@ rm -f "$TEST_IPP_PID" "$TEST_SNMP_PID"
 
 # -------------------------------------------------------------
 echo ""
-echo "--- Test 15: Regression — Refusal to modify unowned CUPS queues ---"
+echo "--- Test 15: Regression — Three-way URI verification and refusal to modify unowned queues ---"
 alien_meta="${TEST_DIR}/cups_queue.meta"
 export EMU_META_FILE="$alien_meta"
 export EMU_CUPS_QUEUE="AlienQueue_Test"
@@ -424,19 +429,38 @@ if ! "$EMULATOR" verify-queue "AlienQueue_Test" >/dev/null 2>&1; then
 fi
 assert_test "Test 15: Refuses queue operations when metadata is missing" '$unowned_modify_refused'
 
-# Case 2: Metadata file exists but points to different queue name or URI
+# Case 2: Metadata file exists but points to different queue name
+cat > "$alien_meta" << EOF
+QUEUE_NAME=DifferentQueue
+DEVICE_URI=ipp://${EMU_HOST}:${EMU_PORT}/ipp/print
+EOF
+wrong_name_refused=false
+if ! "$EMULATOR" verify-queue "AlienQueue_Test" >/dev/null 2>&1; then
+    wrong_name_refused=true
+fi
+assert_test "Test 15: Refuses queue operations when metadata queue name does not match" '$wrong_name_refused'
+
+# Case 3: Metadata file exists with correct queue name, but incorrect/alien URI
 cat > "$alien_meta" << EOF
 QUEUE_NAME=AlienQueue_Test
-DEVICE_URI=ipp://alien-host:631/printers/AlienQueue_Test
+DEVICE_URI=ipp://alien-printer:631/printers/AlienQueue_Test
 EOF
 
-mismatch_modify_refused=false
+alien_uri_refused=false
 if ! "$EMULATOR" verify-queue "AlienQueue_Test" >/dev/null 2>&1; then
-    mismatch_modify_refused=true
+    alien_uri_refused=true
 fi
-assert_test "Test 15: Refuses queue operations when URI/queue does not match expected emulator URI" '$mismatch_modify_refused'
+assert_test "Test 15: Refuses queue operations when metadata URI points to unrelated printer/endpoint" '$alien_uri_refused'
 
-# Case 3: Refuse to remove or modify baseline system queue without ownership metadata
+# Case 4: Refusal to delete queue when metadata URI does not match configured emulator URI
+alien_del_refused=false
+if ! "$EMULATOR" remove-cups "AlienQueue_Test" >/dev/null 2>&1; then
+    alien_del_refused=true
+fi
+assert_test "Test 15: Refuses remove-cups when metadata URI does not match configured URI" '$alien_del_refused'
+assert_test "Test 15: Metadata file preserved when remove-cups is refused" '[[ -f "$alien_meta" ]]'
+
+# Case 5: Refuse to remove or modify baseline system queue without ownership metadata
 system_queue_refused=false
 if ! "$EMULATOR" remove-cups "DCPT310" >/dev/null 2>&1; then
     system_queue_refused=true
@@ -448,12 +472,61 @@ export EMU_CUPS_QUEUE="XeroxGoFaultEmu"
 
 # -------------------------------------------------------------
 echo ""
-echo "--- Test 16: Safe cleanup of all emulator resources ---"
+echo "--- Test 16: Regression — Failed CUPS queue deletion preserves metadata ---"
+if command -v lpadmin >/dev/null 2>&1 && lpstat -r >/dev/null 2>&1; then
+    FAULT_TEST_QUEUE="XeroxGoFaultQ_${$}"
+    test_queue_meta="${TEST_DIR}/fault_queue.meta"
+    export EMU_CUPS_QUEUE="$FAULT_TEST_QUEUE"
+    export EMU_META_FILE="$test_queue_meta"
+
+    # Create temporary verified driverless CUPS queue targeting emulator
+    if "$EMULATOR" setup-cups >/dev/null 2>&1; then
+        assert_test "Test 16: Setup temporary driverless test queue succeeded" 'lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
+        assert_test "Test 16: Verification succeeds on matching configured, metadata, and actual URIs" '"$EMULATOR" verify-queue "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
+
+        # Simulate lpadmin -x failure via mock
+        mock_bin_dir="${TEST_DIR}/mock_bin"
+        mkdir -p "$mock_bin_dir"
+        cat > "${mock_bin_dir}/lpadmin" << 'MOCK_EOF'
+#!/usr/bin/env bash
+echo "lpadmin: simulated deletion failure" >&2
+exit 1
+MOCK_EOF
+        chmod +x "${mock_bin_dir}/lpadmin"
+
+        simulated_del_failed=false
+        PATH="${mock_bin_dir}:${PATH}" "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1 || simulated_del_failed=true
+
+        assert_test "Test 16: remove-cups propagates lpadmin -x failure (non-zero return code)" '$simulated_del_failed'
+        assert_test "Test 16: Ownership metadata preserved when deletion fails" '[[ -f "$test_queue_meta" ]]'
+        assert_test "Test 16: Queue still exists in CUPS when deletion fails" 'lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
+
+        rm -rf "$mock_bin_dir"
+
+        # Now execute clean removal with real lpadmin
+        real_del_succeeded=false
+        if "$EMULATOR" remove-cups "$FAULT_TEST_QUEUE" >/dev/null 2>&1; then
+            real_del_succeeded=true
+        fi
+
+        assert_test "Test 16: remove-cups succeeds with real lpadmin" '$real_del_succeeded'
+        assert_test "Test 16: Metadata removed only after queue verified deleted from CUPS" '[[ ! -f "$test_queue_meta" ]]'
+        assert_test "Test 16: Queue verified deleted from CUPS" '! lpstat -p "$FAULT_TEST_QUEUE" >/dev/null 2>&1'
+    fi
+
+    rm -f "$test_queue_meta"
+    export EMU_CUPS_QUEUE="XeroxGoFaultEmu"
+    export EMU_META_FILE="${TEST_DIR}/cups_queue.meta"
+fi
+
+# -------------------------------------------------------------
+echo ""
+echo "--- Test 17: Safe cleanup of all emulator resources ---"
 "$EMULATOR" cleanup
 
-assert_test "Test 16: IPP PID file deleted" '[[ ! -f "$TEST_IPP_PID" ]]'
-assert_test "Test 16: SNMP PID file deleted" '[[ ! -f "$TEST_SNMP_PID" ]]'
-assert_test "Test 16: Fault state file deleted" '[[ ! -f "$TEST_FAULT_STATE" ]]'
+assert_test "Test 17: IPP PID file deleted" '[[ ! -f "$TEST_IPP_PID" ]]'
+assert_test "Test 17: SNMP PID file deleted" '[[ ! -f "$TEST_SNMP_PID" ]]'
+assert_test "Test 17: Fault state file deleted" '[[ ! -f "$TEST_FAULT_STATE" ]]'
 
 echo ""
 echo "============================================================"
