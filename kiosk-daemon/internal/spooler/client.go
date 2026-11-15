@@ -77,6 +77,11 @@ type ClientConfig struct {
 	SoundPlayer              audio.Player
 	OnJobCompleted           func(jobID string)
 	TrustedOrigins           []string
+	EnableShadowHealth       bool
+	ShadowHealthInterval     time.Duration
+	MockCUPSHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockSNMPHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockIPPState             func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error)
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -137,6 +142,12 @@ type Client struct {
 
 	ippStateMu sync.RWMutex
 	ippState   printer.IPPPrinterStateResult
+
+	shadowMu     sync.RWMutex
+	latestShadow *ShadowHealthReport
+
+	prodHealthMu     sync.RWMutex
+	latestProdHealth contracts.PrinterHealth
 }
 
 // NewClient validates the configuration and initializes a new spooler client.
@@ -259,6 +270,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	if cfg.HealthPollInterval <= 0 {
 		cfg.HealthPollInterval = 500 * time.Millisecond
+	}
+	if cfg.ShadowHealthInterval <= 0 {
+		cfg.ShadowHealthInterval = 30 * time.Second
 	}
 
 	if cfg.AdsCachePath == "" {
@@ -668,6 +682,15 @@ func (c *Client) Run(ctx context.Context) error {
 		defer wg.Done()
 		c.healthMonitorLoop(ctx)
 	}()
+
+	// 3d. Start background printer health shadow reconciliation loop if enabled and CUPS queue is configured
+	if c.cfg.EnableShadowHealth && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.shadowHealthLoop(ctx)
+		}()
+	}
 
 	// 4. Connection & reconnection loop
 	delay := c.minBackoff
@@ -2096,6 +2119,10 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 		sheets = s
 	}
 	h := c.healthPoller(ctx, sheets)
+
+	c.prodHealthMu.Lock()
+	c.latestProdHealth = h
+	c.prodHealthMu.Unlock()
 
 	isFault, reason, custMsg := isBlockingHardwareFault(h)
 

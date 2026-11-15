@@ -276,6 +276,8 @@ func main() {
 	enableSound := flag.Bool("enable-sound", true, "Enable sound playback on job completion (degrades gracefully if hardware unavailable)")
 	simulatedFailure := flag.String("simulated-failure", "", "Simulated failure condition: none, paper-empty, jam, offline")
 	simulatedFailureSheet := flag.Int("simulated-failure-sheet", 0, "Sheet number after which to inject simulated failure (0 = fail at start/health)")
+	enableShadowHealth := flag.Bool("enable-shadow-health", false, "Enable read-only background printer health shadow reconciliation mode (default false)")
+	shadowHealthInterval := flag.Duration("shadow-health-interval", 30*time.Second, "Interval between background shadow health reconciliation checks (default 30s)")
 	flag.Parse()
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
@@ -535,6 +537,8 @@ func main() {
 		PaymentTimeout:           *paymentPendingTimeout,
 		PaymentURLBase:           *paymentURLBase,
 		SoundPlayer:              soundPlayer,
+		EnableShadowHealth:       *enableShadowHealth,
+		ShadowHealthInterval:     *shadowHealthInterval,
 		OnJobCompleted: func(jobID string) {
 			if viewerServer != nil {
 				viewerServer.NotifyJobCompleted(jobID)
@@ -555,6 +559,9 @@ func main() {
 		targetDesc = "cups:" + *cupsPrinter
 	}
 	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s, model=%s)", *kioskID, *cloudURL, targetDesc, effectivePrinterModel)
+	if *enableShadowHealth {
+		log.Printf("XeroxGo kiosk daemon: shadow health reconciliation mode enabled (interval: %v, queue: %q)", *shadowHealthInterval, *cupsPrinter)
+	}
 
 	if err := client.Run(ctx); err != nil {
 		log.Printf("spooler client exited with error: %v", err)
