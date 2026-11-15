@@ -81,7 +81,12 @@ type IPPPrinterStateResult struct {
 	// HasHardwareFault indicates whether a blocking hardware error was detected in reasons.
 	HasHardwareFault bool `json:"has_hardware_fault"`
 
-	// QueueAccessible indicates whether CUPS responded to the IPP query without transport error.
+	// EndpointReachable indicates whether the local IPP service responded at the transport layer,
+	// proving the CUPS endpoint was reached (even if an IPP failure status such as client-error-not-found was returned).
+	EndpointReachable bool `json:"endpoint_reachable"`
+
+	// QueueAccessible indicates whether the specific CUPS queue was confirmed to exist and be accessible
+	// (i.e. the endpoint was reached AND returned a successful IPP status for the queue).
 	QueueAccessible bool `json:"queue_accessible"`
 
 	// StatusCode is the IPP status code (e.g. "successful-ok", "client-error-not-found").
@@ -271,9 +276,11 @@ func ParseIPPPrinterState(out []byte, queue string) IPPPrinterStateResult {
 			}
 		case "marker-supply-low", "toner-low", "ink-low":
 			res.MarkerLow = true
-		case "marker-waste-full":
+		case "marker-waste-full", "marker-waste-almost-full":
 			res.OtherError = true
-			res.HasHardwareFault = true
+			if parsed.Severity == SeverityError || (parsed.Severity == SeverityNone && parsed.Keyword == "marker-waste-full") {
+				res.HasHardwareFault = true
+			}
 		default:
 			if parsed.Severity == SeverityError {
 				res.OtherError = true
@@ -287,18 +294,20 @@ func ParseIPPPrinterState(out []byte, queue string) IPPPrinterStateResult {
 
 // QueryIPPPrinterState queries Get-Printer-Attributes via ipptool for printer-state,
 // printer-state-reasons, and printer-is-accepting-jobs.
-// It returns a normalized result distinguishing queue accessibility, job acceptance,
-// operational state, and recognized hardware fault indicators.
+// It returns a normalized result distinguishing transport reachability, queue accessibility,
+// job acceptance, operational state, and recognized hardware fault indicators.
 func QueryIPPPrinterState(ctx context.Context, runner CommandRunner, queue string) (IPPPrinterStateResult, error) {
 	now := time.Now().UTC()
 	queue = strings.TrimSpace(queue)
 	if queue == "" {
 		return IPPPrinterStateResult{
-			Source:        CapabilitySourceCUPSQueue,
-			State:         IPPPrinterStateUnknown,
-			AcceptingJobs: AcceptingJobsUnknown,
-			ObservedAt:    now,
-			Error:         "cups queue name cannot be empty",
+			Source:            CapabilitySourceCUPSQueue,
+			State:             IPPPrinterStateUnknown,
+			AcceptingJobs:     AcceptingJobsUnknown,
+			EndpointReachable: false,
+			QueueAccessible:   false,
+			ObservedAt:        now,
+			Error:             "cups queue name cannot be empty",
 		}, errors.New("cups queue name cannot be empty")
 	}
 
@@ -315,27 +324,39 @@ func QueryIPPPrinterState(ctx context.Context, runner CommandRunner, queue strin
 	// Parse whatever attributes were received in output to preserve partial data
 	res := ParseIPPPrinterState(out, queue)
 
-	// 1. Runner execution error (absent binary, network failure, timeout, exit code)
+	// If a valid IPP response was returned (indicated by parsed status-code or recognized attributes),
+	// the transport endpoint was reached and responded.
+	hasIPPResponse := res.StatusCode != "" || res.HasRecognizedStateAttributes()
+	if hasIPPResponse {
+		res.EndpointReachable = true
+	}
+
+	// 1. Check for explicit IPP failure status (e.g. client-error-not-found, server-error-internal-error)
+	if isIPPFailureStatus(res.StatusCode) {
+		res.QueueAccessible = false
+		res.Error = fmt.Sprintf("IPP state query returned failure status %q for CUPS queue %q", res.StatusCode, queue)
+		return res, fmt.Errorf("IPP state query returned failure status %q for CUPS queue %q", res.StatusCode, queue)
+	}
+
+	// 2. Check for runner execution error (transport failure, absent binary, timeout, etc.)
 	if runnerErr != nil {
+		if !hasIPPResponse {
+			res.EndpointReachable = false
+		}
 		res.QueueAccessible = false
 		res.Error = runnerErr.Error()
 		return res, fmt.Errorf("ipptool state query failed for CUPS queue %q: %w", queue, runnerErr)
 	}
 
-	// 2. Explicit IPP failure status (e.g. client-error-not-found, server-error-internal-error)
-	if isIPPFailureStatus(res.StatusCode) {
-		res.QueueAccessible = false
-		res.Error = fmt.Sprintf("IPP failure status %q", res.StatusCode)
-		return res, fmt.Errorf("IPP state query returned failure status %q for CUPS queue %q", res.StatusCode, queue)
-	}
-
 	// 3. Lack of recognizable printer state attributes
 	if !res.HasRecognizedStateAttributes() {
+		res.EndpointReachable = false
 		res.QueueAccessible = false
 		res.Error = "no recognizable printer state attributes found in IPP response"
 		return res, fmt.Errorf("no recognizable printer state attributes found in IPP response for CUPS queue %q", queue)
 	}
 
+	res.EndpointReachable = true
 	res.QueueAccessible = true
 	return res, nil
 }

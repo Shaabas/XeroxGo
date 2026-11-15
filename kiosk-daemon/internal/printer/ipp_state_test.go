@@ -10,10 +10,10 @@ import (
 
 func TestParseIPPPrinterState_TableDriven(t *testing.T) {
 	tests := []struct {
-		name      string
-		queue     string
-		output    string
-		checkRes  func(t *testing.T, res IPPPrinterStateResult)
+		name     string
+		queue    string
+		output   string
+		checkRes func(t *testing.T, res IPPPrinterStateResult)
 	}{
 		{
 			name:  "idle printer accepting jobs with none reason",
@@ -172,6 +172,78 @@ printer-state-reasons (keyword) = media-empty-error,toner-empty-error
 			},
 		},
 		{
+			name:  "marker-waste-full-error sets HasHardwareFault and OtherError",
+			queue: "WasteErrorQueue",
+			output: `
+status-code = successful-ok
+printer-state (enum) = stopped
+printer-is-accepting-jobs (boolean) = false
+printer-state-reasons (keyword) = marker-waste-full-error
+`,
+			checkRes: func(t *testing.T, res IPPPrinterStateResult) {
+				if !res.OtherError {
+					t.Errorf("expected OtherError true for marker-waste-full-error")
+				}
+				if !res.HasHardwareFault {
+					t.Errorf("expected HasHardwareFault true for marker-waste-full-error")
+				}
+				if len(res.ParsedReasons) != 1 {
+					t.Fatalf("expected 1 parsed reason, got %d", len(res.ParsedReasons))
+				}
+				if res.ParsedReasons[0].Keyword != "marker-waste-full" || res.ParsedReasons[0].Severity != SeverityError {
+					t.Errorf("unexpected parsed reason: %+v", res.ParsedReasons[0])
+				}
+			},
+		},
+		{
+			name:  "marker-waste-full-warning sets OtherError but NOT HasHardwareFault",
+			queue: "WasteWarningQueue",
+			output: `
+status-code = successful-ok
+printer-state (enum) = idle
+printer-is-accepting-jobs (boolean) = true
+printer-state-reasons (keyword) = marker-waste-full-warning
+`,
+			checkRes: func(t *testing.T, res IPPPrinterStateResult) {
+				if !res.OtherError {
+					t.Errorf("expected OtherError true for marker-waste-full-warning")
+				}
+				if res.HasHardwareFault {
+					t.Errorf("expected HasHardwareFault false for warning severity")
+				}
+				if len(res.ParsedReasons) != 1 {
+					t.Fatalf("expected 1 parsed reason, got %d", len(res.ParsedReasons))
+				}
+				if res.ParsedReasons[0].Keyword != "marker-waste-full" || res.ParsedReasons[0].Severity != SeverityWarning {
+					t.Errorf("unexpected parsed reason: %+v", res.ParsedReasons[0])
+				}
+			},
+		},
+		{
+			name:  "marker-waste-full-report sets OtherError but NOT HasHardwareFault",
+			queue: "WasteReportQueue",
+			output: `
+status-code = successful-ok
+printer-state (enum) = idle
+printer-is-accepting-jobs (boolean) = true
+printer-state-reasons (keyword) = marker-waste-full-report
+`,
+			checkRes: func(t *testing.T, res IPPPrinterStateResult) {
+				if !res.OtherError {
+					t.Errorf("expected OtherError true for marker-waste-full-report")
+				}
+				if res.HasHardwareFault {
+					t.Errorf("expected HasHardwareFault false for report severity")
+				}
+				if len(res.ParsedReasons) != 1 {
+					t.Fatalf("expected 1 parsed reason, got %d", len(res.ParsedReasons))
+				}
+				if res.ParsedReasons[0].Keyword != "marker-waste-full" || res.ParsedReasons[0].Severity != SeverityReport {
+					t.Errorf("unexpected parsed reason: %+v", res.ParsedReasons[0])
+				}
+			},
+		},
+		{
 			name:  "report severity suffix does not flag blocking hardware fault",
 			queue: "ReportQueue",
 			output: `
@@ -233,8 +305,8 @@ printer-name (nameWithoutLanguage) = MissingAttrsQueue
 			},
 		},
 		{
-			name:  "empty output",
-			queue: "EmptyQueue",
+			name:   "empty output",
+			queue:  "EmptyQueue",
 			output: "",
 			checkRes: func(t *testing.T, res IPPPrinterStateResult) {
 				if res.State != IPPPrinterStateUnknown {
@@ -286,6 +358,9 @@ func TestQueryIPPPrinterState_RunnerCases(t *testing.T) {
 		if res.QueueAccessible {
 			t.Errorf("expected QueueAccessible false")
 		}
+		if res.EndpointReachable {
+			t.Errorf("expected EndpointReachable false")
+		}
 	})
 
 	t.Run("empty output returns error", func(t *testing.T) {
@@ -300,9 +375,76 @@ func TestQueryIPPPrinterState_RunnerCases(t *testing.T) {
 		if res.QueueAccessible {
 			t.Errorf("expected QueueAccessible false")
 		}
+		if res.EndpointReachable {
+			t.Errorf("expected EndpointReachable false for empty output")
+		}
 	})
 
-	t.Run("command failure propagates error and preserves partial diagnostics", func(t *testing.T) {
+	t.Run("IPP failure response sets EndpointReachable true and QueueAccessible false", func(t *testing.T) {
+		// CUPS responds with client-error-not-found (e.g. queue deleted/nonexistent)
+		// ipptool may exit with status 1 on IPP error, but output contains the IPP response frame
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			output := `
+status-code = client-error-not-found (The printer or class was not found.)
+printer-state (enum) = unknown
+`
+			return []byte(output), errors.New("exit status 1")
+		}
+
+		res, err := QueryIPPPrinterState(context.Background(), runner, "GhostQueue")
+		if err == nil {
+			t.Fatal("expected error for explicit IPP error status")
+		}
+		if !res.EndpointReachable {
+			t.Errorf("expected EndpointReachable true because server responded with IPP frame")
+		}
+		if res.QueueAccessible {
+			t.Errorf("expected QueueAccessible false because queue was not found")
+		}
+		if res.StatusCode != "client-error-not-found" {
+			t.Errorf("expected StatusCode client-error-not-found, got %q", res.StatusCode)
+		}
+		if !strings.Contains(err.Error(), "client-error-not-found") {
+			t.Errorf("expected error mentioning status code, got: %v", err)
+		}
+	})
+
+	t.Run("transport failure sets EndpointReachable false and QueueAccessible false", func(t *testing.T) {
+		// Transport level failure (e.g. ipptool missing or socket connect failure with no IPP response)
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return nil, errors.New("exec: \"ipptool\": executable file not found in $PATH")
+		}
+
+		res, err := QueryIPPPrinterState(context.Background(), runner, "OfflineQueue")
+		if err == nil {
+			t.Fatal("expected runner error to be returned")
+		}
+		if res.EndpointReachable {
+			t.Errorf("expected EndpointReachable false on transport failure")
+		}
+		if res.QueueAccessible {
+			t.Errorf("expected QueueAccessible false on transport failure")
+		}
+	})
+
+	t.Run("connection refused sets EndpointReachable false and QueueAccessible false", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("ipptool: Unable to connect to localhost:631: Connection refused\n"), errors.New("exit status 1")
+		}
+
+		res, err := QueryIPPPrinterState(context.Background(), runner, "RefusedQueue")
+		if err == nil {
+			t.Fatal("expected runner error to be returned")
+		}
+		if res.EndpointReachable {
+			t.Errorf("expected EndpointReachable false on connection refused")
+		}
+		if res.QueueAccessible {
+			t.Errorf("expected QueueAccessible false on connection refused")
+		}
+	})
+
+	t.Run("command failure with partial diagnostics preserves attributes", func(t *testing.T) {
 		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			output := `
 printer-state (enum) = stopped
@@ -311,7 +453,7 @@ printer-state-reasons (keyword) = media-jam-error
 			return []byte(output), errors.New("exit status 1")
 		}
 
-		res, err := QueryIPPPrinterState(context.Background(), runner, "FailedCommandQueue")
+		res, err := QueryIPPPrinterState(context.Background(), runner, "PartialDiagnosticsQueue")
 		if err == nil {
 			t.Fatal("expected runner error to be returned")
 		}
@@ -327,27 +469,6 @@ printer-state-reasons (keyword) = media-jam-error
 		}
 		if res.Error == "" {
 			t.Errorf("expected Error field populated")
-		}
-	})
-
-	t.Run("explicit IPP client-error status returns error", func(t *testing.T) {
-		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			output := `
-status-code = client-error-not-found (The printer or class was not found.)
-printer-state (enum) = unknown
-`
-			return []byte(output), nil
-		}
-
-		res, err := QueryIPPPrinterState(context.Background(), runner, "GhostQueue")
-		if err == nil {
-			t.Fatal("expected error for explicit IPP error status")
-		}
-		if res.QueueAccessible {
-			t.Errorf("expected QueueAccessible false")
-		}
-		if !strings.Contains(err.Error(), "client-error-not-found") {
-			t.Errorf("expected error mentioning status code, got: %v", err)
 		}
 	})
 
@@ -368,12 +489,15 @@ printer-state (enum) = unknown
 		if err == nil {
 			t.Fatal("expected timeout error")
 		}
+		if res.EndpointReachable {
+			t.Errorf("expected EndpointReachable false on timeout")
+		}
 		if res.QueueAccessible {
 			t.Errorf("expected QueueAccessible false on timeout")
 		}
 	})
 
-	t.Run("successful query constructs correct URI and sets QueueAccessible", func(t *testing.T) {
+	t.Run("successful query constructs correct URI and sets both EndpointReachable and QueueAccessible", func(t *testing.T) {
 		var invokedName string
 		var invokedArgs []string
 
@@ -401,6 +525,9 @@ printer-state-reasons (keyword) = none
 			t.Errorf("unexpected arguments: %v", invokedArgs)
 		}
 
+		if !res.EndpointReachable {
+			t.Errorf("expected EndpointReachable true")
+		}
 		if !res.QueueAccessible {
 			t.Errorf("expected QueueAccessible true")
 		}
