@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -796,4 +799,227 @@ func TestSNMPEmulator_DeterministicCounterUpdates(t *testing.T) {
 			t.Errorf("step %d: expected counter %d, got %d", step, expected, count)
 		}
 	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 8: Integration with actual D2 snmp_responder binary process
+// -----------------------------------------------------------------------------
+func buildOrFindSNMPResponder(t *testing.T) string {
+	t.Helper()
+	relPaths := []string{
+		"../../../tools/printer-emulator",
+		"../../tools/printer-emulator",
+		"./tools/printer-emulator",
+	}
+	var emuDir string
+	for _, p := range relPaths {
+		if fi, err := os.Stat(filepath.Join(p, "snmp_responder.go")); err == nil && !fi.IsDir() {
+			emuDir = p
+			break
+		}
+	}
+	if emuDir == "" {
+		t.Fatalf("could not locate tools/printer-emulator directory")
+	}
+
+	binPath := filepath.Join(emuDir, "snmp_responder")
+	srcPath := filepath.Join(emuDir, "snmp_responder.go")
+
+	binInfo, binErr := os.Stat(binPath)
+	srcInfo, srcErr := os.Stat(srcPath)
+	if srcErr != nil {
+		t.Fatalf("failed to stat snmp_responder.go: %v", srcErr)
+	}
+
+	if binErr != nil || srcInfo.ModTime().After(binInfo.ModTime()) {
+		cmd := exec.Command("go", "build", "-o", "snmp_responder", "snmp_responder.go")
+		cmd.Dir = emuDir
+		cmd.Env = append(os.Environ(), "GOWORK=off")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed to compile snmp_responder: %v (output: %s)", err, string(out))
+		}
+	}
+
+	absBin, err := filepath.Abs(binPath)
+	if err != nil {
+		t.Fatalf("failed to resolve absolute path for binary: %v", err)
+	}
+	return absBin
+}
+
+func TestSNMPEmulator_ActualBinaryProcess(t *testing.T) {
+	binPath := buildOrFindSNMPResponder(t)
+
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "snmp_state.json")
+	pidFile := filepath.Join(tempDir, "snmp_responder.pid")
+	portFile := filepath.Join(tempDir, "snmp_responder.port")
+
+	// Start snmp_responder serve on temporary loopback UDP port (dynamic port 0)
+	cmd := exec.Command(binPath, "serve",
+		"-host", "127.0.0.1",
+		"-port", "0",
+		"-community", "public",
+		"-state", stateFile,
+		"-pid", pidFile,
+		"-port-file", portFile,
+	)
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start snmp_responder binary process: %v", err)
+	}
+
+	// Guarantee cleanup of the OS process
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				_ = cmd.Process.Kill()
+			}
+		}
+	}()
+
+	// Wait for portFile to be written by the running daemon
+	var boundPort int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(portFile); err == nil && len(data) > 0 {
+			pStr := strings.TrimSpace(string(data))
+			if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+				boundPort = p
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if boundPort <= 0 {
+		t.Fatalf("snmp_responder process did not write bound port within timeout")
+	}
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      boundPort,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   1,
+	}
+
+	ctx := context.Background()
+
+	// Wait for responder readiness
+	ready := false
+	for time.Now().Before(deadline) {
+		if life := PollMarkerLifeCount(ctx, cfg); life >= 0 {
+			ready = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatalf("snmp_responder on port %d was not ready within timeout", boundPort)
+	}
+
+	// 1. Verify healthy status through actual responder
+	t.Run("ActualBinary_HealthyStatus", func(t *testing.T) {
+		health := PollHealthConfig(ctx, cfg, 250)
+		if !health.Online {
+			t.Fatalf("expected Online=true, got false (error: %s)", health.ErrorMessage)
+		}
+		if health.State != "IDLE" {
+			t.Errorf("expected State='IDLE', got %q", health.State)
+		}
+		if health.PaperTrayStatus != "OK" {
+			t.Errorf("expected PaperTrayStatus='OK', got %q", health.PaperTrayStatus)
+		}
+		if health.PaperJam || health.CoverOpen || health.OutputBinFull {
+			t.Errorf("expected no fault flags, got Jam=%v Cover=%v Output=%v", health.PaperJam, health.CoverOpen, health.OutputBinFull)
+		}
+		if health.TonerLevelPercent != 85 || health.DrumLifePercent != 95 {
+			t.Errorf("expected Toner=85, Drum=95, got Toner=%d Drum=%d", health.TonerLevelPercent, health.DrumLifePercent)
+		}
+
+		telem := PollHardwareTelemetry(ctx, cfg)
+		if !telem.Online || telem.StatusState != "IDLE" {
+			t.Errorf("telem: Online=%v StatusState=%q", telem.Online, telem.StatusState)
+		}
+		if !telem.HasLife || telem.LifeCount != 1000 {
+			t.Errorf("expected LifeCount=1000, got HasLife=%v LifeCount=%d", telem.HasLife, telem.LifeCount)
+		}
+
+		life := PollMarkerLifeCount(ctx, cfg)
+		if life != 1000 {
+			t.Errorf("expected PollMarkerLifeCount=1000, got %d", life)
+		}
+	})
+
+	// 2. Verify jam bit update through actual responder
+	t.Run("ActualBinary_JamBit", func(t *testing.T) {
+		setCmd := exec.Command(binPath, "set", "-state", stateFile, "-set-error", "jammed")
+		if out, err := setCmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed to update state with snmp_responder set: %v (output: %s)", err, string(out))
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		health := PollHealthConfig(ctx, cfg, 250)
+		if health.State != "ERROR" {
+			t.Errorf("expected State='ERROR' after jam, got %q", health.State)
+		}
+		if !health.PaperJam {
+			t.Errorf("expected PaperJam=true after jam bit set")
+		}
+		if !strings.Contains(health.ErrorMessage, "paper jam") {
+			t.Errorf("expected ErrorMessage to contain 'paper jam', got %q", health.ErrorMessage)
+		}
+
+		telem := PollHardwareTelemetry(ctx, cfg)
+		if !telem.Flags.Jammed {
+			t.Errorf("expected telem.Flags.Jammed=true")
+		}
+	})
+
+	// 3. Verify deterministic counter update through actual responder
+	t.Run("ActualBinary_CounterUpdate", func(t *testing.T) {
+		setCmd := exec.Command(binPath, "set", "-state", stateFile, "-counter-inc", "150")
+		if out, err := setCmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed to increment counter: %v (output: %s)", err, string(out))
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		life := PollMarkerLifeCount(ctx, cfg)
+		if life != 1150 {
+			t.Errorf("expected PollMarkerLifeCount=1150, got %d", life)
+		}
+
+		telem := PollHardwareTelemetry(ctx, cfg)
+		if telem.LifeCount != 1150 {
+			t.Errorf("expected telem.LifeCount=1150, got %d", telem.LifeCount)
+		}
+	})
+
+	// 4. Verify unavailable / omitted OID through actual responder
+	t.Run("ActualBinary_UnavailableOID", func(t *testing.T) {
+		setCmd := exec.Command(binPath, "set", "-state", stateFile, "-omit-oid", oidPrtMarkerLifeCount)
+		if out, err := setCmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed to omit OID: %v (output: %s)", err, string(out))
+		}
+
+		time.Sleep(50 * time.Millisecond)
+
+		life := PollMarkerLifeCount(ctx, cfg)
+		if life != -1 {
+			t.Errorf("expected PollMarkerLifeCount=-1 for omitted OID, got %d", life)
+		}
+
+		telem := PollHardwareTelemetry(ctx, cfg)
+		if telem.HasLife {
+			t.Errorf("expected telem.HasLife=false for omitted OID, got true")
+		}
+	})
 }

@@ -223,7 +223,7 @@ func NewServer(host string, port int, community string, store *StateStore, pidFi
 	if !isLoopbackHost(host) {
 		return nil, fmt.Errorf("safety violation: host '%s' is not loopback. Refusing to bind", host)
 	}
-	if port <= 0 || port > 65535 {
+	if port < 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port: %d", port)
 	}
 	if community == "" {
@@ -615,10 +615,11 @@ func main() {
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	host := fs.String("host", "127.0.0.1", "Host/interface to bind (must be loopback)")
-	port := fs.Int("port", 1161, "UDP port to listen on")
+	port := fs.Int("port", 1161, "UDP port to listen on (0 for dynamic port)")
 	community := fs.String("community", "public", "SNMPv2c community string")
 	stateFile := fs.String("state", "snmp_state.json", "Path to JSON state file")
 	pidFile := fs.String("pid", "snmp_responder.pid", "Path to PID file")
+	portFile := fs.String("port-file", "", "Optional path to write assigned port number")
 	_ = fs.Parse(args)
 
 	if !isLoopbackHost(*host) {
@@ -638,6 +639,9 @@ func cmdServe(args []string) {
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Failed to start SNMP responder: %v", err)
 	}
+	if *portFile != "" {
+		_ = os.WriteFile(*portFile, []byte(fmt.Sprintf("%d\n", srv.Port())), 0644)
+	}
 	log.Printf("SNMPv2c printer emulator running on %s:%d (community: %s)", *host, srv.Port(), *community)
 
 	sigCh := make(chan os.Signal, 1)
@@ -646,6 +650,9 @@ func cmdServe(args []string) {
 	sig := <-sigCh
 	log.Printf("Received signal %s, shutting down SNMP responder...", sig)
 	srv.Stop()
+	if *portFile != "" {
+		_ = os.Remove(*portFile)
+	}
 	log.Printf("SNMP responder stopped.")
 }
 

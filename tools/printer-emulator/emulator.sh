@@ -777,7 +777,10 @@ cmd_cleanup() {
 
     # Clean up SNMP resources if present
     if is_snmp_running || [[ -f "$SNMP_PID_FILE" ]] || [[ -f "$SNMP_STATE_FILE" ]]; then
-        cmd_stop_snmp 2>/dev/null || true
+        if ! cmd_stop_snmp; then
+            echo "ERROR: Failed to safely stop SNMP emulator process during cleanup. Preserving metadata." >&2
+            return 1
+        fi
         rm -f "$SNMP_PID_FILE" "$SNMP_LOG_FILE" "$SNMP_STATE_FILE"
         rm -rf "$SNMP_LOCK_DIR" 2>/dev/null || true
     fi
@@ -1071,10 +1074,14 @@ cmd_status_snmp() {
 }
 
 cmd_cleanup_snmp() {
-    cmd_stop_snmp || true
+    if ! cmd_stop_snmp; then
+        echo "ERROR: Failed to safely stop SNMP emulator process. Refusing to remove PID or state metadata for safety." >&2
+        return 1
+    fi
     rm -f "$SNMP_PID_FILE" "$SNMP_LOG_FILE" "$SNMP_STATE_FILE"
     rm -rf "$SNMP_LOCK_DIR" 2>/dev/null || true
     echo "SNMP cleanup complete. Verified emulator resources removed."
+    return 0
 }
 
 cmd_snmp_set() {
@@ -1125,6 +1132,8 @@ SNMP Options:
   --snmp-port <port>         SNMP UDP port (default: ${SNMP_PORT})
   --snmp-community <string>  SNMPv2c community (default: ${SNMP_COMMUNITY})
   --snmp-state <path>        Path to SNMP state JSON (default: ${SNMP_STATE_FILE})
+  --snmp-pid <path>          Path to SNMP PID file (default: ${SNMP_PID_FILE})
+  --snmp-log <path>          Path to SNMP log file (default: ${SNMP_LOG_FILE})
 
 General Options:
   --help                     Show this help message
@@ -1175,6 +1184,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --snmp-state)
             SNMP_STATE_FILE="$2"
+            shift 2
+            ;;
+        --snmp-pid)
+            SNMP_PID_FILE="$2"
+            shift 2
+            ;;
+        --snmp-log)
+            SNMP_LOG_FILE="$2"
             shift 2
             ;;
         --help)

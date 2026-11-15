@@ -20,6 +20,14 @@ TEST_STATE_FILE="${TEST_DIR}/snmp_state.json"
 TEST_PID_FILE="${TEST_DIR}/snmp_responder.pid"
 TEST_LOG_FILE="${TEST_DIR}/snmp_responder.log"
 
+# Export isolated configuration so emulator.sh subcommands use test paths consistently
+export SNMP_HOST="${TEST_SNMP_HOST}"
+export SNMP_PORT="${TEST_SNMP_PORT}"
+export SNMP_COMMUNITY="${TEST_SNMP_COMMUNITY}"
+export SNMP_STATE_FILE="${TEST_STATE_FILE}"
+export SNMP_PID_FILE="${TEST_PID_FILE}"
+export SNMP_LOG_FILE="${TEST_LOG_FILE}"
+
 TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
@@ -39,15 +47,51 @@ fail() {
     echo ""
 }
 
+# Verify that PID belongs to the exact expected SNMP emulator test instance
+verify_expected_snmp_process() {
+    local pid="$1"
+    local expected_port="$2"
+    if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ || "$pid" -le 0 ]]; then
+        return 1
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    local comm=""
+    if [[ -f "/proc/${pid}/comm" ]]; then
+        comm=$(cat "/proc/${pid}/comm" 2>/dev/null || true)
+    else
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    fi
+    if [[ "$comm" != "snmp_responder" && "$comm" != "main" ]]; then
+        return 1
+    fi
+    local cmdline=""
+    if [[ -f "/proc/${pid}/cmdline" ]]; then
+        cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+    else
+        cmdline=$(ps -p "$pid" -o args= 2>/dev/null || true)
+    fi
+    if [[ ! "$cmdline" =~ snmp_responder ]]; then
+        return 1
+    fi
+    if [[ -n "$expected_port" && ! "$cmdline" =~ $expected_port ]]; then
+        return 1
+    fi
+    return 0
+}
+
 cleanup_test_env() {
     echo "--- Cleaning up test environment ---"
     if [[ -f "$TEST_PID_FILE" ]]; then
         local pid
         pid=$(cat "$TEST_PID_FILE" 2>/dev/null || true)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if [[ -n "$pid" ]] && verify_expected_snmp_process "$pid" "$TEST_SNMP_PORT"; then
             kill "$pid" 2>/dev/null || true
             sleep 0.2
-            kill -9 "$pid" 2>/dev/null || true
+            if kill -0 "$pid" 2>/dev/null && verify_expected_snmp_process "$pid" "$TEST_SNMP_PORT"; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
         fi
     fi
     rm -rf "$TEST_DIR" 2>/dev/null || true
@@ -60,6 +104,9 @@ echo "============================================================"
 echo "Working directory: ${SCRIPT_DIR}"
 echo "Test temporary dir: ${TEST_DIR}"
 echo "Test UDP port:     ${TEST_SNMP_PORT}"
+echo "Test PID file:     ${TEST_PID_FILE}"
+echo "Test state file:   ${TEST_STATE_FILE}"
+echo "Test log file:     ${TEST_LOG_FILE}"
 echo ""
 
 # Prerequisites verification
@@ -88,15 +135,14 @@ echo "--- Test 1: SNMP emulator startup and lifecycle ---"
     --snmp-port "$TEST_SNMP_PORT" \
     --snmp-community "$TEST_SNMP_COMMUNITY" \
     --snmp-state "$TEST_STATE_FILE" \
+    --snmp-pid "$TEST_PID_FILE" \
+    --snmp-log "$TEST_LOG_FILE" \
     start-snmp
 
 if [[ ! -f "$TEST_PID_FILE" ]]; then
-    # Default pid path was used
-    TEST_PID_FILE="${SCRIPT_DIR}/snmp_responder.pid"
-fi
-
-if ! kill -0 "$(cat "$TEST_PID_FILE")" 2>/dev/null; then
-    fail "Test 1: SNMP emulator startup" "Process PID is not alive"
+    fail "Test 1: SNMP emulator startup" "Isolated PID file was not created: ${TEST_PID_FILE}"
+elif ! verify_expected_snmp_process "$(cat "$TEST_PID_FILE")" "$TEST_SNMP_PORT"; then
+    fail "Test 1: SNMP emulator startup" "Process PID failed verification as expected emulator instance"
 else
     echo "  SNMP emulator responsive on port ${TEST_SNMP_PORT} (PID $(cat "$TEST_PID_FILE"))"
     pass "Test 1: SNMP emulator startup and lifecycle"
@@ -159,7 +205,12 @@ pass "Test 2: Default healthy state MIB queries (snmpget)"
 # -----------------------------------------------------------------------------
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 echo "--- Test 3: Status command reporting ---"
-out_stat=$("$EMULATOR_SCRIPT" --snmp-port "$TEST_SNMP_PORT" --snmp-state "$TEST_STATE_FILE" status-snmp)
+out_stat=$("$EMULATOR_SCRIPT" \
+    --snmp-port "$TEST_SNMP_PORT" \
+    --snmp-pid "$TEST_PID_FILE" \
+    --snmp-state "$TEST_STATE_FILE" \
+    --snmp-log "$TEST_LOG_FILE" \
+    status-snmp)
 echo "$out_stat"
 if [[ ! "$out_stat" =~ "SNMP Status: RUNNING" ]] || [[ ! "$out_stat" =~ "IDLE (3)" ]]; then
     fail "Test 3: Status reporting" "Expected RUNNING status with IDLE (3), got: $out_stat"
@@ -263,7 +314,10 @@ echo "--- Test 9: Stop -> Restart state persistence ---"
 "$EMULATOR_SCRIPT" --snmp-state "$TEST_STATE_FILE" snmp-set -counter 7777 -toner-level 33
 
 last_pid=$(cat "$TEST_PID_FILE" 2>/dev/null || true)
-"$EMULATOR_SCRIPT" --snmp-port "$TEST_SNMP_PORT" stop-snmp
+"$EMULATOR_SCRIPT" \
+    --snmp-port "$TEST_SNMP_PORT" \
+    --snmp-pid "$TEST_PID_FILE" \
+    stop-snmp
 sleep 0.5
 
 # Verify previous process stopped
@@ -271,12 +325,14 @@ if [[ -n "$last_pid" ]] && kill -0 "$last_pid" 2>/dev/null; then
     fail "Test 9: Stop emulator" "Process PID $last_pid failed to stop"
 fi
 
-# Restart using same state file
+# Restart using same isolated state and PID files
 "$EMULATOR_SCRIPT" \
     --snmp-host "$TEST_SNMP_HOST" \
     --snmp-port "$TEST_SNMP_PORT" \
     --snmp-community "$TEST_SNMP_COMMUNITY" \
     --snmp-state "$TEST_STATE_FILE" \
+    --snmp-pid "$TEST_PID_FILE" \
+    --snmp-log "$TEST_LOG_FILE" \
     start-snmp
 
 out_cnt=$(snmp_get "1.3.6.1.2.1.43.10.2.1.4.1.1")
@@ -327,13 +383,17 @@ fi
 # -----------------------------------------------------------------------------
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 echo "--- Safety Test 12: Occupied port detection ---"
-# Spin up a dummy netcat listener on an unprivileged port
 collision_port=11197
 nc -u -l 127.0.0.1 "$collision_port" &
 dummy_nc_pid=$!
 sleep 0.2
 
-out_coll=$("$EMULATOR_SCRIPT" --snmp-port "$collision_port" --snmp-state "${TEST_DIR}/dummy.json" start-snmp 2>&1 || true)
+out_coll=$("$EMULATOR_SCRIPT" \
+    --snmp-port "$collision_port" \
+    --snmp-state "${TEST_DIR}/dummy.json" \
+    --snmp-pid "${TEST_DIR}/dummy.pid" \
+    --snmp-log "${TEST_DIR}/dummy.log" \
+    start-snmp 2>&1 || true)
 kill "$dummy_nc_pid" 2>/dev/null || true
 echo "  Collision startup attempt output: $out_coll"
 
@@ -349,7 +409,11 @@ fi
 # -----------------------------------------------------------------------------
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 echo "--- Safety Test 13: Loopback safety enforcement ---"
-out_loop=$("$EMULATOR_SCRIPT" --snmp-host "192.168.99.200" --snmp-port 11199 start-snmp 2>&1 || true)
+out_loop=$("$EMULATOR_SCRIPT" \
+    --snmp-host "192.168.99.200" \
+    --snmp-port 11199 \
+    --snmp-pid "${TEST_DIR}/dummy_loop.pid" \
+    start-snmp 2>&1 || true)
 echo "  Non-loopback attempt output: $out_loop"
 if [[ "$out_loop" =~ "Safety violation" ]]; then
     echo "  start-snmp correctly rejected non-loopback host interface"
@@ -359,41 +423,85 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Safety Test 14: Unrelated PID protection
+# Safety Test 14: Unrelated PID protection in stop-snmp
 # -----------------------------------------------------------------------------
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
-echo "--- Safety Test 14: Unrelated PID protection ---"
-fake_pid_file="${SCRIPT_DIR}/snmp_responder.pid"
-# Find another active process (current shell PID)
+echo "--- Safety Test 14: Unrelated PID protection (stop-snmp) ---"
+alien_pid_file="${TEST_DIR}/alien_stop.pid"
 target_pid=$$
-echo "$target_pid" > "$fake_pid_file"
+echo "$target_pid" > "$alien_pid_file"
 
-out_unrel=$("$EMULATOR_SCRIPT" --snmp-port "$TEST_SNMP_PORT" stop-snmp 2>&1 || true)
-rm -f "$fake_pid_file"
-echo "  Unrelated PID stop output: $out_unrel"
+set +e
+out_unrel=$("$EMULATOR_SCRIPT" \
+    --snmp-pid "$alien_pid_file" \
+    --snmp-port "$TEST_SNMP_PORT" \
+    stop-snmp 2>&1)
+stop_rc=$?
+set -euo pipefail
 
-if [[ "$out_unrel" =~ "Refusing to signal unrelated process" ]]; then
-    echo "  stop-snmp correctly refused to signal unrelated PID ($target_pid)"
-    pass "Safety Test 14: Unrelated PID protection (refuses to kill alien PID)"
+echo "  Unrelated PID stop output (rc=${stop_rc}): $out_unrel"
+
+if [[ $stop_rc -ne 0 ]] && \
+   [[ "$out_unrel" =~ "Refusing to signal unrelated process" ]] && \
+   [[ -f "$alien_pid_file" ]] && \
+   kill -0 "$target_pid" 2>/dev/null; then
+    echo "  stop-snmp correctly refused to signal unrelated PID ($target_pid) and preserved PID file"
+    pass "Safety Test 14: Unrelated PID protection in stop-snmp"
 else
-    fail "Safety Test 14: Unrelated PID protection" "stop-snmp failed to protect unrelated PID"
+    fail "Safety Test 14: Unrelated PID protection" "stop-snmp failed to protect unrelated PID or returned 0"
 fi
+rm -f "$alien_pid_file"
 
 # -----------------------------------------------------------------------------
-# Test 15: Safe cleanup (cleanup-snmp)
+# Safety Test 15: Failed-stop cleanup refusal in cleanup-snmp
 # -----------------------------------------------------------------------------
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
-echo "--- Test 15: Safe cleanup ---"
+echo "--- Safety Test 15: Failed-stop cleanup refusal (cleanup-snmp) ---"
+alien_clean_pid="${TEST_DIR}/alien_cleanup.pid"
+alien_clean_state="${TEST_DIR}/alien_cleanup.json"
+echo "$$" > "$alien_clean_pid"
+echo '{"sys_descr":"protected_state"}' > "$alien_clean_state"
+
+set +e
+out_clean=$("$EMULATOR_SCRIPT" \
+    --snmp-pid "$alien_clean_pid" \
+    --snmp-state "$alien_clean_state" \
+    --snmp-port "$TEST_SNMP_PORT" \
+    cleanup-snmp 2>&1)
+clean_rc=$?
+set -euo pipefail
+
+echo "  Alien cleanup attempt output (rc=${clean_rc}): $out_clean"
+
+if [[ $clean_rc -ne 0 ]] && \
+   [[ "$out_clean" =~ "Refusing to remove PID or state metadata" ]] && \
+   [[ -f "$alien_clean_pid" ]] && \
+   [[ -f "$alien_clean_state" ]] && \
+   kill -0 "$$" 2>/dev/null; then
+    echo "  cleanup-snmp correctly failed and preserved PID and state metadata when process could not be safely stopped"
+    pass "Safety Test 15: Failed-stop cleanup refusal in cleanup-snmp"
+else
+    fail "Safety Test 15: Failed-stop cleanup refusal" "cleanup-snmp removed metadata despite failed stop"
+fi
+rm -f "$alien_clean_pid" "$alien_clean_state"
+
+# -----------------------------------------------------------------------------
+# Test 16: Safe cleanup of verified emulator instance (cleanup-snmp)
+# -----------------------------------------------------------------------------
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+echo "--- Test 16: Safe cleanup of verified emulator instance ---"
 "$EMULATOR_SCRIPT" \
     --snmp-port "$TEST_SNMP_PORT" \
+    --snmp-pid "$TEST_PID_FILE" \
     --snmp-state "$TEST_STATE_FILE" \
+    --snmp-log "$TEST_LOG_FILE" \
     cleanup-snmp
 
-if [[ -f "$TEST_STATE_FILE" ]]; then
-    fail "Test 15: Cleanup" "State file was not deleted"
+if [[ -f "$TEST_STATE_FILE" ]] || [[ -f "$TEST_PID_FILE" ]]; then
+    fail "Test 16: Cleanup" "State or PID file was not deleted after successful cleanup"
 else
     echo "  Verified cleanup removed emulator state and terminated process"
-    pass "Test 15: Safe cleanup"
+    pass "Test 16: Safe cleanup of verified emulator instance"
 fi
 
 # -----------------------------------------------------------------------------
