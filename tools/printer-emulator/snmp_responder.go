@@ -67,6 +67,7 @@ type SNMPState struct {
 	DrumLevel       int      `json:"drum_level"`
 	DrumMax         int      `json:"drum_max"`
 	OmittedOIDs     []string `json:"omitted_oids,omitempty"`
+	Offline         bool     `json:"offline,omitempty"`
 }
 
 // DefaultState returns healthy/idle default state.
@@ -82,6 +83,7 @@ func DefaultState() SNMPState {
 		DrumLevel:       95,
 		DrumMax:         100,
 		OmittedOIDs:     nil,
+		Offline:         false,
 	}
 }
 
@@ -308,6 +310,11 @@ func (srv *Server) listenLoop() {
 		// Reload state file if modified externally
 		srv.store.ReloadIfChanged()
 		state := srv.store.GetState()
+
+		// Offline simulation: drop incoming requests to simulate communication loss
+		if state.Offline {
+			continue
+		}
 
 		packet, err := g.SnmpDecodePacket(buf[:n])
 		if err != nil {
@@ -588,6 +595,11 @@ func printState(state SNMPState, w io.Writer) {
 	if len(state.OmittedOIDs) > 0 {
 		fmt.Fprintf(w, "  Omitted OIDs:          %s\n", strings.Join(state.OmittedOIDs, ", "))
 	}
+	if state.Offline {
+		fmt.Fprintf(w, "  Communication:         OFFLINE (packets dropped)\n")
+	} else {
+		fmt.Fprintf(w, "  Communication:         ONLINE\n")
+	}
 }
 
 func main() {
@@ -696,6 +708,7 @@ func cmdSet(args []string) {
 	unomitOID := fs.String("unomit-oid", "", "OID to restore if previously omitted")
 	clearOmitted := fs.Bool("clear-omitted", false, "Clear all omitted OIDs")
 	sysDescr := fs.String("sys-descr", "", "Set sysDescr value")
+	offline := fs.String("offline", "", "Simulate communication loss (true/false)")
 	_ = fs.Parse(args)
 
 	store, err := NewStateStore(*stateFile)
@@ -809,6 +822,9 @@ func cmdSet(args []string) {
 		}
 		if *sysDescr != "" {
 			s.SysDescr = *sysDescr
+		}
+		if *offline != "" {
+			s.Offline = strings.EqualFold(*offline, "true") || *offline == "1"
 		}
 	})
 

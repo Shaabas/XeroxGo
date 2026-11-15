@@ -356,3 +356,95 @@ Exercises XeroxGo's Go SNMP polling implementation against the local emulator, v
 - Timeouts and context cancellation
 - Restart persistence across daemon restarts
 - Deterministic counter updates
+
+---
+
+## 11. Coordinated IPP + SNMP Fault Injection (Task D3)
+
+Simulates a single physical printer with coherent, coordinated telemetry across both the D1 IPP (`ippeveprinter`) and D2 SNMP (`snmp_responder`) emulators.
+
+### Coordinated Fault Controller Architecture
+
+The fault controller (`tools/printer-emulator/fault.sh` or `./emulator.sh fault`) orchestrates both emulators through a shared state model (`fault_state.json`), ensuring that simulated physical printer conditions update both IPP attributes and SNMP MIB observations consistently.
+
+```
+                  ┌──────────────────────────────────────────────┐
+                  │   fault.sh / emulator.sh fault controller     │
+                  └───────┬──────────────────────────────┬───────┘
+                          │                              │
+             (CUPS filter protocol & SIGSTOP)     (Local state & packet drop)
+                          │                              │
+                          ▼                              ▼
+              ┌──────────────────────┐       ┌──────────────────────┐
+              │    ippeveprinter     │       │    snmp_responder    │
+              │   (IPP Everywhere)   │       │   (RFC 2790 SNMPv2c) │
+              └──────────────────────┘       └──────────────────────┘
+```
+
+### Supported Scenarios
+
+| Scenario | IPP Attributes (`printer-state-reasons`) | SNMP MIBs (`hrPrinterStatus`, Error Bits) | Description |
+|---|---|---|---|
+| `healthy` | `printer-state=idle`, `reasons=none` | `hrPrinterStatus=idle(3)`, `00 00` | Normal idle operation; zero error flags |
+| `printing` | `printer-state=processing`, active job delay | `hrPrinterStatus=printing(4)`, `00 00` | Simulated active print execution |
+| `paper-empty` | `reasons=media-empty-report` | `hrPrinterStatus=other(1)`, `40 00` (`noPaper`) | Paper tray empty |
+| `paper-jam` | `reasons=media-jam-report` | `hrPrinterStatus=other(1)`, `04 00` (`jammed`) | Media jam in transport path |
+| `cover-open` | `reasons=cover-open-report` | `hrPrinterStatus=other(1)`, `08 00` (`doorOpen`) | Access door or cover open |
+| `stopped` | `reasons=paused-report`, `cupsdisable` queue | `hrPrinterStatus=other(1)` | Stopped / paused queue state |
+| `offline` | Transport unresponsive (SIGSTOP) | UDP packets dropped silently | Complete communication loss |
+| `recovery` | Restored to `idle`, `reasons=none` | `hrPrinterStatus=idle(3)`, `00 00` | Clean recovery from any prior fault |
+
+### Truthful Emulation & Subsystem Characteristics
+
+- **Stopped State:** Standalone `ippeveprinter` only supports internal states 3 (`idle`) and 4 (`processing`) in its binary. State 5 (`stopped`) is truthfully represented in standalone IPP via the `paused` reason (`paused-report`), and when a temporary CUPS queue is registered, `cupsdisable <queue>` disables the queue.
+- **Media Empty Wait Loop:** `ippeveprinter` suspends command processing when `media-empty` is set. When transitioning away from `paper-empty`, the controller performs an instantaneous in-memory restart (< 0.1s) of `ippeveprinter` to reset the bitmask cleanly.
+- **Controlled Communication Loss:** The `offline` scenario pauses `ippeveprinter` via `SIGSTOP` (leaving TCP sockets unresponsive) and configures `snmp_responder` to silently drop incoming UDP packets. Recovery restores both immediately without modifying host interfaces, routes, or iptables.
+- **Deterministic Odometer:** Page counts are deterministic and explicitly controllable via `--counter <N>`. Processing test jobs or synchronization probes does not auto-increment the counter.
+
+### Fault Controller CLI Usage
+
+```bash
+cd tools/printer-emulator
+
+# 1. Inspect coordinated status and cross-subsystem telemetry analysis
+./fault.sh status
+# or: ./emulator.sh fault status
+
+# 2. Inject coordinated paper-jam scenario across both IPP and SNMP
+./fault.sh set paper-jam
+
+# 3. Inject coordinated cover-open scenario
+./fault.sh set cover-open
+
+# 4. Inject coordinated paper-empty scenario
+./fault.sh set paper-empty
+
+# 5. Simulate communication loss (both IPP TCP and SNMP UDP unresponsive)
+./fault.sh set offline
+
+# 6. Recover from offline or any active fault
+./fault.sh set recovery
+
+# 7. Independent target injection (simulate subsystem contradictions/disagreements)
+# IPP reports paper-jam while SNMP reports healthy:
+./fault.sh set --target ipp paper-jam
+
+# SNMP reports paper-jam while IPP reports healthy:
+./fault.sh set --ipp healthy --snmp paper-jam
+
+# 8. Deterministic counter and consumable configuration
+./fault.sh set healthy --counter 12500 --toner 40 --drum 75
+
+# 9. Clear all faults and return to healthy agreement
+./fault.sh clear
+```
+
+### Coordinated Fault Smoke & Verification Suites
+
+```bash
+# Run comprehensive D3 smoke test suite (35 automated assertions)
+./fault_smoke_test.sh
+
+# Run XeroxGo Go reconciliation integration test suite
+go test -v -race ./kiosk-daemon/internal/printer -run TestFaultReconciliation
+```

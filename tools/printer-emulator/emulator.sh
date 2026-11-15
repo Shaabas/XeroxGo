@@ -36,6 +36,10 @@ SNMP_LOG_FILE="${SNMP_LOG_FILE:-${SCRIPT_DIR}/snmp_responder.log}"
 SNMP_STATE_FILE="${SNMP_STATE_FILE:-${SCRIPT_DIR}/snmp_state.json}"
 SNMP_LOCK_DIR="${SCRIPT_DIR}/.snmp_startup.lock"
 
+# Coordinated Fault Controller configuration with environment variable overrides
+EMU_FAULT_STATE_FILE="${EMU_FAULT_STATE_FILE:-${SCRIPT_DIR}/fault_state.json}"
+EMU_IPP_PAUSED_FILE="${EMU_IPP_PAUSED_FILE:-${SCRIPT_DIR}/ipp_paused.flag}"
+
 # Locate ippeveprinter binary
 find_ippeveprinter() {
     if command -v ippeveprinter >/dev/null 2>&1; then
@@ -309,6 +313,20 @@ verify_emulator_process() {
     return 0
 }
 
+# Check if process is paused in kernel via SIGSTOP
+is_process_paused() {
+    local pid="$1"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || [[ ! -d "/proc/${pid}" ]]; then
+        return 1
+    fi
+    local state
+    state=$(awk '/^State:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || true)
+    if [[ "$state" == "T" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Check if port is in use
 is_port_in_use() {
     local host="$1"
@@ -453,6 +471,8 @@ cmd_start() {
 
     args+=("$EMU_NAME")
 
+    export EMU_FAULT_STATE_FILE
+
     # Start ippeveprinter in background
     "$ippeveprinter_bin" "${args[@]}" > "$EMU_LOG_FILE" 2>&1 &
     local emu_pid=$!
@@ -497,6 +517,19 @@ cmd_start() {
     echo "  Spool Dir: ${EMU_SPOOL_DIR}"
     echo "  Log File:  ${EMU_LOG_FILE}"
 
+    # Re-apply active fault state if configured
+    if [[ -f "$EMU_FAULT_STATE_FILE" ]]; then
+        local ipp_off
+        ipp_off=$(get_fault_state_field "ipp_offline" "false")
+        if [[ "$ipp_off" == "true" ]]; then
+            echo "Applying active offline fault to IPP emulator (SIGSTOP)..."
+            kill -STOP "$emu_pid" 2>/dev/null || true
+            echo "$emu_pid" > "$EMU_IPP_PAUSED_FILE"
+        else
+            sync_ipp_state "$EMU_HOST" "$EMU_PORT"
+        fi
+    fi
+
     release_lock
     return 0
 }
@@ -527,6 +560,12 @@ cmd_stop() {
         echo "ERROR: PID ${pid} does not match running ippeveprinter emulator on port ${EMU_PORT}." >&2
         echo "Refusing to signal unrelated process." >&2
         return 1
+    fi
+
+    # If process is paused in kernel via SIGSTOP (e.g. offline fault), resume it so it can handle SIGTERM
+    if is_process_paused "$pid" || [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
+        kill -CONT "$pid" 2>/dev/null || true
+        rm -f "$EMU_IPP_PAUSED_FILE"
     fi
 
     echo "Stopping IPP printer emulator (PID: ${pid})..."
@@ -561,7 +600,11 @@ cmd_status() {
     if is_running; then
         local pid
         pid=$(get_pid)
-        echo "Status: RUNNING (PID: ${pid})"
+        if [[ -n "$pid" ]] && is_process_paused "$pid"; then
+            echo "Status: RUNNING (PID: ${pid}, PAUSED/OFFLINE)"
+        else
+            echo "Status: RUNNING (PID: ${pid})"
+        fi
         echo "  Endpoint:  ipp://${EMU_HOST}:${EMU_PORT}/ipp/print"
         echo "  Spool Dir: ${EMU_SPOOL_DIR}"
         echo "  Log File:  ${EMU_LOG_FILE}"
@@ -772,7 +815,7 @@ cmd_cleanup() {
         fi
     fi
 
-    rm -f "$EMU_PID_FILE" "$EMU_LOG_FILE"
+    rm -f "$EMU_PID_FILE" "$EMU_LOG_FILE" "$EMU_FAULT_STATE_FILE" "$EMU_IPP_PAUSED_FILE"
     rm -rf "$EMU_LOCK_DIR" 2>/dev/null || true
 
     # Clean up SNMP resources if present
@@ -1099,6 +1142,559 @@ cmd_snmp_reset() {
     "${SCRIPT_DIR}/snmp_responder" reset -state "$SNMP_STATE_FILE" "$@"
 }
 
+# -----------------------------------------------------------------------------
+# Coordinated Fault Controller Functions
+# -----------------------------------------------------------------------------
+
+sync_ipp_state() {
+    local host="${1:-$EMU_HOST}"
+    local port="${2:-$EMU_PORT}"
+    local sample_pdf="${SCRIPT_DIR}/testdata/sample.pdf"
+
+    if ! is_running; then
+        return 0
+    fi
+    local pid
+    pid=$(get_pid)
+    if [[ -n "$pid" ]] && is_process_paused "$pid"; then
+        return 0
+    fi
+
+    if [[ ! -f "$sample_pdf" ]]; then
+        return 0
+    fi
+
+    if command -v ipptool >/dev/null 2>&1; then
+        local test_file="${SCRIPT_DIR}/sync_probe.test"
+        if [[ ! -f "$test_file" ]]; then
+            test_file="print-job.test"
+        fi
+        ipptool -f "$sample_pdf" "ipp://${host}:${port}/ipp/print" "$test_file" >/dev/null 2>&1 || true
+    fi
+}
+
+get_fault_state_field() {
+    local field="$1"
+    local default="${2:-}"
+    if [[ ! -f "$EMU_FAULT_STATE_FILE" ]]; then
+        echo "$default"
+        return 0
+    fi
+    python3 -c "import json, sys; data = json.load(open(sys.argv[1])); print(data.get(sys.argv[2], sys.argv[3]))" "$EMU_FAULT_STATE_FILE" "$field" "$default" 2>/dev/null || echo "$default"
+}
+
+write_fault_state() {
+    local scenario="$1"
+    local target="$2"
+    local ipp_scen="$3"
+    local snmp_scen="$4"
+    local ipp_reasons="$5"
+    local ipp_offline="$6"
+    local snmp_offline="$7"
+    local hold_job="$8"
+
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    cat > "$EMU_FAULT_STATE_FILE" << EOF
+{
+  "scenario": "${scenario}",
+  "target": "${target}",
+  "ipp_scenario": "${ipp_scen}",
+  "snmp_scenario": "${snmp_scen}",
+  "ipp_reasons": ${ipp_reasons},
+  "ipp_offline": ${ipp_offline},
+  "snmp_offline": ${snmp_offline},
+  "hold_job": ${hold_job},
+  "updated_at": "${ts}"
+}
+EOF
+}
+
+cmd_fault_set() {
+    local scenario=""
+    local target="both"
+    local opt_ipp=""
+    local opt_snmp=""
+    local opt_counter=""
+    local opt_toner=""
+    local opt_drum=""
+    local opt_speed=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target)
+                target="$2"
+                shift 2
+                ;;
+            --ipp)
+                opt_ipp="$2"
+                shift 2
+                ;;
+            --snmp)
+                opt_snmp="$2"
+                shift 2
+                ;;
+            --counter)
+                opt_counter="$2"
+                shift 2
+                ;;
+            --toner)
+                opt_toner="$2"
+                shift 2
+                ;;
+            --drum)
+                opt_drum="$2"
+                shift 2
+                ;;
+            --speed)
+                opt_speed="$2"
+                shift 2
+                ;;
+            --fault-state)
+                EMU_FAULT_STATE_FILE="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$scenario" ]]; then
+                    scenario="$1"
+                    shift
+                else
+                    echo "Unexpected argument for fault set: $1" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$scenario" && -z "$opt_ipp" && -z "$opt_snmp" && -z "$opt_counter" && -z "$opt_toner" && -z "$opt_drum" ]]; then
+        echo "ERROR: Missing scenario name for fault set." >&2
+        echo "Valid scenarios: healthy, printing, paper-empty, paper-jam, cover-open, stopped, offline, recovery, clear" >&2
+        return 1
+    fi
+
+    if [[ -n "$scenario" ]]; then
+        case "$scenario" in
+            healthy|printing|paper-empty|paper-jam|cover-open|stopped|offline|recovery|clear)
+                ;;
+            *)
+                echo "ERROR: Unknown fault scenario '${scenario}'." >&2
+                echo "Valid scenarios: healthy, printing, paper-empty, paper-jam, cover-open, stopped, offline, recovery, clear" >&2
+                return 1
+                ;;
+        esac
+    else
+        scenario=$(get_fault_state_field "scenario" "healthy")
+    fi
+
+    case "$target" in
+        both|ipp|snmp)
+            ;;
+        *)
+            echo "ERROR: Invalid target '${target}'. Must be 'both', 'ipp', or 'snmp'." >&2
+            return 1
+            ;;
+    esac
+
+    local prev_ipp
+    prev_ipp=$(get_fault_state_field "ipp_scenario" "healthy")
+    local prev_ipp_reasons
+    prev_ipp_reasons=$(get_fault_state_field "ipp_reasons" "[]")
+    local prev_snmp
+    prev_snmp=$(get_fault_state_field "snmp_scenario" "healthy")
+
+    local ipp_scen="$prev_ipp"
+    local snmp_scen="$prev_snmp"
+
+    if [[ -n "$opt_ipp" ]]; then
+        ipp_scen="$opt_ipp"
+    elif [[ "$target" == "both" || "$target" == "ipp" ]]; then
+        ipp_scen="$scenario"
+    fi
+
+    if [[ -n "$opt_snmp" ]]; then
+        snmp_scen="$opt_snmp"
+    elif [[ "$target" == "both" || "$target" == "snmp" ]]; then
+        snmp_scen="$scenario"
+    fi
+
+    local ipp_reasons='[]'
+    local ipp_offline=false
+    local snmp_offline=false
+    local hold_job=false
+
+    # IPP state configuration
+    case "$ipp_scen" in
+        healthy|recovery|clear)
+            ipp_scen="healthy"
+            ipp_reasons='[]'
+            ipp_offline=false
+            hold_job=false
+            ;;
+        printing)
+            ipp_reasons='[]'
+            ipp_offline=false
+            hold_job=true
+            ;;
+        paper-empty)
+            ipp_reasons='["media-empty"]'
+            ipp_offline=false
+            hold_job=false
+            ;;
+        paper-jam)
+            ipp_reasons='["media-jam"]'
+            ipp_offline=false
+            hold_job=false
+            ;;
+        cover-open)
+            ipp_reasons='["cover-open"]'
+            ipp_offline=false
+            hold_job=false
+            ;;
+        stopped)
+            ipp_reasons='["paused"]'
+            ipp_offline=false
+            hold_job=false
+            ;;
+        offline)
+            ipp_offline=true
+            hold_job=false
+            ;;
+        *)
+            echo "ERROR: Unknown IPP scenario '${ipp_scen}'." >&2
+            return 1
+            ;;
+    esac
+
+    # SNMP state configuration
+    local snmp_args=()
+    case "$snmp_scen" in
+        healthy|recovery|clear)
+            snmp_scen="healthy"
+            snmp_offline=false
+            snmp_args=(-status idle -clear-all-errors -offline false)
+            ;;
+        printing)
+            snmp_offline=false
+            snmp_args=(-status printing -clear-all-errors -offline false)
+            ;;
+        paper-empty)
+            snmp_offline=false
+            snmp_args=(-status other -clear-all-errors -set-error no_paper -offline false)
+            ;;
+        paper-jam)
+            snmp_offline=false
+            snmp_args=(-status other -clear-all-errors -set-error paper_jam -offline false)
+            ;;
+        cover-open)
+            snmp_offline=false
+            snmp_args=(-status other -clear-all-errors -set-error cover_open -offline false)
+            ;;
+        stopped)
+            snmp_offline=false
+            snmp_args=(-status other -offline false)
+            ;;
+        offline)
+            snmp_offline=true
+            snmp_args=(-offline true)
+            ;;
+        *)
+            echo "ERROR: Unknown SNMP scenario '${snmp_scen}'." >&2
+            return 1
+            ;;
+    esac
+
+    # Apply IPP subsystem mutations
+    if [[ "$target" == "both" || "$target" == "ipp" ]]; then
+        if [[ "$ipp_offline" == "true" ]]; then
+            # Freeze IPP process via SIGSTOP to simulate network/host communication loss
+            write_fault_state "$scenario" "$target" "$ipp_scen" "$snmp_scen" "$ipp_reasons" "$ipp_offline" "$snmp_offline" "$hold_job"
+            if is_running; then
+                local pid
+                pid=$(get_pid)
+                if [[ -n "$pid" ]] && ! is_process_paused "$pid"; then
+                    kill -STOP "$pid" 2>/dev/null || true
+                    echo "$pid" > "$EMU_IPP_PAUSED_FILE"
+                fi
+            fi
+        else
+            # Unpause if process was previously paused (offline recovery)
+            if is_running; then
+                local pid
+                pid=$(get_pid)
+                if [[ -n "$pid" ]] && (is_process_paused "$pid" || [[ -f "$EMU_IPP_PAUSED_FILE" ]]); then
+                    kill -CONT "$pid" 2>/dev/null || true
+                    rm -f "$EMU_IPP_PAUSED_FILE"
+                fi
+            fi
+
+            # If media-empty was active and we are transitioning away, ippeveprinter's in-memory
+            # media-empty wait loop must be cleared via a fast restart (< 0.1s).
+            local need_restart=false
+            if [[ "$prev_ipp" == "paper-empty" || "$prev_ipp_reasons" =~ media-empty ]] && [[ "$ipp_scen" != "paper-empty" ]]; then
+                need_restart=true
+            fi
+
+            write_fault_state "$scenario" "$target" "$ipp_scen" "$snmp_scen" "$ipp_reasons" "$ipp_offline" "$snmp_offline" "$hold_job"
+
+            if [[ "$need_restart" == "true" ]] && is_running; then
+                cmd_stop >/dev/null 2>&1 || true
+                cmd_start >/dev/null 2>&1 || true
+            else
+                # Synchronize state attributes via ippeveprinter filter protocol
+                sync_ipp_state "$EMU_HOST" "$EMU_PORT"
+            fi
+
+            # If stopped scenario was requested and CUPS queue exists, disable CUPS queue
+            if [[ "$ipp_scen" == "stopped" ]]; then
+                if command -v cupsdisable >/dev/null 2>&1 && [[ -f "$EMU_META_FILE" ]]; then
+                    cupsdisable "$EMU_CUPS_QUEUE" 2>/dev/null || true
+                fi
+            elif [[ "$ipp_scen" == "healthy" ]]; then
+                if command -v cupsenable >/dev/null 2>&1 && [[ -f "$EMU_META_FILE" ]]; then
+                    cupsenable "$EMU_CUPS_QUEUE" 2>/dev/null || true
+                fi
+            fi
+        fi
+    else
+        # Only SNMP targeted: preserve existing IPP state in fault_state.json
+        local cur_ipp_reasons
+        cur_ipp_reasons=$(get_fault_state_field "ipp_reasons" "[]")
+        local cur_ipp_off
+        cur_ipp_off=$(get_fault_state_field "ipp_offline" "false")
+        local cur_hold
+        cur_hold=$(get_fault_state_field "hold_job" "false")
+        write_fault_state "$scenario" "$target" "$ipp_scen" "$snmp_scen" "$cur_ipp_reasons" "$cur_ipp_off" "$snmp_offline" "$cur_hold"
+    fi
+
+    # Apply SNMP subsystem mutations
+    if [[ "$target" == "both" || "$target" == "snmp" ]]; then
+        if [[ -n "$opt_counter" ]]; then
+            snmp_args+=(-counter "$opt_counter")
+        fi
+        if [[ -n "$opt_toner" ]]; then
+            snmp_args+=(-toner-level "$opt_toner" -toner-max 100)
+        fi
+        if [[ -n "$opt_drum" ]]; then
+            snmp_args+=(-drum-level "$opt_drum" -drum-max 100)
+        fi
+        cmd_snmp_set "${snmp_args[@]}" >/dev/null
+    fi
+
+    echo "Coordinated Fault Injected:"
+    echo "  Scenario:      ${scenario}"
+    echo "  Target:        ${target}"
+    echo "  IPP State:     ${ipp_scen} (reasons: ${ipp_reasons}, offline: ${ipp_offline})"
+    echo "  SNMP State:    ${snmp_scen} (offline: ${snmp_offline})"
+    return 0
+}
+
+cmd_fault_clear() {
+    cmd_fault_set healthy --target both "$@"
+}
+
+cmd_fault_status() {
+    echo "============================================================"
+    echo "  XeroxGo Coordinated Fault Controller Status"
+    echo "============================================================"
+
+    local scen target ipp_scen snmp_scen ipp_reasons ipp_off snmp_off updated_at
+    scen=$(get_fault_state_field "scenario" "healthy")
+    target=$(get_fault_state_field "target" "both")
+    ipp_scen=$(get_fault_state_field "ipp_scenario" "healthy")
+    snmp_scen=$(get_fault_state_field "snmp_scenario" "healthy")
+    ipp_reasons=$(get_fault_state_field "ipp_reasons" "[]")
+    ipp_off=$(get_fault_state_field "ipp_offline" "false")
+    snmp_off=$(get_fault_state_field "snmp_offline" "false")
+    updated_at=$(get_fault_state_field "updated_at" "unknown")
+
+    echo "Configured Fault Scenario: ${scen}"
+    echo "  Target:       ${target}"
+    echo "  IPP Target:   ${ipp_scen} (reasons: ${ipp_reasons}, offline: ${ipp_off})"
+    echo "  SNMP Target:  ${snmp_scen} (offline: ${snmp_off})"
+    echo "  Updated At:   ${updated_at}"
+    echo ""
+
+    echo "--- IPP Subsystem Telemetry ---"
+    local ipp_running=false
+    local ipp_paused=false
+    local ipp_pid=""
+    if is_running; then
+        ipp_running=true
+        ipp_pid=$(get_pid)
+        if [[ -n "$ipp_pid" ]] && is_process_paused "$ipp_pid"; then
+            ipp_paused=true
+        fi
+    fi
+
+    local live_ipp_state="UNKNOWN"
+    local live_ipp_reasons="unknown"
+    local live_ipp_accepting="unknown"
+
+    if [[ "$ipp_running" == "false" ]]; then
+        echo "  IPP Emulator:  STOPPED"
+    elif [[ "$ipp_paused" == "true" ]]; then
+        echo "  IPP Emulator:  RUNNING (PID: ${ipp_pid}, PAUSED/OFFLINE via SIGSTOP)"
+        echo "  Endpoint:      ipp://${EMU_HOST}:${EMU_PORT}/ipp/print"
+        echo "  Communication: OFFLINE (TCP socket unresponsive)"
+        live_ipp_state="OFFLINE"
+        live_ipp_reasons="none"
+    else
+        echo "  IPP Emulator:  RUNNING (PID: ${ipp_pid})"
+        echo "  Endpoint:      ipp://${EMU_HOST}:${EMU_PORT}/ipp/print"
+        echo "  Communication: ONLINE"
+        if command -v ipptool >/dev/null 2>&1; then
+            local ipp_attrs
+            ipp_attrs=$(ipptool -tv "ipp://${EMU_HOST}:${EMU_PORT}/ipp/print" get-printer-attributes.test 2>/dev/null || true)
+            live_ipp_state=$(echo "$ipp_attrs" | awk '/printer-state \(enum\)/ {print $NF}')
+            live_ipp_reasons=$(echo "$ipp_attrs" | grep "printer-state-reasons" | sed -E 's/.*=[[:space:]]*//' | tr -d ' ' || true)
+            live_ipp_accepting=$(echo "$ipp_attrs" | awk '/printer-is-accepting-jobs \(boolean\)/ {print $NF}')
+            echo "  printer-state:               ${live_ipp_state:-unknown}"
+            echo "  printer-state-reasons:       ${live_ipp_reasons:-none}"
+            echo "  printer-is-accepting-jobs:   ${live_ipp_accepting:-unknown}"
+        fi
+    fi
+
+    if [[ -f "$EMU_META_FILE" ]] && command -v lpstat >/dev/null 2>&1; then
+        echo "  CUPS Queue (${EMU_CUPS_QUEUE}):"
+        lpstat -p "$EMU_CUPS_QUEUE" 2>&1 | sed 's/^/    /' || true
+    fi
+    echo ""
+
+    echo "--- SNMP Subsystem Telemetry ---"
+    local snmp_running=false
+    local snmp_pid=""
+    if is_snmp_running; then
+        snmp_running=true
+        snmp_pid=$(get_snmp_pid)
+    fi
+
+    local snmp_state_json="{}"
+    local snmp_comm="UNKNOWN"
+    local snmp_flags=""
+    local snmp_status_val=0
+
+    if [[ "$snmp_running" == "false" ]]; then
+        echo "  SNMP Emulator: STOPPED"
+    else
+        echo "  SNMP Emulator: RUNNING (PID: ${snmp_pid})"
+        echo "  Endpoint:      ${SNMP_HOST}:${SNMP_PORT} (UDP, community: ${SNMP_COMMUNITY})"
+        ensure_snmp_responder_binary
+        "${SCRIPT_DIR}/snmp_responder" get -state "$SNMP_STATE_FILE" | sed 's/^/  /'
+        snmp_state_json=$("${SCRIPT_DIR}/snmp_responder" get -state "$SNMP_STATE_FILE" -json 2>/dev/null || echo "{}")
+        snmp_comm=$(python3 -c "import json, sys; data=json.load(open(sys.argv[1])); print('OFFLINE' if data.get('offline') else 'ONLINE')" "$SNMP_STATE_FILE" 2>/dev/null || echo "UNKNOWN")
+        snmp_flags=$(python3 -c "
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    b0 = data.get('error_byte_0', 0)
+    b1 = data.get('error_byte_1', 0)
+    flags = []
+    if b0 & 0x80: flags.append('lowPaper')
+    if b0 & 0x40: flags.append('noPaper')
+    if b0 & 0x20: flags.append('lowToner')
+    if b0 & 0x10: flags.append('noToner')
+    if b0 & 0x08: flags.append('doorOpen')
+    if b0 & 0x04: flags.append('jammed')
+    if b0 & 0x02: flags.append('offline')
+    if b0 & 0x01: flags.append('serviceRequested')
+    if b1 & 0x80: flags.append('inputTrayMissing')
+    if b1 & 0x40: flags.append('outputTrayMissing')
+    if b1 & 0x20: flags.append('markerSupplyMissing')
+    if b1 & 0x10: flags.append('outputNearFull')
+    if b1 & 0x08: flags.append('outputFull')
+    if b1 & 0x04: flags.append('inputTrayEmpty')
+    if b1 & 0x02: flags.append('overduePreventMaint')
+    print(','.join(flags))
+except Exception:
+    print('')
+" "$SNMP_STATE_FILE" 2>/dev/null || echo "")
+        snmp_status_val=$(python3 -c "import json, sys; data=json.load(open(sys.argv[1])); print(data.get('hr_printer_status', 0))" "$SNMP_STATE_FILE" 2>/dev/null || echo "0")
+    fi
+    echo ""
+
+    echo "--- Coordinated Telemetry Analysis ---"
+    if [[ "$ipp_paused" == "true" || "$live_ipp_state" == "OFFLINE" ]] && [[ "$snmp_comm" == "OFFLINE" ]]; then
+        echo "  Status: [AGREEMENT] Both IPP and SNMP are OFFLINE (IPP TCP unresponsive, SNMP UDP dropped)."
+    elif [[ "$ipp_paused" == "true" || "$live_ipp_state" == "OFFLINE" ]] && [[ "$snmp_comm" == "ONLINE" ]]; then
+        echo "  Status: [CONTRADICTION] IPP is OFFLINE (frozen), but SNMP reports ONLINE."
+    elif [[ "$ipp_paused" == "false" && "$live_ipp_state" != "OFFLINE" ]] && [[ "$snmp_comm" == "OFFLINE" ]]; then
+        echo "  Status: [CONTRADICTION] SNMP is OFFLINE (packet drop), but IPP reports ONLINE."
+    else
+        local ipp_jam=false ipp_cover=false ipp_empty=false ipp_paused_r=false
+        if echo "$live_ipp_reasons" | grep -q "media-jam"; then ipp_jam=true; fi
+        if echo "$live_ipp_reasons" | grep -q "cover-open"; then ipp_cover=true; fi
+        if echo "$live_ipp_reasons" | grep -q "media-empty"; then ipp_empty=true; fi
+        if echo "$live_ipp_reasons" | grep -q "paused"; then ipp_paused_r=true; fi
+
+        local snmp_jam=false snmp_cover=false snmp_empty=false
+        if echo "$snmp_flags" | grep -qiE "jam|jammed|paper_jam"; then snmp_jam=true; fi
+        if echo "$snmp_flags" | grep -qiE "door|cover"; then snmp_cover=true; fi
+        if echo "$snmp_flags" | grep -qiE "nopaper|no_paper|empty"; then snmp_empty=true; fi
+
+        if [[ "$scen" == "printing" || "$snmp_status_val" == "4" ]]; then
+            echo "  Status: [AGREEMENT] Both IPP and SNMP report PRINTING."
+        elif [[ "$ipp_jam" == "true" && "$snmp_jam" == "true" ]]; then
+            echo "  Status: [AGREEMENT] Both IPP and SNMP report PAPER-JAM."
+        elif [[ "$ipp_cover" == "true" && "$snmp_cover" == "true" ]]; then
+            echo "  Status: [AGREEMENT] Both IPP and SNMP report COVER-OPEN."
+        elif [[ "$ipp_empty" == "true" && "$snmp_empty" == "true" ]]; then
+            echo "  Status: [AGREEMENT] Both IPP and SNMP report PAPER-EMPTY."
+        elif [[ "$ipp_jam" == "true" && "$snmp_jam" == "false" ]]; then
+            echo "  Status: [CONTRADICTION] IPP reports paper-jam (${live_ipp_reasons}), but SNMP reports no paper-jam."
+        elif [[ "$ipp_jam" == "false" && "$snmp_jam" == "true" ]]; then
+            echo "  Status: [CONTRADICTION] SNMP reports paper-jam, but IPP reports healthy (${live_ipp_reasons})."
+        elif [[ "$ipp_cover" == "true" && "$snmp_cover" == "false" ]]; then
+            echo "  Status: [CONTRADICTION] IPP reports cover-open (${live_ipp_reasons}), but SNMP reports no cover-open."
+        elif [[ "$ipp_cover" == "false" && "$snmp_cover" == "true" ]]; then
+            echo "  Status: [CONTRADICTION] SNMP reports cover-open, but IPP reports healthy (${live_ipp_reasons})."
+        elif [[ "$ipp_empty" == "true" && "$snmp_empty" == "false" ]]; then
+            echo "  Status: [CONTRADICTION] IPP reports paper-empty (${live_ipp_reasons}), but SNMP reports no empty."
+        elif [[ "$ipp_empty" == "false" && "$snmp_empty" == "true" ]]; then
+            echo "  Status: [CONTRADICTION] SNMP reports paper-empty, but IPP reports healthy (${live_ipp_reasons})."
+        elif [[ "$ipp_paused_r" == "true" ]]; then
+            echo "  Status: [IPP-STOPPED] IPP reports paused reason (state: ${live_ipp_state})."
+        else
+            echo "  Status: [AGREEMENT] Both IPP and SNMP report HEALTHY / IDLE."
+        fi
+    fi
+    echo "  Limitation note: Standalone ippeveprinter only reports states 3 (idle) and 4 (processing). State 5 (stopped) is managed via CUPS queue (cupsdisable)."
+    echo "============================================================"
+    return 0
+}
+
+cmd_fault() {
+    local subcmd="${1:-}"
+    if [[ -z "$subcmd" ]]; then
+        cmd_fault_status
+        return 0
+    fi
+    shift
+    case "$subcmd" in
+        set)
+            cmd_fault_set "$@"
+            ;;
+        clear)
+            cmd_fault_clear "$@"
+            ;;
+        status)
+            cmd_fault_status "$@"
+            ;;
+        *)
+            case "$subcmd" in
+                healthy|printing|paper-empty|paper-jam|cover-open|stopped|offline|recovery|clear)
+                    cmd_fault_set "$subcmd" "$@"
+                    ;;
+                *)
+                    echo "Unknown fault subcommand: $subcmd" >&2
+                    echo "Usage: $(basename "$0") fault [set|clear|status] [scenario] [options]" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+}
+
 show_help() {
     cat << EOF
 Usage: $(basename "$0") [options] <command> [command-options]
@@ -1120,6 +1716,11 @@ SNMP Emulator Commands:
   snmp-get     Inspect current simulated SNMP state
   snmp-reset   Reset simulated SNMP values to default healthy/idle state
 
+Coordinated Fault Injection Commands:
+  fault set <scenario> [options]  Inject coordinated fault (healthy, printing, paper-empty, paper-jam, cover-open, stopped, offline, recovery)
+  fault clear                     Clear active fault and restore healthy state across IPP and SNMP
+  fault status                    Show coordinated fault controller telemetry and agreement/contradiction analysis
+
 IPP Options:
   -h, --host <host>          Host interface to bind (default: ${EMU_HOST})
   -p, --port <port>          Port number to bind (default: ${EMU_PORT})
@@ -1135,12 +1736,22 @@ SNMP Options:
   --snmp-pid <path>          Path to SNMP PID file (default: ${SNMP_PID_FILE})
   --snmp-log <path>          Path to SNMP log file (default: ${SNMP_LOG_FILE})
 
+Fault Injection Options:
+  --target <both|ipp|snmp>   Subsystem telemetry target (default: both)
+  --ipp <scenario>           Explicit IPP scenario override
+  --snmp <scenario>          Explicit SNMP scenario override
+  --counter <N>              Explicit odometer marker count (Counter32)
+  --toner <pct>              Toner level percentage (0-100)
+  --drum <pct>               Drum life percentage (0-100)
+  --fault-state <path>       Path to fault state JSON (default: ${EMU_FAULT_STATE_FILE})
+
 General Options:
   --help                     Show this help message
 
 Environment Variables:
   EMU_HOST, EMU_PORT, EMU_NAME, EMU_CUPS_QUEUE, EMU_SPOOL_DIR
   SNMP_HOST, SNMP_PORT, SNMP_COMMUNITY, SNMP_STATE_FILE, SNMP_PID_FILE
+  EMU_FAULT_STATE_FILE
 EOF
 }
 
@@ -1194,6 +1805,10 @@ while [[ $# -gt 0 ]]; do
             SNMP_LOG_FILE="$2"
             shift 2
             ;;
+        --fault-state)
+            EMU_FAULT_STATE_FILE="$2"
+            shift 2
+            ;;
         --help)
             show_help
             exit 0
@@ -1203,6 +1818,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         snmp-set|snmp-get|snmp-reset)
+            COMMAND="$1"
+            shift
+            COMMAND_ARGS=("$@")
+            break
+            ;;
+        fault|fault-set|fault-clear|fault-status)
             COMMAND="$1"
             shift
             COMMAND_ARGS=("$@")
@@ -1264,6 +1885,18 @@ case "$COMMAND" in
         ;;
     snmp-reset)
         cmd_snmp_reset "${COMMAND_ARGS[@]}"
+        ;;
+    fault)
+        cmd_fault "${COMMAND_ARGS[@]}"
+        ;;
+    fault-set)
+        cmd_fault_set "${COMMAND_ARGS[@]}"
+        ;;
+    fault-clear)
+        cmd_fault_clear "${COMMAND_ARGS[@]}"
+        ;;
+    fault-status)
+        cmd_fault_status "${COMMAND_ARGS[@]}"
         ;;
     *)
         echo "Unknown command: $COMMAND" >&2
