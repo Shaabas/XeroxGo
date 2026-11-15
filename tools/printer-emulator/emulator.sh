@@ -73,7 +73,7 @@ validate_spool_dir() {
 
     # Reject dangerous system roots and user roots
     case "$target_dir" in
-        /|/bin|/sbin|/boot|/dev|/etc|/lib|/lib64|/proc|/root|/sys|/usr|/var|/opt|/home|/tmp)
+        /|/bin|/bin/*|/sbin|/sbin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|/proc|/proc/*|/root|/root/*|/sys|/sys/*|/usr|/usr/*|/var|/var/log|/var/log/*|/opt|/home|/tmp)
             echo "ERROR: Refusing to use system directory '$target_dir' as spool directory." >&2
             return 1
             ;;
@@ -88,7 +88,7 @@ validate_spool_dir() {
         local link_target
         link_target=$(realpath "$dir" 2>/dev/null || true)
         case "$link_target" in
-            /|/bin|/sbin|/boot|/dev|/etc|/lib|/lib64|/proc|/root|/sys|/usr|/var|/opt|/home|/tmp|"$HOME")
+            /|/bin|/bin/*|/sbin|/sbin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|/proc|/proc/*|/root|/root/*|/sys|/sys/*|/usr|/usr/*|/var|/var/log|/var/log/*|/opt|/home|/tmp|"$HOME")
                 echo "ERROR: Spool symlink points to forbidden directory '$link_target'." >&2
                 return 1
                 ;;
@@ -96,6 +96,100 @@ validate_spool_dir() {
     fi
 
     echo "$target_dir"
+    return 0
+}
+
+# Verify if a filename matches standard IPP emulator print artifacts
+# Format: <job-id>-<title>.<ext> or <job-id>.<ext>
+# Extensions: pdf, prn, ps, pwg, urf, bin, txt, raw, pcl, ras, dat
+is_emulator_artifact() {
+    local fname="$1"
+    [[ -n "$fname" ]] || return 1
+    local regex="^[0-9]+(-[A-Za-z0-9_.\-]+)?\.(pdf|PDF|prn|PRN|ps|PS|pwg|PWG|urf|URF|bin|BIN|txt|TXT|raw|RAW|pcl|PCL|ras|RAS|dat|DAT)$"
+    [[ "$fname" =~ $regex ]]
+}
+
+# Verify spool directory ownership and initialize or reuse strictly
+verify_and_init_spool_dir() {
+    local dir="$1"
+    local marker="${dir}/${SPOOL_MARKER_NAME}"
+
+    # Ensure directory exists
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir"
+    fi
+
+    # Protect against directory being a symlink
+    if [[ -L "$dir" ]]; then
+        echo "ERROR: Refusing to use symlink '$dir' directly as spool directory." >&2
+        return 1
+    fi
+
+    if [[ ! -f "$marker" ]]; then
+        # Requirement 2 & 3: For unowned directory, require it to be empty before claiming ownership
+        local entry fname
+        for entry in "$dir"/* "$dir"/.*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            fname=$(basename "$entry")
+            [[ "$fname" != "." && "$fname" != ".." ]] || continue
+
+            # Allow .gitkeep in empty repository directories, reject any other file, directory, or symlink
+            if [[ "$fname" != ".gitkeep" ]]; then
+                echo "ERROR: Spool directory '$dir' is unowned and not empty (found '$fname')." >&2
+                echo "Refusing to claim ownership of existing directory containing unrelated files." >&2
+                return 1
+            fi
+        done
+
+        # Directory is empty (or has only .gitkeep) - initialize ownership marker
+        cat << EOF > "$marker"
+EMULATOR_OWNED_SPOOL=true
+CREATED_BY=xeroxgo_emulator
+CREATED_AT=$(date -u +%FT%TZ)
+HOST=${EMU_HOST}
+PORT=${EMU_PORT}
+EOF
+        return 0
+    fi
+
+    # Requirement 4 & 8: Existing directories containing only valid emulator-owned artifacts may be reused
+    if ! grep -q "EMULATOR_OWNED_SPOOL=true" "$marker" 2>/dev/null; then
+        echo "ERROR: Spool directory ownership marker in '$dir' is invalid or corrupt. Refusing startup." >&2
+        return 1
+    fi
+
+    local entry fname
+    for entry in "$dir"/* "$dir"/.*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        fname=$(basename "$entry")
+        [[ "$fname" != "." && "$fname" != ".." ]] || continue
+
+        # Refuse startup if directory contains symlinks, subdirectories, or special files
+        if [[ -L "$entry" ]]; then
+            echo "ERROR: Owned spool directory contains unexpected symlink '$fname'. Refusing startup for safety." >&2
+            return 1
+        fi
+        if [[ -d "$entry" ]]; then
+            echo "ERROR: Owned spool directory contains unexpected subdirectory '$fname'. Refusing startup for safety." >&2
+            return 1
+        fi
+        if [[ ! -f "$entry" ]]; then
+            echo "ERROR: Owned spool directory contains unexpected non-regular file '$fname'. Refusing startup for safety." >&2
+            return 1
+        fi
+
+        # Marker and .gitkeep are valid metadata entries
+        if [[ "$fname" == "$SPOOL_MARKER_NAME" || "$fname" == ".gitkeep" ]]; then
+            continue
+        fi
+
+        # Only recognized emulator artifacts are permitted for reuse
+        if ! is_emulator_artifact "$fname"; then
+            echo "ERROR: Owned spool directory contains unrecognized or foreign file '$fname'. Refusing startup for safety." >&2
+            return 1
+        fi
+    done
+
     return 0
 }
 
@@ -222,6 +316,12 @@ cmd_start() {
     fi
     EMU_SPOOL_DIR="$clean_spool"
 
+    # Verify spool directory ownership and initialize or validate contents
+    if ! verify_and_init_spool_dir "$EMU_SPOOL_DIR"; then
+        release_lock
+        return 1
+    fi
+
     # Check if already running
     if is_running; then
         local pid
@@ -253,10 +353,6 @@ cmd_start() {
         release_lock
         return 1
     fi
-
-    # Ensure spool directory exists and create ownership marker
-    mkdir -p "$EMU_SPOOL_DIR"
-    echo "EMULATOR_OWNED_SPOOL=true" > "${EMU_SPOOL_DIR}/${SPOOL_MARKER_NAME}"
 
     if [[ ! "$EMU_PROCESSOR" = /* ]]; then
         EMU_PROCESSOR="$(pwd)/${EMU_PROCESSOR}"
@@ -397,8 +493,15 @@ cmd_status() {
         echo "  Log File:  ${EMU_LOG_FILE}"
 
         if [[ -d "$EMU_SPOOL_DIR" ]]; then
-            local file_count
-            file_count=$(find "$EMU_SPOOL_DIR" -maxdepth 1 -type f ! -name "${SPOOL_MARKER_NAME}" 2>/dev/null | wc -l)
+            local file_count=0
+            local entry fname
+            for entry in "$EMU_SPOOL_DIR"/*; do
+                [[ -f "$entry" && ! -L "$entry" ]] || continue
+                fname=$(basename "$entry")
+                if is_emulator_artifact "$fname"; then
+                    ((file_count++))
+                fi
+            done
             echo "  Jobs in spool: ${file_count}"
         fi
         return 0
@@ -529,16 +632,49 @@ cmd_cleanup() {
 
     cmd_stop || true
 
-    # Requirement 10 & 11: Validate spool path and verify ownership marker before cleaning
+    # Requirement 6, 7, 8, 9, 10: Validate spool path, verify ownership marker,
+    # and selectively remove only verified emulator artifacts while strictly
+    # preserving any unrelated files, subdirectories, symlinks, and metadata.
     if [[ -d "$EMU_SPOOL_DIR" ]]; then
         local clean_spool
         if clean_spool=$(validate_spool_dir "$EMU_SPOOL_DIR"); then
             local marker="${clean_spool}/${SPOOL_MARKER_NAME}"
-            if [[ -f "$marker" ]]; then
-                echo "Cleaning spool files in ${clean_spool}..."
-                find "$clean_spool" -maxdepth 1 -type f ! -name "${SPOOL_MARKER_NAME}" -delete 2>/dev/null || true
+            if [[ ! -f "$marker" ]] || ! grep -q "EMULATOR_OWNED_SPOOL=true" "$marker" 2>/dev/null; then
+                echo "Warning: Spool directory '${clean_spool}' does not have verified emulator ownership marker." >&2
+                echo "Skipping spool file deletion for safety." >&2
             else
-                echo "Warning: Ownership marker not found in '${clean_spool}'. Skipping file deletion for safety." >&2
+                echo "Cleaning verified emulator spool files in ${clean_spool}..."
+                local entry fname
+                for entry in "$clean_spool"/* "$clean_spool"/.*; do
+                    [[ -e "$entry" || -L "$entry" ]] || continue
+                    fname=$(basename "$entry")
+                    [[ "$fname" != "." && "$fname" != ".." ]] || continue
+
+                    # Protect symlinks, subdirectories, marker, and .gitkeep
+                    if [[ -L "$entry" ]]; then
+                        echo "Notice: Preserving symlink '${fname}' in spool directory."
+                        continue
+                    fi
+                    if [[ -d "$entry" ]]; then
+                        echo "Notice: Preserving subdirectory '${fname}' in spool directory."
+                        continue
+                    fi
+                    if [[ ! -f "$entry" ]]; then
+                        echo "Notice: Preserving special file '${fname}' in spool directory."
+                        continue
+                    fi
+                    if [[ "$fname" == "$SPOOL_MARKER_NAME" || "$fname" == ".gitkeep" ]]; then
+                        continue
+                    fi
+
+                    # Only delete verified emulator artifacts
+                    if is_emulator_artifact "$fname"; then
+                        rm -f "$entry"
+                        echo "  Deleted emulator artifact: ${fname}"
+                    else
+                        echo "Notice: Preserving non-emulator file '${fname}' in spool directory."
+                    fi
+                done
             fi
         else
             echo "Warning: Spool directory path failed safety validation. Skipping spool cleanup." >&2

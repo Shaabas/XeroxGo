@@ -518,6 +518,190 @@ lpadmin -x "$ALIEN_QUEUE" 2>/dev/null || true
 echo ""
 
 # -----------------------------------------------------------------------------
+# Safety Test 13: Spool Ownership — Refuse Pre-Existing Directory with Files
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 13: Spool ownership — refuse unowned directory with files ---"
+UNOWNED_DIR="/tmp/xeroxgo-unowned-spool-${$}"
+rm -rf "$UNOWNED_DIR"
+mkdir -p "$UNOWNED_DIR"
+PERSONAL_FILE="${UNOWNED_DIR}/personal_document.txt"
+echo "Confidential data" > "$PERSONAL_FILE"
+PERSONAL_MD5_BEFORE=$(md5sum "$PERSONAL_FILE" | awk '{print $1}')
+
+set +e
+START_UNOWNED_OUT=$("${SCRIPT_DIR}/emulator.sh" start -p 8645 --spool-dir "$UNOWNED_DIR" 2>&1)
+START_UNOWNED_STATUS=$?
+set -e
+
+PERSONAL_MD5_AFTER=$(md5sum "$PERSONAL_FILE" 2>/dev/null | awk '{print $1}' || echo "missing")
+
+if [[ $START_UNOWNED_STATUS -ne 0 ]] && \
+   echo "$START_UNOWNED_OUT" | grep -q "Refusing to claim ownership" && \
+   [[ "$PERSONAL_MD5_BEFORE" == "$PERSONAL_MD5_AFTER" ]] && \
+   [[ ! -f "${UNOWNED_DIR}/.xeroxgo_emulator_spool" ]]; then
+    echo "  emulator.sh start correctly refused unowned directory containing personal files"
+    echo "  Verified personal file remained completely intact and marker was NOT created"
+    echo "[PASS] Safety Test 13: Spool ownership — refuse unowned directory with files"
+    ((PASSED_COUNT++))
+else
+    echo "  start output: $START_UNOWNED_OUT"
+    echo "[FAIL] Safety Test 13: Failed to reject unowned directory or modified personal file"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$UNOWNED_DIR"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 14: Spool Ownership — Initialize Marker in Empty Directory
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 14: Spool ownership — initialize marker in empty directory ---"
+EMPTY_SPOOL_DIR="/tmp/xeroxgo-empty-spool-${$}"
+rm -rf "$EMPTY_SPOOL_DIR"
+mkdir -p "$EMPTY_SPOOL_DIR"
+EMPTY_PID_FILE="/tmp/xeroxgo-empty-${$}.pid"
+EMPTY_LOG_FILE="/tmp/xeroxgo-empty-${$}.log"
+
+set +e
+START_EMPTY_OUT=$(EMU_PID_FILE="$EMPTY_PID_FILE" EMU_LOG_FILE="$EMPTY_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p 8646 --spool-dir "$EMPTY_SPOOL_DIR" 2>&1)
+START_EMPTY_STATUS=$?
+set -e
+
+MARKER_FILE="${EMPTY_SPOOL_DIR}/.xeroxgo_emulator_spool"
+MARKER_VALID=false
+if [[ -f "$MARKER_FILE" ]] && grep -q "EMULATOR_OWNED_SPOOL=true" "$MARKER_FILE"; then
+    MARKER_VALID=true
+fi
+
+# Stop the emulator instance
+EMU_PID_FILE="$EMPTY_PID_FILE" "${SCRIPT_DIR}/emulator.sh" stop -p 8646 >/dev/null 2>&1 || true
+
+if [[ $START_EMPTY_STATUS -eq 0 ]] && [[ "$MARKER_VALID" == "true" ]]; then
+    echo "  emulator.sh start succeeded for empty directory and created valid ownership marker"
+    echo "[PASS] Safety Test 14: Spool ownership — initialize marker in empty directory"
+    ((PASSED_COUNT++))
+else
+    echo "  start output: $START_EMPTY_OUT"
+    echo "[FAIL] Safety Test 14: Failed to start in empty directory or initialize marker"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$EMPTY_SPOOL_DIR" "$EMPTY_PID_FILE" "$EMPTY_LOG_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 15: Spool Ownership — Reuse Owned Directory with Valid Artifacts
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 15: Spool ownership — reuse owned directory with valid artifacts ---"
+OWNED_SPOOL_DIR="/tmp/xeroxgo-owned-spool-${$}"
+rm -rf "$OWNED_SPOOL_DIR"
+mkdir -p "$OWNED_SPOOL_DIR"
+echo "EMULATOR_OWNED_SPOOL=true" > "${OWNED_SPOOL_DIR}/.xeroxgo_emulator_spool"
+touch "${OWNED_SPOOL_DIR}/1-sample.pdf"
+touch "${OWNED_SPOOL_DIR}/1-sample.prn"
+OWNED_PID_FILE="/tmp/xeroxgo-owned-${$}.pid"
+OWNED_LOG_FILE="/tmp/xeroxgo-owned-${$}.log"
+
+set +e
+START_OWNED_OUT=$(EMU_PID_FILE="$OWNED_PID_FILE" EMU_LOG_FILE="$OWNED_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p 8647 --spool-dir "$OWNED_SPOOL_DIR" 2>&1)
+START_OWNED_STATUS=$?
+set -e
+
+# Stop the emulator instance
+EMU_PID_FILE="$OWNED_PID_FILE" "${SCRIPT_DIR}/emulator.sh" stop -p 8647 >/dev/null 2>&1 || true
+
+if [[ $START_OWNED_STATUS -eq 0 ]] && \
+   [[ -f "${OWNED_SPOOL_DIR}/1-sample.pdf" ]] && \
+   [[ -f "${OWNED_SPOOL_DIR}/1-sample.prn" ]]; then
+    echo "  emulator.sh start succeeded for owned directory containing valid artifacts"
+    echo "  Verified valid artifacts were preserved"
+    echo "[PASS] Safety Test 15: Spool ownership — reuse owned directory with valid artifacts"
+    ((PASSED_COUNT++))
+else
+    echo "  start output: $START_OWNED_OUT"
+    echo "[FAIL] Safety Test 15: Failed to start in owned directory with valid artifacts"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$OWNED_SPOOL_DIR" "$OWNED_PID_FILE" "$OWNED_LOG_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 16: Spool Ownership — Preserve Unrelated Files Added After Startup
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 16: Spool ownership — preserve unrelated files during cleanup ---"
+CLEANUP_SPOOL_DIR="/tmp/xeroxgo-cleanup-spool-${$}"
+rm -rf "$CLEANUP_SPOOL_DIR"
+mkdir -p "$CLEANUP_SPOOL_DIR"
+CLEANUP_PID_FILE="/tmp/xeroxgo-cleanup-${$}.pid"
+CLEANUP_LOG_FILE="/tmp/xeroxgo-cleanup-${$}.log"
+CLEANUP_PORT=8648
+
+# 1. Start emulator in empty directory (initializes marker)
+EMU_PID_FILE="$CLEANUP_PID_FILE" EMU_LOG_FILE="$CLEANUP_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p "$CLEANUP_PORT" --spool-dir "$CLEANUP_SPOOL_DIR" >/dev/null 2>&1
+
+# 2. Simulate print job submission by sending a job via ipptool
+ipptool -f "$SAMPLE_PDF" "ipp://localhost:${CLEANUP_PORT}/ipp/print" print-job.test >/dev/null 2>&1 || true
+sleep 0.5
+
+# Ensure a verified artifact exists
+if ! ls "$CLEANUP_SPOOL_DIR"/[0-9]*-* >/dev/null 2>&1; then
+    touch "${CLEANUP_SPOOL_DIR}/1-testjob.pdf"
+fi
+
+# 3. Add unrelated personal files, a symlink, and a subdirectory after startup
+UNRELATED_FILE="${CLEANUP_SPOOL_DIR}/personal_document.txt"
+echo "My personal document created after startup" > "$UNRELATED_FILE"
+UNRELATED_MD5_BEFORE=$(md5sum "$UNRELATED_FILE" | awk '{print $1}')
+mkdir -p "${CLEANUP_SPOOL_DIR}/personal_folder"
+touch "${CLEANUP_SPOOL_DIR}/personal_folder/nested.txt"
+ln -s /tmp "${CLEANUP_SPOOL_DIR}/personal_symlink"
+
+# 4. Run cleanup
+set +e
+CLEANUP_OUT=$(EMU_PID_FILE="$CLEANUP_PID_FILE" EMU_LOG_FILE="$CLEANUP_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" cleanup -p "$CLEANUP_PORT" --spool-dir "$CLEANUP_SPOOL_DIR" 2>&1)
+CLEANUP_STATUS=$?
+set -e
+
+UNRELATED_MD5_AFTER=$(md5sum "$UNRELATED_FILE" 2>/dev/null | awk '{print $1}' || echo "missing")
+
+# 5. Verify results:
+# - Emulator artifacts must be deleted
+# - Unrelated personal file must remain completely INTACT
+# - Subdirectory must remain completely INTACT
+# - Symlink must remain completely INTACT
+REMAINING_ARTIFACTS=0
+for f in "$CLEANUP_SPOOL_DIR"/*; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    fname=$(basename "$f")
+    if [[ "$fname" =~ ^[0-9]+(-[A-Za-z0-9_.\-]+)?\.(pdf|prn|ps|pwg|urf|bin|txt|raw)$ ]]; then
+        ((REMAINING_ARTIFACTS++))
+    fi
+done
+
+if [[ $CLEANUP_STATUS -eq 0 ]] && \
+   [[ $REMAINING_ARTIFACTS -eq 0 ]] && \
+   [[ -f "$UNRELATED_FILE" ]] && \
+   [[ "$UNRELATED_MD5_BEFORE" == "$UNRELATED_MD5_AFTER" ]] && \
+   [[ -d "${CLEANUP_SPOOL_DIR}/personal_folder" ]] && \
+   [[ -L "${CLEANUP_SPOOL_DIR}/personal_symlink" ]]; then
+    echo "  Verified cleanup deleted emulator job artifacts"
+    echo "  Verified unrelated personal file was preserved intact (matching checksum)"
+    echo "  Verified unrelated subdirectory and symlink were preserved intact"
+    echo "[PASS] Safety Test 16: Spool ownership — preserve unrelated files during cleanup"
+    ((PASSED_COUNT++))
+else
+    echo "  cleanup output: $CLEANUP_OUT"
+    echo "  Remaining artifacts: $REMAINING_ARTIFACTS"
+    echo "  Personal file exists: $([[ -f "$UNRELATED_FILE" ]] && echo yes || echo no)"
+    echo "[FAIL] Safety Test 16: Cleanup deleted unrelated files or failed to clean artifacts"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$CLEANUP_SPOOL_DIR" "$CLEANUP_PID_FILE" "$CLEANUP_LOG_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo "============================================================"
