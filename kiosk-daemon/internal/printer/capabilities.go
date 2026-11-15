@@ -1,0 +1,308 @@
+package printer
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// CapabilityStatus represents the tri-state support level of a printer feature.
+type CapabilityStatus string
+
+const (
+	// CapabilityUnknown indicates the attribute was not present in the IPP response
+	// or could not be determined.
+	CapabilityUnknown CapabilityStatus = "UNKNOWN"
+	// CapabilitySupported indicates the printer queue explicitly reports support for the feature.
+	CapabilitySupported CapabilityStatus = "SUPPORTED"
+	// CapabilityUnsupported indicates the printer queue explicitly omitted or reported no support.
+	CapabilityUnsupported CapabilityStatus = "UNSUPPORTED"
+)
+
+const (
+	// CapabilitySourceCUPSQueue identifies the capability origin as the CUPS queue configuration.
+	// This reflects the CUPS queue / PPD configuration, NOT verified physical hardware capabilities.
+	CapabilitySourceCUPSQueue = "CUPS_QUEUE"
+)
+
+// PrinterCapabilities holds normalized and raw capability details discovered from a CUPS queue via IPP.
+// Note: These capabilities represent the properties advertised by the CUPS queue and its driver/PPD.
+// They do NOT constitute verified physical printer hardware capabilities.
+type PrinterCapabilities struct {
+	// Source identifies where these capabilities were queried from (e.g. CapabilitySourceCUPSQueue).
+	Source string `json:"source"`
+	// Queue is the name of the CUPS queue queried.
+	Queue string `json:"queue"`
+
+	// Normalized capabilities (tri-state: SUPPORTED, UNSUPPORTED, UNKNOWN)
+	PDFSupport             CapabilityStatus `json:"pdf_support"`
+	A4Support              CapabilityStatus `json:"a4_support"`
+	SimplexSupport         CapabilityStatus `json:"simplex_support"`
+	DuplexLongEdgeSupport  CapabilityStatus `json:"duplex_long_edge_support"`
+	DuplexShortEdgeSupport CapabilityStatus `json:"duplex_short_edge_support"`
+	ColorSupport           CapabilityStatus `json:"color_support"`
+	MonochromeSupport      CapabilityStatus `json:"monochrome_support"`
+
+	// Printer identity attributes
+	PrinterName         string `json:"printer_name,omitempty"`
+	PrinterMakeAndModel string `json:"printer_make_and_model,omitempty"`
+	PrinterInfo         string `json:"printer_info,omitempty"`
+	PrinterState        string `json:"printer_state,omitempty"`
+
+	// Raw multi-value attributes parsed from IPP response
+	DocumentFormatSupported []string `json:"document_format_supported,omitempty"`
+	SidesSupported          []string `json:"sides_supported,omitempty"`
+	PrintColorModeSupported []string `json:"print_color_mode_supported,omitempty"`
+	MediaSupported          []string `json:"media_supported,omitempty"`
+
+	// Default attributes
+	DocumentFormatDefault string `json:"document_format_default,omitempty"`
+	SidesDefault          string `json:"sides_default,omitempty"`
+	PrintColorModeDefault string `json:"print_color_mode_default,omitempty"`
+	MediaDefault          string `json:"media_default,omitempty"`
+
+	// RawAttributes contains all parsed IPP attributes
+	RawAttributes map[string][]string `json:"raw_attributes,omitempty"`
+}
+
+var ippAttributeRegex = regexp.MustCompile(`^\s*([a-zA-Z0-9_\-]+)(?:\s*\([^\)]*\))?\s*=\s*(.*)$`)
+
+// ParsePrinterCapabilities parses the output of `ipptool -tv ... get-printer-attributes.test`
+// and returns normalized printer capabilities.
+// Unknown or missing attributes are kept distinct from unsupported attributes (never assumed false).
+func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
+	caps := PrinterCapabilities{
+		Source:                 CapabilitySourceCUPSQueue,
+		Queue:                  queue,
+		PDFSupport:             CapabilityUnknown,
+		A4Support:              CapabilityUnknown,
+		SimplexSupport:         CapabilityUnknown,
+		DuplexLongEdgeSupport:  CapabilityUnknown,
+		DuplexShortEdgeSupport: CapabilityUnknown,
+		ColorSupport:           CapabilityUnknown,
+		MonochromeSupport:      CapabilityUnknown,
+		RawAttributes:          make(map[string][]string),
+	}
+
+	if len(out) == 0 {
+		return caps
+	}
+
+	presentAttrs := make(map[string]bool)
+	singleAttrs := make(map[string]string)
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		m := ippAttributeRegex.FindStringSubmatch(line)
+		if len(m) < 3 {
+			continue
+		}
+
+		attrName := strings.ToLower(strings.TrimSpace(m[1]))
+		val := strings.TrimSpace(m[2])
+
+		presentAttrs[attrName] = true
+		if _, exists := singleAttrs[attrName]; !exists {
+			singleAttrs[attrName] = val
+		}
+
+		parts := splitIPPValues(val)
+		if len(parts) > 0 {
+			caps.RawAttributes[attrName] = append(caps.RawAttributes[attrName], parts...)
+		}
+	}
+
+	// 1. Identity attributes
+	if v, ok := singleAttrs["printer-name"]; ok {
+		caps.PrinterName = v
+	}
+	if v, ok := singleAttrs["printer-make-and-model"]; ok {
+		caps.PrinterMakeAndModel = v
+	}
+	if v, ok := singleAttrs["printer-info"]; ok {
+		caps.PrinterInfo = v
+	}
+	if v, ok := singleAttrs["printer-state"]; ok {
+		caps.PrinterState = v
+	}
+
+	// 2. Default attributes
+	if v, ok := singleAttrs["document-format-default"]; ok {
+		caps.DocumentFormatDefault = v
+	}
+	if v, ok := singleAttrs["sides-default"]; ok {
+		caps.SidesDefault = v
+	}
+	if v, ok := singleAttrs["print-color-mode-default"]; ok {
+		caps.PrintColorModeDefault = v
+	}
+	if v, ok := singleAttrs["media-default"]; ok {
+		caps.MediaDefault = v
+	}
+
+	// 3. Raw slices
+	caps.DocumentFormatSupported = caps.RawAttributes["document-format-supported"]
+	caps.SidesSupported = caps.RawAttributes["sides-supported"]
+	caps.PrintColorModeSupported = caps.RawAttributes["print-color-mode-supported"]
+	caps.MediaSupported = caps.RawAttributes["media-supported"]
+
+	// 4. Normalized: PDF support
+	if presentAttrs["document-format-supported"] {
+		if containsCaseInsensitive(caps.DocumentFormatSupported, "application/pdf") {
+			caps.PDFSupport = CapabilitySupported
+		} else {
+			caps.PDFSupport = CapabilityUnsupported
+		}
+	}
+
+	// 5. Normalized: A4 support
+	if presentAttrs["media-supported"] {
+		if hasA4Media(caps.MediaSupported) {
+			caps.A4Support = CapabilitySupported
+		} else {
+			caps.A4Support = CapabilityUnsupported
+		}
+	}
+
+	// 6. Normalized: Sides / Duplex support
+	if presentAttrs["sides-supported"] {
+		if containsCaseInsensitive(caps.SidesSupported, "one-sided") || containsCaseInsensitive(caps.SidesSupported, "simplex") {
+			caps.SimplexSupport = CapabilitySupported
+		} else {
+			caps.SimplexSupport = CapabilityUnsupported
+		}
+
+		if containsCaseInsensitive(caps.SidesSupported, "two-sided-long-edge") || containsCaseInsensitive(caps.SidesSupported, "duplex") {
+			caps.DuplexLongEdgeSupport = CapabilitySupported
+		} else {
+			caps.DuplexLongEdgeSupport = CapabilityUnsupported
+		}
+
+		if containsCaseInsensitive(caps.SidesSupported, "two-sided-short-edge") || containsCaseInsensitive(caps.SidesSupported, "tumble") {
+			caps.DuplexShortEdgeSupport = CapabilitySupported
+		} else {
+			caps.DuplexShortEdgeSupport = CapabilityUnsupported
+		}
+	}
+
+	// 7. Normalized: Color and Monochrome support
+	hasColorAttr := presentAttrs["print-color-mode-supported"] || presentAttrs["color-supported"]
+	if hasColorAttr {
+		colorSupportedVal := singleAttrs["color-supported"]
+		if strings.EqualFold(colorSupportedVal, "false") {
+			caps.ColorSupport = CapabilityUnsupported
+			caps.MonochromeSupport = CapabilitySupported
+		} else if strings.EqualFold(colorSupportedVal, "true") {
+			caps.ColorSupport = CapabilitySupported
+			if presentAttrs["print-color-mode-supported"] {
+				if containsAnyCaseInsensitive(caps.PrintColorModeSupported, "monochrome", "process-monochrome", "auto", "bi-level", "monochrome-only") {
+					caps.MonochromeSupport = CapabilitySupported
+				} else {
+					caps.MonochromeSupport = CapabilityUnsupported
+				}
+			} else {
+				caps.MonochromeSupport = CapabilityUnknown
+			}
+		} else if presentAttrs["print-color-mode-supported"] {
+			if containsCaseInsensitive(caps.PrintColorModeSupported, "color") {
+				caps.ColorSupport = CapabilitySupported
+			} else {
+				caps.ColorSupport = CapabilityUnsupported
+			}
+
+			if containsAnyCaseInsensitive(caps.PrintColorModeSupported, "monochrome", "process-monochrome", "auto", "bi-level", "monochrome-only") {
+				caps.MonochromeSupport = CapabilitySupported
+			} else {
+				caps.MonochromeSupport = CapabilityUnsupported
+			}
+		}
+	}
+
+	return caps
+}
+
+// DiscoverCUPSPrinterCapabilities queries Get-Printer-Attributes via ipptool for the given CUPS queue.
+// It parses the response into normalized and raw capabilities.
+// If ipptool is missing, times out, or returns an error, an error is returned along with
+// any partial capabilities that could be parsed from the output.
+func DiscoverCUPSPrinterCapabilities(ctx context.Context, runner CommandRunner, queue string) (PrinterCapabilities, error) {
+	queue = strings.TrimSpace(queue)
+	if queue == "" {
+		return PrinterCapabilities{
+			Source:                 CapabilitySourceCUPSQueue,
+			PDFSupport:             CapabilityUnknown,
+			A4Support:              CapabilityUnknown,
+			SimplexSupport:         CapabilityUnknown,
+			DuplexLongEdgeSupport:  CapabilityUnknown,
+			DuplexShortEdgeSupport: CapabilityUnknown,
+			ColorSupport:           CapabilityUnknown,
+			MonochromeSupport:      CapabilityUnknown,
+		}, errors.New("cups queue name cannot be empty")
+	}
+
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	ippURI := fmt.Sprintf("ipp://localhost:631/printers/%s", queue)
+	out, err := runner(ctx, "ipptool", "-tv", ippURI, "get-printer-attributes.test")
+
+	// Even if runner returned an error (e.g. exit status 1 due to IPP validation warning),
+	// parse whatever attributes were received in output to preserve partial data.
+	caps := ParsePrinterCapabilities(out, queue)
+
+	if err != nil {
+		return caps, fmt.Errorf("ipptool query failed for CUPS queue %q: %w", queue, err)
+	}
+
+	return caps, nil
+}
+
+func splitIPPValues(val string) []string {
+	parts := strings.Split(val, ",")
+	var result []string
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func containsCaseInsensitive(slice []string, target string) bool {
+	for _, item := range slice {
+		if strings.EqualFold(strings.TrimSpace(item), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyCaseInsensitive(slice []string, targets ...string) bool {
+	for _, target := range targets {
+		if containsCaseInsensitive(slice, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasA4Media(mediaList []string) bool {
+	for _, m := range mediaList {
+		lower := strings.ToLower(strings.TrimSpace(m))
+		if lower == "iso_a4_210x297mm" || lower == "iso-a4" || lower == "a4" || lower == "iso_a4" ||
+			strings.HasPrefix(lower, "iso_a4") || strings.HasPrefix(lower, "iso-a4") {
+			return true
+		}
+	}
+	return false
+}
