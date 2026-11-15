@@ -53,22 +53,23 @@ FAILED_COUNT=0
 cleanup_test_env() {
     echo ""
     echo "--- Cleaning up fault test environment ---"
-    # Unpause IPP if paused so it can be terminated
+    # Ensure abnormal test termination does not leave IPP process suspended by SIGSTOP
+    # Never signal a PID without verifying the expected emulator process identity
     if [[ -f "$TEST_IPP_PID" ]]; then
         local pid
         pid=$(cat "$TEST_IPP_PID" 2>/dev/null || true)
-        if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
-            kill -CONT "$pid" 2>/dev/null || true
-            kill "$pid" 2>/dev/null || true
+        if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            if [[ -f "/proc/${pid}/comm" ]] && grep -q "ippeveprinter" "/proc/${pid}/comm" 2>/dev/null; then
+                kill -CONT "$pid" 2>/dev/null || true
+            fi
         fi
     fi
-    if [[ -f "$TEST_SNMP_PID" ]]; then
-        local pid
-        pid=$(cat "$TEST_SNMP_PID" 2>/dev/null || true)
-        if [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]]; then
-            kill "$pid" 2>/dev/null || true
-        fi
-    fi
+
+    # Reuse D1/D2 validated stop and cleanup mechanisms
+    "$EMULATOR" cleanup >/dev/null 2>&1 || {
+        "$EMULATOR" stop >/dev/null 2>&1 || true
+        "$EMULATOR" stop-snmp >/dev/null 2>&1 || true
+    }
     rm -rf "$TEST_DIR" 2>/dev/null || true
 }
 trap cleanup_test_env EXIT
@@ -352,12 +353,107 @@ assert_test "Test 11: Coordinated status reports HEALTHY agreement" '$t11_clear'
 
 # -------------------------------------------------------------
 echo ""
-echo "--- Test 12: Safe cleanup of all emulator resources ---"
+echo "--- Test 12: Regression — Failed probe detection when emulator is stopped ---"
+"$EMULATOR" stop >/dev/null 2>&1 || true
+
+probe_fail_rc=0
+"$FAULT_CLI" set paper-jam >/dev/null 2>&1 || probe_fail_rc=$?
+
+assert_test "Test 12: fault set returns non-zero when probe fails" '[[ $probe_fail_rc -ne 0 ]]'
+
+# Restart emulators for next tests
+"$EMULATOR" start >/dev/null 2>&1
+"$FAULT_CLI" clear >/dev/null 2>&1
+
+# -------------------------------------------------------------
+echo ""
+echo "--- Test 13: Regression — Failed recovery detection when emulator is stopped ---"
+"$EMULATOR" stop >/dev/null 2>&1 || true
+
+recovery_fail_rc=0
+"$FAULT_CLI" set recovery >/dev/null 2>&1 || recovery_fail_rc=$?
+
+assert_test "Test 13: fault set recovery returns non-zero when endpoint is unavailable" '[[ $recovery_fail_rc -ne 0 ]]'
+
+# Restart emulators for next tests
+"$EMULATOR" start >/dev/null 2>&1
+"$FAULT_CLI" clear >/dev/null 2>&1
+
+# -------------------------------------------------------------
+echo ""
+echo "--- Test 14: Regression — Unrelated PID protection ---"
+"$EMULATOR" stop >/dev/null 2>&1 || true
+"$EMULATOR" stop-snmp >/dev/null 2>&1 || true
+
+sleep 120 &
+DUMMY_PID=$!
+
+echo "$DUMMY_PID" > "$TEST_IPP_PID"
+ipp_stop_rc=0
+"$EMULATOR" stop >/dev/null 2>&1 || ipp_stop_rc=$?
+
+assert_test "Test 14: emulator stop refuses to signal unrelated PID" '[[ $ipp_stop_rc -ne 0 ]]'
+assert_test "Test 14: unrelated process remains alive after stop attempt" 'kill -0 "$DUMMY_PID" 2>/dev/null'
+
+echo "$DUMMY_PID" > "$TEST_SNMP_PID"
+snmp_stop_rc=0
+"$EMULATOR" stop-snmp >/dev/null 2>&1 || snmp_stop_rc=$?
+
+assert_test "Test 14: stop-snmp refuses to signal unrelated PID" '[[ $snmp_stop_rc -ne 0 ]]'
+assert_test "Test 14: unrelated process remains alive after stop-snmp attempt" 'kill -0 "$DUMMY_PID" 2>/dev/null'
+
+kill "$DUMMY_PID" 2>/dev/null || true
+wait "$DUMMY_PID" 2>/dev/null || true
+rm -f "$TEST_IPP_PID" "$TEST_SNMP_PID"
+
+# Restart for normal state
+"$EMULATOR" start >/dev/null 2>&1
+"$EMULATOR" start-snmp >/dev/null 2>&1
+
+# -------------------------------------------------------------
+echo ""
+echo "--- Test 15: Regression — Refusal to modify unowned CUPS queues ---"
+alien_meta="${TEST_DIR}/cups_queue.meta"
+export EMU_META_FILE="$alien_meta"
+export EMU_CUPS_QUEUE="AlienQueue_Test"
+
+# Case 1: No metadata file exists
+unowned_modify_refused=false
+if ! "$EMULATOR" verify-queue "AlienQueue_Test" >/dev/null 2>&1; then
+    unowned_modify_refused=true
+fi
+assert_test "Test 15: Refuses queue operations when metadata is missing" '$unowned_modify_refused'
+
+# Case 2: Metadata file exists but points to different queue name or URI
+cat > "$alien_meta" << EOF
+QUEUE_NAME=AlienQueue_Test
+DEVICE_URI=ipp://alien-host:631/printers/AlienQueue_Test
+EOF
+
+mismatch_modify_refused=false
+if ! "$EMULATOR" verify-queue "AlienQueue_Test" >/dev/null 2>&1; then
+    mismatch_modify_refused=true
+fi
+assert_test "Test 15: Refuses queue operations when URI/queue does not match expected emulator URI" '$mismatch_modify_refused'
+
+# Case 3: Refuse to remove or modify baseline system queue without ownership metadata
+system_queue_refused=false
+if ! "$EMULATOR" remove-cups "DCPT310" >/dev/null 2>&1; then
+    system_queue_refused=true
+fi
+assert_test "Test 15: Refuses queue operations on unowned system CUPS queues" '$system_queue_refused'
+
+rm -f "$alien_meta"
+export EMU_CUPS_QUEUE="XeroxGoFaultEmu"
+
+# -------------------------------------------------------------
+echo ""
+echo "--- Test 16: Safe cleanup of all emulator resources ---"
 "$EMULATOR" cleanup
 
-assert_test "Test 12: IPP PID file deleted" '[[ ! -f "$TEST_IPP_PID" ]]'
-assert_test "Test 12: SNMP PID file deleted" '[[ ! -f "$TEST_SNMP_PID" ]]'
-assert_test "Test 12: Fault state file deleted" '[[ ! -f "$TEST_FAULT_STATE" ]]'
+assert_test "Test 16: IPP PID file deleted" '[[ ! -f "$TEST_IPP_PID" ]]'
+assert_test "Test 16: SNMP PID file deleted" '[[ ! -f "$TEST_SNMP_PID" ]]'
+assert_test "Test 16: Fault state file deleted" '[[ ! -f "$TEST_FAULT_STATE" ]]'
 
 echo ""
 echo "============================================================"

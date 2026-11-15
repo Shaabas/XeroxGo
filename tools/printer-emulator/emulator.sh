@@ -687,21 +687,12 @@ EOF
     return 0
 }
 
-cmd_remove_cups() {
-    if ! command -v lpadmin >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local target_queue="${EMU_CUPS_QUEUE}"
-    if [[ -z "$target_queue" ]]; then
-        echo "ERROR: Queue name cannot be empty." >&2
-        return 1
-    fi
-
-    # Requirement 5 & 6: Verify ownership and expected URI before deletion; refuse if cannot be verified
+# Verify queue ownership using metadata, queue name and actual device URI
+verify_cups_queue_ownership() {
+    local target_queue="$1"
     if [[ ! -f "$EMU_META_FILE" ]]; then
         echo "ERROR: Ownership metadata not found (${EMU_META_FILE})." >&2
-        echo "Cannot verify that CUPS queue '${target_queue}' was created by this harness. Refusing deletion." >&2
+        echo "Cannot verify that CUPS queue '${target_queue}' was created by this harness." >&2
         return 1
     fi
 
@@ -710,7 +701,39 @@ cmd_remove_cups() {
     meta_uri=$(grep -E "^DEVICE_URI=" "$EMU_META_FILE" | cut -d'=' -f2- || true)
 
     if [[ "$meta_queue" != "$target_queue" ]]; then
-        echo "ERROR: Metadata queue name ('${meta_queue}') does not match requested queue ('${target_queue}'). Refusing deletion." >&2
+        echo "ERROR: Metadata queue name ('${meta_queue}') does not match target queue ('${target_queue}')." >&2
+        return 1
+    fi
+
+    # Check actual URI in CUPS
+    local actual_uri
+    actual_uri=$(lpstat -v "$target_queue" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+    if [[ -z "$actual_uri" ]]; then
+        echo "ERROR: CUPS queue '${target_queue}' does not exist in CUPS lpstat." >&2
+        return 1
+    fi
+
+    if [[ "$actual_uri" != "$meta_uri" ]]; then
+        echo "ERROR: CUPS queue '${target_queue}' device URI ('${actual_uri}') does not match expected emulator URI ('${meta_uri}')." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+cmd_verify_queue() {
+    local target_queue="${1:-$EMU_CUPS_QUEUE}"
+    verify_cups_queue_ownership "$target_queue"
+}
+
+cmd_remove_cups() {
+    if ! command -v lpadmin >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local target_queue="${1:-$EMU_CUPS_QUEUE}"
+    if [[ -z "$target_queue" ]]; then
+        echo "ERROR: Queue name cannot be empty." >&2
         return 1
     fi
 
@@ -721,12 +744,9 @@ cmd_remove_cups() {
         return 0
     fi
 
-    # Check actual URI in CUPS
-    local actual_uri
-    actual_uri=$(lpstat -v "$target_queue" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
-    if [[ "$actual_uri" != "$meta_uri" ]]; then
-        echo "ERROR: CUPS queue '${target_queue}' device URI ('${actual_uri}') does not match expected emulator URI ('${meta_uri}')." >&2
-        echo "Queue may have been reconfigured or points elsewhere. Refusing deletion." >&2
+    # Verify ownership and expected URI before deletion; refuse if cannot be verified
+    if ! verify_cups_queue_ownership "$target_queue"; then
+        echo "Refusing deletion of unverified CUPS queue '${target_queue}'." >&2
         return 1
     fi
 
@@ -1146,31 +1166,126 @@ cmd_snmp_reset() {
 # Coordinated Fault Controller Functions
 # -----------------------------------------------------------------------------
 
+verify_ipp_attributes() {
+    local host="${1:-$EMU_HOST}"
+    local port="${2:-$EMU_PORT}"
+    local scenario="${3:-}"
+
+    if [[ -z "$scenario" ]]; then
+        scenario=$(get_fault_state_field "ipp_scenario" "healthy")
+    fi
+
+    if ! command -v ipptool >/dev/null 2>&1; then
+        echo "ERROR: ipptool command not found in PATH." >&2
+        return 1
+    fi
+
+    local matched=false
+    local cur_state="" cur_reasons="" attrs_out=""
+    for _ in {1..25}; do
+        attrs_out=$(ipptool -tv "ipp://${host}:${port}/ipp/print" get-printer-attributes.test 2>&1) || true
+        cur_state=$(echo "$attrs_out" | awk '/printer-state \(enum\)/ {print $NF}')
+        cur_reasons=$(echo "$attrs_out" | grep "printer-state-reasons" | sed -E 's/.*=[[:space:]]*//' | tr -d ' ' || true)
+
+        case "$scenario" in
+            healthy|recovery|clear)
+                if [[ "$cur_reasons" == "none" ]] && [[ "$cur_state" == "idle" || "$cur_state" == "3" ]]; then
+                    matched=true
+                    break
+                fi
+                ;;
+            paper-jam)
+                if [[ "$cur_reasons" =~ media-jam ]]; then
+                    matched=true
+                    break
+                fi
+                ;;
+            cover-open)
+                if [[ "$cur_reasons" =~ cover-open ]]; then
+                    matched=true
+                    break
+                fi
+                ;;
+            paper-empty)
+                if [[ "$cur_reasons" =~ media-empty ]]; then
+                    matched=true
+                    break
+                fi
+                ;;
+            stopped)
+                if [[ "$cur_reasons" =~ paused ]]; then
+                    matched=true
+                    break
+                fi
+                ;;
+            printing)
+                matched=true
+                break
+                ;;
+            offline)
+                matched=true
+                break
+                ;;
+            *)
+                matched=true
+                break
+                ;;
+        esac
+        sleep 0.1
+    done
+
+    if [[ "$matched" != "true" ]]; then
+        echo "ERROR: IPP attribute verification failed. Expected scenario '${scenario}', but live IPP attributes report reasons='${cur_reasons}', state='${cur_state}'." >&2
+        return 1
+    fi
+
+    return 0
+}
+
 sync_ipp_state() {
     local host="${1:-$EMU_HOST}"
     local port="${2:-$EMU_PORT}"
+    local expected_scenario="${3:-}"
     local sample_pdf="${SCRIPT_DIR}/testdata/sample.pdf"
 
     if ! is_running; then
-        return 0
+        echo "ERROR: IPP emulator is not running on ${host}:${port}. Cannot synchronize state." >&2
+        return 1
     fi
+
     local pid
     pid=$(get_pid)
     if [[ -n "$pid" ]] && is_process_paused "$pid"; then
-        return 0
+        echo "ERROR: IPP emulator process (PID: ${pid}) is paused via SIGSTOP. Cannot synchronize state." >&2
+        return 1
     fi
 
     if [[ ! -f "$sample_pdf" ]]; then
-        return 0
+        echo "ERROR: Sample PDF document not found at '${sample_pdf}'." >&2
+        return 1
     fi
 
-    if command -v ipptool >/dev/null 2>&1; then
-        local test_file="${SCRIPT_DIR}/sync_probe.test"
-        if [[ ! -f "$test_file" ]]; then
-            test_file="print-job.test"
-        fi
-        ipptool -f "$sample_pdf" "ipp://${host}:${port}/ipp/print" "$test_file" >/dev/null 2>&1 || true
+    if ! command -v ipptool >/dev/null 2>&1; then
+        echo "ERROR: ipptool command not found in PATH." >&2
+        return 1
     fi
+
+    local test_file="${SCRIPT_DIR}/sync_probe.test"
+    if [[ ! -f "$test_file" ]]; then
+        echo "ERROR: IPP sync probe test file '${test_file}' not found." >&2
+        return 1
+    fi
+
+    local probe_out probe_rc=0
+    probe_out=$(ipptool -tv -f "$sample_pdf" "ipp://${host}:${port}/ipp/print" "$test_file" 2>&1) || probe_rc=$?
+    if [[ $probe_rc -ne 0 ]]; then
+        echo "ERROR: IPP state synchronization probe failed (exit code ${probe_rc}):" >&2
+        echo "$probe_out" >&2
+        return 1
+    fi
+
+    # Requirement 5: Verify actual IPP attributes after injection
+    verify_ipp_attributes "$host" "$port" "$expected_scenario"
 }
 
 get_fault_state_field() {
@@ -1180,7 +1295,7 @@ get_fault_state_field() {
         echo "$default"
         return 0
     fi
-    python3 -c "import json, sys; data = json.load(open(sys.argv[1])); print(data.get(sys.argv[2], sys.argv[3]))" "$EMU_FAULT_STATE_FILE" "$field" "$default" 2>/dev/null || echo "$default"
+    python3 -c "import json, sys; data = json.load(open(sys.argv[1])); v = data.get(sys.argv[2], sys.argv[3]); print(json.dumps(v) if isinstance(v, (list, dict)) else v)" "$EMU_FAULT_STATE_FILE" "$field" "$default" 2>/dev/null || echo "$default"
 }
 
 write_fault_state() {
@@ -1359,6 +1474,8 @@ cmd_fault_set() {
         offline)
             ipp_offline=true
             hold_job=false
+            ipp_scen="$prev_ipp"
+            ipp_reasons="$prev_ipp_reasons"
             ;;
         *)
             echo "ERROR: Unknown IPP scenario '${ipp_scen}'." >&2
@@ -1431,28 +1548,63 @@ cmd_fault_set() {
             # If media-empty was active and we are transitioning away, ippeveprinter's in-memory
             # media-empty wait loop must be cleared via a fast restart (< 0.1s).
             local need_restart=false
-            if [[ "$prev_ipp" == "paper-empty" || "$prev_ipp_reasons" =~ media-empty ]] && [[ "$ipp_scen" != "paper-empty" ]]; then
-                need_restart=true
+            if [[ "$ipp_scen" != "paper-empty" ]]; then
+                if [[ "$prev_ipp" == "paper-empty" || "$prev_ipp_reasons" =~ media-empty ]]; then
+                    need_restart=true
+                elif is_running; then
+                    sleep 0.1
+                    local cur_attrs
+                    cur_attrs=$(timeout 1 ipptool -T 1 "ipp://${EMU_HOST}:${EMU_PORT}/ipp/print" get-printer-attributes.test 2>/dev/null || true)
+                    if [[ "$cur_attrs" =~ media-empty || "$cur_attrs" =~ media-needed ]]; then
+                        need_restart=true
+                    fi
+                fi
             fi
 
             write_fault_state "$scenario" "$target" "$ipp_scen" "$snmp_scen" "$ipp_reasons" "$ipp_offline" "$snmp_offline" "$hold_job"
 
             if [[ "$need_restart" == "true" ]] && is_running; then
-                cmd_stop >/dev/null 2>&1 || true
-                cmd_start >/dev/null 2>&1 || true
+                if ! cmd_stop; then
+                    echo "ERROR: Failed to stop IPP emulator during paper-empty recovery." >&2
+                    return 1
+                fi
+                if ! cmd_start; then
+                    echo "ERROR: Failed to restart IPP emulator during paper-empty recovery." >&2
+                    return 1
+                fi
             else
                 # Synchronize state attributes via ippeveprinter filter protocol
-                sync_ipp_state "$EMU_HOST" "$EMU_PORT"
+                if ! sync_ipp_state "$EMU_HOST" "$EMU_PORT" "$ipp_scen"; then
+                    echo "ERROR: Failed to synchronize IPP fault state." >&2
+                    return 1
+                fi
             fi
 
-            # If stopped scenario was requested and CUPS queue exists, disable CUPS queue
+            # Requirement 7: Never report successful recovery if the endpoint remains unavailable or retains the fault
+            if [[ "$scenario" == "recovery" || "$scenario" == "healthy" ]]; then
+                if ! verify_ipp_attributes "$EMU_HOST" "$EMU_PORT" "healthy"; then
+                    echo "ERROR: Recovery verification failed. IPP endpoint is unavailable or retains faults." >&2
+                    return 1
+                fi
+            fi
+
+            # Requirement 8 & 9: Before cupsdisable or cupsenable, verify queue ownership using metadata,
+            # queue name and actual device URI. Refuse to modify any queue whose ownership cannot be verified.
             if [[ "$ipp_scen" == "stopped" ]]; then
-                if command -v cupsdisable >/dev/null 2>&1 && [[ -f "$EMU_META_FILE" ]]; then
-                    cupsdisable "$EMU_CUPS_QUEUE" 2>/dev/null || true
+                if command -v cupsdisable >/dev/null 2>&1 && [[ -n "$EMU_CUPS_QUEUE" ]] && lpstat -p "$EMU_CUPS_QUEUE" >/dev/null 2>&1; then
+                    if verify_cups_queue_ownership "$EMU_CUPS_QUEUE"; then
+                        cupsdisable "$EMU_CUPS_QUEUE" 2>/dev/null || true
+                    else
+                        echo "Warning: Refusing to disable unverified CUPS queue '${EMU_CUPS_QUEUE}'." >&2
+                    fi
                 fi
             elif [[ "$ipp_scen" == "healthy" ]]; then
-                if command -v cupsenable >/dev/null 2>&1 && [[ -f "$EMU_META_FILE" ]]; then
-                    cupsenable "$EMU_CUPS_QUEUE" 2>/dev/null || true
+                if command -v cupsenable >/dev/null 2>&1 && [[ -n "$EMU_CUPS_QUEUE" ]] && lpstat -p "$EMU_CUPS_QUEUE" >/dev/null 2>&1; then
+                    if verify_cups_queue_ownership "$EMU_CUPS_QUEUE"; then
+                        cupsenable "$EMU_CUPS_QUEUE" 2>/dev/null || true
+                    else
+                        echo "Warning: Refusing to enable unverified CUPS queue '${EMU_CUPS_QUEUE}'." >&2
+                    fi
                 fi
             fi
         fi
@@ -1478,7 +1630,19 @@ cmd_fault_set() {
         if [[ -n "$opt_drum" ]]; then
             snmp_args+=(-drum-level "$opt_drum" -drum-max 100)
         fi
-        cmd_snmp_set "${snmp_args[@]}" >/dev/null
+        if ! cmd_snmp_set "${snmp_args[@]}"; then
+            echo "ERROR: Failed to update SNMP emulator state." >&2
+            return 1
+        fi
+
+        if [[ "$scenario" == "recovery" || "$scenario" == "healthy" ]]; then
+            local snmp_chk_err
+            snmp_chk_err=$(python3 -c "import json, sys; data=json.load(open(sys.argv[1])); print(data.get('error_byte_0', 0) | data.get('error_byte_1', 0))" "$SNMP_STATE_FILE" 2>/dev/null || echo "1")
+            if [[ "$snmp_chk_err" != "0" ]]; then
+                echo "ERROR: SNMP recovery verification failed. Active errors remain in SNMP state." >&2
+                return 1
+            fi
+        fi
     fi
 
     echo "Coordinated Fault Injected:"
@@ -1860,7 +2024,10 @@ case "$COMMAND" in
         cmd_setup_cups
         ;;
     remove-cups)
-        cmd_remove_cups
+        cmd_remove_cups "${COMMAND_ARGS[@]}"
+        ;;
+    verify-queue)
+        cmd_verify_queue "${COMMAND_ARGS[@]}"
         ;;
     cleanup)
         cmd_cleanup
