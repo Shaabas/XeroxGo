@@ -1696,3 +1696,144 @@ func TestShadowHealth_CUPSCommandFailureVsDisabledContrasts(t *testing.T) {
 		}
 	})
 }
+
+func TestShadowHealth_CUPSOutputValidation(t *testing.T) {
+	now := time.Now().UTC()
+
+	mockIPP := func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+		return printer.IPPPrinterStateResult{
+			Source:            printer.CapabilitySourceCUPSQueue,
+			Queue:             queue,
+			State:             printer.IPPPrinterStateIdle,
+			AcceptingJobs:     printer.AcceptingJobsAccepting,
+			EndpointReachable: true,
+			QueueAccessible:   true,
+			ObservedAt:        now,
+		}, nil
+	}
+
+	t.Run("empty_output_classified_as_unknown", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return []byte(""), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Available {
+			t.Error("expected CUPSSample.Available=false for empty lpstat output")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Error("expected non-empty QueryErrors for empty lpstat output")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN for empty output", report.Reconciled.EffectiveState)
+		}
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") {
+				t.Errorf("expected no offline fault in BlockingFaults, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+	})
+
+	t.Run("whitespace_only_output_classified_as_unknown", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return []byte("   \n\t  \r\n   "), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Available {
+			t.Error("expected CUPSSample.Available=false for whitespace-only lpstat output")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN for whitespace output", report.Reconciled.EffectiveState)
+		}
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") {
+				t.Errorf("expected no offline fault in BlockingFaults, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+	})
+
+	t.Run("unrelated_text_classified_as_unknown", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return []byte("kernel: [12345.678] usb reset\n"), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Available {
+			t.Error("expected CUPSSample.Available=false for unrelated text output")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Error("expected QueryErrors for unrelated output")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN for unrelated text", report.Reconciled.EffectiveState)
+		}
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") {
+				t.Errorf("expected no offline fault in BlockingFaults, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+	})
+
+	t.Run("wrong_queue_output_classified_as_unknown", func(t *testing.T) {
+		client, cleanup := createTestClient(t, ClientConfig{
+			CUPSQueue:          "BrotherDCP",
+			EnableShadowHealth: true,
+			CUPSRunner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return []byte("printer CanonMG3600 is idle. enabled since Sun Nov 15 10:00:00 2026\n"), nil
+			},
+			MockIPPState: mockIPP,
+		})
+		defer cleanup()
+
+		report := client.RunShadowHealthCheck(context.Background())
+		if report == nil {
+			t.Fatal("expected non-nil ShadowHealthReport")
+		}
+
+		if report.CUPSSample.Available {
+			t.Error("expected CUPSSample.Available=false when output describes wrong queue")
+		}
+		if len(report.QueryErrors) == 0 {
+			t.Error("expected QueryErrors when output describes wrong queue")
+		}
+		if report.Reconciled.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN for wrong queue output", report.Reconciled.EffectiveState)
+		}
+		for _, bf := range report.Reconciled.BlockingFaults {
+			if strings.Contains(strings.ToLower(bf), "offline") {
+				t.Errorf("expected no offline fault in BlockingFaults, got %v", report.Reconciled.BlockingFaults)
+			}
+		}
+	})
+}

@@ -991,6 +991,134 @@ func TestQueryCUPSHealthDiagnostic(t *testing.T) {
 			t.Errorf("expected Online=false State=ERROR for empty queue, got Online=%t State=%s", health.Online, health.State)
 		}
 	})
+
+	t.Run("empty_output_returns_error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte(""), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err == nil {
+			t.Fatal("expected error for empty output")
+		}
+		if !strings.Contains(err.Error(), "empty or whitespace-only") {
+			t.Errorf("expected 'empty or whitespace-only' error, got %v", err)
+		}
+		if health.Online || health.State != "UNKNOWN" {
+			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
+		}
+
+		// Contrast with legacy PollCUPSHealthCustom which preserves backward-compatible fallback to READY
+		legacy := PollCUPSHealthCustom(context.Background(), runner, "BrotherDCP", 50)
+		if !legacy.Online || legacy.State != "READY" {
+			t.Errorf("expected legacy PollCUPSHealthCustom to return Online=true State=READY on empty output, got Online=%t State=%s", legacy.Online, legacy.State)
+		}
+	})
+
+	t.Run("whitespace_only_output_returns_error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("   \n\t  \r\n   "), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err == nil {
+			t.Fatal("expected error for whitespace-only output")
+		}
+		if !strings.Contains(err.Error(), "empty or whitespace-only") {
+			t.Errorf("expected 'empty or whitespace-only' error, got %v", err)
+		}
+		if health.Online || health.State != "UNKNOWN" {
+			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
+		}
+	})
+
+	t.Run("unrelated_text_returns_error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("kernel: [12345.678] usb 1-1: device reset high-speed USB device\nsystemd[1]: Started CUPS scheduler.\n"), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err == nil {
+			t.Fatal("expected error for unrelated text output")
+		}
+		if !strings.Contains(err.Error(), "lacks recognizable printer status line") {
+			t.Errorf("expected 'lacks recognizable printer status line' in error, got %v", err)
+		}
+		if health.Online || health.State != "UNKNOWN" {
+			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
+		}
+
+		// Legacy poller fallback
+		legacy := PollCUPSHealthCustom(context.Background(), runner, "BrotherDCP", 50)
+		if !legacy.Online || legacy.State != "READY" {
+			t.Errorf("expected legacy poller to return READY for unparsed text, got State=%s", legacy.State)
+		}
+	})
+
+	t.Run("wrong_queue_output_returns_error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer CanonMG3600 is idle. enabled since Sun Nov 15 10:00:00 2026\n"), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err == nil {
+			t.Fatal("expected error when output describes different printer queue")
+		}
+		if !strings.Contains(err.Error(), "describes queue") || !strings.Contains(err.Error(), "CanonMG3600") {
+			// Note token may be lowercased
+			if !strings.Contains(strings.ToLower(err.Error()), "canonmg3600") {
+				t.Errorf("expected error mentioning described queue 'canonmg3600', got %v", err)
+			}
+		}
+		if health.Online || health.State != "UNKNOWN" {
+			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
+		}
+	})
+
+	t.Run("malformed_output_lacking_state_attributes_returns_error", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer BrotherDCP\n"), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err == nil {
+			t.Fatal("expected error when output lacks recognizable state attributes")
+		}
+		if !strings.Contains(err.Error(), "lacks recognizable state attributes") {
+			t.Errorf("expected 'lacks recognizable state attributes' error, got %v", err)
+		}
+		if health.Online || health.State != "UNKNOWN" {
+			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
+		}
+	})
+
+	t.Run("valid_queue_printing", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer BrotherDCP now printing BrotherDCP-42. enabled since Sun Nov 15 10:00:00 2026\n"), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err != nil {
+			t.Fatalf("expected nil error for printing queue, got %v", err)
+		}
+		if !health.Online || health.State != "PRINTING" {
+			t.Errorf("expected Online=true State=PRINTING, got Online=%t State=%s", health.Online, health.State)
+		}
+	})
+
+	t.Run("valid_queue_media_jam_fault", func(t *testing.T) {
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return []byte("printer BrotherDCP is idle. enabled since Sun Nov 15 10:00:00 2026 - media-jam-error\n"), nil
+		}
+
+		health, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "BrotherDCP", 50)
+		if err != nil {
+			t.Fatalf("expected nil query error for valid queue with jam fault, got %v", err)
+		}
+		if !health.PaperJam || health.State != "ERROR" {
+			t.Errorf("expected PaperJam=true State=ERROR, got PaperJam=%t State=%s", health.PaperJam, health.State)
+		}
+	})
 }
 
 func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {

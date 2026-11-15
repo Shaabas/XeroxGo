@@ -885,8 +885,8 @@ func QueryCUPSHealth(ctx context.Context, queue string, estimatedSheets int) (co
 
 // QueryCUPSHealthDiagnostic queries CUPS health for a queue using 'lpstat -l -p' with fallback to 'lpstat -p'.
 // It returns both the parsed PrinterHealth and an explicit query error/status,
-// allowing callers (such as shadow health mode) to distinguish command execution failures from
-// successful CUPS responses that report a disabled, stopped, or offline queue.
+// allowing callers (such as shadow health mode) to distinguish command execution failures,
+// empty/unrelated/malformed output, or wrong-queue responses from valid CUPS queue observations.
 func QueryCUPSHealthDiagnostic(
 	ctx context.Context,
 	runner CommandRunner,
@@ -925,20 +925,169 @@ func QueryCUPSHealthDiagnostic(
 		}, fmt.Errorf("lpstat query failed for queue %q: %w", queue, err)
 	}
 
+	if err := validateCUPSOutput(out, queue); err != nil {
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "UNKNOWN",
+			PaperTrayStatus: "UNKNOWN",
+			EstimatedSheets: estimatedSheets,
+			ErrorMessage:    err.Error(),
+			UpdatedAt:       now,
+		}, err
+	}
+
 	return parseCUPSHealthOutput(out, estimatedSheets, now), nil
+}
+
+// validateCUPSOutput validates that lpstat output is non-empty and contains recognizable evidence
+// for the specifically requested CUPS queue (rejecting empty output, diagnostic noise, unrelated text,
+// and output describing a different printer queue).
+func validateCUPSOutput(out []byte, queue string) error {
+	trimmed := strings.TrimSpace(string(out))
+	if len(trimmed) == 0 {
+		return fmt.Errorf("lpstat output is empty or whitespace-only for CUPS queue %q", queue)
+	}
+
+	qClean := strings.TrimSpace(queue)
+	qLower := strings.ToLower(qClean)
+
+	lines := strings.Split(trimmed, "\n")
+	var otherQueues []string
+	foundRequestedQueue := false
+	hasStateEvidence := false
+
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		lowerLine := strings.ToLower(trimmedLine)
+		if !strings.HasPrefix(lowerLine, "printer") {
+			continue
+		}
+
+		rest := strings.TrimSpace(strings.TrimPrefix(lowerLine, "printer"))
+		rest = strings.TrimPrefix(rest, ":")
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			continue
+		}
+
+		// Extract queue name token (delimited by space, tab, slash, dot, colon)
+		var token string
+		for i, r := range rest {
+			if r == ' ' || r == '\t' || r == '/' || r == '.' || r == ':' {
+				token = rest[:i]
+				break
+			}
+		}
+		if token == "" {
+			token = rest
+		}
+
+		isMatch := token == qLower || strings.Split(token, "/")[0] == qLower ||
+			rest == qLower || strings.HasPrefix(rest, qLower+" ") || strings.HasPrefix(rest, qLower+"\t") ||
+			strings.HasPrefix(rest, qLower+"/") || strings.HasPrefix(rest, qLower+":") || strings.HasPrefix(rest, qLower+".")
+
+		if isMatch {
+			foundRequestedQueue = true
+			if isRecognizableCUPSStateText(lowerLine) {
+				hasStateEvidence = true
+			}
+		} else if token != "" {
+			otherQueues = append(otherQueues, token)
+		}
+	}
+
+	if !foundRequestedQueue {
+		if len(otherQueues) > 0 {
+			return fmt.Errorf("lpstat output describes queue %q, not requested CUPS queue %q", otherQueues[0], queue)
+		}
+		return fmt.Errorf("lpstat output lacks recognizable printer status line for CUPS queue %q: %q", queue, trimmed)
+	}
+
+	if !hasStateEvidence && !isRecognizableCUPSStateText(strings.ToLower(trimmed)) {
+		return fmt.Errorf("lpstat output for CUPS queue %q lacks recognizable state attributes: %q", queue, trimmed)
+	}
+
+	return nil
+}
+
+func isRecognizableCUPSStateText(s string) bool {
+	return strings.Contains(s, "is idle") ||
+		strings.Contains(s, "now printing") ||
+		strings.Contains(s, "printing") ||
+		strings.Contains(s, "disabled") ||
+		strings.Contains(s, "stopped") ||
+		strings.Contains(s, "enabled") ||
+		strings.Contains(s, "paused") ||
+		strings.Contains(s, "waiting") ||
+		strings.Contains(s, "processing") ||
+		strings.Contains(s, "offline") ||
+		strings.Contains(s, "error") ||
+		strings.Contains(s, "filter failed") ||
+		strings.Contains(s, "media-jam") ||
+		strings.Contains(s, "jam") ||
+		strings.Contains(s, "cover-open") ||
+		strings.Contains(s, "door-open") ||
+		strings.Contains(s, "cover open") ||
+		strings.Contains(s, "door open") ||
+		strings.Contains(s, "output-bin-full") ||
+		strings.Contains(s, "output-area-full") ||
+		strings.Contains(s, "bin full") ||
+		strings.Contains(s, "out of paper") ||
+		strings.Contains(s, "media-empty") ||
+		strings.Contains(s, "media-needed") ||
+		strings.Contains(s, "ready") ||
+		strings.Contains(s, "toner-empty") ||
+		strings.Contains(s, "toner-low") ||
+		strings.Contains(s, "marker-supply-empty") ||
+		strings.Contains(s, "marker-supply-low") ||
+		strings.Contains(s, "marker-waste-full") ||
+		strings.Contains(s, "input-tray-missing") ||
+		strings.Contains(s, "intervention-needed")
 }
 
 // PollCUPSHealthCustom allows injection of a custom command runner for testing CUPS health checks.
 // It queries CUPS using 'lpstat -l -p' to inspect extended printer status and state reasons (e.g. media-jam-error),
 // falling back to 'lpstat -p' if extended status is unavailable.
+// Preserves legacy production poller behavior.
 func PollCUPSHealthCustom(
 	ctx context.Context,
 	runner CommandRunner,
 	queue string,
 	estimatedSheets int,
 ) contracts.PrinterHealth {
-	health, _ := QueryCUPSHealthDiagnostic(ctx, runner, queue, estimatedSheets)
-	return health
+	now := time.Now().UTC()
+	if strings.TrimSpace(queue) == "" {
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "ERROR",
+			PaperTrayStatus: "UNKNOWN",
+			EstimatedSheets: estimatedSheets,
+			UpdatedAt:       now,
+		}
+	}
+
+	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+
+	out, err := runner(pollCtx, "lpstat", "-l", "-p", queue)
+	if err != nil {
+		out, err = runner(pollCtx, "lpstat", "-p", queue)
+	}
+	if err != nil {
+		return contracts.PrinterHealth{
+			Online:          false,
+			State:           "OFFLINE",
+			PaperTrayStatus: "UNKNOWN",
+			EstimatedSheets: estimatedSheets,
+			UpdatedAt:       now,
+		}
+	}
+
+	return parseCUPSHealthOutput(out, estimatedSheets, now)
 }
 
 // parseCUPSHealthOutput parses the raw stdout of lpstat into normalized contracts.PrinterHealth.
