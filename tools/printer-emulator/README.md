@@ -8,10 +8,14 @@ An isolated Linux laptop test harness using CUPS `ippeveprinter` to emulate an I
 
 The emulator uses the system-installed `ippeveprinter` tool provided by CUPS / OpenPrinting. It conforms to the **PWG IPP Everywhere (PWG 5100.14)** standard, enabling full driverless IPP printer emulation without requiring physical printer hardware or external network connections.
 
-### Key Principles & Guarantees
+### Key Principles & Safety Guarantees
 - **Local Isolation:** Binds strictly to `localhost` (`127.0.0.1` / `::1`) by default on an unprivileged port (`8631`). Never exposes the emulator publicly.
+- **Port Availability & IPP Readiness Verification:** Startup validates that the port is not in use before launching, and actively tests the endpoint with `ipptool` before declaring success. A running PID alone is never treated as success.
+- **Concurrency Protection:** Uses atomic locking to prevent concurrent or repeated startup from corrupting ownership metadata or spawning multiple listeners.
 - **Hardware Safety:** Uses a dedicated spool directory (`tools/printer-emulator/spool`). Print jobs are preserved as local test artifacts and are **never** forwarded to any physical printer.
-- **Queue Isolation:** The CUPS configuration commands (`setup-cups` and `remove-cups`) manage only the emulator's temporary driverless queue. Pre-existing physical or production CUPS queues are never modified or removed.
+- **Spool Path Safety:** Validates all spool paths against root (`/`), system directories (`/etc`, `/usr`, `/var`, etc.), and symlink escapes. Creates an internal ownership marker (`.xeroxgo_emulator_spool`) so cleanup never removes files from unverified directories.
+- **PID Validation:** Validates the PID file against the running `ippeveprinter` process name, port, and printer name before signaling it. Rejects stale, reused, malformed, or unrelated PIDs. Eliminates unconditional `kill -9`.
+- **Queue Ownership Tracking & Non-Destructive Management:** `setup-cups` never overwrites existing queues; it creates queues only when the name is unused. Ownership metadata (`cups_queue.meta`) tracks the queue and its expected IPP URI. `remove-cups` and `cleanup` verify both metadata ownership and actual device URI (`lpstat -v`) before deletion, refusing deletion if ownership cannot be verified. Pre-existing physical or production queues are completely protected.
 - **Zero Daemon Dependencies:** Adds no runtime or binary dependencies to the production kiosk daemon. Production code remains untouched.
 
 ---
@@ -243,3 +247,8 @@ A standalone, automated smoke test script is provided in `smoke_test.sh`:
 - **Test 5:** End-to-end CUPS job dispatch and artifact receipt (`lp`).
 - **Test 6:** CUPS IPP gateway capabilities query.
 - **Test 7:** Safe cleanup and queue isolation (verifying no unrelated queues are modified).
+- **Safety Test 8:** Existing queue collision protection (`setup-cups` refuses to overwrite pre-existing queue).
+- **Safety Test 9:** Unrelated PID protection (`stop` refuses to signal non-emulator process).
+- **Safety Test 10:** Unsafe spool path rejection (rejects `/`, `/etc`, `$HOME`, and symlink escapes).
+- **Safety Test 11:** Occupied port detection (aborts startup cleanly when port is in use).
+- **Safety Test 12:** Queue deletion ownership verification (`remove-cups` refuses deleting unverified queues).

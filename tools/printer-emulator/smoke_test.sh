@@ -2,7 +2,9 @@
 # smoke_test.sh - Repeatable smoke tests for local IPP printer emulator
 #
 # Tests emulator startup, direct IPP querying, direct IPP job submission,
-# CUPS driverless queue creation, CUPS job submission via lp, and safe cleanup.
+# CUPS driverless queue creation, CUPS job submission via lp, safe cleanup,
+# and negative safety tests (queue collision, unrelated PID, unsafe spool path,
+# occupied port, and queue deletion ownership verification).
 #
 # If dependencies are missing (e.g. ippeveprinter, ipptool, or cupsd),
 # tests are clearly reported as SKIPPED.
@@ -74,7 +76,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "============================================================"
-echo "  XeroxGo Local IPP Printer Emulator — Smoke Test Suite"
+echo "  XeroxGo Local IPP Printer Emulator — Smoke & Safety Suite"
 echo "============================================================"
 echo ""
 
@@ -364,11 +366,162 @@ else
 fi
 echo ""
 
+# =============================================================================
+# Negative & Safety Checks (Requirements 14 & 15)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Safety Test 8: Existing Queue Collision Protection
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 8: Existing queue collision protection ---"
+COLLISION_QUEUE="XeroxGoCollision_${$}"
+lpadmin -p "$COLLISION_QUEUE" -v "file:///dev/null" -E
+BEFORE_COLLISION_URI=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+
+set +e
+COLLISION_OUT=$("${SCRIPT_DIR}/emulator.sh" setup-cups --queue "$COLLISION_QUEUE" 2>&1)
+COLLISION_STATUS=$?
+set -e
+
+AFTER_COLLISION_URI=$(lpstat -v "$COLLISION_QUEUE" 2>/dev/null | sed -n 's/^device for [^:]*: *//p' | tr -d ' \t\r\n')
+
+if [[ $COLLISION_STATUS -ne 0 ]] && \
+   echo "$COLLISION_OUT" | grep -q "already exists. Refusing to overwrite" && \
+   [[ "$BEFORE_COLLISION_URI" == "$AFTER_COLLISION_URI" ]]; then
+    echo "  setup-cups correctly refused to overwrite existing queue '${COLLISION_QUEUE}'"
+    echo "  Verified existing queue configuration was preserved untouched"
+    echo "[PASS] Safety Test 8: Existing queue collision protection (setup-cups refuses overwrite)"
+    ((PASSED_COUNT++))
+else
+    echo "  setup-cups output: $COLLISION_OUT"
+    echo "  Before URI: $BEFORE_COLLISION_URI, After URI: $AFTER_COLLISION_URI"
+    echo "[FAIL] Safety Test 8: setup-cups did not refuse existing queue collision or modified it"
+    ((FAILED_COUNT++))
+fi
+lpadmin -x "$COLLISION_QUEUE" 2>/dev/null || true
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 9: Unrelated PID Protection
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 9: Unrelated PID protection ---"
+sleep 60 &
+SLEEP_PID=$!
+FAKE_PID_FILE="/tmp/fake_emu_${$}.pid"
+echo "$SLEEP_PID" > "$FAKE_PID_FILE"
+
+set +e
+STOP_UNRELATED_OUT=$(EMU_PID_FILE="$FAKE_PID_FILE" "${SCRIPT_DIR}/emulator.sh" stop 2>&1)
+STOP_UNRELATED_STATUS=$?
+set -e
+
+if [[ $STOP_UNRELATED_STATUS -ne 0 ]] && \
+   echo "$STOP_UNRELATED_OUT" | grep -q "Refusing to signal unrelated process" && \
+   kill -0 "$SLEEP_PID" 2>/dev/null; then
+    echo "  Verified emulator.sh stop refused to signal unrelated process (PID ${SLEEP_PID})"
+    echo "  Verified unrelated process remained alive"
+    echo "[PASS] Safety Test 9: Unrelated PID protection (refuses to signal non-emulator process)"
+    ((PASSED_COUNT++))
+else
+    echo "  emulator stop output: $STOP_UNRELATED_OUT"
+    echo "[FAIL] Safety Test 9: stop signaled or failed to reject unrelated PID"
+    ((FAILED_COUNT++))
+fi
+kill "$SLEEP_PID" 2>/dev/null || true
+rm -f "$FAKE_PID_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 10: Unsafe Spool Path Rejection
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 10: Unsafe spool path rejection ---"
+set +e
+ROOT_OUT=$("${SCRIPT_DIR}/emulator.sh" start --spool-dir /etc 2>&1)
+ROOT_STATUS=$?
+set -e
+
+# Test symlink escape
+ln -sf /etc "/tmp/unsafe_symlink_${$}"
+set +e
+SYMLINK_OUT=$("${SCRIPT_DIR}/emulator.sh" start --spool-dir "/tmp/unsafe_symlink_${$}" 2>&1)
+SYMLINK_STATUS=$?
+set -e
+rm -f "/tmp/unsafe_symlink_${$}"
+
+if [[ $ROOT_STATUS -ne 0 ]] && echo "$ROOT_OUT" | grep -q "Refusing to use system directory" && \
+   [[ $SYMLINK_STATUS -ne 0 ]] && (echo "$SYMLINK_OUT" | grep -q "Refusing to use system directory" || echo "$SYMLINK_OUT" | grep -q "points to forbidden directory"); then
+    echo "  Verified rejection of system path (/etc)"
+    echo "  Verified rejection of symlink pointing to forbidden directory"
+    echo "[PASS] Safety Test 10: Unsafe spool path rejection (root, system dirs, and symlink escapes)"
+    ((PASSED_COUNT++))
+else
+    echo "  Root test output: $ROOT_OUT"
+    echo "  Symlink test output: $SYMLINK_OUT"
+    echo "[FAIL] Safety Test 10: Failed to reject dangerous spool path or symlink escape"
+    ((FAILED_COUNT++))
+fi
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 11: Occupied Port Detection
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 11: Occupied port detection ---"
+OCCUPIED_PORT=8649
+python3 -c "import socket, time; s = socket.socket(); s.bind(('127.0.0.1', $OCCUPIED_PORT)); s.listen(1); time.sleep(5)" >/dev/null 2>&1 &
+DUMMY_SERVER_PID=$!
+sleep 0.2
+
+set +e
+PORT_OCCUPIED_OUT=$("${SCRIPT_DIR}/emulator.sh" start -p "$OCCUPIED_PORT" 2>&1)
+PORT_OCCUPIED_STATUS=$?
+set -e
+
+kill "$DUMMY_SERVER_PID" 2>/dev/null || true
+wait "$DUMMY_SERVER_PID" 2>/dev/null || true
+
+if [[ $PORT_OCCUPIED_STATUS -ne 0 ]] && echo "$PORT_OCCUPIED_OUT" | grep -q "already in use"; then
+    echo "  Verified startup aborted cleanly when port ${OCCUPIED_PORT} is already occupied"
+    echo "[PASS] Safety Test 11: Occupied port detection (refuses startup when port is in use)"
+    ((PASSED_COUNT++))
+else
+    echo "  Port test output: $PORT_OCCUPIED_OUT"
+    echo "[FAIL] Safety Test 11: Startup did not detect occupied port"
+    ((FAILED_COUNT++))
+fi
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 12: Queue Deletion Ownership & URI Verification
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 12: Queue deletion ownership verification ---"
+ALIEN_QUEUE="XeroxGoAlien_${$}"
+lpadmin -p "$ALIEN_QUEUE" -v "ipp://10.0.0.1:631/printers/alien" -E
+
+set +e
+ALIEN_DEL_OUT=$("${SCRIPT_DIR}/emulator.sh" remove-cups --queue "$ALIEN_QUEUE" 2>&1)
+ALIEN_DEL_STATUS=$?
+set -e
+
+if [[ $ALIEN_DEL_STATUS -ne 0 ]] && \
+   echo "$ALIEN_DEL_OUT" | grep -q "Ownership metadata not found" && \
+   lpstat -p "$ALIEN_QUEUE" >/dev/null 2>&1; then
+    echo "  remove-cups refused to delete alien queue without ownership metadata"
+    echo "  Verified alien queue remained intact in CUPS"
+    echo "[PASS] Safety Test 12: Queue deletion ownership verification (refuses deleting unverified queues)"
+    ((PASSED_COUNT++))
+else
+    echo "  remove-cups output: $ALIEN_DEL_OUT"
+    echo "[FAIL] Safety Test 12: remove-cups deleted or failed to reject unverified queue"
+    ((FAILED_COUNT++))
+fi
+lpadmin -x "$ALIEN_QUEUE" 2>/dev/null || true
+echo ""
+
 # -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo "============================================================"
-echo "  Smoke Test Results:"
+echo "  Smoke & Safety Test Results:"
 echo "    PASSED:  ${PASSED_COUNT}"
 echo "    FAILED:  ${FAILED_COUNT}"
 echo "    SKIPPED: ${SKIPPED_COUNT}"

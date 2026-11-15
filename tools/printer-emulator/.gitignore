@@ -1,6 +1,8 @@
 # Ignore runtime PID and log files
 emulator.pid
 emulator.log
+cups_queue.meta
+.emulator_startup.lock
 
 # Ignore job artifacts generated in spool directory
 spool/*
@@ -8,4 +10,5 @@ spool/*
 
 # Track test sample PDF
 !testdata/*.pdf
+
 
