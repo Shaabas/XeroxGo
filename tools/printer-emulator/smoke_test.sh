@@ -596,6 +596,8 @@ OWNED_SPOOL_DIR="/tmp/xeroxgo-owned-spool-${$}"
 rm -rf "$OWNED_SPOOL_DIR"
 mkdir -p "$OWNED_SPOOL_DIR"
 echo "EMULATOR_OWNED_SPOOL=true" > "${OWNED_SPOOL_DIR}/.xeroxgo_emulator_spool"
+echo "1-sample.pdf" > "${OWNED_SPOOL_DIR}/.xeroxgo_emulator_manifest"
+echo "1-sample.prn" >> "${OWNED_SPOOL_DIR}/.xeroxgo_emulator_manifest"
 touch "${OWNED_SPOOL_DIR}/1-sample.pdf"
 touch "${OWNED_SPOOL_DIR}/1-sample.prn"
 OWNED_PID_FILE="/tmp/xeroxgo-owned-${$}.pid"
@@ -803,6 +805,81 @@ else
     ((FAILED_COUNT++))
 fi
 rm -rf "$PATTERN_SPOOL_DIR" "$PATTERN_PID_FILE" "$PATTERN_LOG_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 19: Preserve Unrelated Artifact-Pattern File Across Restarts
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 19: Preserve unrelated file across start -> stop -> restart -> cleanup ---"
+RESTART_SPOOL_DIR="/tmp/xeroxgo-restart-spool-${$}"
+rm -rf "$RESTART_SPOOL_DIR"
+mkdir -p "$RESTART_SPOOL_DIR"
+RESTART_PID_FILE="/tmp/xeroxgo-restart-${$}.pid"
+RESTART_LOG_FILE="/tmp/xeroxgo-restart-${$}.log"
+RESTART_PORT=8656
+
+# 1. Start emulator in fresh directory
+EMU_PID_FILE="$RESTART_PID_FILE" EMU_LOG_FILE="$RESTART_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p "$RESTART_PORT" --spool-dir "$RESTART_SPOOL_DIR" >/dev/null 2>&1
+
+# 2. Submit print job 1 so genuine emulator artifact is produced and tracked in manifest
+ipptool -f "$SAMPLE_PDF" "ipp://localhost:${RESTART_PORT}/ipp/print" print-job.test >/dev/null 2>&1 || true
+sleep 0.5
+
+# 3. Introduce an unrelated file specifically named matching the artifact pattern (2-notes.pdf)
+UNRELATED_NOTES="${RESTART_SPOOL_DIR}/2-notes.pdf"
+echo "Confidential user notes to survive across restarts" > "$UNRELATED_NOTES"
+NOTES_MD5_BEFORE=$(md5sum "$UNRELATED_NOTES" | awk '{print $1}')
+
+# 4. Stop the emulator
+EMU_PID_FILE="$RESTART_PID_FILE" "${SCRIPT_DIR}/emulator.sh" stop -p "$RESTART_PORT" >/dev/null 2>&1 || true
+
+# 5. Restart the emulator on the same spool directory
+# Must NOT enroll 2-notes.pdf into .xeroxgo_emulator_manifest!
+set +e
+RESTART_OUT=$(EMU_PID_FILE="$RESTART_PID_FILE" EMU_LOG_FILE="$RESTART_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p "$RESTART_PORT" --spool-dir "$RESTART_SPOOL_DIR" 2>&1)
+RESTART_STATUS=$?
+set -e
+
+# Verify manifest does NOT contain 2-notes.pdf after restart
+MANIFEST_FILE="${RESTART_SPOOL_DIR}/.xeroxgo_emulator_manifest"
+MANIFEST_HAS_NOTES=false
+if [[ -f "$MANIFEST_FILE" ]] && grep -Fxq "2-notes.pdf" "$MANIFEST_FILE"; then
+    MANIFEST_HAS_NOTES=true
+fi
+
+# 6. Run cleanup
+set +e
+CLEANUP_RESTART_OUT=$(EMU_PID_FILE="$RESTART_PID_FILE" EMU_LOG_FILE="$RESTART_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" cleanup -p "$RESTART_PORT" --spool-dir "$RESTART_SPOOL_DIR" 2>&1)
+CLEANUP_RESTART_STATUS=$?
+set -e
+
+NOTES_MD5_AFTER=$(md5sum "$UNRELATED_NOTES" 2>/dev/null | awk '{print $1}' || echo "missing")
+REMAINING_GENUINE=$(find "$RESTART_SPOOL_DIR" -maxdepth 1 -type f -name "1-*" 2>/dev/null | wc -l)
+
+if [[ $RESTART_STATUS -eq 0 ]] && \
+   [[ "$MANIFEST_HAS_NOTES" == "false" ]] && \
+   [[ $CLEANUP_RESTART_STATUS -eq 0 ]] && \
+   [[ $REMAINING_GENUINE -eq 0 ]] && \
+   [[ -f "$UNRELATED_NOTES" ]] && \
+   [[ "$NOTES_MD5_BEFORE" == "$NOTES_MD5_AFTER" ]]; then
+    echo "  Verified restart did NOT enroll 2-notes.pdf into manifest"
+    echo "  Verified cleanup deleted genuine emulator artifacts (1-*)"
+    echo "  Verified 2-notes.pdf survived start -> stop -> restart -> cleanup intact"
+    echo "[PASS] Safety Test 19: Preserve unrelated file across start -> stop -> restart -> cleanup"
+    ((PASSED_COUNT++))
+else
+    echo "  restart status: $RESTART_STATUS, output: $RESTART_OUT"
+    echo "  manifest has notes: $MANIFEST_HAS_NOTES"
+    echo "  cleanup status: $CLEANUP_RESTART_STATUS, output: $CLEANUP_RESTART_OUT"
+    echo "  remaining genuine: $REMAINING_GENUINE"
+    echo "  2-notes.pdf exists: $([[ -f "$UNRELATED_NOTES" ]] && echo yes || echo no)"
+    echo "[FAIL] Safety Test 19: Failed restart preservation of unrelated file"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$RESTART_SPOOL_DIR" "$RESTART_PID_FILE" "$RESTART_LOG_FILE"
 echo ""
 
 # -----------------------------------------------------------------------------

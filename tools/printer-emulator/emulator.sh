@@ -217,6 +217,9 @@ EOF
         return 1
     fi
 
+    # Ensure manifest file exists; treat existing manifest as authoritative
+    [[ -f "$manifest" ]] || touch "$manifest"
+
     local entry fname
     for entry in "$dir"/* "$dir"/.*; do
         [[ -e "$entry" || -L "$entry" ]] || continue
@@ -248,13 +251,9 @@ EOF
             return 1
         fi
 
-        # Track existing legitimate artifact in manifest
-        echo "$fname" >> "$manifest"
+        # Do NOT automatically enroll existing files into manifest based on filename pattern alone.
+        # The manifest and execution logs remain authoritative for genuine emulator artifacts.
     done
-
-    if [[ -f "$manifest" ]]; then
-        sort -u "$manifest" -o "$manifest" 2>/dev/null || true
-    fi
 
     return 0
 }
