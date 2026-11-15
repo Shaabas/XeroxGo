@@ -228,6 +228,25 @@ When using `ippeveprinter` as a development and test harness, note the following
    - Non-root users cannot bind to standard IPP port 631 or SNMP port 161.
    - Unprivileged ports (`> 1024`, e.g. IPP `8631`, SNMP UDP `1161`) must be used.
 
+6. **Standalone IPP State Enum Limitations (State 3/4 vs 5):**
+   - Standalone `ippeveprinter` binary implements internal states 3 (`idle`) and 4 (`processing`), but does not transition its top-level `printer-state` enum to 5 (`stopped`).
+   - Pausing the printer via filter protocol serializes the `paused` keyword into `printer-state-reasons` (`paused-report`), while `printer-state` remains `idle` (3).
+   - True queue-level `stopped` state requires registering a driverless CUPS queue and executing `cupsdisable <queue>`.
+
+7. **Reason Suffix Serialization (`-report` vs `-warning` vs `-error`):**
+   - In `ippeveprinter`, reason keywords emitted via filter protocol (`STATE: +<keyword>`) are serialized with a suffix determined by daemon lifecycle:
+     - When idle: keywords receive a `-report` suffix (e.g. `media-jam-report`, `media-empty-report`, `cover-open-report`).
+     - When actively processing: keywords receive a `-warning` suffix.
+   - Per RFC 8011 and XeroxGo health rules, `-report` and `-warning` reasons are advisory (non-blocking) unless independently confirmed by physical SNMP telemetry. Coordinated fault injection pairs IPP reason injection with corresponding SNMP RFC 2790 error bitmasks to establish verified blocking faults.
+
+8. **Media Empty Command Suspension Loop:**
+   - When `media-empty` is active, `ippeveprinter` enters an in-memory loop awaiting paper replenishment, pausing subsequent filter execution.
+   - Because `ippeveprinter` does not process new print filter commands while out of paper, clearing `media-empty` via filter protocol alone is impossible without a fast in-memory process restart (`cmd_stop` → `cmd_start`).
+
+9. **Asynchronous Filter Protocol Update Delay:**
+   - When a sync probe job completes, `processor.sh` outputs `STATE:` directives to stderr. The parent `ippeveprinter` process reads this pipe and updates `printer->state_reasons` asynchronously.
+   - Client queries executed immediately in the same millisecond may observe pre-probe state. Strict verification helpers poll `get-printer-attributes.test` with exponential/retry backoff (up to 2.5s) to guarantee attribute synchronization.
+
 ---
 
 ## 9. Local SNMP Printer Emulator (SNMPv2c)
@@ -356,3 +375,97 @@ Exercises XeroxGo's Go SNMP polling implementation against the local emulator, v
 - Timeouts and context cancellation
 - Restart persistence across daemon restarts
 - Deterministic counter updates
+
+---
+
+## 11. Coordinated IPP + SNMP Fault Injection (Task D3)
+
+Simulates a single physical printer with coherent, coordinated telemetry across both the D1 IPP (`ippeveprinter`) and D2 SNMP (`snmp_responder`) emulators.
+
+### Coordinated Fault Controller Architecture
+
+The fault controller (`tools/printer-emulator/fault.sh` or `./emulator.sh fault`) orchestrates both emulators through a shared state model (`fault_state.json`), ensuring that simulated physical printer conditions update both IPP attributes and SNMP MIB observations consistently.
+
+```
+                  ┌──────────────────────────────────────────────┐
+                  │   fault.sh / emulator.sh fault controller     │
+                  └───────┬──────────────────────────────┬───────┘
+                          │                              │
+             (CUPS filter protocol & SIGSTOP)     (Local state & packet drop)
+                          │                              │
+                          ▼                              ▼
+              ┌──────────────────────┐       ┌──────────────────────┐
+              │    ippeveprinter     │       │    snmp_responder    │
+              │   (IPP Everywhere)   │       │   (RFC 2790 SNMPv2c) │
+              └──────────────────────┘       └──────────────────────┘
+```
+
+### Supported Scenarios
+
+| Scenario | IPP Attributes (`printer-state-reasons`) | SNMP MIBs (`hrPrinterStatus`, Error Bits) | Description |
+|---|---|---|---|
+| `healthy` | `printer-state=idle`, `reasons=none` | `hrPrinterStatus=idle(3)`, `00 00` | Normal idle operation; zero error flags |
+| `printing` | `printer-state=processing`, active job delay | `hrPrinterStatus=printing(4)`, `00 00` | Simulated active print execution |
+| `paper-empty` | `reasons=media-empty-report` | `hrPrinterStatus=other(1)`, `40 00` (`noPaper`) | Paper tray empty |
+| `paper-jam` | `reasons=media-jam-report` | `hrPrinterStatus=other(1)`, `04 00` (`jammed`) | Media jam in transport path |
+| `cover-open` | `reasons=cover-open-report` | `hrPrinterStatus=other(1)`, `08 00` (`doorOpen`) | Access door or cover open |
+| `stopped` | `reasons=paused-report`, `cupsdisable` queue | `hrPrinterStatus=other(1)` | Stopped / paused queue state |
+| `offline` | Transport unresponsive (SIGSTOP) | UDP packets dropped silently | Complete communication loss |
+| `recovery` | Restored to `idle`, `reasons=none` | `hrPrinterStatus=idle(3)`, `00 00` | Clean recovery from any prior fault |
+
+### Truthful Emulation & Subsystem Characteristics
+
+- **Stopped State:** Standalone `ippeveprinter` only supports internal states 3 (`idle`) and 4 (`processing`) in its binary. State 5 (`stopped`) is truthfully represented in standalone IPP via the `paused` reason (`paused-report`), and when a temporary CUPS queue is registered, `cupsdisable <queue>` disables the queue.
+- **Queue Ownership Enforcement:** Before issuing `cupsdisable` or `cupsenable`, the harness verifies queue ownership by validating `cups_queue.meta` existence, checking that the requested queue matches the metadata queue name, and verifying that `lpstat -v` device URI points to the verified emulator IPP URI. Unverified or foreign queues are strictly protected and never modified.
+- **Media Empty Wait Loop & Restart Recovery:** `ippeveprinter` suspends command processing when `media-empty` is set. When transitioning away from `paper-empty` (including transitions through `offline`), the controller performs an instantaneous in-memory restart (< 0.1s) of `ippeveprinter` to reset the bitmask cleanly. All start/stop failures during restart are strictly propagated.
+- **Attribute Verification & Failure Detection:** Probe submission alone is never treated as synchronization success. `sync_ipp_state` and recovery operations actively poll `get-printer-attributes.test` to verify that `printer-state-reasons` match the injected scenario before declaring success. Recovery operations strictly fail if the endpoint remains unavailable or retains fault reasons.
+- **Controlled Communication Loss:** The `offline` scenario pauses `ippeveprinter` via `SIGSTOP` (leaving TCP sockets unresponsive) and configures `snmp_responder` to silently drop incoming UDP packets. Recovery restores both immediately without modifying host interfaces, routes, or iptables.
+- **Deterministic Odometer:** Page counts are deterministic and explicitly controllable via `--counter <N>`. Processing test jobs or synchronization probes does not auto-increment the counter.
+
+### Fault Controller CLI Usage
+
+```bash
+cd tools/printer-emulator
+
+# 1. Inspect coordinated status and cross-subsystem telemetry analysis
+./fault.sh status
+# or: ./emulator.sh fault status
+
+# 2. Inject coordinated paper-jam scenario across both IPP and SNMP
+./fault.sh set paper-jam
+
+# 3. Inject coordinated cover-open scenario
+./fault.sh set cover-open
+
+# 4. Inject coordinated paper-empty scenario
+./fault.sh set paper-empty
+
+# 5. Simulate communication loss (both IPP TCP and SNMP UDP unresponsive)
+./fault.sh set offline
+
+# 6. Recover from offline or any active fault
+./fault.sh set recovery
+
+# 7. Independent target injection (simulate subsystem contradictions/disagreements)
+# IPP reports paper-jam while SNMP reports healthy:
+./fault.sh set --target ipp paper-jam
+
+# SNMP reports paper-jam while IPP reports healthy:
+./fault.sh set --ipp healthy --snmp paper-jam
+
+# 8. Deterministic counter and consumable configuration
+./fault.sh set healthy --counter 12500 --toner 40 --drum 75
+
+# 9. Clear all faults and return to healthy agreement
+./fault.sh clear
+```
+
+### Coordinated Fault Smoke & Verification Suites
+
+```bash
+# Run comprehensive D3 smoke test suite (44 automated assertions including safety regressions)
+./fault_smoke_test.sh
+
+# Run XeroxGo Go reconciliation integration test suite (live SNMP + real IPP parsing)
+go test -v -race ./kiosk-daemon/internal/printer -run TestFaultReconciliation
+```
