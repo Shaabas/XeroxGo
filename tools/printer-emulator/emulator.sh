@@ -25,6 +25,7 @@ EMU_FORMATS="${EMU_FORMATS:-application/pdf,image/pwg-raster,image/urf,applicati
 EMU_SPEED="${EMU_SPEED:-20,20}"
 EMU_DUPLEX="${EMU_DUPLEX:-true}"
 SPOOL_MARKER_NAME=".xeroxgo_emulator_spool"
+SPOOL_MANIFEST_NAME=".xeroxgo_emulator_manifest"
 
 # Locate ippeveprinter binary
 find_ippeveprinter() {
@@ -109,10 +110,67 @@ is_emulator_artifact() {
     [[ "$fname" =~ $regex ]]
 }
 
+# Sync artifacts actually created by emulator into spool manifest
+sync_spool_manifest() {
+    local spool_dir="$1"
+    local manifest="${spool_dir}/${SPOOL_MANIFEST_NAME}"
+
+    if [[ ! -d "$spool_dir" ]]; then
+        return 0
+    fi
+
+    # Read from emulator log if available
+    if [[ -f "$EMU_LOG_FILE" ]]; then
+        while IFS= read -r fpath; do
+            if [[ -n "$fpath" ]]; then
+                local bname
+                bname=$(basename "$fpath")
+                echo "$bname" >> "$manifest"
+            fi
+        done < <(sed -n 's/.*Created job file "\([^"]*\)".*/\1/p' "$EMU_LOG_FILE" 2>/dev/null || true)
+
+        while IFS= read -r fpath; do
+            if [[ -n "$fpath" ]]; then
+                local bname
+                bname=$(basename "$fpath")
+                echo "$bname" >> "$manifest"
+            fi
+        done < <(sed -n 's/.*Saving print command output to "\([^"]*\)".*/\1/p' "$EMU_LOG_FILE" 2>/dev/null || true)
+    fi
+
+    # Deduplicate manifest safely if it exists
+    if [[ -f "$manifest" ]]; then
+        sort -u "$manifest" -o "$manifest" 2>/dev/null || true
+    fi
+}
+
+# Check if a filename is verified as an artifact actually produced by the emulator
+is_tracked_artifact() {
+    local spool_dir="$1"
+    local fname="$2"
+    local manifest="${spool_dir}/${SPOOL_MANIFEST_NAME}"
+
+    # Check spool manifest file
+    if [[ -f "$manifest" ]] && grep -Fxq "$fname" "$manifest" 2>/dev/null; then
+        return 0
+    fi
+
+    # Check emulator log file directly as secondary verification
+    if [[ -f "$EMU_LOG_FILE" ]]; then
+        if grep -q "Created job file \".*/${fname}\"" "$EMU_LOG_FILE" 2>/dev/null || \
+           grep -q "Saving print command output to \".*/${fname}\"" "$EMU_LOG_FILE" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # Verify spool directory ownership and initialize or reuse strictly
 verify_and_init_spool_dir() {
     local dir="$1"
     local marker="${dir}/${SPOOL_MARKER_NAME}"
+    local manifest="${dir}/${SPOOL_MANIFEST_NAME}"
 
     # Ensure directory exists
     if [[ ! -d "$dir" ]]; then
@@ -141,7 +199,7 @@ verify_and_init_spool_dir() {
             fi
         done
 
-        # Directory is empty (or has only .gitkeep) - initialize ownership marker
+        # Directory is empty (or has only .gitkeep) - initialize ownership marker and manifest
         cat << EOF > "$marker"
 EMULATOR_OWNED_SPOOL=true
 CREATED_BY=xeroxgo_emulator
@@ -149,6 +207,7 @@ CREATED_AT=$(date -u +%FT%TZ)
 HOST=${EMU_HOST}
 PORT=${EMU_PORT}
 EOF
+        touch "$manifest"
         return 0
     fi
 
@@ -178,8 +237,8 @@ EOF
             return 1
         fi
 
-        # Marker and .gitkeep are valid metadata entries
-        if [[ "$fname" == "$SPOOL_MARKER_NAME" || "$fname" == ".gitkeep" ]]; then
+        # Marker, manifest, and .gitkeep are valid metadata entries
+        if [[ "$fname" == "$SPOOL_MARKER_NAME" || "$fname" == "$SPOOL_MANIFEST_NAME" || "$fname" == ".gitkeep" ]]; then
             continue
         fi
 
@@ -188,7 +247,14 @@ EOF
             echo "ERROR: Owned spool directory contains unrecognized or foreign file '$fname'. Refusing startup for safety." >&2
             return 1
         fi
+
+        # Track existing legitimate artifact in manifest
+        echo "$fname" >> "$manifest"
     done
+
+    if [[ -f "$manifest" ]]; then
+        sort -u "$manifest" -o "$manifest" 2>/dev/null || true
+    fi
 
     return 0
 }
@@ -499,7 +565,7 @@ cmd_status() {
                 [[ -f "$entry" && ! -L "$entry" ]] || continue
                 fname=$(basename "$entry")
                 if is_emulator_artifact "$fname"; then
-                    ((file_count++))
+                    file_count=$((file_count + 1))
                 fi
             done
             echo "  Jobs in spool: ${file_count}"
@@ -630,19 +696,30 @@ cmd_cleanup() {
         }
     fi
 
+    # Sync any remaining produced artifacts from emulator log before stopping daemon
+    if [[ -d "$EMU_SPOOL_DIR" ]]; then
+        local clean_spool
+        if clean_spool=$(validate_spool_dir "$EMU_SPOOL_DIR" 2>/dev/null); then
+            sync_spool_manifest "$clean_spool"
+        fi
+    fi
+
     cmd_stop || true
 
-    # Requirement 6, 7, 8, 9, 10: Validate spool path, verify ownership marker,
-    # and selectively remove only verified emulator artifacts while strictly
-    # preserving any unrelated files, subdirectories, symlinks, and metadata.
+    # Requirement 3, 4, 5, 6, 7, 8: Validate spool path, verify ownership marker,
+    # and selectively remove only verified emulator artifacts actually produced by emulator.
+    # Strictly preserves unrelated files (even if matching naming patterns like 2-notes.pdf),
+    # subdirectories, symlinks, and metadata.
     if [[ -d "$EMU_SPOOL_DIR" ]]; then
         local clean_spool
         if clean_spool=$(validate_spool_dir "$EMU_SPOOL_DIR"); then
             local marker="${clean_spool}/${SPOOL_MARKER_NAME}"
+            local manifest="${clean_spool}/${SPOOL_MANIFEST_NAME}"
             if [[ ! -f "$marker" ]] || ! grep -q "EMULATOR_OWNED_SPOOL=true" "$marker" 2>/dev/null; then
                 echo "Warning: Spool directory '${clean_spool}' does not have verified emulator ownership marker." >&2
                 echo "Skipping spool file deletion for safety." >&2
             else
+                sync_spool_manifest "$clean_spool"
                 echo "Cleaning verified emulator spool files in ${clean_spool}..."
                 local entry fname
                 for entry in "$clean_spool"/* "$clean_spool"/.*; do
@@ -650,7 +727,7 @@ cmd_cleanup() {
                     fname=$(basename "$entry")
                     [[ "$fname" != "." && "$fname" != ".." ]] || continue
 
-                    # Protect symlinks, subdirectories, marker, and .gitkeep
+                    # Protect symlinks, subdirectories, marker, manifest, and .gitkeep
                     if [[ -L "$entry" ]]; then
                         echo "Notice: Preserving symlink '${fname}' in spool directory."
                         continue
@@ -663,18 +740,24 @@ cmd_cleanup() {
                         echo "Notice: Preserving special file '${fname}' in spool directory."
                         continue
                     fi
-                    if [[ "$fname" == "$SPOOL_MARKER_NAME" || "$fname" == ".gitkeep" ]]; then
+                    if [[ "$fname" == "$SPOOL_MARKER_NAME" || "$fname" == "$SPOOL_MANIFEST_NAME" || "$fname" == ".gitkeep" ]]; then
                         continue
                     fi
 
-                    # Only delete verified emulator artifacts
-                    if is_emulator_artifact "$fname"; then
+                    # Requirement 3, 4, 5: Filename patterns alone must not authorize deletion.
+                    # Delete only if it matches artifact pattern AND is tracked as actually produced by emulator.
+                    if is_emulator_artifact "$fname" && is_tracked_artifact "$clean_spool" "$fname"; then
                         rm -f "$entry"
                         echo "  Deleted emulator artifact: ${fname}"
                     else
                         echo "Notice: Preserving non-emulator file '${fname}' in spool directory."
                     fi
                 done
+
+                # Clear manifest of deleted artifacts
+                if [[ -f "$manifest" ]]; then
+                    > "$manifest"
+                fi
             fi
         else
             echo "Warning: Spool directory path failed safety validation. Skipping spool cleanup." >&2

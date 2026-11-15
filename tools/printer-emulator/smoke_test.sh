@@ -647,6 +647,7 @@ sleep 0.5
 # Ensure a verified artifact exists
 if ! ls "$CLEANUP_SPOOL_DIR"/[0-9]*-* >/dev/null 2>&1; then
     touch "${CLEANUP_SPOOL_DIR}/1-testjob.pdf"
+    echo "1-testjob.pdf" >> "${CLEANUP_SPOOL_DIR}/.xeroxgo_emulator_manifest"
 fi
 
 # 3. Add unrelated personal files, a symlink, and a subdirectory after startup
@@ -699,6 +700,109 @@ else
     ((FAILED_COUNT++))
 fi
 rm -rf "$CLEANUP_SPOOL_DIR" "$CLEANUP_PID_FILE" "$CLEANUP_LOG_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Test 17: Status Command Robustness with Spool Artifacts (Safe Increment)
+# -----------------------------------------------------------------------------
+echo "--- Test 17: Status command robustness with spool artifacts (safe increment) ---"
+STATUS_SPOOL_DIR="/tmp/xeroxgo-status-spool-${$}"
+rm -rf "$STATUS_SPOOL_DIR"
+mkdir -p "$STATUS_SPOOL_DIR"
+STATUS_PID_FILE="/tmp/xeroxgo-status-${$}.pid"
+STATUS_LOG_FILE="/tmp/xeroxgo-status-${$}.log"
+STATUS_PORT=8654
+
+# Start emulator
+EMU_PID_FILE="$STATUS_PID_FILE" EMU_LOG_FILE="$STATUS_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p "$STATUS_PORT" --spool-dir "$STATUS_SPOOL_DIR" >/dev/null 2>&1
+
+# Submit print job so artifacts exist in spool
+ipptool -f "$SAMPLE_PDF" "ipp://localhost:${STATUS_PORT}/ipp/print" print-job.test >/dev/null 2>&1 || true
+sleep 0.5
+
+# Ensure at least one artifact is present
+if ! ls "$STATUS_SPOOL_DIR"/[0-9]*-* >/dev/null 2>&1; then
+    touch "${STATUS_SPOOL_DIR}/1-sample.pdf"
+fi
+
+# Run status under bash -e to strictly test against arithmetic post-increment failure
+set +e
+STATUS_OUT=$(bash -e -c "EMU_PID_FILE='$STATUS_PID_FILE' EMU_LOG_FILE='$STATUS_LOG_FILE' '${SCRIPT_DIR}/emulator.sh' status -p '$STATUS_PORT' --spool-dir '$STATUS_SPOOL_DIR'" 2>&1)
+STATUS_EXIT=$?
+set -e
+
+# Stop emulator
+EMU_PID_FILE="$STATUS_PID_FILE" "${SCRIPT_DIR}/emulator.sh" stop -p "$STATUS_PORT" >/dev/null 2>&1 || true
+
+if [[ $STATUS_EXIT -eq 0 ]] && \
+   echo "$STATUS_OUT" | grep -q "Status: RUNNING" && \
+   echo "$STATUS_OUT" | grep -q "Jobs in spool: [1-9]"; then
+    echo "  emulator.sh status succeeded under set -e with spool artifacts present"
+    echo "  Verified output: $(echo "$STATUS_OUT" | grep 'Jobs in spool:')"
+    echo "[PASS] Test 17: Status command robustness with spool artifacts (safe increment)"
+    ((PASSED_COUNT++))
+else
+    echo "  status exit code: $STATUS_EXIT"
+    echo "  status output: $STATUS_OUT"
+    echo "[FAIL] Test 17: Status command failed with spool artifacts"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$STATUS_SPOOL_DIR" "$STATUS_PID_FILE" "$STATUS_LOG_FILE"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Safety Test 18: Preserve Unrelated Files Matching Artifact Pattern (2-notes.pdf)
+# -----------------------------------------------------------------------------
+echo "--- Safety Test 18: Preserve unrelated file matching artifact pattern (2-notes.pdf) ---"
+PATTERN_SPOOL_DIR="/tmp/xeroxgo-pattern-spool-${$}"
+rm -rf "$PATTERN_SPOOL_DIR"
+mkdir -p "$PATTERN_SPOOL_DIR"
+PATTERN_PID_FILE="/tmp/xeroxgo-pattern-${$}.pid"
+PATTERN_LOG_FILE="/tmp/xeroxgo-pattern-${$}.log"
+PATTERN_PORT=8655
+
+# 1. Start emulator in empty directory
+EMU_PID_FILE="$PATTERN_PID_FILE" EMU_LOG_FILE="$PATTERN_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" start -p "$PATTERN_PORT" --spool-dir "$PATTERN_SPOOL_DIR" >/dev/null 2>&1
+
+# 2. Submit print job so emulator actually produces genuine artifacts
+ipptool -f "$SAMPLE_PDF" "ipp://localhost:${PATTERN_PORT}/ipp/print" print-job.test >/dev/null 2>&1 || true
+sleep 0.5
+
+# 3. Add an unrelated file specifically named matching the artifact pattern, e.g. 2-notes.pdf
+MATCHING_UNRELATED="${PATTERN_SPOOL_DIR}/2-notes.pdf"
+echo "Confidential user notes matching emulator artifact naming pattern" > "$MATCHING_UNRELATED"
+MATCHING_MD5_BEFORE=$(md5sum "$MATCHING_UNRELATED" | awk '{print $1}')
+
+# 4. Run cleanup
+set +e
+CLEANUP_PATTERN_OUT=$(EMU_PID_FILE="$PATTERN_PID_FILE" EMU_LOG_FILE="$PATTERN_LOG_FILE" \
+    "${SCRIPT_DIR}/emulator.sh" cleanup -p "$PATTERN_PORT" --spool-dir "$PATTERN_SPOOL_DIR" 2>&1)
+CLEANUP_PATTERN_STATUS=$?
+set -e
+
+MATCHING_MD5_AFTER=$(md5sum "$MATCHING_UNRELATED" 2>/dev/null | awk '{print $1}' || echo "missing")
+
+# 5. Check that emulator artifacts were deleted, but 2-notes.pdf was PRESERVED
+GENUINE_ARTIFACTS=$(find "$PATTERN_SPOOL_DIR" -maxdepth 1 -type f -name "1-*" 2>/dev/null | wc -l)
+
+if [[ $CLEANUP_PATTERN_STATUS -eq 0 ]] && \
+   [[ $GENUINE_ARTIFACTS -eq 0 ]] && \
+   [[ -f "$MATCHING_UNRELATED" ]] && \
+   [[ "$MATCHING_MD5_BEFORE" == "$MATCHING_MD5_AFTER" ]]; then
+    echo "  Verified cleanup deleted genuine emulator artifacts (1-*)"
+    echo "  Verified unrelated file matching artifact pattern (2-notes.pdf) was PRESERVED intact"
+    echo "[PASS] Safety Test 18: Preserve unrelated file matching artifact pattern (2-notes.pdf)"
+    ((PASSED_COUNT++))
+else
+    echo "  cleanup output: $CLEANUP_PATTERN_OUT"
+    echo "  Genuine artifacts remaining: $GENUINE_ARTIFACTS"
+    echo "  2-notes.pdf exists: $([[ -f "$MATCHING_UNRELATED" ]] && echo yes || echo no)"
+    echo "[FAIL] Safety Test 18: Cleanup deleted 2-notes.pdf or failed to remove emulator artifact"
+    ((FAILED_COUNT++))
+fi
+rm -rf "$PATTERN_SPOOL_DIR" "$PATTERN_PID_FILE" "$PATTERN_LOG_FILE"
 echo ""
 
 # -----------------------------------------------------------------------------
