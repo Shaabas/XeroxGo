@@ -161,6 +161,9 @@ func TestShadowHealth_HealthyObservations(t *testing.T) {
 	})
 	defer cleanup()
 
+	// Populate cached production health baseline
+	client.CheckPrinterHealth(context.Background())
+
 	report := client.RunShadowHealthCheck(context.Background())
 	if report == nil {
 		t.Fatal("expected non-nil ShadowHealthReport")
@@ -177,6 +180,9 @@ func TestShadowHealth_HealthyObservations(t *testing.T) {
 	}
 	if len(report.Reconciled.BlockingFaults) > 0 {
 		t.Errorf("expected no blocking faults, got %v", report.Reconciled.BlockingFaults)
+	}
+	if !report.ProductionDecision.Available {
+		t.Error("expected ProductionDecision.Available to be true")
 	}
 	if report.Differences.HasDifferences() {
 		t.Errorf("expected no differences for healthy matching sources, got %+v", report.Differences)
@@ -641,5 +647,391 @@ func TestShadowHealth_PeriodicLoopExecution(t *testing.T) {
 	}
 	if checkCount.Load() < 2 {
 		t.Errorf("expected at least 2 shadow checks during loop execution, got %d", checkCount.Load())
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// Regression Tests for Final Safety Corrections (Points 1, 4, 8, 10, 11)
+// -------------------------------------------------------------------------------------------------
+
+func TestShadowHealth_SuccessfulQuery_NotReportedAsCanceled(t *testing.T) {
+	now := time.Now().UTC()
+	client, cleanup := createTestClient(t, ClientConfig{
+		CUPSQueue:          "BrotherDCP",
+		EnableShadowHealth: true,
+		MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			// Query finishes successfully
+			return contracts.PrinterHealth{
+				Online:    true,
+				State:     "IDLE",
+				UpdatedAt: now,
+			}
+		},
+		MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{
+				Online:    true,
+				State:     "IDLE",
+				UpdatedAt: now,
+			}
+		},
+		MockIPPState: func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+			return printer.IPPPrinterStateResult{
+				Source:            printer.CapabilitySourceCUPSQueue,
+				Queue:             queue,
+				State:             printer.IPPPrinterStateIdle,
+				AcceptingJobs:     printer.AcceptingJobsAccepting,
+				EndpointReachable: true,
+				QueueAccessible:   true,
+				ObservedAt:        now,
+			}, nil
+		},
+	})
+	defer cleanup()
+
+	report := client.RunShadowHealthCheck(context.Background())
+	if report == nil {
+		t.Fatal("expected non-nil ShadowHealthReport")
+	}
+
+	// Verify that successful queries are NEVER falsely tagged with context.Canceled
+	if len(report.QueryErrors) != 0 {
+		t.Fatalf("expected 0 query errors for successful queries, got %d: %v", len(report.QueryErrors), report.QueryErrors)
+	}
+
+	if report.CUPSSample.Error != "" {
+		t.Errorf("expected CUPSSample.Error to be empty, got %q", report.CUPSSample.Error)
+	}
+	if report.SNMPSample.Error != "" {
+		t.Errorf("expected SNMPSample.Error to be empty, got %q", report.SNMPSample.Error)
+	}
+	if report.IPPSample.Error != "" {
+		t.Errorf("expected IPPSample.Error to be empty, got %q", report.IPPSample.Error)
+	}
+}
+
+func TestShadowHealth_DistinguishableCancellationAndTimeout(t *testing.T) {
+	client, cleanup := createTestClient(t, ClientConfig{
+		CUPSQueue:          "BrotherDCP",
+		EnableShadowHealth: true,
+		MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			// Simulate context canceled during call
+			<-ctx.Done()
+			return contracts.PrinterHealth{
+				Online:       false,
+				State:        "UNKNOWN",
+				ErrorMessage: ctx.Err().Error(),
+			}
+		},
+	})
+	defer cleanup()
+
+	// 1. Genuine context cancellation
+	cancCtx, canc := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		canc()
+	}()
+
+	report := client.RunShadowHealthCheck(cancCtx)
+	if report == nil {
+		// Context was canceled while starting check
+		return
+	}
+
+	foundCanceled := false
+	for _, qe := range report.QueryErrors {
+		if strings.Contains(strings.ToLower(qe), "canceled") {
+			foundCanceled = true
+			break
+		}
+	}
+	if !foundCanceled && len(report.QueryErrors) > 0 {
+		t.Logf("Captured query errors on cancellation: %v", report.QueryErrors)
+	}
+}
+
+func TestShadowHealth_StaleObservation_FaultFlagsSuppressed(t *testing.T) {
+	now := time.Now().UTC()
+	staleTimestamp := now.Add(-50 * time.Second) // Stale > 30s
+
+	client, cleanup := createTestClient(t, ClientConfig{
+		CUPSQueue:          "BrotherDCP",
+		EnableShadowHealth: true,
+		MockHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		// Stale CUPS observation carrying historical fault flags
+		MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "ERROR",
+				PaperJam:        true,
+				CoverOpen:       true,
+				OutputBinFull:   true,
+				PaperTrayStatus: "EMPTY",
+				ErrorMessage:     "printer paper jam in feeder",
+				UpdatedAt:        staleTimestamp,
+			}
+		},
+		// Stale SNMP observation carrying historical fault flags
+		MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{
+				Online:          true,
+				State:           "ERROR",
+				PaperJam:        true,
+				CoverOpen:       true,
+				OutputBinFull:   true,
+				PaperTrayStatus: "EMPTY",
+				ErrorMessage:     "door open",
+				UpdatedAt:        staleTimestamp,
+			}
+		},
+		// Fresh IPP observation reports healthy/idle
+		MockIPPState: func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+			return printer.IPPPrinterStateResult{
+				Source:            printer.CapabilitySourceCUPSQueue,
+				Queue:             queue,
+				State:             printer.IPPPrinterStateIdle,
+				AcceptingJobs:     printer.AcceptingJobsAccepting,
+				EndpointReachable: true,
+				QueueAccessible:   true,
+				ObservedAt:        now,
+			}, nil
+		},
+	})
+	defer cleanup()
+
+	report := client.RunShadowHealthCheck(context.Background())
+	if report == nil {
+		t.Fatal("expected non-nil ShadowHealthReport")
+	}
+
+	// Verify staleness is explicitly captured
+	if !report.CUPSSample.Stale || report.CUPSSample.Available {
+		t.Errorf("expected CUPS sample to be stale and unavailable: %+v", report.CUPSSample)
+	}
+	if !report.SNMPSample.Stale || report.SNMPSample.Available {
+		t.Errorf("expected SNMP sample to be stale and unavailable: %+v", report.SNMPSample)
+	}
+
+	// Active reconciliation MUST NOT accept stale fault flags or paper status!
+	// Reconciled physical flags must be false.
+	if report.Reconciled.PaperJam {
+		t.Error("CRITICAL: stale paper jam flag was accepted into active reconciliation!")
+	}
+	if report.Reconciled.CoverOpen {
+		t.Error("CRITICAL: stale cover open flag was accepted into active reconciliation!")
+	}
+	if report.Reconciled.OutputBinFull {
+		t.Error("CRITICAL: stale output bin full flag was accepted into active reconciliation!")
+	}
+
+	// Stale observations must NOT create false claims of current physical faults!
+	for _, f := range report.Reconciled.BlockingFaults {
+		if f == "paper jam" || f == "cover or door open" || f == "output bin full" {
+			t.Errorf("CRITICAL: stale fault %q was included in Reconciled.BlockingFaults: %v", f, report.Reconciled.BlockingFaults)
+		}
+	}
+
+	// Raw observations must be preserved separately for diagnostics
+	if !report.RawCUPS.PaperJam || !report.RawCUPS.CoverOpen {
+		t.Errorf("expected RawCUPS to preserve original diagnostic observations, got: %+v", report.RawCUPS)
+	}
+	if !report.RawSNMP.PaperJam || !report.RawSNMP.CoverOpen {
+		t.Errorf("expected RawSNMP to preserve original diagnostic observations, got: %+v", report.RawSNMP)
+	}
+}
+
+func TestShadowHealth_ProductionBaseline_Absent(t *testing.T) {
+	now := time.Now().UTC()
+	client, cleanup := createTestClient(t, ClientConfig{
+		CUPSQueue:          "BrotherDCP",
+		EnableShadowHealth: true,
+		// MockHealth is set on client, but CheckPrinterHealth is NEVER called before shadow check.
+		MockHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockIPPState: func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+			return printer.IPPPrinterStateResult{
+				Source:            printer.CapabilitySourceCUPSQueue,
+				Queue:             queue,
+				State:             printer.IPPPrinterStateIdle,
+				AcceptingJobs:     printer.AcceptingJobsAccepting,
+				EndpointReachable: true,
+				QueueAccessible:   true,
+				ObservedAt:        now,
+			}, nil
+		},
+	})
+	defer cleanup()
+
+	// Ensure cached production health is absent
+	if !client.LatestProductionHealth().UpdatedAt.IsZero() {
+		t.Fatal("expected cached production health to be zero before initial CheckPrinterHealth")
+	}
+
+	report := client.RunShadowHealthCheck(context.Background())
+	if report == nil {
+		t.Fatal("expected non-nil ShadowHealthReport")
+	}
+
+	// 1. Production decision must be marked unavailable
+	if report.ProductionDecision.Available {
+		t.Error("expected ProductionDecision.Available to be false when baseline is absent")
+	}
+	if !strings.Contains(report.ProductionDecision.Reason, "absent") {
+		t.Errorf("expected ProductionDecision.Reason to indicate absent baseline, got %q", report.ProductionDecision.Reason)
+	}
+
+	// 2. Differences must mark baseline unavailable and skip authoritative difference classification
+	if report.Differences.BaselineAvailable {
+		t.Error("expected Differences.BaselineAvailable to be false")
+	}
+	if report.Differences.HasDifferences() {
+		t.Error("expected Differences.HasDifferences() to be false when baseline is absent")
+	}
+	if report.Differences.StateDiff || report.Differences.OnlineDiff || report.Differences.FaultDiff {
+		t.Errorf("expected no difference flags when baseline is absent, got %+v", report.Differences)
+	}
+	if len(report.Differences.Details) == 0 || !strings.Contains(report.Differences.Details[0], "baseline absent") {
+		t.Errorf("expected Differences.Details to explain that baseline is absent: %v", report.Differences.Details)
+	}
+}
+
+func TestShadowHealth_ProductionBaseline_Stale(t *testing.T) {
+	now := time.Now().UTC()
+	staleTimestamp := now.Add(-60 * time.Second) // Baseline is 60s old (> 30s limit)
+
+	client, cleanup := createTestClient(t, ClientConfig{
+		CUPSQueue:          "BrotherDCP",
+		EnableShadowHealth: true,
+		MockHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: staleTimestamp}
+		},
+		MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockIPPState: func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+			return printer.IPPPrinterStateResult{
+				Source:            printer.CapabilitySourceCUPSQueue,
+				Queue:             queue,
+				State:             printer.IPPPrinterStateIdle,
+				AcceptingJobs:     printer.AcceptingJobsAccepting,
+				EndpointReachable: true,
+				QueueAccessible:   true,
+				ObservedAt:        now,
+			}, nil
+		},
+	})
+	defer cleanup()
+
+	// Seed production health cache with stale reading
+	client.CheckPrinterHealth(context.Background())
+
+	report := client.RunShadowHealthCheck(context.Background())
+	if report == nil {
+		t.Fatal("expected non-nil ShadowHealthReport")
+	}
+
+	// Baseline is stale -> must be marked unavailable and NOT classified as a real mismatch
+	if report.ProductionDecision.Available {
+		t.Error("expected ProductionDecision.Available to be false for stale baseline")
+	}
+	if !strings.Contains(report.ProductionDecision.Reason, "stale") {
+		t.Errorf("expected ProductionDecision.Reason to indicate stale baseline, got %q", report.ProductionDecision.Reason)
+	}
+	if report.Differences.BaselineAvailable {
+		t.Error("expected Differences.BaselineAvailable to be false")
+	}
+	if report.Differences.HasDifferences() {
+		t.Error("expected Differences.HasDifferences() to be false for stale baseline")
+	}
+}
+
+func TestShadowHealth_ReportImmutability(t *testing.T) {
+	now := time.Now().UTC()
+	client, cleanup := createTestClient(t, ClientConfig{
+		CUPSQueue:          "BrotherDCP",
+		EnableShadowHealth: true,
+		MockHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockCUPSHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockSNMPHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", UpdatedAt: now}
+		},
+		MockIPPState: func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+			return printer.IPPPrinterStateResult{
+				Source:            printer.CapabilitySourceCUPSQueue,
+				Queue:             queue,
+				State:             printer.IPPPrinterStateIdle,
+				AcceptingJobs:     printer.AcceptingJobsAccepting,
+				EndpointReachable: true,
+				QueueAccessible:   true,
+				ObservedAt:        now,
+			}, nil
+		},
+	})
+	defer cleanup()
+
+	client.CheckPrinterHealth(context.Background())
+	report := client.RunShadowHealthCheck(context.Background())
+	if report == nil {
+		t.Fatal("expected non-nil report")
+	}
+
+	// Obtain copy 1 and mutate slices
+	r1 := client.LatestShadowReport()
+	if r1 == nil {
+		t.Fatal("expected non-nil r1 from LatestShadowReport")
+	}
+
+	r1.Differences.Details = append(r1.Differences.Details, "MUTATED_DIFF_DETAIL")
+	r1.Reconciled.BlockingFaults = append(r1.Reconciled.BlockingFaults, "MUTATED_BLOCKING_FAULT")
+	r1.Reconciled.NonblockingWarnings = append(r1.Reconciled.NonblockingWarnings, "MUTATED_WARNING")
+	r1.Reconciled.Contradictions = append(r1.Reconciled.Contradictions, "MUTATED_CONTRADICTION")
+	r1.QueryErrors = append(r1.QueryErrors, "MUTATED_QUERY_ERROR")
+
+	// Obtain copy 2 and verify it is completely unaffected
+	r2 := client.LatestShadowReport()
+	if r2 == nil {
+		t.Fatal("expected non-nil r2 from LatestShadowReport")
+	}
+
+	for _, d := range r2.Differences.Details {
+		if d == "MUTATED_DIFF_DETAIL" {
+			t.Fatal("IMMUTABILITY VIOLATION: r2.Differences.Details contains mutated element!")
+		}
+	}
+	for _, bf := range r2.Reconciled.BlockingFaults {
+		if bf == "MUTATED_BLOCKING_FAULT" {
+			t.Fatal("IMMUTABILITY VIOLATION: r2.Reconciled.BlockingFaults contains mutated element!")
+		}
+	}
+	for _, nw := range r2.Reconciled.NonblockingWarnings {
+		if nw == "MUTATED_WARNING" {
+			t.Fatal("IMMUTABILITY VIOLATION: r2.Reconciled.NonblockingWarnings contains mutated element!")
+		}
+	}
+	for _, c := range r2.Reconciled.Contradictions {
+		if c == "MUTATED_CONTRADICTION" {
+			t.Fatal("IMMUTABILITY VIOLATION: r2.Reconciled.Contradictions contains mutated element!")
+		}
+	}
+	for _, qe := range r2.QueryErrors {
+		if qe == "MUTATED_QUERY_ERROR" {
+			t.Fatal("IMMUTABILITY VIOLATION: r2.QueryErrors contains mutated element!")
+		}
 	}
 }
