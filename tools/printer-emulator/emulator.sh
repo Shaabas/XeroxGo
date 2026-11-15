@@ -472,6 +472,10 @@ cmd_start() {
     args+=("$EMU_NAME")
 
     export EMU_FAULT_STATE_FILE
+    export EMU_JOB_ACTIVE_FILE="${EMU_JOB_ACTIVE_FILE:-}"
+    export EMU_JOB_GATE_FILE="${EMU_JOB_GATE_FILE:-}"
+    export EMU_JOB_RELEASE_FILE="${EMU_JOB_RELEASE_FILE:-}"
+    export EMU_GATE_TIMEOUT_TENTHS="${EMU_GATE_TIMEOUT_TENTHS:-50}"
 
     # Start ippeveprinter in background
     "$ippeveprinter_bin" "${args[@]}" > "$EMU_LOG_FILE" 2>&1 &
@@ -1594,6 +1598,25 @@ cmd_fault_set() {
 
             write_fault_state "$scenario" "$target" "$ipp_scen" "$snmp_scen" "$ipp_reasons" "$ipp_offline" "$snmp_offline" "$hold_job"
 
+            local active_in_processor=false
+            if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ -f "$EMU_JOB_ACTIVE_FILE" ]]; then
+                local marker_state marker_pid marker_job
+                marker_state=$(sed -n 's/^STATE=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                marker_pid=$(sed -n 's/^PID=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                marker_job=$(sed -n 's/^JOB_NAME=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+
+                # Strictly reject stale markers (STATE != processing) and dead PIDs (Requirement 9)
+                if [[ "$marker_state" == "processing" ]] && [[ -n "$marker_pid" ]] && kill -0 "$marker_pid" 2>/dev/null; then
+                    local pid_cmdline pid_comm
+                    pid_cmdline=$(tr '\0' ' ' < "/proc/${marker_pid}/cmdline" 2>/dev/null || true)
+                    pid_comm=$(cat "/proc/${marker_pid}/comm" 2>/dev/null || ps -p "$marker_pid" -o comm= 2>/dev/null || true)
+                    # Strictly reject unrelated shell processes or reused PIDs: cmdline must reference processor.sh
+                    if [[ "$pid_cmdline" =~ processor\.sh ]] || [[ "$pid_comm" =~ processor ]]; then
+                        active_in_processor=true
+                    fi
+                fi
+            fi
+
             if [[ "$need_restart" == "true" ]] && is_running; then
                 if ! cmd_stop; then
                     echo "ERROR: Failed to stop IPP emulator during paper-empty recovery." >&2
@@ -1603,6 +1626,12 @@ cmd_fault_set() {
                     echo "ERROR: Failed to restart IPP emulator during paper-empty recovery." >&2
                     return 1
                 fi
+            elif [[ "$active_in_processor" == "true" ]]; then
+                # An active print job is currently running in processor.sh.
+                # Writing fault state triggers processor.sh to emit filter protocol STATE messages directly.
+                # Submitting an external sync probe would fail with server-error-busy because ippeveprinter is busy.
+                # Verify live IPP attributes updated by active processor.
+                verify_ipp_attributes "$EMU_HOST" "$EMU_PORT" "$ipp_scen"
             else
                 # Synchronize state attributes via ippeveprinter filter protocol
                 if ! sync_ipp_state "$EMU_HOST" "$EMU_PORT" "$ipp_scen"; then
