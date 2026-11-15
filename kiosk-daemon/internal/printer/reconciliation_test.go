@@ -1604,3 +1604,183 @@ func TestReconcilePrinterHealth_MissingVsExplicitlyHealthyObservations(t *testin
 	})
 }
 
+func TestReconcilePrinterHealth_SourceValidityCUPSContrasts(t *testing.T) {
+	evalTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	freshTime := evalTime.Add(-2 * time.Second)
+
+	ipp := IPPPrinterStateResult{
+		Source:            CapabilitySourceCUPSQueue,
+		Queue:             "BrotherQueue",
+		State:             IPPPrinterStateIdle,
+		EndpointReachable: true,
+		QueueAccessible:   true,
+		ObservedAt:        freshTime,
+	}
+	snmp := contracts.PrinterHealth{
+		Online: false,
+		State:  "UNKNOWN",
+	}
+
+	t.Run("cups_invalid_yields_unknown_without_offline_fault", func(t *testing.T) {
+		cups := contracts.PrinterHealth{
+			Online:          false,
+			State:           "OFFLINE",
+			ErrorMessage:    "printer disabled",
+			PaperTrayStatus: "UNKNOWN",
+			UpdatedAt:       freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime, SourceValidity{
+			CUPSValid: false,
+			SNMPValid: false,
+		})
+
+		if res.EffectiveState != "UNKNOWN" {
+			t.Errorf("EffectiveState = %q, want UNKNOWN", res.EffectiveState)
+		}
+		if res.Online {
+			t.Error("Online must be false")
+		}
+		for _, f := range res.BlockingFaults {
+			if strings.Contains(strings.ToLower(f), "offline") {
+				t.Errorf("invalid CUPS must not produce queue offline blocking fault: %v", res.BlockingFaults)
+			}
+		}
+		for _, d := range res.DiagnosticDetails {
+			if d.Code == FaultQueueOffline {
+				t.Errorf("invalid CUPS must not emit FaultQueueOffline diagnostic item")
+			}
+		}
+		if res.SourceAttribution.CUPS.Available {
+			t.Error("CUPS attribution Available must be false when invalid")
+		}
+	})
+
+	t.Run("cups_valid_offline_yields_offline_fault", func(t *testing.T) {
+		cups := contracts.PrinterHealth{
+			Online:          false,
+			State:           "OFFLINE",
+			ErrorMessage:    "printer disabled",
+			PaperTrayStatus: "UNKNOWN",
+			UpdatedAt:       freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime, SourceValidity{
+			CUPSValid: true,
+			SNMPValid: false,
+		})
+
+		if res.EffectiveState != "OFFLINE" {
+			t.Errorf("EffectiveState = %q, want OFFLINE", res.EffectiveState)
+		}
+		if res.Online {
+			t.Error("Online must be false")
+		}
+		hasOffline := false
+		for _, f := range res.BlockingFaults {
+			if strings.Contains(strings.ToLower(f), "offline") {
+				hasOffline = true
+				break
+			}
+		}
+		if !hasOffline {
+			t.Errorf("valid offline CUPS must produce queue offline blocking fault: %v", res.BlockingFaults)
+		}
+		if !res.SourceAttribution.CUPS.Available {
+			t.Error("CUPS attribution Available must be true for valid CUPS observation")
+		}
+	})
+}
+
+func TestReconcilePrinterHealth_SourceValiditySNMPContrasts(t *testing.T) {
+	evalTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	freshTime := evalTime.Add(-2 * time.Second)
+
+	cups := contracts.PrinterHealth{
+		Online:          true,
+		State:           "IDLE",
+		PaperTrayStatus: "OK",
+		EstimatedSheets: 100,
+		UpdatedAt:       freshTime,
+	}
+	ipp := IPPPrinterStateResult{
+		Source:            CapabilitySourceCUPSQueue,
+		Queue:             "BrotherQueue",
+		State:             IPPPrinterStateIdle,
+		EndpointReachable: true,
+		QueueAccessible:   true,
+		ObservedAt:        freshTime,
+	}
+
+	t.Run("snmp_invalid_suppresses_hardware_faults", func(t *testing.T) {
+		snmp := contracts.PrinterHealth{
+			Online:            true,
+			State:             "ERROR",
+			PaperJam:          true,
+			CoverOpen:         true,
+			OutputBinFull:     true,
+			PaperTrayStatus:   "EMPTY",
+			TonerLevelPercent: 5,
+			DrumLifePercent:   10,
+			UpdatedAt:         freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime, SourceValidity{
+			CUPSValid: true,
+			SNMPValid: false,
+		})
+
+		if res.EffectiveState != "IDLE" {
+			t.Errorf("EffectiveState = %q, want IDLE (from valid CUPS)", res.EffectiveState)
+		}
+		if res.PaperJam {
+			t.Error("PaperJam must be false when SNMP is invalid")
+		}
+		if res.CoverOpen {
+			t.Error("CoverOpen must be false when SNMP is invalid")
+		}
+		if res.OutputBinFull {
+			t.Error("OutputBinFull must be false when SNMP is invalid")
+		}
+		if res.TonerLevelPercent != 0 {
+			t.Errorf("TonerLevelPercent = %d, want 0 when SNMP is invalid", res.TonerLevelPercent)
+		}
+		if len(res.BlockingFaults) > 0 {
+			t.Errorf("expected no blocking faults, got %v", res.BlockingFaults)
+		}
+		if res.SourceAttribution.SNMP.Available {
+			t.Error("SNMP attribution Available must be false when invalid")
+		}
+	})
+
+	t.Run("snmp_valid_accepts_hardware_faults", func(t *testing.T) {
+		snmp := contracts.PrinterHealth{
+			Online:            true,
+			State:             "ERROR",
+			PaperJam:          true,
+			PaperTrayStatus:   "EMPTY",
+			TonerLevelPercent: 50,
+			DrumLifePercent:   60,
+			UpdatedAt:         freshTime,
+		}
+
+		res := ReconcilePrinterHealth(cups, ipp, snmp, evalTime, SourceValidity{
+			CUPSValid: true,
+			SNMPValid: true,
+		})
+
+		if res.EffectiveState != "ERROR" {
+			t.Errorf("EffectiveState = %q, want ERROR", res.EffectiveState)
+		}
+		if !res.PaperJam {
+			t.Error("PaperJam must be true when SNMP is valid")
+		}
+		if res.TonerLevelPercent != 50 {
+			t.Errorf("TonerLevelPercent = %d, want 50", res.TonerLevelPercent)
+		}
+		if !res.SourceAttribution.SNMP.Available {
+			t.Error("SNMP attribution Available must be true when valid")
+		}
+	})
+}
+
