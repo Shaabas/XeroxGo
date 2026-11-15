@@ -27,6 +27,15 @@ EMU_DUPLEX="${EMU_DUPLEX:-true}"
 SPOOL_MARKER_NAME=".xeroxgo_emulator_spool"
 SPOOL_MANIFEST_NAME=".xeroxgo_emulator_manifest"
 
+# SNMP emulator configuration with environment variable overrides
+SNMP_HOST="${SNMP_HOST:-127.0.0.1}"
+SNMP_PORT="${SNMP_PORT:-1161}"
+SNMP_COMMUNITY="${SNMP_COMMUNITY:-public}"
+SNMP_PID_FILE="${SNMP_PID_FILE:-${SCRIPT_DIR}/snmp_responder.pid}"
+SNMP_LOG_FILE="${SNMP_LOG_FILE:-${SCRIPT_DIR}/snmp_responder.log}"
+SNMP_STATE_FILE="${SNMP_STATE_FILE:-${SCRIPT_DIR}/snmp_state.json}"
+SNMP_LOCK_DIR="${SCRIPT_DIR}/.snmp_startup.lock"
+
 # Locate ippeveprinter binary
 find_ippeveprinter() {
     if command -v ippeveprinter >/dev/null 2>&1; then
@@ -765,14 +774,336 @@ cmd_cleanup() {
 
     rm -f "$EMU_PID_FILE" "$EMU_LOG_FILE"
     rm -rf "$EMU_LOCK_DIR" 2>/dev/null || true
+
+    # Clean up SNMP resources if present
+    if is_snmp_running || [[ -f "$SNMP_PID_FILE" ]] || [[ -f "$SNMP_STATE_FILE" ]]; then
+        if ! cmd_stop_snmp; then
+            echo "ERROR: Failed to safely stop SNMP emulator process during cleanup. Preserving metadata." >&2
+            return 1
+        fi
+        rm -f "$SNMP_PID_FILE" "$SNMP_LOG_FILE" "$SNMP_STATE_FILE"
+        rm -rf "$SNMP_LOCK_DIR" 2>/dev/null || true
+    fi
+
     echo "Cleanup complete. Verified emulator resources removed."
+}
+
+# -----------------------------------------------------------------------------
+# SNMP Emulator Functions
+# -----------------------------------------------------------------------------
+
+# Validate that target host interface is loopback
+validate_loopback_host() {
+    local host="$1"
+    local clean
+    clean=$(echo "$host" | tr '[:upper:]' '[:lower:]' | xargs)
+    if [[ "$clean" == "localhost" || "$clean" == "127.0.0.1" || "$clean" == "::1" || "$clean" =~ ^127\. ]]; then
+        return 0
+    fi
+    echo "ERROR: Safety violation. Host '$host' is not loopback. Only localhost / 127.0.0.1 permitted." >&2
+    return 1
+}
+
+# Verify that PID belongs to an active snmp_responder process
+verify_snmp_process() {
+    local pid="$1"
+    local expected_port="${2:-}"
+
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || [[ "$pid" -le 0 ]]; then
+        return 1
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    local comm=""
+    if [[ -f "/proc/${pid}/comm" ]]; then
+        comm=$(cat "/proc/${pid}/comm" 2>/dev/null || true)
+    else
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    fi
+
+    if [[ "$comm" != "snmp_responder" && "$comm" != "main" ]]; then
+        return 1
+    fi
+
+    if [[ -f "/proc/${pid}/cmdline" ]]; then
+        local cmdline
+        cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+        if [[ ! "$cmdline" =~ snmp_responder ]]; then
+            return 1
+        fi
+        if [[ -n "$expected_port" ]] && [[ ! "$cmdline" =~ -port[[:space:]=]+"$expected_port" ]] && [[ ! "$cmdline" =~ :"$expected_port" ]]; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Check if UDP port is in use
+is_udp_port_in_use() {
+    local port="$1"
+
+    if command -v ss >/dev/null 2>&1; then
+        if ss -uln "sport = :$port" 2>/dev/null | grep -q ":$port "; then
+            return 0
+        fi
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof -iUDP:"$port" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+ensure_snmp_responder_binary() {
+    local bin="${SCRIPT_DIR}/snmp_responder"
+    local src="${SCRIPT_DIR}/snmp_responder.go"
+    if [[ ! -x "$bin" || "$src" -nt "$bin" ]]; then
+        echo "Building snmp_responder..."
+        (cd "$SCRIPT_DIR" && GOWORK=off go build -o snmp_responder snmp_responder.go)
+    fi
+}
+
+is_snmp_running() {
+    if [[ -f "$SNMP_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$SNMP_PID_FILE" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && verify_snmp_process "$pid" "$SNMP_PORT"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_snmp_pid() {
+    if [[ -f "$SNMP_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$SNMP_PID_FILE" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && verify_snmp_process "$pid" "$SNMP_PORT"; then
+            echo "$pid"
+        fi
+    fi
+}
+
+cmd_start_snmp() {
+    validate_loopback_host "$SNMP_HOST" || return 1
+
+    # Concurrency lock
+    if ! mkdir "$SNMP_LOCK_DIR" 2>/dev/null; then
+        local lock_age=0
+        if [[ -d "$SNMP_LOCK_DIR" ]]; then
+            local now_ts lock_ts
+            now_ts=$(date +%s)
+            lock_ts=$(stat -c %Y "$SNMP_LOCK_DIR" 2>/dev/null || echo "$now_ts")
+            lock_age=$((now_ts - lock_ts))
+        fi
+        if [[ $lock_age -gt 15 ]]; then
+            rm -rf "$SNMP_LOCK_DIR" 2>/dev/null || true
+            mkdir "$SNMP_LOCK_DIR" 2>/dev/null || {
+                echo "ERROR: Unable to acquire SNMP startup lock." >&2
+                return 1
+            }
+        else
+            echo "ERROR: Another SNMP startup operation is currently in progress." >&2
+            return 1
+        fi
+    fi
+
+    release_snmp_lock() {
+        rm -rf "$SNMP_LOCK_DIR" 2>/dev/null || true
+    }
+
+    if is_snmp_running; then
+        local pid
+        pid=$(get_snmp_pid)
+        echo "SNMP printer emulator is already running (PID: ${pid}) on ${SNMP_HOST}:${SNMP_PORT}"
+        release_snmp_lock
+        return 0
+    fi
+
+    # Clean stale PID file if present
+    if [[ -f "$SNMP_PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$SNMP_PID_FILE" 2>/dev/null || true)
+        if [[ -n "$old_pid" ]] && ! kill -0 "$old_pid" 2>/dev/null; then
+            rm -f "$SNMP_PID_FILE"
+        fi
+    fi
+
+    # Check if UDP port is in use
+    if is_udp_port_in_use "$SNMP_PORT"; then
+        echo "ERROR: UDP port ${SNMP_PORT} is already in use by another process. Refusing startup." >&2
+        release_snmp_lock
+        return 1
+    fi
+
+    ensure_snmp_responder_binary
+
+    local bin="${SCRIPT_DIR}/snmp_responder"
+    if [[ ! -x "$bin" ]]; then
+        echo "ERROR: snmp_responder binary not found or not executable at $bin" >&2
+        release_snmp_lock
+        return 1
+    fi
+
+    # Launch daemon in background
+    nohup "$bin" serve \
+        -host "$SNMP_HOST" \
+        -port "$SNMP_PORT" \
+        -community "$SNMP_COMMUNITY" \
+        -state "$SNMP_STATE_FILE" \
+        -pid "$SNMP_PID_FILE" \
+        </dev/null >> "$SNMP_LOG_FILE" 2>&1 &
+    local snmp_pid=$!
+
+    # Wait up to 5 seconds for readiness
+    local ready=false
+    for _ in {1..50}; do
+        if ! kill -0 "$snmp_pid" 2>/dev/null; then
+            break
+        fi
+        if [[ -f "$SNMP_PID_FILE" ]] && is_udp_port_in_use "$SNMP_PORT"; then
+            ready=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [[ "$ready" != "true" ]]; then
+        echo "ERROR: SNMP responder started (PID: ${snmp_pid}), but failed readiness verification." >&2
+        if [[ -f "$SNMP_LOG_FILE" ]]; then
+            cat "$SNMP_LOG_FILE" >&2
+        fi
+        if kill -0 "$snmp_pid" 2>/dev/null; then
+            kill "$snmp_pid" 2>/dev/null || true
+        fi
+        rm -f "$SNMP_PID_FILE"
+        release_snmp_lock
+        return 1
+    fi
+
+    echo "SNMP printer emulator started (PID: ${snmp_pid})"
+    echo "  Endpoint:   ${SNMP_HOST}:${SNMP_PORT} (UDP)"
+    echo "  Community:  ${SNMP_COMMUNITY}"
+    echo "  State File: ${SNMP_STATE_FILE}"
+    echo "  Log File:   ${SNMP_LOG_FILE}"
+
+    release_snmp_lock
+    return 0
+}
+
+cmd_stop_snmp() {
+    if [[ ! -f "$SNMP_PID_FILE" ]]; then
+        echo "SNMP printer emulator is not running (no PID file)."
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$SNMP_PID_FILE" 2>/dev/null || true)
+
+    if [[ -z "$pid" ]] || [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        echo "Warning: PID file contains malformed PID '${pid}'. Removing invalid PID file."
+        rm -f "$SNMP_PID_FILE"
+        return 0
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Notice: Stale PID file (${pid}). Process is already terminated."
+        rm -f "$SNMP_PID_FILE"
+        return 0
+    fi
+
+    if ! verify_snmp_process "$pid" "$SNMP_PORT"; then
+        echo "ERROR: PID ${pid} does not match running snmp_responder on port ${SNMP_PORT}." >&2
+        echo "Refusing to signal unrelated process." >&2
+        return 1
+    fi
+
+    echo "Stopping SNMP printer emulator (PID: ${pid})..."
+    kill "$pid" 2>/dev/null || true
+
+    local terminated=false
+    for _ in {1..30}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            terminated=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [[ "$terminated" != "true" ]]; then
+        if verify_snmp_process "$pid" "$SNMP_PORT"; then
+            echo "Process did not terminate gracefully after timeout; terminating PID ${pid}..."
+            kill -9 "$pid" 2>/dev/null || true
+        else
+            echo "Warning: PID ${pid} changed before forced termination; aborted kill." >&2
+        fi
+    fi
+
+    rm -f "$SNMP_PID_FILE"
+    echo "SNMP printer emulator stopped."
+    return 0
+}
+
+cmd_status_snmp() {
+    if is_snmp_running; then
+        local pid
+        pid=$(get_snmp_pid)
+        echo "SNMP Status: RUNNING (PID: ${pid})"
+        echo "  Endpoint:   ${SNMP_HOST}:${SNMP_PORT} (UDP)"
+        echo "  Community:  ${SNMP_COMMUNITY}"
+        echo "  State File: ${SNMP_STATE_FILE}"
+        echo "  Log File:   ${SNMP_LOG_FILE}"
+        ensure_snmp_responder_binary
+        local bin="${SCRIPT_DIR}/snmp_responder"
+        if [[ -x "$bin" && -f "$SNMP_STATE_FILE" ]]; then
+            echo ""
+            "$bin" get -state "$SNMP_STATE_FILE"
+        fi
+        return 0
+    else
+        echo "SNMP Status: STOPPED"
+        return 1
+    fi
+}
+
+cmd_cleanup_snmp() {
+    if ! cmd_stop_snmp; then
+        echo "ERROR: Failed to safely stop SNMP emulator process. Refusing to remove PID or state metadata for safety." >&2
+        return 1
+    fi
+    rm -f "$SNMP_PID_FILE" "$SNMP_LOG_FILE" "$SNMP_STATE_FILE"
+    rm -rf "$SNMP_LOCK_DIR" 2>/dev/null || true
+    echo "SNMP cleanup complete. Verified emulator resources removed."
+    return 0
+}
+
+cmd_snmp_set() {
+    ensure_snmp_responder_binary
+    "${SCRIPT_DIR}/snmp_responder" set -state "$SNMP_STATE_FILE" "$@"
+}
+
+cmd_snmp_get() {
+    ensure_snmp_responder_binary
+    "${SCRIPT_DIR}/snmp_responder" get -state "$SNMP_STATE_FILE" "$@"
+}
+
+cmd_snmp_reset() {
+    ensure_snmp_responder_binary
+    "${SCRIPT_DIR}/snmp_responder" reset -state "$SNMP_STATE_FILE" "$@"
 }
 
 show_help() {
     cat << EOF
-Usage: $(basename "$0") [options] <command>
+Usage: $(basename "$0") [options] <command> [command-options]
 
-Commands:
+IPP Emulator Commands:
   start        Start the IPP printer emulator daemon
   stop         Stop the IPP printer emulator daemon
   status       Check emulator daemon status
@@ -780,21 +1111,43 @@ Commands:
   remove-cups  Remove the temporary CUPS driverless queue (verified ownership)
   cleanup      Stop emulator, delete verified CUPS queue, and clean spool artifacts
 
-Options:
-  -h, --host <host>       Host interface to bind (default: ${EMU_HOST})
-  -p, --port <port>       Port number to bind (default: ${EMU_PORT})
-  -n, --name <name>       Printer service name (default: ${EMU_NAME})
-  -q, --queue <queue>     CUPS queue name (default: ${EMU_CUPS_QUEUE})
-  -d, --spool-dir <dir>   Spool directory (default: ${EMU_SPOOL_DIR})
-  --help                  Show this help message
+SNMP Emulator Commands:
+  start-snmp   Start the SNMPv2c printer emulator daemon
+  stop-snmp    Stop the SNMPv2c printer emulator daemon
+  status-snmp  Check SNMP emulator daemon status and simulated MIB values
+  cleanup-snmp Stop SNMP emulator and remove PID, log, and state files
+  snmp-set     Update simulated SNMP values (error bits, consumables, status, etc.)
+  snmp-get     Inspect current simulated SNMP state
+  snmp-reset   Reset simulated SNMP values to default healthy/idle state
+
+IPP Options:
+  -h, --host <host>          Host interface to bind (default: ${EMU_HOST})
+  -p, --port <port>          Port number to bind (default: ${EMU_PORT})
+  -n, --name <name>          Printer service name (default: ${EMU_NAME})
+  -q, --queue <queue>        CUPS queue name (default: ${EMU_CUPS_QUEUE})
+  -d, --spool-dir <dir>      Spool directory (default: ${EMU_SPOOL_DIR})
+
+SNMP Options:
+  --snmp-host <host>         SNMP host interface (loopback only, default: ${SNMP_HOST})
+  --snmp-port <port>         SNMP UDP port (default: ${SNMP_PORT})
+  --snmp-community <string>  SNMPv2c community (default: ${SNMP_COMMUNITY})
+  --snmp-state <path>        Path to SNMP state JSON (default: ${SNMP_STATE_FILE})
+  --snmp-pid <path>          Path to SNMP PID file (default: ${SNMP_PID_FILE})
+  --snmp-log <path>          Path to SNMP log file (default: ${SNMP_LOG_FILE})
+
+General Options:
+  --help                     Show this help message
 
 Environment Variables:
   EMU_HOST, EMU_PORT, EMU_NAME, EMU_CUPS_QUEUE, EMU_SPOOL_DIR
+  SNMP_HOST, SNMP_PORT, SNMP_COMMUNITY, SNMP_STATE_FILE, SNMP_PID_FILE
 EOF
 }
 
-# Parse options
-POSITIONAL_ARGS=()
+# Parse options and dispatch
+COMMAND=""
+COMMAND_ARGS=()
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--host)
@@ -817,25 +1170,62 @@ while [[ $# -gt 0 ]]; do
             EMU_SPOOL_DIR="$2"
             shift 2
             ;;
+        --snmp-host)
+            SNMP_HOST="$2"
+            shift 2
+            ;;
+        --snmp-port)
+            SNMP_PORT="$2"
+            shift 2
+            ;;
+        --snmp-community)
+            SNMP_COMMUNITY="$2"
+            shift 2
+            ;;
+        --snmp-state)
+            SNMP_STATE_FILE="$2"
+            shift 2
+            ;;
+        --snmp-pid)
+            SNMP_PID_FILE="$2"
+            shift 2
+            ;;
+        --snmp-log)
+            SNMP_LOG_FILE="$2"
+            shift 2
+            ;;
         --help)
             show_help
             exit 0
             ;;
-        *)
-            POSITIONAL_ARGS+=("$1")
+        start|stop|status|setup-cups|remove-cups|cleanup|start-snmp|stop-snmp|status-snmp|cleanup-snmp)
+            COMMAND="$1"
             shift
+            ;;
+        snmp-set|snmp-get|snmp-reset)
+            COMMAND="$1"
+            shift
+            COMMAND_ARGS=("$@")
+            break
+            ;;
+        *)
+            if [[ -z "$COMMAND" ]]; then
+                COMMAND="$1"
+                shift
+            else
+                COMMAND_ARGS+=("$1")
+                shift
+            fi
             ;;
     esac
 done
 
-set -- "${POSITIONAL_ARGS[@]:-}"
-
-if [[ $# -lt 1 ]]; then
+if [[ -z "$COMMAND" ]]; then
     show_help
     exit 1
 fi
 
-case "$1" in
+case "$COMMAND" in
     start)
         cmd_start
         ;;
@@ -854,8 +1244,29 @@ case "$1" in
     cleanup)
         cmd_cleanup
         ;;
+    start-snmp)
+        cmd_start_snmp
+        ;;
+    stop-snmp)
+        cmd_stop_snmp
+        ;;
+    status-snmp)
+        cmd_status_snmp
+        ;;
+    cleanup-snmp)
+        cmd_cleanup_snmp
+        ;;
+    snmp-set)
+        cmd_snmp_set "${COMMAND_ARGS[@]}"
+        ;;
+    snmp-get)
+        cmd_snmp_get "${COMMAND_ARGS[@]}"
+        ;;
+    snmp-reset)
+        cmd_snmp_reset "${COMMAND_ARGS[@]}"
+        ;;
     *)
-        echo "Unknown command: $1" >&2
+        echo "Unknown command: $COMMAND" >&2
         show_help
         exit 1
         ;;

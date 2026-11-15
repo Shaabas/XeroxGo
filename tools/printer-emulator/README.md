@@ -205,51 +205,154 @@ In `ippeveprinter`, the job lifecycle proceeds through standard IPP states:
 
 When using `ippeveprinter` as a development and test harness, note the following architectural boundaries:
 
-1. **No Native SNMP Responder:**
+1. **No Native SNMP in ippeveprinter:**
    - `ippeveprinter` implements only the IPP protocol over HTTP/HTTPS.
    - It does **not** listen on UDP port 161 or respond to SNMP MIB queries (`HOST-RESOURCES-MIB`, `Printer-MIB`).
-   - SNMP emulation is intentionally decoupled and reserved for **Task D2**.
+   - SNMP emulation is implemented as a dedicated lightweight SNMPv2c responder daemon (`snmp_responder`, see Section 9).
 
 2. **Accurate Hardware Page Counting (Odometers):**
    - Physical page counts and sensor odometers do not exist in software emulation.
    - Impressions and completed pages reflect client-supplied attributes or print processor signals.
+   - In the SNMP emulator, odometer counters can be deterministically updated for testing, but they represent synthetic telemetry, never physical sheets.
 
 3. **Hardware Fault Simulation:**
    - `ippeveprinter` starts in a clean `idle` state without physical faults.
-   - Simulating faults (e.g. `media-jam`, `cover-open`, `media-empty`) requires either:
-     - Configuring custom print processors emitting `STATE: +media-jam-error` on stderr, or
-     - Modifying state configurations.
-   - Dynamic external fault injection cannot be assumed out of the box.
+   - Simulating faults in IPP requires print processors emitting `STATE: +media-jam-error` on stderr.
+   - For SNMP telemetry, full RFC-compatible hardware faults (paper jam, cover open, empty tray, output full, low consumables) are controlled dynamically via the SNMP emulator (`snmp-set`).
 
 4. **Document Format Advertising:**
    - By default, `ippeveprinter` only advertises raster formats (`image/pwg-raster`, `image/urf`, `application/octet-stream`).
    - To support direct PDF submission from CUPS without rasterization filters, `-f application/pdf,...` must be explicitly specified (configured by default in `emulator.sh`).
 
 5. **Port Binding Restrictions:**
-   - Non-root users cannot bind to standard IPP port 631.
-   - Unprivileged ports (`> 1024`, e.g. `8631`) must be used.
+   - Non-root users cannot bind to standard IPP port 631 or SNMP port 161.
+   - Unprivileged ports (`> 1024`, e.g. IPP `8631`, SNMP UDP `1161`) must be used.
 
 ---
 
-## 9. Smoke Test Suite
+## 9. Local SNMP Printer Emulator (SNMPv2c)
 
-A standalone, automated smoke test script is provided in `smoke_test.sh`:
+To complement IPP Everywhere emulation with accurate physical hardware telemetry, a local SNMPv2c responder daemon is provided in `snmp_responder.go`.
 
+### Architecture & Safety Guarantees
+- **Pure Loopback:** Binds strictly to `127.0.0.1` / `localhost` on an unprivileged UDP port (default `1161`). Safely rejects any non-loopback bind address.
+- **Protocol Compliance:** Uses `github.com/gosnmp/gosnmp` to decode and encode standard SNMPv2c packets with strict ASN.1 typing without custom BER parsers.
+- **Separate State:** State is stored in an isolated JSON file (`snmp_state.json`), completely separated from production databases and logs.
+- **Dynamic Reloading:** State changes made via `snmp-set` take effect immediately without needing server restarts.
+- **Safety Protections:** Port collision detection, PID ownership verification before signaling, and safe cleanup prevent interfering with host services or unrelated processes.
+
+### Supported MIB OIDs & ASN.1 Types
+
+| OID | MIB / Object Name | ASN.1 Type | Default Value | Description |
+|---|---|---|---|---|
+| `1.3.6.1.2.1.1.1.0` | `SNMPv2-MIB::sysDescr.0` | `OctetString` | `"Xerox WorkCentre 3025 (Local Emulator)"` | System hardware description |
+| `1.3.6.1.2.1.25.3.5.1.1.1` | `HOST-RESOURCES-MIB::hrPrinterStatus.1` | `Integer` | `3` (`idle`) | RFC 2790 printer state (1=other, 2=unknown, 3=idle, 4=printing, 5=warmup) |
+| `1.3.6.1.2.1.25.3.5.1.2.1` | `HOST-RESOURCES-MIB::hrPrinterDetectedErrorState.1` | `OctetString` | `[0x00, 0x00]` | RFC 2790 2-byte error bitmasks |
+| `1.3.6.1.2.1.43.10.2.1.4.1.1` | `Printer-MIB::prtMarkerLifeCount.1.1` | `Counter32` | `1000` | Physical odometer count |
+| `1.3.6.1.2.1.43.11.1.1.9.1.1` | `Printer-MIB::prtMarkerSuppliesLevel.1.1` | `Integer` | `85` | Supply 1 (toner) level |
+| `1.3.6.1.2.1.43.11.1.1.8.1.1` | `Printer-MIB::prtMarkerSuppliesMaxCapacity.1.1` | `Integer` | `100` | Supply 1 (toner) max capacity |
+| `1.3.6.1.2.1.43.11.1.1.9.1.2` | `Printer-MIB::prtMarkerSuppliesLevel.1.2` | `Integer` | `95` | Supply 2 (drum) level |
+| `1.3.6.1.2.1.43.11.1.1.8.1.2` | `Printer-MIB::prtMarkerSuppliesMaxCapacity.1.2` | `Integer` | `100` | Supply 2 (drum) max capacity |
+
+### RFC 2790 Error Bitmasks
+
+**Byte 0 (bits 0..7):**
+- `0x80`: `lowPaper`
+- `0x40`: `noPaper`
+- `0x20`: `lowToner`
+- `0x10`: `noToner`
+- `0x08`: `doorOpen`
+- `0x04`: `jammed`
+- `0x02`: `offline`
+- `0x01`: `serviceRequested`
+
+**Byte 1 (bits 8..15):**
+- `0x80`: `inputTrayMissing`
+- `0x40`: `outputTrayMissing`
+- `0x20`: `markerSupplyMissing`
+- `0x10`: `outputNearFull`
+- `0x08`: `outputFull`
+- `0x04`: `inputTrayEmpty`
+- `0x02`: `overduePreventMaint`
+
+### SNMP Quick Start & Commands
+
+```bash
+cd tools/printer-emulator
+
+# 1. Start SNMP emulator daemon (default UDP 1161, community public)
+./start_snmp.sh
+# or: ./emulator.sh start-snmp
+
+# 2. Check SNMP emulator status and current telemetry
+./status_snmp.sh
+# or: ./emulator.sh status-snmp
+
+# 3. Query telemetry with snmpget CLI
+snmpget -v2c -c public 127.0.0.1:1161 \
+    1.3.6.1.2.1.1.1.0 \
+    1.3.6.1.2.1.25.3.5.1.1.1 \
+    1.3.6.1.2.1.25.3.5.1.2.1 \
+    1.3.6.1.2.1.43.10.2.1.4.1.1
+
+# 4. Inject simulated hardware faults
+./emulator.sh snmp-set -set-error jammed,door_open
+
+# 5. Deterministically increment odometer counter
+./emulator.sh snmp-set -counter-inc 50
+
+# 6. Simulate missing / unsupported OIDs
+./emulator.sh snmp-set -omit-oid 1.3.6.1.2.1.43.10.2.1.4.1.1
+
+# 7. Reset to default healthy/idle state
+./emulator.sh snmp-reset
+
+# 8. Stop SNMP emulator
+./stop_snmp.sh
+# or: ./emulator.sh stop-snmp
+
+# 9. Clean up all SNMP runtime files
+./emulator.sh cleanup-snmp
+```
+
+---
+
+## 10. Smoke Test Suites
+
+### IPP Smoke & Safety Test Suite
 ```bash
 ./smoke_test.sh
 ```
+Runs 19 comprehensive tests validating IPP Everywhere operations, CUPS driverless printing, spool path safety, PID protection, and artifact persistence.
 
-### Test Coverage
-- **Prerequisite Validation:** Checks `ippeveprinter`, `ipptool`, `lpstat`, `lpadmin`, `lp`, and running `cupsd`. (Reports `[SKIP]` with install instructions if missing).
-- **Test 1:** Emulator startup and process lifecycle.
-- **Test 2:** Direct IPP attribute discovery (`ipptool`).
-- **Test 3:** Direct IPP print submission and lifecycle completion.
-- **Test 4:** CUPS driverless queue registration (`lpadmin`).
-- **Test 5:** End-to-end CUPS job dispatch and artifact receipt (`lp`).
-- **Test 6:** CUPS IPP gateway capabilities query.
-- **Test 7:** Safe cleanup and queue isolation (verifying no unrelated queues are modified).
-- **Safety Test 8:** Existing queue collision protection (`setup-cups` refuses to overwrite pre-existing queue).
-- **Safety Test 9:** Unrelated PID protection (`stop` refuses to signal non-emulator process).
-- **Safety Test 10:** Unsafe spool path rejection (rejects `/`, `/etc`, `$HOME`, and symlink escapes).
-- **Safety Test 11:** Occupied port detection (aborts startup cleanly when port is in use).
-- **Safety Test 12:** Queue deletion ownership verification (`remove-cups` refuses deleting unverified queues).
+### SNMP Smoke & Safety Test Suite
+```bash
+./snmp_smoke_test.sh
+```
+Runs 15 automated tests validating:
+- Startup, UDP port binding, and process lifecycle
+- Default healthy state MIB queries via `snmpget`
+- Status reporting and state inspection
+- Controlled Byte 0 and Byte 1 error bit updates
+- Consumables and status modifications
+- Deterministic counter updates
+- Missing OID simulation (`NoSuchInstance`)
+- Stop → Restart state persistence
+- Reset to healthy state
+- Unauthorized community string rejection
+- Occupied port detection and non-loopback safety enforcement
+- Unrelated PID protection
+- Safe cleanup
+
+### Go Integration Test Suite
+```bash
+go test -v -race ./kiosk-daemon/internal/printer -run TestSNMPEmulator
+```
+Exercises XeroxGo's Go SNMP polling implementation against the local emulator, verifying:
+- Healthy state polling (`PollHealthConfig`, `PollHardwareTelemetry`, `PollMarkerLifeCount`)
+- Error bit decoding across all RFC 2790 flags
+- Toner and drum percentage calculations
+- Missing OIDs returning `UNKNOWN` state
+- Timeouts and context cancellation
+- Restart persistence across daemon restarts
+- Deterministic counter updates
