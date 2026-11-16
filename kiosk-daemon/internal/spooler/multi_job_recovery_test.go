@@ -293,6 +293,7 @@ func TestMultiJobRecovery_MultipleActiveCUPSIDs_NoConcurrentPrinting(t *testing.
 	}
 
 	var holdCalled atomic.Int32
+	var is202Held atomic.Bool
 	var heldJobIDs []string
 	var holdMu sync.Mutex
 
@@ -304,6 +305,9 @@ func TestMultiJobRecovery_MultipleActiveCUPSIDs_NoConcurrentPrinting(t *testing.
 					holdMu.Lock()
 					if i > 1 && args[i-2] == "-i" {
 						heldJobIDs = append(heldJobIDs, args[i-1])
+						if strings.Contains(args[i-1], "202") {
+							is202Held.Store(true)
+						}
 					}
 					holdMu.Unlock()
 					return []byte(""), nil
@@ -317,6 +321,9 @@ func TestMultiJobRecovery_MultipleActiveCUPSIDs_NoConcurrentPrinting(t *testing.
 					return []byte("job-state (enum) = processing\njob-media-sheets-completed (integer) = 0\n"), nil
 				}
 				if strings.Contains(arg, "/jobs/202") {
+					if is202Held.Load() {
+						return []byte("job-state (enum) = pending-held\njob-media-sheets-completed (integer) = 0\n"), nil
+					}
 					return []byte("job-state (enum) = pending\njob-media-sheets-completed (integer) = 0\n"), nil
 				}
 			}
@@ -824,5 +831,319 @@ func TestMultiJobRecovery_CommandReplayPostRecovery(t *testing.T) {
 	jAfterConflict, _ := store.GetJob(ctx, cmdComp.JobID)
 	if jAfterConflict.Status != contracts.JobStatusCompleted || jAfterConflict.Command.SHA256Checksum == conflictCmd.SHA256Checksum {
 		t.Errorf("conflicting replay corrupted stored job: %+v", jAfterConflict)
+	}
+}
+
+// TestMultiJobRecovery_Negative_NewCommandDuringUnresolvedRecovery verifies Requirements 2 & 4:
+// When an unresolved job exists in SQLite, fresh incoming print commands are blocked by the print barrier,
+// while duplicate commands for existing jobs continue to be safely acknowledged.
+func TestMultiJobRecovery_Negative_NewCommandDuringUnresolvedRecovery(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "unresolved_barrier.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Seed unresolved job in PAUSED_ERROR
+	unresCmd := sampleCommand("job-unresolved-1")
+	if err := store.SaveJob(ctx, unresCmd, contracts.JobStatusPausedError); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	_ = store.MarkJobSubmitting(ctx, unresCmd.JobID)
+	_ = store.RecordJobSubmission(ctx, unresCmd.JobID, "DCPT310-501")
+	_ = store.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID:       unresCmd.JobID,
+		KioskID:     unresCmd.KioskID,
+		Status:      contracts.JobStatusPausedError,
+		ErrorReason: "paper jam; operator reconciliation required",
+		Timestamp:   time.Now().UTC(),
+	})
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-barrier-test",
+		StateStore:          store,
+		CUPSQueue:           "DCPT310",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. Fresh new incoming command arrives: MUST be rejected by unresolved print barrier
+	freshCmd := sampleCommand("job-fresh-new")
+	client.handleIncomingJob(freshCmd)
+
+	storedFresh, _ := store.GetJob(ctx, freshCmd.JobID)
+	if storedFresh != nil {
+		t.Fatalf("security violation: fresh command was saved to store while unresolved jobs exist: %+v", storedFresh)
+	}
+
+	client.activeMu.Lock()
+	freshIsActive := client.activeJobs[freshCmd.JobID]
+	client.activeMu.Unlock()
+	if freshIsActive {
+		t.Fatalf("security violation: fresh command was marked active while unresolved jobs exist")
+	}
+
+	// 2. Safe duplicate acknowledgment of existing unresolved job: MUST be permitted without resubmission
+	client.handleIncomingJob(unresCmd)
+	storedUnres, _ := store.GetJob(ctx, unresCmd.JobID)
+	if storedUnres.Status != contracts.JobStatusPausedError {
+		t.Errorf("expected duplicate unresCmd to remain PAUSED_ERROR, got: %s", storedUnres.Status)
+	}
+}
+
+// TestMultiJobRecovery_Negative_StartupDBFailure_EntersFailClosedBarrier verifies Requirements 5 & 6:
+// If startup GetIncompleteJobs fails, the client enters durable fail-closed mode and does not accept printing.
+func TestMultiJobRecovery_Negative_StartupDBFailure_EntersFailClosedBarrier(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "db_failure_barrier.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	ctx := context.Background()
+	cmd := sampleCommand("job-pre-seeded")
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+
+	// Close database to force startup query failure
+	store.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-db-fail",
+		StateStore:          store,
+		CUPSQueue:           "DCPT310",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelRecov()
+	_ = client.Run(recovCtx)
+
+	// Assert: durable in-process fail-closed recovery barrier is active
+	blocked, reason := client.IsRecoveryBarrierActive()
+	if !blocked {
+		t.Fatalf("expected recovery barrier to be active on startup DB failure")
+	}
+	if !strings.Contains(reason, "database error") {
+		t.Errorf("expected barrier reason mentioning database error, got: %s", reason)
+	}
+
+	// Incoming new print command must be rejected
+	newCmd := sampleCommand("job-new-during-db-barrier")
+	client.handleIncomingJob(newCmd)
+
+	client.activeMu.Lock()
+	isActive := client.activeJobs[newCmd.JobID]
+	client.activeMu.Unlock()
+	if isActive {
+		t.Errorf("expected new command to be rejected by fail-closed barrier")
+	}
+}
+
+// TestMultiJobRecovery_Negative_FullJobQueue_ReleasesReservationAndDefers verifies Requirement 7:
+// When queue admission fails (channel full), the active reservation is released and the job is preserved in retryable state.
+func TestMultiJobRecovery_Negative_FullJobQueue_ReleasesReservationAndDefers(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "full_queue.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Seed unsubmitted job
+	cmd1 := sampleCommand("job-unsubmitted-queue-full")
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-full-queue",
+		StateStore:          store,
+		CUPSQueue:           "DCPT310",
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Pre-fill client.jobQueue to full capacity (16 slots) so admission fails
+	for len(client.jobQueue) < cap(client.jobQueue) {
+		client.jobQueue <- sampleCommand(fmt.Sprintf("dummy-queue-blocker-%d", len(client.jobQueue)))
+	}
+
+	// Run startup recovery with canceled context so workers don't drain the dummy job
+	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelRecov()
+	_ = client.Run(recovCtx)
+
+	// Verify Requirement 7:
+	// 1. Active reservation was RELEASED
+	client.activeMu.Lock()
+	isActive := client.activeJobs[cmd1.JobID]
+	client.activeMu.Unlock()
+	if isActive {
+		t.Errorf("reservation leak: expected active reservation for %s to be released on queue full", cmd1.JobID)
+	}
+
+	// 2. Preserved in retryable state: in SQLite as SPOOLING, in memory in deferredJobs
+	stored, err := store.GetJob(ctx, cmd1.JobID)
+	if err != nil || stored == nil {
+		t.Fatalf("failed to get stored job: %v", err)
+	}
+	if stored.Status != contracts.JobStatusSpooling {
+		t.Errorf("expected stored status to remain retryable SPOOLING, got: %s", stored.Status)
+	}
+
+	client.deferredMu.Lock()
+	foundInDeferred := false
+	for _, dj := range client.deferredJobs {
+		if dj.JobID == cmd1.JobID {
+			foundInDeferred = true
+			break
+		}
+	}
+	client.deferredMu.Unlock()
+	if !foundInDeferred {
+		t.Errorf("expected unadmitted job %s to be preserved in deferredJobs for retry", cmd1.JobID)
+	}
+}
+
+// TestMultiJobRecovery_Negative_MultipleActiveCUPSJobs_HoldFailure_BlocksFreshSubmissions verifies Requirements 8, 9 & 10:
+// If an additional hold fails or remains processing, fresh submissions are blocked (recovery barrier activated),
+// physical output uncertainty is flagged, and the primary active job is contained in PAUSED_ERROR rather than resumed.
+func TestMultiJobRecovery_Negative_MultipleActiveCUPSJobs_HoldFailure_BlocksFreshSubmissions(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "hold_failure_active.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	queueName := "DCPT310"
+
+	// Job 1: PRINTING, CUPS ID DCPT310-601, processing in CUPS
+	cmd1 := sampleCommand("job-1-primary-processing")
+	cmd1.TotalSheets = 2
+	cmd1.TotalPages = 2
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusPrinting)
+	_ = store.MarkJobSubmitting(ctx, cmd1.JobID)
+	_ = store.RecordJobSubmission(ctx, cmd1.JobID, queueName+"-601")
+
+	// Job 2: PRINTING, CUPS ID DCPT310-602, processing in CUPS
+	cmd2 := sampleCommand("job-2-additional-processing")
+	cmd2.TotalSheets = 2
+	cmd2.TotalPages = 2
+	_ = store.SaveJob(ctx, cmd2, contracts.JobStatusPrinting)
+	_ = store.MarkJobSubmitting(ctx, cmd2.JobID)
+	_ = store.RecordJobSubmission(ctx, cmd2.JobID, queueName+"-602")
+
+	// Runner: lp hold fails for 602 (simulating printer communication timeout or CUPS error)
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			for _, arg := range args {
+				if arg == "-H" {
+					return nil, fmt.Errorf("lp: scheduler communication error")
+				}
+			}
+		}
+		if name == "ipptool" {
+			for _, arg := range args {
+				if strings.Contains(arg, "/jobs/601") || strings.Contains(arg, "/jobs/602") {
+					return []byte("job-state (enum) = processing\njob-media-sheets-completed (integer) = 0\n"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            "ws://127.0.0.1:8080/ws",
+		KioskID:             "kiosk-hold-fail",
+		StateStore:          store,
+		CUPSQueue:           queueName,
+		CUPSRunner:          runner,
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelRecov()
+	go func() {
+		_ = client.Run(recovCtx)
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+
+	// 1. Requirement 10: Fresh submissions blocked by recovery barrier
+	blocked, reason := client.IsRecoveryBarrierActive()
+	if !blocked {
+		t.Fatalf("expected recovery barrier to be active after failed hold on additional active job")
+	}
+	if !strings.Contains(reason, "uncontained active CUPS jobs") {
+		t.Errorf("expected barrier reason mentioning uncontained active CUPS jobs, got: %s", reason)
+	}
+
+	// 2. Requirement 8 & 9: Primary job 1 was NOT resumed into monitoring; it was also paused in PAUSED_ERROR
+	client.activeMu.Lock()
+	isJob1Active := client.activeJobs[cmd1.JobID]
+	client.activeMu.Unlock()
+	if isJob1Active {
+		t.Errorf("safety violation: primary active job 1 was resumed despite uncontained additional active job")
+	}
+
+	j1, _ := store.GetJob(ctx, cmd1.JobID)
+	if j1 == nil || j1.Status != contracts.JobStatusPausedError {
+		t.Errorf("expected Job 1 to be contained in PAUSED_ERROR, got: %+v", j1)
+	}
+	if !strings.Contains(j1.ErrorReason, "uncontained concurrent output") && !strings.Contains(j1.ErrorReason, "multiple active CUPS jobs") {
+		t.Errorf("expected Job 1 error reason mentioning multiple active jobs / uncontained output, got: %s", j1.ErrorReason)
+	}
+
+	// 3. Additional job 2 was paused in PAUSED_ERROR flagging physical output uncertainty
+	j2, _ := store.GetJob(ctx, cmd2.JobID)
+	if j2 == nil || j2.Status != contracts.JobStatusPausedError {
+		t.Errorf("expected Job 2 to be paused in PAUSED_ERROR, got: %+v", j2)
+	}
+	if !strings.Contains(j2.ErrorReason, "hold request failed") {
+		t.Errorf("expected Job 2 error reason mentioning hold request failed, got: %s", j2.ErrorReason)
+	}
+
+	// 4. Fresh incoming command is rejected by barrier
+	freshCmd := sampleCommand("job-new-blocked-by-uncontained")
+	client.handleIncomingJob(freshCmd)
+	storedFresh, _ := store.GetJob(ctx, freshCmd.JobID)
+	if storedFresh != nil {
+		t.Errorf("security violation: fresh command accepted during uncontained barrier: %+v", storedFresh)
 	}
 }
