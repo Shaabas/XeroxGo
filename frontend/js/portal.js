@@ -1417,8 +1417,8 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        const livePrice = getQuotedPrice(doc, draftSettings);
+        if (saveSettingsPrice) saveSettingsPrice.textContent = livePrice === null ? 'Pending quote' : formatRupees(livePrice);
         renderPreviewSheet();
       });
 
