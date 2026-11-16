@@ -28,16 +28,6 @@
   }
   const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
-  // Rates in paise (Authoritative default fixed rates in code)
-  // 3 for single side b&w (300p)
-  // 5 for double side b&w (500p per 2 pages)
-  // 8 for single side colour (800p)
-  // 10 for double side colour (1000p per 2 pages)
-  const RATE_BW_SINGLE_PAISE = 300;
-  const RATE_BW_DOUBLE_PAISE = 500;
-  const RATE_COLOR_SINGLE_PAISE = 800;
-  const RATE_COLOR_DOUBLE_PAISE = 1000;
-
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
   const viewSettings = document.getElementById('view-settings');
@@ -287,56 +277,77 @@
     return { valid: true, error: null, pages: selected };
   }
 
-  // Per-document price calculation in integer paise
-  // Rates:
-  // - 3 for single side b&w (₹3 per page)
-  // - 5 for double side b&w (₹5 per 2 pages)
-  // - 8 for single side colour (₹8 per page)
-  // - 10 for double side colour (₹10 per 2 pages)
-  // Odd trailing page on double side: charged at single side rate (₹3 for B&W, ₹8 for Colour)
-  function calculateDocPrice(totalPages, settings) {
-    if (!settings || totalPages <= 0) return 0;
-    let pagesCount = totalPages;
+  // Prices are computed only by the cloud. No monetary arithmetic lives here.
+  function quoteKey(settings) {
+    return JSON.stringify(settings);
+  }
+
+  function getQuotedPrice(doc, settings) {
+    if (!doc || !settings || doc.quotedSettingsKey !== quoteKey(settings)) return null;
+    const amount = doc.authoritativePricePaise;
+    return Number.isSafeInteger(amount) && amount > 0 ? amount : null;
+  }
+
+  function quotePageRange(doc, settings) {
     if (settings.pageSelection === 'Custom Range') {
-      const from = Math.max(1, Math.min(settings.rangeFrom || 1, totalPages));
-      const to = Math.max(from, Math.min(settings.rangeTo || totalPages, totalPages));
-      pagesCount = Math.max(1, to - from + 1);
-    } else if (settings.pageSelection === 'Selection') {
-      const sel = Array.isArray(settings.selectedPages) ? settings.selectedPages : [];
-      pagesCount = sel.length;
-    } else if (settings.customPageRange) {
-      const parsed = parseCustomPages(settings.customPageRange, totalPages);
-      if (parsed.valid && parsed.pages.length > 0) {
-        pagesCount = parsed.pages.length;
+      const from = settings.rangeFrom || 1;
+      const to = settings.rangeTo || doc.totalPages;
+      return from === to ? String(from) : `${from}-${to}`;
+    }
+    if (settings.pageSelection === 'Selection') {
+      return (settings.selectedPages || []).slice().sort((a,b) => a-b).join(',');
+    }
+    return settings.customPageRange || '';
+  }
+
+  // Quoting occurs when a file is ready or settings are saved, not on each tap.
+  // Every response is tied to a settings snapshot so older responses are ignored.
+  async function requestDocumentQuote(doc) {
+    if (!doc || doc.status !== 'ready' || !doc.pdfBytes) return;
+    const key = quoteKey(doc.settings);
+    const seq = (doc.quoteSequence || 0) + 1;
+    doc.quoteSequence = seq;
+    doc.quotePending = true;
+    doc.quoteError = '';
+    doc.quotedSettingsKey = null;
+    doc.authoritativePricePaise = null;
+    renderCart();
+
+    const settings = doc.settings;
+    const form = new FormData();
+    const fileName = doc.name.replace(/\.[^.]+$/, '') + '.pdf';
+    form.append('file', new Blob([doc.pdfBytes], { type: 'application/pdf' }), fileName);
+    form.append('copies', String(settings.copies || 1));
+    form.append('duplex', settings.sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
+    form.append('color_mode', settings.mode === 'Color' ? 'COLOR' : 'BW');
+    form.append('orientation', (settings.orientation || 'Auto').toUpperCase());
+    form.append('pages_per_sheet', String(parseInt(settings.pagesPerSheet, 10) || 1));
+    const pageRange = quotePageRange(doc, settings);
+    if (pageRange) form.append('page_range', pageRange);
+    form.append('format', 'json');
+
+    try {
+      const response = await fetch('/api/documents/preview', {
+        method: 'POST', body: form, headers: { Accept: 'application/json' }
+      });
+      if (!response.ok) throw new Error((await response.text()) || 'Cloud quote unavailable');
+      const data = await response.json();
+      const amount = data.total_price_paise;
+      if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Invalid cloud price');
+      if (seq !== doc.quoteSequence || key !== quoteKey(doc.settings) || !cartItems.includes(doc)) return;
+      doc.authoritativePricePaise = amount;
+      doc.quotedSettingsKey = key;
+      doc.totalSheets = data.total_sheets;
+      doc.billedSides = data.billed_sides;
+    } catch (error) {
+      if (seq !== doc.quoteSequence || !cartItems.includes(doc)) return;
+      doc.quoteError = error.message || 'Cloud quote unavailable';
+    } finally {
+      if (seq === doc.quoteSequence && cartItems.includes(doc)) {
+        doc.quotePending = false;
+        renderCart();
       }
     }
-
-    if (pagesCount <= 0) return 0;
-
-    const nup = parseInt(settings.pagesPerSheet, 10) || 1;
-    const imposedPages = Math.ceil(pagesCount / nup);
-    const isColor = (settings.mode === 'Color');
-    const isDuplex = (settings.sides === 'Double-sided');
-    const copies = Math.max(1, parseInt(settings.copies, 10) || 1);
-
-    let singleCopyPricePaise = 0;
-    if (isDuplex) {
-      const fullSheets = Math.floor(imposedPages / 2);
-      const hasOddPage = (imposedPages % 2 !== 0);
-      if (isColor) {
-        singleCopyPricePaise = (fullSheets * RATE_COLOR_DOUBLE_PAISE) + (hasOddPage ? RATE_COLOR_SINGLE_PAISE : 0);
-      } else {
-        singleCopyPricePaise = (fullSheets * RATE_BW_DOUBLE_PAISE) + (hasOddPage ? RATE_BW_SINGLE_PAISE : 0);
-      }
-    } else {
-      if (isColor) {
-        singleCopyPricePaise = imposedPages * RATE_COLOR_SINGLE_PAISE;
-      } else {
-        singleCopyPricePaise = imposedPages * RATE_BW_SINGLE_PAISE;
-      }
-    }
-
-    return singleCopyPricePaise * copies;
   }
 
   function getDocSelectedPages(totalPages, settings) {
@@ -512,9 +523,9 @@
         // ready
         readyCount++;
         const hasAuthPrice = (typeof item.authoritativePricePaise === 'number' && !isNaN(item.authoritativePricePaise));
-        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : calculateDocPrice(item.totalPages, item.settings);
+        const itemPrice = getQuotedPrice(item, item.settings);
         item.pricePaise = itemPrice;
-        totalCartPaise += itemPrice;
+        if (itemPrice !== null) totalCartPaise += itemPrice;
 
         let pageCountText = `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
         if (item.settings.pageSelection === 'Custom Range') {
@@ -543,7 +554,7 @@
           metaText += ` · ${item.totalSheets} sheet${item.totalSheets > 1 ? 's' : ''}`;
         }
 
-        const priceDisplayHtml = formatRupees(itemPrice);
+        const priceDisplayHtml = itemPrice === null ? (item.quoteError ? 'Quote unavailable' : 'Calculating...') : formatRupees(itemPrice);
 
         card.innerHTML = `
           <div class="doc-card-top">
@@ -600,8 +611,10 @@
       cartDocsCount.textContent = `${cartItems.length} document${cartItems.length > 1 ? 's' : ''}`;
     }
     const isProcessing = cartItems.some(it => it.status === 'processing');
+    const allQuoted = readyCount > 0 && cartItems.filter(it => it.status === 'ready')
+      .every(it => getQuotedPrice(it, it.settings) !== null);
     if (cartTotalAmount) {
-      if (isProcessing && readyCount === 0) {
+      if (isProcessing || !allQuoted) {
         cartTotalAmount.innerHTML = `<span class="price-loading-dots" role="status" aria-label="Calculating price"><span class="price-dot"></span><span class="price-dot"></span><span class="price-dot"></span></span>`;
       } else if (readyCount > 0 && totalCartPaise > 0) {
         cartTotalAmount.textContent = formatRupees(totalCartPaise);
@@ -617,7 +630,7 @@
         <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
-      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0;
+      const canProceed = !isProcessing && allQuoted && totalCartPaise > 0;
       btnReviewOrder.disabled = !canProceed;
     }
   }
@@ -932,8 +945,9 @@
       item.previewPending = false;
       item.authoritativePricePaise = null;
       item.totalSheets = Math.ceil(totalPages / (defaultSides === 'Double-sided' ? 2 : 1));
-      item.pricePaise = calculateDocPrice(totalPages, item.settings);
+      item.pricePaise = null;
       renderCart();
+      void requestDocumentQuote(item);
     } catch (err) {
       if (item.abortController?.signal?.aborted) {
         return;
@@ -1055,8 +1069,8 @@
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
     const isColor = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColor ? '₹8.00/sheet' : '₹3.00/sheet';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColor ? '₹10.00/sheet' : '₹5.00/sheet';
+    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = 'Cloud pricing';
+    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = 'Cloud pricing';
 
     syncSettingsUI(doc);
     renderPreviewSheet();
@@ -1083,9 +1097,9 @@
       });
     }
 
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+    const livePrice = getQuotedPrice(doc, draftSettings);
     if (saveSettingsPrice) {
-      saveSettingsPrice.textContent = formatRupees(livePrice);
+      saveSettingsPrice.textContent = livePrice === null ? 'Pending quote' : formatRupees(livePrice);
     }
   }
 
@@ -1185,9 +1199,9 @@
       rangeErrorText.classList.add('hidden');
     }
 
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
+    const livePrice = getQuotedPrice(doc, draftSettings);
     if (saveSettingsPrice) {
-      saveSettingsPrice.textContent = formatRupees(livePrice);
+      saveSettingsPrice.textContent = livePrice === null ? 'Pending quote' : formatRupees(livePrice);
     }
   }
 
@@ -1241,8 +1255,8 @@
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
     const isColorChoice = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColorChoice ? '₹8.00/sheet' : '₹3.00/sheet';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColorChoice ? '₹10.00/sheet' : '₹5.00/sheet';
+    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = 'Cloud pricing';
+    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = 'Cloud pricing';
 
     // 5. Orientation
     btnOrientAuto.classList.toggle('active', draftSettings.orientation === 'Auto');
@@ -1257,8 +1271,8 @@
     if (cardNup6) cardNup6.classList.toggle('active', curNup === '6');
 
     // Live bottom price button
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+    const livePrice = getQuotedPrice(doc, draftSettings);
+    if (saveSettingsPrice) saveSettingsPrice.textContent = livePrice === null ? 'Pending quote' : formatRupees(livePrice);
 
     if (previewSideToggle) {
       previewSideToggle.classList.toggle('hidden', draftSettings.sides !== 'Double-sided');
@@ -1371,8 +1385,8 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        const livePrice = getQuotedPrice(doc, draftSettings);
+        if (saveSettingsPrice) saveSettingsPrice.textContent = livePrice === null ? 'Pending quote' : formatRupees(livePrice);
         renderPreviewSheet();
       });
 
@@ -1591,10 +1605,11 @@
       const nup = parseInt(doc.settings.pagesPerSheet, 10) || 1;
       const count = doc.selectedPages.length;
       doc.totalSheets = Math.max(1, isDuplex ? Math.ceil(count / (nup * 2)) : Math.ceil(count / nup));
-      doc.pricePaise = calculateDocPrice(doc.totalPages, doc.settings);
-      doc.authoritativePricePaise = doc.pricePaise;
-
+      doc.pricePaise = null;
+      doc.authoritativePricePaise = null;
+      doc.quotedSettingsKey = null;
       switchView('cart');
+      void requestDocumentQuote(doc);
     });
   }
 
@@ -1962,6 +1977,12 @@
       }
 
       formData.append('metadata', JSON.stringify(metadata));
+      const confirmedTotalPaise = readyItems.reduce((sum, item) => sum + getQuotedPrice(item, item.settings), 0);
+      if (!Number.isSafeInteger(confirmedTotalPaise) || confirmedTotalPaise <= 0 ||
+          readyItems.some(item => getQuotedPrice(item, item.settings) === null)) {
+        throw new Error('Prices are not confirmed. Please retry the cloud quote.');
+      }
+      formData.append('accepted_total_price_paise', String(confirmedTotalPaise));
 
       if (readyItems.length > 0) {
         const first = readyItems[0];
@@ -2021,7 +2042,7 @@
         checkoutDocsCount.textContent = `${readyItems.length} file${readyItems.length > 1 ? 's' : ''}`;
       }
       if (checkoutTotalAmount) {
-        const totalPaise = data.total_price_paise || readyItems.reduce((acc, it) => acc + it.pricePaise, 0);
+        const totalPaise = data.total_price_paise;
         checkoutTotalAmount.textContent = formatRupees(totalPaise);
       }
 
@@ -2331,7 +2352,7 @@
         submitOrder,
         convertDocumentOnServer,
         renderPreviewSheet,
-        calculateDocPrice,
+        requestDocumentQuote,
         switchView,
         openSettings
       };
