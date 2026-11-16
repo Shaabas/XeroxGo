@@ -327,6 +327,243 @@ is_process_paused() {
     return 1
 }
 
+# Capture immutable process start time in ticks from /proc/<pid>/stat (Requirements 3, 5, 6)
+# Fails closed if /proc/<pid>/stat is unavailable, unreadable, or start time is malformed.
+get_process_start_time() {
+    local pid="$1"
+    if [[ -z "$pid" ]] || [[ ! "$pid" =~ ^[0-9]+$ ]] || [[ "$pid" -le 0 ]] || [[ ! -d "/proc/${pid}" ]]; then
+        return 1
+    fi
+    local stat_str
+    stat_str=$(cat "/proc/${pid}/stat" 2>/dev/null || true)
+    if [[ -z "$stat_str" ]]; then
+        return 1
+    fi
+    # Field 22 in /proc/<pid>/stat is the 20th field after the last ')'
+    local after_paren="${stat_str##*) }"
+    local start_time
+    start_time=$(echo "$after_paren" | awk '{print $20}')
+    if [[ -n "$start_time" ]] && [[ "$start_time" =~ ^[0-9]+$ ]] && [[ "$start_time" -gt 0 ]]; then
+        echo "$start_time"
+        return 0
+    fi
+    return 1
+}
+
+# Record process identity evidence and pause process via SIGSTOP (Requirements 3, 4, 6, 7, 8)
+record_and_pause_process() {
+    local role="$1" # "ipp" or "processor"
+    local pid="$2"
+
+    if [[ -z "$pid" ]] || [[ ! "$pid" =~ ^[0-9]+$ ]] || [[ "$pid" -le 0 ]]; then
+        echo "ERROR: Invalid PID for pause: '$pid'" >&2
+        return 1
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "ERROR: PID $pid is not alive; cannot pause." >&2
+        return 1
+    fi
+
+    local st comm
+    st=$(get_process_start_time "$pid")
+    if [[ -z "$st" ]] || [[ ! "$st" =~ ^[0-9]+$ ]] || [[ "$st" -le 0 ]]; then
+        echo "ERROR: Failed to capture immutable process start time for PID $pid." >&2
+        return 1
+    fi
+
+    comm=$(cat "/proc/${pid}/comm" 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null || true)
+    comm=$(echo "$comm" | tr -d ' \t\r\n')
+    if [[ -z "$comm" ]]; then
+        echo "ERROR: Failed to capture process comm for PID $pid." >&2
+        return 1
+    fi
+
+    if [[ "$role" == "ipp" ]]; then
+        if ! verify_emulator_process "$pid" "$EMU_PORT" "$EMU_NAME"; then
+            echo "ERROR: Refusing to pause PID $pid: does not match emulator process on port $EMU_PORT." >&2
+            return 1
+        fi
+    elif [[ "$role" == "processor" ]]; then
+        local cmdline
+        cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+        if [[ ! "$cmdline" =~ processor\.sh ]] && [[ ! "$comm" =~ processor ]]; then
+            echo "ERROR: Refusing to pause PID $pid: does not match processor.sh." >&2
+            return 1
+        fi
+    else
+        echo "ERROR: Unknown role '$role' for pause." >&2
+        return 1
+    fi
+
+    # Check kill -STOP exit status; never record process as paused when SIGSTOP failed (Requirements 7, 8)
+    if ! is_process_paused "$pid"; then
+        if ! kill -STOP "$pid" 2>/dev/null; then
+            echo "ERROR: Failed to send SIGSTOP to PID $pid." >&2
+            return 1
+        fi
+        local paused=false
+        for _ in {1..10}; do
+            if is_process_paused "$pid"; then
+                paused=true
+                break
+            fi
+            sleep 0.01
+        done
+        if [[ "$paused" != "true" ]]; then
+            echo "ERROR: Process $pid did not transition to stopped state after SIGSTOP." >&2
+            return 1
+        fi
+    fi
+
+    # Record ONLY after verified successful pause
+    echo "${role}:${pid}:${st}:${comm}" >> "$EMU_IPP_PAUSED_FILE"
+    return 0
+}
+
+# Verify that paused process identity matches stored evidence before signaling (Requirements 2, 3, 4, 6)
+verify_paused_process_identity() {
+    local role="$1"
+    local pid="$2"
+    local expected_st="$3"
+    local expected_comm="$4"
+
+    if [[ -z "$pid" ]] || [[ ! "$pid" =~ ^[0-9]+$ ]] || [[ "$pid" -le 0 ]]; then
+        echo "ERROR: Invalid PID '$pid' in paused process record." >&2
+        return 1
+    fi
+
+    if [[ -z "$expected_st" ]] || [[ ! "$expected_st" =~ ^[0-9]+$ ]] || [[ "$expected_st" -le 0 ]]; then
+        echo "ERROR: Missing or malformed expected start time '$expected_st' for PID $pid." >&2
+        return 1
+    fi
+
+    if [[ -z "$expected_comm" ]]; then
+        echo "ERROR: Missing expected comm for PID $pid." >&2
+        return 1
+    fi
+
+    # 1. Process existence check
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "ERROR: Paused process PID $pid is no longer alive (stale record)." >&2
+        return 1
+    fi
+
+    # 2. Check process start time to protect against PID reuse (Requirements 3, 5, 6)
+    local actual_st
+    actual_st=$(get_process_start_time "$pid")
+    if [[ -z "$actual_st" ]] || [[ "$actual_st" != "$expected_st" ]]; then
+        echo "ERROR: PID reuse or missing start time detected for PID $pid! Expected start time '$expected_st', found '$actual_st'. Refusing to signal." >&2
+        return 1
+    fi
+
+    # 3. Check comm
+    local actual_comm
+    actual_comm=$(cat "/proc/${pid}/comm" 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null || true)
+    actual_comm=$(echo "$actual_comm" | tr -d ' \t\r\n')
+    if [[ -z "$actual_comm" ]] || [[ "$actual_comm" != "$expected_comm" ]]; then
+        echo "ERROR: Comm mismatch for PID $pid! Expected '$expected_comm', found '$actual_comm'. Refusing to signal." >&2
+        return 1
+    fi
+
+    # 4. Role-specific validation (Requirements 3, 4)
+    if [[ "$role" == "ipp" ]]; then
+        if ! verify_emulator_process "$pid" "$EMU_PORT" "$EMU_NAME"; then
+            echo "ERROR: PID $pid does not match running ippeveprinter on port $EMU_PORT. Refusing to signal." >&2
+            return 1
+        fi
+    elif [[ "$role" == "processor" ]]; then
+        local cmdline
+        cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+        if [[ ! "$cmdline" =~ processor\.sh ]] && [[ ! "$actual_comm" =~ processor ]]; then
+            echo "ERROR: PID $pid cmdline does not contain processor.sh. Refusing to signal." >&2
+            return 1
+        fi
+    else
+        echo "ERROR: Unknown role '$role' in paused record. Refusing to signal." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# Safely unpause all paused processes with identity verification (Requirements 2, 3, 4, 6, 7, 8, 9, 10)
+safe_unpause_all_paused_processes() {
+    local restore_err=0
+    local failed_entries=()
+    local resumed_pids=()
+
+    if [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line=$(echo "$line" | tr -d '\r')
+            [[ -n "$line" ]] || continue
+
+            local role pid expected_st expected_comm
+            role=$(echo "$line" | cut -d':' -f1)
+            pid=$(echo "$line" | cut -d':' -f2)
+            expected_st=$(echo "$line" | cut -d':' -f3)
+            expected_comm=$(echo "$line" | cut -d':' -f4)
+
+            if [[ -z "$role" ]] || [[ -z "$pid" ]] || [[ -z "$expected_st" ]] || [[ -z "$expected_comm" ]]; then
+                echo "ERROR: Corrupt or incomplete process identity evidence in paused record: '$line'. Refusing to signal." >&2
+                failed_entries+=("corrupt:$line")
+                restore_err=1
+                continue
+            fi
+
+            if verify_paused_process_identity "$role" "$pid" "$expected_st" "$expected_comm"; then
+                if ! kill -CONT "$pid" 2>/dev/null; then
+                    echo "ERROR: Failed to send SIGCONT to verified PID $pid." >&2
+                    failed_entries+=("signal_failed:$line")
+                    restore_err=1
+                else
+                    resumed_pids+=("$pid")
+                fi
+            else
+                echo "ERROR: Safe restoration could not be established for entry '${role}:${pid}:${expected_st}:${expected_comm}'. Refusing to send SIGCONT." >&2
+                failed_entries+=("unverified:$line")
+                restore_err=1
+            fi
+        done < "$EMU_IPP_PAUSED_FILE"
+    fi
+
+    # Check for unrecorded paused processes (Requirement 11)
+    # 1. Emulator process: if running and paused, but not in resumed_pids
+    if is_running; then
+        local emu_pid
+        emu_pid=$(get_pid)
+        if [[ -n "$emu_pid" ]] && is_process_paused "$emu_pid"; then
+            echo "ERROR: Emulator PID $emu_pid is paused in kernel without saved verification evidence. Refusing unverified restoration." >&2
+            failed_entries+=("unrecorded:ipp:$emu_pid")
+            restore_err=1
+        fi
+    fi
+
+    # 2. Active processor process: if active file exists and processor is paused, but not in resumed_pids
+    if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ -f "$EMU_JOB_ACTIVE_FILE" ]]; then
+        local proc_pid
+        proc_pid=$(sed -n 's/^PID=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+        if [[ -n "$proc_pid" ]] && [[ "$proc_pid" =~ ^[0-9]+$ ]] && kill -0 "$proc_pid" 2>/dev/null; then
+            if is_process_paused "$proc_pid"; then
+                echo "ERROR: Processor PID $proc_pid is paused in kernel without saved verification evidence. Refusing unverified restoration." >&2
+                failed_entries+=("unrecorded:processor:$proc_pid")
+                restore_err=1
+            fi
+        fi
+    fi
+
+    if [[ "$restore_err" -ne 0 ]]; then
+        # Requirements 7, 9: Preserve diagnostics and paused records when restoration fails
+        local diag_file="${EMU_IPP_PAUSED_FILE}.diag_$(date +%s)"
+        printf "%s\n" "${failed_entries[@]}" > "$diag_file"
+        echo "Preserved restoration failure diagnostics in ${diag_file}" >&2
+        return 1
+    fi
+
+    rm -f "$EMU_IPP_PAUSED_FILE"
+    return 0
+}
+
 # Check if port is in use
 is_port_in_use() {
     local host="$1"
@@ -527,8 +764,11 @@ cmd_start() {
         ipp_off=$(get_fault_state_field "ipp_offline" "false")
         if [[ "$ipp_off" == "true" ]]; then
             echo "Applying active offline fault to IPP emulator (SIGSTOP)..."
-            kill -STOP "$emu_pid" 2>/dev/null || true
-            echo "$emu_pid" > "$EMU_IPP_PAUSED_FILE"
+            if ! record_and_pause_process "ipp" "$emu_pid"; then
+                echo "ERROR: Failed to safely pause emulator on startup." >&2
+                release_lock
+                return 1
+            fi
         else
             sync_ipp_state "$EMU_HOST" "$EMU_PORT"
         fi
@@ -566,10 +806,12 @@ cmd_stop() {
         return 1
     fi
 
-    # If process is paused in kernel via SIGSTOP (e.g. offline fault), resume it so it can handle SIGTERM
-    if is_process_paused "$pid" || [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
-        kill -CONT "$pid" 2>/dev/null || true
-        rm -f "$EMU_IPP_PAUSED_FILE"
+    # If processes were paused (e.g. offline fault), safely unpause verified processes so they can terminate cleanly (Requirements 2, 8, 10)
+    if [[ -f "$EMU_IPP_PAUSED_FILE" ]] || is_process_paused "$pid"; then
+        if ! safe_unpause_all_paused_processes; then
+            echo "ERROR: Failed to safely restore all paused processes before stop. Refusing to signal unverified processes." >&2
+            return 1
+        fi
     fi
 
     echo "Stopping IPP printer emulator (PID: ${pid})..."
@@ -754,6 +996,52 @@ cmd_verify_queue() {
     verify_cups_queue_ownership "$target_queue"
 }
 
+# Cancel an explicit job after verifying current 3-way queue ownership (Requirement 12)
+cmd_cancel_job() {
+    local target_queue="${1:-$EMU_CUPS_QUEUE}"
+    local job_id="${2:-}"
+    if [[ -z "$target_queue" ]] || [[ -z "$job_id" ]]; then
+        echo "ERROR: Queue name and job ID must be provided to cancel-job." >&2
+        return 1
+    fi
+    if ! verify_cups_queue_ownership "$target_queue"; then
+        echo "ERROR: Refusing to cancel job '${job_id}' on unverified queue '${target_queue}'." >&2
+        return 1
+    fi
+    if [[ ! "$job_id" =~ ^${target_queue}-[0-9]+$ ]]; then
+        echo "ERROR: Job ID '${job_id}' does not match target queue '${target_queue}'." >&2
+        return 1
+    fi
+    if ! command -v cancel >/dev/null 2>&1; then
+        echo "ERROR: cancel command not found." >&2
+        return 1
+    fi
+    cancel "$job_id"
+}
+
+# Resume an explicit held job after verifying current 3-way queue ownership (Requirement 12)
+cmd_resume_job() {
+    local target_queue="${1:-$EMU_CUPS_QUEUE}"
+    local job_id="${2:-}"
+    if [[ -z "$target_queue" ]] || [[ -z "$job_id" ]]; then
+        echo "ERROR: Queue name and job ID must be provided to resume-job." >&2
+        return 1
+    fi
+    if ! verify_cups_queue_ownership "$target_queue"; then
+        echo "ERROR: Refusing to resume job '${job_id}' on unverified queue '${target_queue}'." >&2
+        return 1
+    fi
+    if [[ ! "$job_id" =~ ^${target_queue}-[0-9]+$ ]]; then
+        echo "ERROR: Job ID '${job_id}' does not match target queue '${target_queue}'." >&2
+        return 1
+    fi
+    if ! command -v lp >/dev/null 2>&1; then
+        echo "ERROR: lp command not found." >&2
+        return 1
+    fi
+    lp -i "$job_id" -H resume
+}
+
 cmd_remove_cups() {
     if ! command -v lpadmin >/dev/null 2>&1; then
         return 0
@@ -810,7 +1098,10 @@ cmd_cleanup() {
         fi
     fi
 
-    cmd_stop || true
+    if ! cmd_stop; then
+        echo "ERROR: Failed to safely stop emulator during cleanup. Preserving state for diagnostic inspection." >&2
+        return 1
+    fi
 
     # Requirement 3, 4, 5, 6, 7, 8: Validate spool path, verify ownership marker,
     # and selectively remove only verified emulator artifacts actually produced by emulator.
@@ -870,7 +1161,7 @@ cmd_cleanup() {
         fi
     fi
 
-    rm -f "$EMU_PID_FILE" "$EMU_LOG_FILE" "$EMU_FAULT_STATE_FILE" "$EMU_IPP_PAUSED_FILE"
+    rm -f "$EMU_PID_FILE" "$EMU_LOG_FILE" "$EMU_FAULT_STATE_FILE"
     rm -rf "$EMU_LOCK_DIR" 2>/dev/null || true
 
     # Clean up SNMP resources if present
@@ -1224,7 +1515,7 @@ verify_ipp_attributes() {
 
         case "$scenario" in
             healthy|recovery|clear)
-                if [[ "$cur_reasons" == "none" ]] && [[ "$cur_state" == "idle" || "$cur_state" == "3" ]]; then
+                if [[ "$cur_reasons" == "none" || "$cur_reasons" == "job-printing" ]] && [[ "$cur_state" == "idle" || "$cur_state" == "3" || "$cur_state" == "processing" || "$cur_state" == "4" ]]; then
                     matched=true
                     break
                 fi
@@ -1561,22 +1852,37 @@ cmd_fault_set() {
         if [[ "$ipp_offline" == "true" ]]; then
             # Freeze IPP process via SIGSTOP to simulate network/host communication loss
             write_fault_state "$scenario" "$target" "$ipp_scen" "$snmp_scen" "$ipp_reasons" "$ipp_offline" "$snmp_offline" "$hold_job"
+            if [[ -f "$EMU_PID_FILE" ]] && ! is_running; then
+                echo "ERROR: IPP emulator PID file exists but process is not running or verified. Cannot apply offline pause." >&2
+                return 1
+            fi
             if is_running; then
                 local pid
                 pid=$(get_pid)
-                if [[ -n "$pid" ]] && ! is_process_paused "$pid"; then
-                    kill -STOP "$pid" 2>/dev/null || true
-                    echo "$pid" > "$EMU_IPP_PAUSED_FILE"
+                if [[ -n "$pid" ]]; then
+                    if ! record_and_pause_process "ipp" "$pid"; then
+                        echo "ERROR: Failed to record and pause IPP emulator process." >&2
+                        return 1
+                    fi
+                fi
+                # Also pause active processor if running
+                if [[ -n "${EMU_JOB_ACTIVE_FILE:-}" ]] && [[ -f "$EMU_JOB_ACTIVE_FILE" ]]; then
+                    local proc_pid
+                    proc_pid=$(sed -n 's/^PID=//p' "$EMU_JOB_ACTIVE_FILE" | head -n 1)
+                    if [[ -n "$proc_pid" ]] && [[ "$proc_pid" =~ ^[0-9]+$ ]] && kill -0 "$proc_pid" 2>/dev/null; then
+                        if ! record_and_pause_process "processor" "$proc_pid"; then
+                            echo "ERROR: Failed to record and pause processor process." >&2
+                            return 1
+                        fi
+                    fi
                 fi
             fi
         else
-            # Unpause if process was previously paused (offline recovery)
-            if is_running; then
-                local pid
-                pid=$(get_pid)
-                if [[ -n "$pid" ]] && (is_process_paused "$pid" || [[ -f "$EMU_IPP_PAUSED_FILE" ]]); then
-                    kill -CONT "$pid" 2>/dev/null || true
-                    rm -f "$EMU_IPP_PAUSED_FILE"
+            # Unpause if process was previously paused (offline recovery) (Requirements 2, 3, 4, 10)
+            if is_running || [[ -f "$EMU_IPP_PAUSED_FILE" ]]; then
+                if ! safe_unpause_all_paused_processes; then
+                    echo "ERROR: Safe restoration could not be established for paused processes." >&2
+                    return 1
                 fi
             fi
 
@@ -2088,6 +2394,12 @@ case "$COMMAND" in
         ;;
     verify-queue)
         cmd_verify_queue "${COMMAND_ARGS[@]}"
+        ;;
+    cancel-job)
+        cmd_cancel_job "${COMMAND_ARGS[@]}"
+        ;;
+    resume-job)
+        cmd_resume_job "${COMMAND_ARGS[@]}"
         ;;
     cleanup)
         cmd_cleanup

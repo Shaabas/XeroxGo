@@ -67,12 +67,8 @@ func parseCUPSJobIDsFromLPStat(output string, queue string) []string {
 	return ids
 }
 
-// cupsQueueOrMetadataExists returns true if either the ownership metadata file exists on disk
-// or the named queue exists in CUPS (via lpstat -p or lpstat -v).
-func cupsQueueOrMetadataExists(queue string, metaPath string) bool {
-	if _, err := os.Stat(metaPath); err == nil {
-		return true
-	}
+// cupsQueueExists returns true if the queue exists in CUPS (via lpstat -p or lpstat -v).
+func cupsQueueExists(queue string) bool {
 	cmdP := exec.Command("lpstat", "-p", queue)
 	if cmdP.Run() == nil {
 		return true
@@ -81,9 +77,19 @@ func cupsQueueOrMetadataExists(queue string, metaPath string) bool {
 	return cmdV.Run() == nil
 }
 
+// cupsQueueOrMetadataExists returns true if either the ownership metadata file exists on disk
+// or the named queue exists in CUPS (via lpstat -p or lpstat -v).
+func cupsQueueOrMetadataExists(queue string, metaPath string) bool {
+	if _, err := os.Stat(metaPath); err == nil {
+		return true
+	}
+	return cupsQueueExists(queue)
+}
+
 // teardownCUPSQueue performs verified queue deletion during test teardown:
 //  - Never unconditionally deletes ownership metadata.
 //  - Preserves ownership metadata on disk if verified remove-cups fails.
+//  - Verifies actual queue absence after remove-cups before deleting metadata.
 //  - Reports teardown failures as test failures via t.Errorf, not ignored errors or warnings.
 func teardownCUPSQueue(t *testing.T, emuScript string, emuEnv []string, queueName string, metaFile string) {
 	t.Helper()
@@ -96,10 +102,16 @@ func teardownCUPSQueue(t *testing.T, emuScript string, emuEnv []string, queueNam
 		// Preserve metadata if verified remove-cups fails, and report teardown failure.
 		t.Errorf("cleanup failure: remove-cups failed for queue %q: %v (%s). Ownership metadata preserved at %s.",
 			queueName, err, strings.TrimSpace(out), metaFile)
-	} else {
-		// Verified removal succeeded; ensure metadata file is removed
-		_ = os.Remove(metaFile)
+		return
 	}
+	// Requirement 11: Verify actual queue absence after successful removal
+	if cupsQueueExists(queueName) {
+		t.Errorf("cleanup failure: queue %q still exists in CUPS after remove-cups. Ownership metadata preserved at %s.",
+			queueName, metaFile)
+		return
+	}
+	// Verified removal succeeded and queue is confirmed absent; remove metadata file
+	_ = os.Remove(metaFile)
 }
 
 // TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking exercises the complete

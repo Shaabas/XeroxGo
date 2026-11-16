@@ -666,7 +666,9 @@ func TestMidPrintHardwareFault_DistinguishCompletedFromHeld(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("cleanup failure: IPP cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	})
 
 	if out, err := runEmu(t, emuScript, emuEnv, "setup-cups"); err != nil {
