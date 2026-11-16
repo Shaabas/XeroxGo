@@ -461,11 +461,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = os.Remove(outputPath)
 			return
 		}
-		if !verifyAcceptedPrice(w, r, res.PricePaise) {
-		_ = os.Remove(outputPath)
-		return
-	}
-	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
+		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 			_ = os.Remove(outputPath)
 			http.Error(w, "failed to persist order", http.StatusInternalServerError)
 			return
@@ -584,6 +580,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
+	if !verifyAcceptedPrice(w, r, res.PricePaise) {
+		_ = os.Remove(outputPath)
+		return
+	}
 	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, "failed to persist order", http.StatusInternalServerError)
