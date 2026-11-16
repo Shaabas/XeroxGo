@@ -25,7 +25,13 @@ func (app *appServer) handlePublicPricing(w http.ResponseWriter, r *http.Request
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(pricingConfig)
+	_ = json.NewEncoder(w).Encode(struct {
+		store.PricingConfig
+		PricingPolicy string `json:"pricing_policy"`
+	}{
+		PricingConfig: pricingConfig,
+		PricingPolicy: string(app.cfg.pricingPolicy),
+	})
 }
 
 // handleAdminPricing handles GET and PUT /api/admin/pricing
