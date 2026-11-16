@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -131,9 +133,19 @@ func TestCrashHelperProcess(t *testing.T) {
 		if err := lpCmd.Start(); err != nil {
 			log.Fatalf("[CHILD-CW5] lp start failed: %v", err)
 		}
-		log.Printf("[CHILD-CW5] lp process started (PID: %d); signaling readiness while lp is in flight", lpCmd.Process.Pid)
-		// Signal supervisor that lp is actively executing
-		if err := os.WriteFile(readyFile, []byte(strconv.Itoa(lpCmd.Process.Pid)), 0644); err != nil {
+		lpPID := lpCmd.Process.Pid
+		log.Printf("[CHILD-CW5] lp process started (PID: %d); capturing process identity evidence", lpPID)
+
+		// Capture exact immutable process evidence for safe supervisor verification (Requirements 2, 4)
+		ev, err := readLinuxProcessEvidence(lpPID)
+		if err != nil {
+			log.Fatalf("[CHILD-CW5] Failed to capture process evidence for in-flight lp (PID %d): %v", lpPID, err)
+		}
+		evBytes, err := json.Marshal(ev)
+		if err != nil {
+			log.Fatalf("[CHILD-CW5] Failed to marshal process evidence: %v", err)
+		}
+		if err := os.WriteFile(readyFile, evBytes, 0644); err != nil {
 			log.Fatalf("[CHILD-CW5] Failed to write ready marker: %v", err)
 		}
 
@@ -210,33 +222,51 @@ func TestCrashHelperProcess(t *testing.T) {
 			_ = os.WriteFile(capturedFile, []byte(cupsID), 0644)
 		}
 
-		// Requirement 9: Exercise emulator SNMP odometer advancement and monitor persistence before the crash
+		// Requirements 8, 9, 10: Require successful emulator odometer advancement and valid live SNMP telemetry
+		// before persisting verified sheet progress. Fail closed if hardware progress evidence is missing or inconsistent.
 		emuScript := os.Getenv("CRASH_EMU_SCRIPT")
-		if emuScript != "" {
-			snmpSetCmd := exec.Command(emuScript, "snmp-set", "-counter-inc", "1")
-			snmpSetCmd.Env = os.Environ()
-			if snmpOut, err := snmpSetCmd.CombinedOutput(); err != nil {
-				log.Printf("[CHILD-CW7] Warning: snmp-set failed: %v (%s)", err, strings.TrimSpace(string(snmpOut)))
-			}
+		if emuScript == "" {
+			log.Fatalf("[CHILD-CW7] CRASH_EMU_SCRIPT environment variable is required")
 		}
-
-		// Verify live SNMP telemetry from emulator endpoint
 		snmpPortStr := os.Getenv("CRASH_SNMP_PORT")
 		snmpPortVal, _ := strconv.Atoi(snmpPortStr)
-		if snmpPortVal > 0 {
-			snmpCfg := printer.SNMPConfig{
-				Target:    "127.0.0.1",
-				Port:      snmpPortVal,
-				Community: "public",
-				Timeout:   2 * time.Second,
-			}
-			telem := printer.PollHardwareTelemetry(context.Background(), snmpCfg)
-			if telem.HasLife {
-				log.Printf("[CHILD-CW7] Live SNMP telemetry confirmed odometer: %d", telem.LifeCount)
-			}
+		if snmpPortVal <= 0 {
+			log.Fatalf("[CHILD-CW7] Invalid or missing CRASH_SNMP_PORT: %q", snmpPortStr)
 		}
 
-		// Durably record sheet 1 verified physical progress in SQLite (live SNMP-verified)
+		snmpCfg := printer.SNMPConfig{
+			Target:    "127.0.0.1",
+			Port:      snmpPortVal,
+			Community: "public",
+			Timeout:   2 * time.Second,
+		}
+
+		// Step A: Live baseline SNMP query
+		baselineTelem := printer.PollHardwareTelemetry(context.Background(), snmpCfg)
+		if !baselineTelem.Online || !baselineTelem.HasLife {
+			log.Fatalf("[CHILD-CW7] Live baseline SNMP telemetry failed or missing life counter: %+v", baselineTelem)
+		}
+		baselineLife := baselineTelem.LifeCount
+
+		// Step B: Advance emulator odometer via emulator CLI
+		snmpSetCmd := exec.Command(emuScript, "snmp-set", "-counter-inc", "1")
+		snmpSetCmd.Env = os.Environ()
+		if snmpOut, err := snmpSetCmd.CombinedOutput(); err != nil {
+			log.Fatalf("[CHILD-CW7] Emulator snmp-set -counter-inc 1 failed: %v (%s)", err, strings.TrimSpace(string(snmpOut)))
+		}
+
+		// Step C: Verify live SNMP telemetry from emulator endpoint actually advanced
+		postTelem := printer.PollHardwareTelemetry(context.Background(), snmpCfg)
+		if !postTelem.Online || !postTelem.HasLife {
+			log.Fatalf("[CHILD-CW7] Live post-advancement SNMP telemetry failed: %+v", postTelem)
+		}
+		expectedLife := baselineLife + 1
+		if postTelem.LifeCount != expectedLife {
+			log.Fatalf("[CHILD-CW7] Live SNMP hardware progress evidence inconsistent: expected odometer %d, got %d", expectedLife, postTelem.LifeCount)
+		}
+		log.Printf("[CHILD-CW7] Live SNMP verified physical progress: baseline %d -> advanced %d", baselineLife, postTelem.LifeCount)
+
+		// Step D: Only now durably record sheet 1 verified physical progress in SQLite (live SNMP-verified)
 		evt := contracts.JobProgressEvent{
 			JobID:         cmd.JobID,
 			KioskID:       cmd.KioskID,
@@ -419,6 +449,172 @@ func setupCrashTestEnv(t *testing.T, scenario string) (
 }
 
 // -----------------------------------------------------------------------------
+// In-Flight Process Supervision & Process Identity Evidence (Requirements 2, 3, 4, 5, 6)
+// -----------------------------------------------------------------------------
+
+type InFlightProcessEvidence struct {
+	PID            int    `json:"pid"`
+	PPID           int    `json:"ppid"`
+	Comm           string `json:"comm"`
+	Exe            string `json:"exe"`
+	StartTimeTicks uint64 `json:"start_time_ticks"`
+}
+
+// readLinuxProcessEvidence reads live process identity and immutable start time
+// from /proc/<pid>/stat and /proc/<pid>/exe.
+func readLinuxProcessEvidence(pid int) (*InFlightProcessEvidence, error) {
+	if pid <= 1 {
+		return nil, fmt.Errorf("invalid pid %d", pid)
+	}
+	statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read /proc/%d/stat: %w", pid, err)
+	}
+	statStr := string(statBytes)
+	firstParen := strings.Index(statStr, "(")
+	lastParen := strings.LastIndex(statStr, ")")
+	if firstParen == -1 || lastParen == -1 || lastParen <= firstParen {
+		return nil, fmt.Errorf("malformed /proc/%d/stat: cannot parse comm", pid)
+	}
+	comm := statStr[firstParen+1 : lastParen]
+	afterParen := strings.TrimSpace(statStr[lastParen+1:])
+	fields := strings.Fields(afterParen)
+	// afterParen fields:
+	// fields[0] = state (field 3)
+	// fields[1] = ppid (field 4)
+	// ...
+	// fields[19] = starttime (field 22)
+	if len(fields) < 20 {
+		return nil, fmt.Errorf("malformed /proc/%d/stat: insufficient fields (%d)", pid, len(fields))
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return nil, fmt.Errorf("malformed ppid in /proc/%d/stat: %w", pid, err)
+	}
+	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil || startTicks == 0 {
+		return nil, fmt.Errorf("malformed starttime in /proc/%d/stat: %w", pid, err)
+	}
+	exe, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	return &InFlightProcessEvidence{
+		PID:            pid,
+		PPID:           ppid,
+		Comm:           comm,
+		Exe:            exe,
+		StartTimeTicks: startTicks,
+	}, nil
+}
+
+const (
+	sysPidfdOpen       = 434
+	sysPidfdSendSignal = 424
+)
+
+// openPidfd attempts to open a Linux pidfd for the specified process.
+func openPidfd(pid int) (int, error) {
+	if pid <= 1 {
+		return -1, fmt.Errorf("invalid pid %d", pid)
+	}
+	r1, _, errno := syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0)
+	if errno != 0 {
+		return -1, fmt.Errorf("pidfd_open failed for pid %d: %w", pid, errno)
+	}
+	return int(r1), nil
+}
+
+// pidfdSendSignal sends a signal using a Linux pidfd handle.
+func pidfdSendSignal(pidfd int, sig syscall.Signal) error {
+	r1, _, errno := syscall.Syscall6(sysPidfdSendSignal, uintptr(pidfd), uintptr(sig), 0, 0, 0, 0)
+	if r1 != 0 && errno != 0 {
+		return fmt.Errorf("pidfd_send_signal failed: %w", errno)
+	}
+	return nil
+}
+
+// verifyAndTerminateInFlightProcess safely verifies process identity, start time ticks,
+// and parentage before delivering SIGKILL via pidfd or child-scoped signal.
+// Returns terminated=true if verified and killed, alreadyExited=true if process already exited (ESRCH),
+// and fails closed with error if any identity or start-time verification check fails.
+func verifyAndTerminateInFlightProcess(t *testing.T, ev *InFlightProcessEvidence, expectedParentPID int) (terminated bool, alreadyExited bool, err error) {
+	if ev == nil || ev.PID <= 1 {
+		return false, false, fmt.Errorf("invalid in-flight evidence: nil or pid <= 1")
+	}
+	if ev.PID == os.Getpid() || ev.PID == 1 {
+		return false, false, fmt.Errorf("safety boundary violation: in-flight PID %d cannot be test supervisor or init", ev.PID)
+	}
+
+	// Requirement 5: Ensure a normally exited lp subprocess cannot cause an unrelated process to be signaled.
+	// Probe whether the process is alive. If ESRCH, it already exited normally.
+	if probeErr := syscall.Kill(ev.PID, 0); probeErr != nil {
+		if errors.Is(probeErr, syscall.ESRCH) {
+			return false, true, nil
+		}
+		return false, false, fmt.Errorf("kill(pid, 0) failed: %w", probeErr)
+	}
+
+	// Read live process identity from /proc/<pid>/stat and /proc/<pid>/exe
+	liveEv, liveErr := readLinuxProcessEvidence(ev.PID)
+	if liveErr != nil {
+		if errors.Is(liveErr, os.ErrNotExist) || strings.Contains(liveErr.Error(), "no such file or directory") {
+			return false, true, nil
+		}
+		return false, false, fmt.Errorf("failed to read live process evidence for PID %d: %w", ev.PID, liveErr)
+	}
+
+	// Requirement 4: Verify exact subprocess identity and start time, failing closed if uncertain
+	if liveEv.Comm != ev.Comm {
+		return false, false, fmt.Errorf("identity mismatch for PID %d: expected comm %q, got %q", ev.PID, ev.Comm, liveEv.Comm)
+	}
+	if liveEv.StartTimeTicks != ev.StartTimeTicks {
+		return false, false, fmt.Errorf("start time mismatch for PID %d: expected ticks %d, got %d (PID reuse detected)", ev.PID, ev.StartTimeTicks, liveEv.StartTimeTicks)
+	}
+	if ev.Exe != "" && liveEv.Exe != "" && liveEv.Exe != ev.Exe && !strings.HasSuffix(liveEv.Exe, "/"+ev.Comm) {
+		return false, false, fmt.Errorf("executable mismatch for PID %d: expected %q, got %q", ev.PID, ev.Exe, liveEv.Exe)
+	}
+	// Verify that when spawned, the process was a direct child of expectedParentPID
+	if expectedParentPID > 0 && ev.PPID != expectedParentPID {
+		return false, false, fmt.Errorf("recorded parent PID mismatch for PID %d: expected %d, got %d", ev.PID, expectedParentPID, ev.PPID)
+	}
+
+	// Requirement 3: Use a retained OS process handle or Linux pidfd where practical.
+	pfd, pfdErr := openPidfd(ev.PID)
+	if pfdErr == nil && pfd >= 0 {
+		defer syscall.Close(pfd)
+		if sigErr := pidfdSendSignal(pfd, syscall.SIGKILL); sigErr != nil {
+			if errors.Is(sigErr, syscall.ESRCH) {
+				return false, true, nil
+			}
+			return false, false, fmt.Errorf("pidfd_send_signal(SIGKILL) failed: %w", sigErr)
+		}
+	} else {
+		// Fallback to verified child-scoped signal when pidfd is unsupported
+		if sigErr := syscall.Kill(ev.PID, syscall.SIGKILL); sigErr != nil {
+			if errors.Is(sigErr, syscall.ESRCH) {
+				return false, true, nil
+			}
+			return false, false, fmt.Errorf("syscall.Kill(SIGKILL) failed for PID %d: %w", ev.PID, sigErr)
+		}
+	}
+
+	// Wait until in-flight process has terminated
+	terminatedCleanly := false
+	for i := 0; i < 50; i++ {
+		if checkErr := syscall.Kill(ev.PID, 0); checkErr != nil {
+			if errors.Is(checkErr, syscall.ESRCH) {
+				terminatedCleanly = true
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !terminatedCleanly {
+		return false, false, fmt.Errorf("in-flight process %d did not terminate within timeout after SIGKILL", ev.PID)
+	}
+
+	return true, false, nil
+}
+
+// -----------------------------------------------------------------------------
 // Child Subprocess Supervisor: spawnAndKillChild
 // -----------------------------------------------------------------------------
 // Spawns the test binary as a child subprocess, waits until the child signals
@@ -503,29 +699,12 @@ func spawnAndKillChild(
 		t.Fatalf("child process %d died prematurely: %v. Output:\n%s", childPID, err, childOut.String())
 	}
 
-	// Parse optional in-flight subprocess PID (e.g. lp PID in CW-5)
-	var inFlightPID int
-	if p, err := strconv.Atoi(readyContent); err == nil && p > 1 && p != os.Getpid() && p != childPID {
-		inFlightPID = p
-	}
-
-	// Deliver real SIGKILL to the child subprocess
+	// Deliver real SIGKILL to the child runner process
 	if err := syscall.Kill(childPID, syscall.SIGKILL); err != nil {
 		t.Fatalf("failed to deliver SIGKILL to child PID %d: %v", childPID, err)
 	}
 
-	// If there is an in-flight child process (e.g. lp in CW-5), terminate it too as part of the crash
-	if inFlightPID > 0 {
-		_ = syscall.Kill(inFlightPID, syscall.SIGKILL)
-		for i := 0; i < 50; i++ {
-			if err := syscall.Kill(inFlightPID, 0); err != nil {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
-	// Wait for child process to exit and verify termination signal
+	// Wait for child process to exit and verify termination signal (Requirement 6)
 	waitErr := childCmd.Wait()
 	if waitErr == nil {
 		t.Fatalf("expected child process %d to be killed by SIGKILL, but exited with code 0", childPID)
@@ -533,11 +712,31 @@ func spawnAndKillChild(
 	if exitErr, ok := waitErr.(*exec.ExitError); ok {
 		ws := exitErr.Sys().(syscall.WaitStatus)
 		if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
-			t.Fatalf("expected child process to be killed by SIGKILL (9), got: %v", ws)
+			t.Fatalf("expected child process to be killed by SIGKILL (9), got: %v. Output:\n%s", ws, childOut.String())
 		}
 		t.Logf("Child subprocess PID %d successfully terminated by SIGKILL (action: %s)", childPID, action)
 	} else {
-		t.Fatalf("unexpected wait error from child process: %v", waitErr)
+		t.Fatalf("unexpected wait error from child process: %v. Output:\n%s", waitErr, childOut.String())
+	}
+
+	// Requirements 2, 3, 4, 5: If readyContent contains structured in-flight process evidence,
+	// safely verify exact identity, start time ticks, and pidfd before signaling.
+	// Never send SIGKILL based only on a raw numeric PID.
+	if strings.HasPrefix(readyContent, "{") {
+		var inFlightEv InFlightProcessEvidence
+		if err := json.Unmarshal([]byte(readyContent), &inFlightEv); err == nil && inFlightEv.PID > 0 {
+			term, exited, termErr := verifyAndTerminateInFlightProcess(t, &inFlightEv, childPID)
+			if termErr != nil {
+				t.Fatalf("safe in-flight process termination failed: %v", termErr)
+			}
+			if term {
+				t.Logf("Verified in-flight subprocess PID %d (%s) safely terminated by SIGKILL via pidfd/handle", inFlightEv.PID, inFlightEv.Comm)
+			} else if exited {
+				t.Logf("In-flight subprocess PID %d (%s) had already exited normally before signal (no signal sent)", inFlightEv.PID, inFlightEv.Comm)
+			}
+		} else if err != nil {
+			t.Fatalf("failed to parse in-flight process evidence JSON: %v (raw: %q)", err, readyContent)
+		}
 	}
 
 	capturedID := ""
@@ -1287,11 +1486,14 @@ func TestCrashRecovery_CW7_MidPrint_ResumesMonitoring(t *testing.T) {
 	}
 	defer store.Close()
 
+	// Requirements 8, 9, 10: Clearly distinguish live SNMP readings (polled over UDP pre-crash) from synthetic post-restart telemetry.
+	// Pre-crash: Child process verified actual live SNMP hardware progress (1000 -> 1001) against emulator responder before persisting sheet 1.
+	// Post-restart: Synthetic in-memory poller simulates hardware advancing by the remaining sheet during resumed monitoring.
 	var baselineRead atomic.Bool
 	var odoCounter int64 = 1001
 	var odoMu sync.Mutex
 
-	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+	syntheticPostRestartPoller := func(ctx context.Context) printer.HardwareTelemetry {
 		odoMu.Lock()
 		cur := odoCounter
 		if !baselineRead.Load() {
@@ -1326,7 +1528,7 @@ func TestCrashRecovery_CW7_MidPrint_ResumesMonitoring(t *testing.T) {
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
 		HealthPollInterval:  100 * time.Millisecond,
-		SNMPPoller:          snmpPoller,
+		SNMPPoller:          syntheticPostRestartPoller,
 		SNMPCommunity:       "public",
 		SNMPPort:            snmpPort,
 	})
@@ -2046,5 +2248,112 @@ exit 0
 
 	if _, err := os.Stat(metaFile); err == nil {
 		t.Logf("Metadata preservation check verified: Metadata file preserved on non-verified cleanup")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Negative Regression: In-Flight Process Verification Safety (Requirements 2, 4, 5, 7)
+// -----------------------------------------------------------------------------
+// Verifies that in-flight subprocess supervision:
+// 1. Refuses to signal an already-exited or stale process (ESRCH), reporting alreadyExited==true.
+// 2. Refuses to signal a live process when start time ticks do not match (PID reuse protection).
+// 3. Refuses to signal a process when comm or executable identity mismatches.
+// 4. Refuses forbidden PIDs (PID <= 1 or parent test supervisor PID).
+func TestCrashRecovery_InFlightProcessVerification_NegativeSafety(t *testing.T) {
+	// Case 1: Exited process (ESRCH)
+	dummyCmd := exec.Command("true")
+	if err := dummyCmd.Run(); err != nil {
+		t.Fatalf("failed to run dummy command: %v", err)
+	}
+	deadPID := dummyCmd.Process.Pid
+
+	deadEv := &InFlightProcessEvidence{
+		PID:            deadPID,
+		PPID:           os.Getpid(),
+		Comm:           "true",
+		Exe:            "/usr/bin/true",
+		StartTimeTicks: 123456,
+	}
+
+	term, exited, err := verifyAndTerminateInFlightProcess(t, deadEv, os.Getpid())
+	if err != nil {
+		t.Errorf("expected no error for already-exited process, got: %v", err)
+	}
+	if term {
+		t.Errorf("safety violation: claimed to terminate already-exited process %d", deadPID)
+	}
+	if !exited {
+		t.Errorf("expected alreadyExited == true for dead PID %d", deadPID)
+	}
+
+	// Case 2: Stale process identity / PID reuse (start time mismatch)
+	sleepCmd := exec.Command("sleep", "30")
+	if err := sleepCmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep process: %v", err)
+	}
+	livePID := sleepCmd.Process.Pid
+	defer func() {
+		_ = sleepCmd.Process.Kill()
+		_ = sleepCmd.Wait()
+	}()
+
+	liveEv, err := readLinuxProcessEvidence(livePID)
+	if err != nil {
+		t.Fatalf("failed to read live process evidence: %v", err)
+	}
+
+	// Forge mismatched start time ticks
+	staleEv := &InFlightProcessEvidence{
+		PID:            livePID,
+		PPID:           liveEv.PPID,
+		Comm:           liveEv.Comm,
+		Exe:            liveEv.Exe,
+		StartTimeTicks: liveEv.StartTimeTicks + 999999, // Mismatched ticks
+	}
+
+	term, exited, err = verifyAndTerminateInFlightProcess(t, staleEv, os.Getpid())
+	if err == nil {
+		t.Errorf("safety violation: expected error on PID reuse / start time mismatch, but verification succeeded")
+	}
+	if term {
+		t.Errorf("safety violation: signaled process despite start time mismatch")
+	}
+	// Verify sleep process was NOT signaled and remains alive
+	if err := syscall.Kill(livePID, 0); err != nil {
+		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID, err)
+	}
+
+	// Case 3: Identity / executable mismatch
+	mismatchEv := &InFlightProcessEvidence{
+		PID:            livePID,
+		PPID:           liveEv.PPID,
+		Comm:           "lp", // Live process is "sleep", not "lp"
+		Exe:            "/usr/bin/lp",
+		StartTimeTicks: liveEv.StartTimeTicks,
+	}
+	term, exited, err = verifyAndTerminateInFlightProcess(t, mismatchEv, os.Getpid())
+	if err == nil {
+		t.Errorf("safety violation: expected error on comm mismatch, but verification succeeded")
+	}
+	if term {
+		t.Errorf("safety violation: signaled process despite comm mismatch")
+	}
+	if err := syscall.Kill(livePID, 0); err != nil {
+		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID, err)
+	}
+
+	// Case 4: Forbidden PID (supervisor PID or init)
+	selfEv := &InFlightProcessEvidence{
+		PID:            os.Getpid(),
+		PPID:           os.Getppid(),
+		Comm:           "test",
+		StartTimeTicks: 1,
+	}
+	term, exited, err = verifyAndTerminateInFlightProcess(t, selfEv, os.Getppid())
+	if err == nil {
+		t.Errorf("safety violation: expected error for supervisor PID, got nil")
+	}
+	if term {
+		t.Errorf("safety violation: signaled supervisor PID")
 	}
 }
