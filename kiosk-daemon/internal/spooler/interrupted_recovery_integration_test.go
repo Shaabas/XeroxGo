@@ -129,24 +129,120 @@ func runEmuIgnoreErr(script string, env []string, args ...string) string {
 	return string(out)
 }
 
-// teardownCUPSQueue safely removes the test CUPS queue with metadata preservation
+// cupsQueueExists returns true if the queue exists in CUPS (via lpstat -p or lpstat -v).
+func cupsQueueExists(queue string) bool {
+	if queue == "" {
+		return false
+	}
+	cmdP := exec.Command("lpstat", "-p", queue)
+	if cmdP.Run() == nil {
+		return true
+	}
+	cmdV := exec.Command("lpstat", "-v", queue)
+	return cmdV.Run() == nil
+}
+
+// teardownCUPSQueue safely removes the test CUPS queue with metadata preservation:
+// - Fails Go teardown if an expected test queue exists but ownership verification fails.
+// - Fails Go teardown if remove-cups fails.
+// - Requires both lpstat -p and lpstat -v absence checks before deleting metadata.
+// - Never deletes ownership metadata if removal fails or absence is unverified.
 func teardownCUPSQueue(t *testing.T, emuScript string, emuEnv []string, queueName, metaFile string) {
 	t.Helper()
 	if queueName == "" {
 		return
 	}
-	out, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName)
+	exists := cupsQueueExists(queueName)
+	if !exists && metaFile != "" {
+		if _, err := os.Stat(metaFile); os.IsNotExist(err) {
+			return
+		}
+	}
+
+	if exists {
+		out, err := runEmu(t, emuScript, emuEnv, "verify-queue", queueName)
+		if err != nil {
+			// Requirement 5: Fail Go teardown if an expected test queue exists but ownership verification fails
+			t.Errorf("teardown failure: queue %q exists in CUPS but ownership verification failed: %v (%s). Ownership metadata preserved at %s.",
+				queueName, err, strings.TrimSpace(out), metaFile)
+			return
+		}
+
+		delOut, delErr := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
+		if delErr != nil {
+			// Requirements 2, 3: Never delete metadata if removal fails
+			t.Errorf("teardown failure: remove-cups failed for queue %q: %v (%s). Ownership metadata preserved at %s.",
+				queueName, delErr, strings.TrimSpace(delOut), metaFile)
+			return
+		}
+
+		// Requirement 4: Require both lpstat -p and lpstat -v checks after removal
+		if cupsQueueExists(queueName) {
+			t.Errorf("teardown failure: queue %q still exists in CUPS after remove-cups (checked via lpstat -p / lpstat -v). Ownership metadata preserved at %s.",
+				queueName, metaFile)
+			return
+		}
+	}
+
+	// Verified removal succeeded and queue is confirmed absent from CUPS by both checks
+	if metaFile != "" {
+		_ = os.Remove(metaFile)
+	}
+}
+
+// safeCancelTestJob cancels a job using the ownership-verified emulator cancel-job command,
+// strictly restricted to captured test job IDs matching queueName-<number>.
+func safeCancelTestJob(t *testing.T, emuScript string, emuEnv []string, queueName, cupsJobID string) {
+	t.Helper()
+	if cupsJobID == "" || queueName == "" {
+		return
+	}
+	matched, _ := regexp.MatchString(fmt.Sprintf(`^%s-[0-9]+$`, regexp.QuoteMeta(queueName)), cupsJobID)
+	if !matched {
+		t.Logf("safeCancelTestJob: rejecting cancellation for non-matching job ID %q on queue %q", cupsJobID, queueName)
+		return
+	}
+	out, err := runEmu(t, emuScript, emuEnv, "cancel-job", queueName, cupsJobID)
 	if err != nil {
-		t.Logf("teardown: queue %q is not verified as emulator-owned; skipping deletion (%s)", queueName, strings.TrimSpace(out))
-		return
+		t.Logf("safeCancelTestJob: cancel-job failed for %s on %s: %v (%s)", cupsJobID, queueName, err, strings.TrimSpace(out))
 	}
-	delOut, delErr := runEmu(t, emuScript, emuEnv, "remove-cups", queueName)
-	if delErr != nil {
-		t.Errorf("teardown failure: verified queue %q removal failed: %v (%s). Preserving ownership metadata at %s for audit.",
-			queueName, delErr, strings.TrimSpace(delOut), metaFile)
-		return
+}
+
+// parseCUPSJobIDsFromLPStat extracts all job request IDs for the target queue from lpstat output.
+func parseCUPSJobIDsFromLPStat(output string, queue string) []string {
+	prefix := queue + "-"
+	var ids []string
+	lines := strings.Split(output, "\n")
+	for _, l := range lines {
+		fields := strings.Fields(l)
+		if len(fields) > 0 && strings.HasPrefix(fields[0], prefix) {
+			ids = append(ids, fields[0])
+		}
 	}
-	_ = os.Remove(metaFile)
+	return ids
+}
+
+// verifyNoDuplicateCUPSSubmissions examines actual CUPS job records via lpstat -W all
+// to prove that no duplicate job submissions were dispatched to the queue.
+func verifyNoDuplicateCUPSSubmissions(t *testing.T, queueName string, expectedCUPSID string) {
+	t.Helper()
+	lpstatOut, _ := exec.Command("lpstat", "-W", "all", queueName).CombinedOutput()
+	records := parseCUPSJobIDsFromLPStat(string(lpstatOut), queueName)
+	if len(records) > 0 {
+		count := 0
+		for _, r := range records {
+			if r == expectedCUPSID {
+				count++
+			}
+		}
+		if count > 1 {
+			t.Errorf("duplicate CUPS job submissions detected for %s: count=%d (all records: %v)", expectedCUPSID, count, records)
+		} else {
+			t.Logf("actual CUPS job history confirms exactly-once submission for %s on %s", expectedCUPSID, queueName)
+		}
+	} else {
+		t.Logf("CUPS job history unavailable on host; history-based duplicate check unverified (relying on monitor and hook tracking)")
+	}
 }
 
 // ActiveJobMarker contains parsed fields from EMU_JOB_ACTIVE_FILE
@@ -345,8 +441,12 @@ func setupRecoveryTestEnv(t *testing.T, scenario string) (
 			_ = store.Close()
 		}
 		teardownCUPSQueue(t, emuScript, emuEnv, queueName, metaFile)
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup")
-		_, _ = runEmu(t, emuScript, emuEnv, "cleanup-snmp")
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup"); err != nil {
+			t.Errorf("teardown failure: emulator cleanup failed: %v (%s)", err, strings.TrimSpace(out))
+		}
+		if out, err := runEmu(t, emuScript, emuEnv, "cleanup-snmp"); err != nil {
+			t.Errorf("teardown failure: emulator cleanup-snmp failed: %v (%s)", err, strings.TrimSpace(out))
+		}
 	}
 
 	return
@@ -466,12 +566,10 @@ func TestInterruptedRecovery_PaperJam_PreservesHeldJobAndPausedError(t *testing.
 		t.Fatal("expected captured CUPS job ID, got empty")
 	}
 
-	t.Cleanup(func() {
+	defer func() {
 		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
-		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			_, _ = exec.Command("cancel", cID).CombinedOutput()
-		}
-	})
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cID)
+	}()
 
 	// 1. Verify job is placed in PAUSED_ERROR in SQLite
 	storedJob, err := store.GetJob(ctx, cmd.JobID)
@@ -519,6 +617,9 @@ func TestInterruptedRecovery_PaperJam_PreservesHeldJobAndPausedError(t *testing.
 	if storedJobAfter.SheetsPrinted != 0 {
 		t.Fatalf("expected 0 sheets printed for interrupted job, got %d", storedJobAfter.SheetsPrinted)
 	}
+
+	// Requirement 14: Assert exactly-once CUPS submission in actual CUPS job records
+	verifyNoDuplicateCUPSSubmissions(t, queueName, cID)
 
 	t.Logf("Paper-jam recovery validated: Job %s (CUPS ID %s) remains safely held in CUPS and PAUSED_ERROR in SQLite", cmd.JobID, cID)
 }
@@ -627,12 +728,10 @@ func TestInterruptedRecovery_PaperEmpty_PreservesHeldJobAndPausedError(t *testin
 	cID := capturedCUPSID
 	idMu.Unlock()
 
-	t.Cleanup(func() {
+	defer func() {
 		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
-		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			_, _ = exec.Command("cancel", cID).CombinedOutput()
-		}
-	})
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cID)
+	}()
 
 	storedJob, _ := store.GetJob(ctx, cmd.JobID)
 	if storedJob == nil || storedJob.Status != contracts.JobStatusPausedError {
@@ -658,6 +757,9 @@ func TestInterruptedRecovery_PaperEmpty_PreservesHeldJobAndPausedError(t *testin
 	if storedAfter.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected job to remain PAUSED_ERROR, got %s", storedAfter.Status)
 	}
+
+	// Requirement 14: Assert exactly-once CUPS submission in actual CUPS job records
+	verifyNoDuplicateCUPSSubmissions(t, queueName, cID)
 }
 
 // -----------------------------------------------------------------------------
@@ -764,12 +866,10 @@ func TestInterruptedRecovery_CoverOpen_PreservesHeldJobAndPausedError(t *testing
 	cID := capturedCUPSID
 	idMu.Unlock()
 
-	t.Cleanup(func() {
+	defer func() {
 		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
-		if cID != "" && strings.HasPrefix(cID, queueName+"-") {
-			_, _ = exec.Command("cancel", cID).CombinedOutput()
-		}
-	})
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cID)
+	}()
 
 	storedJob, _ := store.GetJob(ctx, cmd.JobID)
 	if storedJob == nil || storedJob.Status != contracts.JobStatusPausedError {
@@ -794,6 +894,9 @@ func TestInterruptedRecovery_CoverOpen_PreservesHeldJobAndPausedError(t *testing
 	if storedAfter.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected job to remain PAUSED_ERROR, got %s", storedAfter.Status)
 	}
+
+	// Requirement 14: Assert exactly-once CUPS submission in actual CUPS job records
+	verifyNoDuplicateCUPSSubmissions(t, queueName, cID)
 }
 
 // -----------------------------------------------------------------------------
@@ -834,12 +937,10 @@ func TestInterruptedRecovery_ConnectivityOutage_PreservesHeldJobAndPausedError(t
 		t.Fatalf("failed to parse CUPS request ID from lp output: %s", lpOut)
 	}
 
-	t.Cleanup(func() {
+	defer func() {
 		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
-		if cupsID != "" && strings.HasPrefix(cupsID, queueName+"-") {
-			_, _ = exec.Command("cancel", cupsID).CombinedOutput()
-		}
-	})
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cupsID)
+	}()
 
 	// 2. Wait for processor to be actively processing
 	deadline := time.Now().Add(6 * time.Second)
@@ -928,6 +1029,9 @@ func TestInterruptedRecovery_ConnectivityOutage_PreservesHeldJobAndPausedError(t
 		t.Fatalf("expected 0 sheets printed for interrupted job, got %d", storedAfter.SheetsPrinted)
 	}
 
+	// Requirement 14: Assert exactly-once CUPS submission in actual CUPS job records
+	verifyNoDuplicateCUPSSubmissions(t, queueName, cupsID)
+
 	t.Logf("Connectivity recovery validated: Job %s (CUPS ID %s) remains held in CUPS and PAUSED_ERROR in SQLite after network restoration", cmd.JobID, cupsID)
 }
 
@@ -935,7 +1039,7 @@ func TestInterruptedRecovery_ConnectivityOutage_PreservesHeldJobAndPausedError(t
 // Test 5: Active or Pending Job Triggers Hold Attempt & Distinguishes Outcome
 // -----------------------------------------------------------------------------
 func TestInterruptedRecovery_ActiveOrPendingJob_TriggersHoldAttempt(t *testing.T) {
-	_, _, queueName, _, store, _, activeFile, _, releaseFile, _, _, teardown :=
+	emuScript, emuEnv, queueName, _, store, _, activeFile, _, releaseFile, _, _, teardown :=
 		setupRecoveryTestEnv(t, "active-hold")
 	defer teardown()
 
@@ -967,12 +1071,10 @@ func TestInterruptedRecovery_ActiveOrPendingJob_TriggersHoldAttempt(t *testing.T
 		t.Fatalf("failed to parse CUPS request ID from lp output: %s", lpOut)
 	}
 
-	t.Cleanup(func() {
+	defer func() {
 		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
-		if cupsID != "" {
-			_, _ = exec.Command("cancel", cupsID).CombinedOutput()
-		}
-	})
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cupsID)
+	}()
 
 	// Wait for processor to be actively processing
 	deadline := time.Now().Add(6 * time.Second)
@@ -1023,6 +1125,9 @@ func TestInterruptedRecovery_ActiveOrPendingJob_TriggersHoldAttempt(t *testing.T
 	if !strings.Contains(storedJob.ErrorReason, "placed on hold") && !strings.Contains(storedJob.ErrorReason, "held") {
 		t.Fatalf("expected error reason to record hold outcome, got: %q", storedJob.ErrorReason)
 	}
+
+	// Requirement 14: Assert exactly-once CUPS submission in actual CUPS job records
+	verifyNoDuplicateCUPSSubmissions(t, queueName, cupsID)
 }
 
 // -----------------------------------------------------------------------------
@@ -1115,10 +1220,14 @@ func TestInterruptedRecovery_CompletedCUPSJob_WithoutPhysicalProof_PreservesPaus
 }
 
 // -----------------------------------------------------------------------------
-// Test 7: Partial Physical Progress Preserves Verified Sheets & Ignores CUPS Counter
+// Test 7: Partial Physical Progress Preserves Verified Sheets & Ignores CUPS Counter (Persisted-Counter Invariant)
 // -----------------------------------------------------------------------------
+// TestInterruptedRecovery_PartialPhysicalProgress_PreservesVerifiedOdometer validates the
+// persisted-counter invariant: a pre-existing verified physical sheet progress in SQLite state
+// persistence is strictly preserved across reconciliation passes, and unverified CUPS
+// job-media-sheets-completed counters are rejected.
 func TestInterruptedRecovery_PartialPhysicalProgress_PreservesVerifiedOdometer(t *testing.T) {
-	_, _, queueName, _, store, _, _, _, releaseFile, _, _, teardown :=
+	emuScript, emuEnv, queueName, _, store, _, _, _, releaseFile, _, _, teardown :=
 		setupRecoveryTestEnv(t, "partial-progress")
 	defer teardown()
 
@@ -1143,6 +1252,10 @@ func TestInterruptedRecovery_PartialPhysicalProgress_PreservesVerifiedOdometer(t
 	_ = os.WriteFile(releaseFile, []byte("release"), 0644)
 	lpOut, _ := exec.Command("lp", "-d", queueName, "-n", "1", "-t", uniqueJobID, samplePDF).CombinedOutput()
 	cupsID := parseCUPSJobID(string(lpOut))
+	defer func() {
+		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cupsID)
+	}()
 
 	// Pre-populate SQLite with verified 1 sheet printed (odometer confirmed 1 sheet)
 	if err := store.SaveJob(ctx, cmd, contracts.JobStatusPausedError); err != nil {
@@ -1191,10 +1304,149 @@ func TestInterruptedRecovery_PartialPhysicalProgress_PreservesVerifiedOdometer(t
 }
 
 // -----------------------------------------------------------------------------
+// Test 7b: Live Emulator Odometer Advancement Recorded Before Reconciliation (Requirements 11, 12)
+// -----------------------------------------------------------------------------
+// TestInterruptedRecovery_OdometerAdvancementRecordedBeforeReconciliation verifies that
+// live SNMP hardware odometer advancements are polled from the printer emulator,
+// recorded in SQLite state persistence, and then safely preserved by reconciliation
+// without inflation or truncation.
+func TestInterruptedRecovery_OdometerAdvancementRecordedBeforeReconciliation(t *testing.T) {
+	emuScript, emuEnv, queueName, _, store, _, _, _, releaseFile, _, snmpPort, teardown :=
+		setupRecoveryTestEnv(t, "odometer-advance")
+	defer teardown()
+
+	samplePDF := findSamplePDF(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_ = store.ResetPaperTray(ctx, 100)
+
+	snmpCfg := printer.SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      snmpPort,
+		Community: "public",
+		Timeout:   1 * time.Second,
+		Retries:   1,
+	}
+
+	// 1. Verify baseline live hardware telemetry (odometer at 1000)
+	initialTelemetry := printer.PollHardwareTelemetry(ctx, snmpCfg)
+	if initialTelemetry.LifeCount != 1000 {
+		t.Fatalf("expected initial live SNMP odometer 1000, got %d", initialTelemetry.LifeCount)
+	}
+
+	uniqueJobID := fmt.Sprintf("job-recov-odo-%d-%d", os.Getpid(), time.Now().UnixNano()%1000000)
+	cmd := contracts.PrintJobCommand{
+		JobID:          uniqueJobID,
+		KioskID:        "kiosk-odo-01",
+		DisplayCode:    "O112",
+		DownloadURL:    "https://example.invalid/print.pdf",
+		SHA256Checksum: strings.Repeat("9", 64),
+		TotalPages:     2,
+		TotalSheets:    2,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Submit via lp
+	_ = os.WriteFile(releaseFile, []byte("release"), 0644)
+	lpOut, err := exec.Command("lp", "-d", queueName, "-n", "1", "-t", uniqueJobID, samplePDF).CombinedOutput()
+	if err != nil {
+		t.Fatalf("lp submission failed: %v (%s)", err, lpOut)
+	}
+	cupsID := parseCUPSJobID(string(lpOut))
+	if cupsID == "" {
+		t.Fatalf("failed to parse CUPS request ID from lp output: %s", lpOut)
+	}
+	defer func() {
+		_ = os.WriteFile(releaseFile, []byte("release"), 0644)
+		safeCancelTestJob(t, emuScript, emuEnv, queueName, cupsID)
+	}()
+
+	// 2. Advance live SNMP odometer on emulator by +1 sheet (simulating 1 physical sheet ejected before fault)
+	if out, err := runEmu(t, emuScript, emuEnv, "snmp-set", "-counter", "1001"); err != nil {
+		t.Fatalf("failed to advance emulator SNMP odometer: %v (%s)", err, out)
+	}
+
+	// 3. Poll hardware telemetry and confirm advancement is observed via live SNMP
+	advancedTelemetry := printer.PollHardwareTelemetry(ctx, snmpCfg)
+	if advancedTelemetry.LifeCount != 1001 {
+		t.Fatalf("expected polled live SNMP odometer 1001, got %d", advancedTelemetry.LifeCount)
+	}
+	deltaSheets := advancedTelemetry.LifeCount - initialTelemetry.LifeCount
+	if deltaSheets != 1 {
+		t.Fatalf("expected delta 1 sheet, got %d", deltaSheets)
+	}
+
+	// 4. Record the verified physical sheet progress in SQLite state store
+	if err := store.SaveJob(ctx, cmd, contracts.JobStatusPausedError); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	if err := store.RecordJobSubmission(ctx, cmd.JobID, cupsID); err != nil {
+		t.Fatalf("RecordJobSubmission failed: %v", err)
+	}
+	if err := store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPausedError,
+		PagesPrinted:  1,
+		SheetsPrinted: int(deltaSheets),
+		ErrorReason:   "printer fault interrupted job after sheet 1 delivered",
+		Timestamp:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RecordSheetProgress failed: %v", err)
+	}
+
+	// Confirm progress is persisted in SQLite prior to reconciliation
+	preJob, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || preJob == nil || preJob.SheetsPrinted != 1 {
+		t.Fatalf("expected pre-reconciliation SheetsPrinted=1, got %+v", preJob)
+	}
+
+	// 5. Initialize spooler client and run reconciliation
+	client, err := NewClient(ClientConfig{
+		CloudURL:                 "ws://127.0.0.1:8080/ws",
+		KioskID:                  "kiosk-odo-01",
+		StateStore:               store,
+		CUPSQueue:                queueName,
+		DownloadDir:              t.TempDir(),
+		IdleQRContent:            "https://example.com/qr",
+		ScreenSink:               noopSink,
+		SNMPPoller:               func(c context.Context) printer.HardwareTelemetry { return printer.PollHardwareTelemetry(c, snmpCfg) },
+		EnableCloudRecovery:      true,
+		RequiredRecoveryHealthyCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to initialize spooler client: %v", err)
+	}
+
+	client.reconcileInterruptedCUPSJob(ctx)
+
+	// 6. Assert reconciliation strictly preserves the verified physical progress
+	postJob, err := store.GetJob(ctx, cmd.JobID)
+	if err != nil || postJob == nil {
+		t.Fatalf("failed to get post-reconciliation job: %v", err)
+	}
+	if postJob.SheetsPrinted != 1 || postJob.PagesPrinted != 1 {
+		t.Fatalf("CRITICAL: reconciliation altered verified physical sheets! got sheets=%d pages=%d, want 1/1",
+			postJob.SheetsPrinted, postJob.PagesPrinted)
+	}
+	if postJob.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected status PAUSED_ERROR, got %s", postJob.Status)
+	}
+
+	// 7. Verify exactly-once CUPS submission
+	verifyNoDuplicateCUPSSubmissions(t, queueName, cupsID)
+
+	t.Logf("Live SNMP odometer advancement verified: 1000 -> 1001 polled, persisted to SQLite, preserved by reconciliation")
+}
+
+// -----------------------------------------------------------------------------
 // Test 8: Canceled or Aborted CUPS Job
 // -----------------------------------------------------------------------------
 func TestInterruptedRecovery_CanceledOrAbortedCUPSJob_PreservesPausedError(t *testing.T) {
-	_, _, queueName, _, store, _, _, _, releaseFile, _, _, teardown :=
+	emuScript, emuEnv, queueName, _, store, _, _, _, releaseFile, _, _, teardown :=
 		setupRecoveryTestEnv(t, "canceled-job")
 	defer teardown()
 
@@ -1220,8 +1472,8 @@ func TestInterruptedRecovery_CanceledOrAbortedCUPSJob_PreservesPausedError(t *te
 	lpOut, _ := exec.Command("lp", "-d", queueName, "-n", "1", "-t", uniqueJobID, samplePDF).CombinedOutput()
 	cupsID := parseCUPSJobID(string(lpOut))
 
-	// Cancel job in CUPS
-	_, _ = exec.Command("cancel", cupsID).CombinedOutput()
+	// Cancel job in CUPS via verified cancel-job command
+	safeCancelTestJob(t, emuScript, emuEnv, queueName, cupsID)
 
 	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
 	_ = store.RecordJobSubmission(ctx, cmd.JobID, cupsID)

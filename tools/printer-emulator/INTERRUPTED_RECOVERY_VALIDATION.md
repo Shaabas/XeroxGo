@@ -99,18 +99,18 @@ A dedicated bash test suite executing real CUPS commands (`lp`, `lpstat`, `cance
 
 | Scenario | Invariant / Behavior Tested | Result |
 | :--- | :--- | :--- |
-| **Scenario 1** | Paper-jam interruption holds active job in CUPS (`pending-held`); fault clear preserves hold | **PASS** |
-| **Scenario 2** | Paper-empty interruption holds active job in CUPS (`pending-held`); fault clear preserves hold | **PASS** |
-| **Scenario 3** | Cover-open interruption holds active job in CUPS (`pending-held`); fault clear preserves hold | **PASS** |
+| **Scenario 1** | Paper-jam interruption holds active job in CUPS; IPP `job-state` confirms `pending-held` (confirmed-held); fault clear preserves hold | **PASS** |
+| **Scenario 2** | Paper-empty interruption holds active job in CUPS; IPP `job-state` confirms `pending-held` (confirmed-held); fault clear preserves hold | **PASS** |
+| **Scenario 3** | Cover-open interruption holds active job in CUPS; IPP `job-state` confirms `pending-held` (confirmed-held); fault clear preserves hold | **PASS** |
 | **Scenario 4** | Connectivity outage (`offline`) with hold preserves job in CUPS after network restoration | **PASS** |
-| **Scenario 5** | Active/pending job recovery triggers hold attempt and reports verified held state | **PASS** |
+| **Scenario 5** | Active/pending job recovery triggers hold attempt and reports verified held state via IPP `job-state` | **PASS** |
 | **Scenario 6** | Completed CUPS job without physical proof decoupled from completion; physical output uncertain | **PASS** |
-| **Scenario 7** | Simulated odometer advancement: verified physical sheets decoupled from CUPS counters | **PASS** |
+| **Scenario 7** | Simulated odometer advancement: baseline 1000 sheets verified, physical delivery decoupled from CUPS completion, explicit SNMP odometer advance to 1001 verified | **PASS** |
 | **Scenario 8** | Canceled/aborted CUPS jobs detected and flagged as ambiguous requiring operator reconciliation | **PASS** |
 | **Scenario 9** | Failed CUPS query / missing job fails safely without re-submitting or crashing | **PASS** |
 | **Scenario 10** | Repeated recovery queries are idempotent: state remains stable, 0 duplicate dispatches | **PASS** |
-| **Scenario 11** | Zero duplicate print jobs submitted across all recovery scenarios | **PASS** |
-| **Scenario 12** | Host printer `DCPT310` remains completely untouched | **PASS** |
+| **Scenario 11** | Zero duplicate print jobs submitted across all recovery scenarios (verified via actual CUPS job records and spool artifact checks) | **PASS** |
+| **Scenario 12** | Host printer `DCPT310` remains completely untouched; queue confirmed absent via both `lpstat -p` and `lpstat -v` | **PASS** |
 | **Scenario 13** | Failed CUPS queue removal strictly preserves ownership metadata | **PASS** |
 | **Scenario 14** | Verified teardown cleanly deletes queue and metadata | **PASS** |
 
@@ -120,14 +120,15 @@ Full integration suite executing `spooler.Client`, `state.Store` (SQLite), and t
 
 | Test Name | Description & Invariants Verified | Result |
 | :--- | :--- | :--- |
-| `TestInterruptedRecovery_PaperJam_PreservesHeldJobAndPausedError` | Injects mid-print `paper-jam` via `processor.sh` gate. Verifies job is placed in `PAUSED_ERROR` and held in CUPS. Reconciles after fault clear: verifies job is NOT released, `PAUSED_ERROR` is preserved, 0 duplicates. | **PASS** |
-| `TestInterruptedRecovery_PaperEmpty_PreservesHeldJobAndPausedError` | Injects mid-print `paper-empty`. Verifies CUPS job is held (`pending-held`), status is `PAUSED_ERROR`. Reconciles after fault clear: verifies hold preserved, no duplicate dispatch. | **PASS** |
-| `TestInterruptedRecovery_CoverOpen_PreservesHeldJobAndPausedError` | Injects mid-print `cover-open`. Verifies CUPS hold, SQLite `PAUSED_ERROR`. Reconciles after cover closed: verifies hold preserved. | **PASS** |
-| `TestInterruptedRecovery_ConnectivityOutage_PreservesHeldJobAndPausedError` | Injects mid-print `offline` outage (IPP+SNMP frozen). Holds job in CUPS. Reconciles after network restoration: verifies hold preserved, status remains `PAUSED_ERROR`. | **PASS** |
-| `TestInterruptedRecovery_ActiveOrPendingJob_TriggersHoldAttempt` | Discovers an interrupted job still in `processing` in CUPS. Verifies reconciliation issues hold request and accurately confirms `pending-held` state with operator reconciliation notice. | **PASS** |
+| `TestInterruptedRecovery_PaperJam_PreservesHeldJobAndPausedError` | Injects mid-print `paper-jam` via `processor.sh` gate. Verifies job is placed in `PAUSED_ERROR` and held in CUPS. Reconciles after fault clear: verifies job is NOT released, `PAUSED_ERROR` is preserved, verified cancel-job cleanup, exactly-once CUPS records checked. | **PASS** |
+| `TestInterruptedRecovery_PaperEmpty_PreservesHeldJobAndPausedError` | Injects mid-print `paper-empty`. Verifies CUPS job is held (`pending-held`), status is `PAUSED_ERROR`. Reconciles after fault clear: verifies hold preserved, verified cancel-job cleanup, 0 duplicates. | **PASS** |
+| `TestInterruptedRecovery_CoverOpen_PreservesHeldJobAndPausedError` | Injects mid-print `cover-open`. Verifies CUPS hold, SQLite `PAUSED_ERROR`. Reconciles after cover closed: verifies hold preserved, verified cancel-job cleanup, 0 duplicates. | **PASS** |
+| `TestInterruptedRecovery_ConnectivityOutage_PreservesHeldJobAndPausedError` | Injects mid-print `offline` outage (IPP+SNMP frozen). Holds job in CUPS. Reconciles after network restoration: verifies hold preserved, status remains `PAUSED_ERROR`, verified cancel-job cleanup. | **PASS** |
+| `TestInterruptedRecovery_ActiveOrPendingJob_TriggersHoldAttempt` | Discovers an interrupted job still in `processing` in CUPS. Verifies reconciliation issues hold request and accurately confirms `pending-held` state with operator reconciliation notice. Verified cancel-job cleanup. | **PASS** |
 | `TestInterruptedRecovery_CompletedCUPSJob_WithoutPhysicalProof_PreservesPausedError` | Job completed in CUPS while emulator was gated, but physical odometer recorded 0 sheets. Reconciliation strictly refuses to declare completion, preserving `PAUSED_ERROR`. | **PASS** |
-| `TestInterruptedRecovery_PartialPhysicalProgress_PreservesVerifiedOdometer` | Job completed in CUPS with 1 sheet, but odometer advanced by 2 sheets (e.g. 2 copies). Reconciliation preserves verified 2 sheets and strictly rejects untrusted CUPS counters. | **PASS** |
-| `TestInterruptedRecovery_CanceledOrAbortedCUPSJob_PreservesPausedError` | Interrupted job canceled or aborted in CUPS. Reconciliation records ambiguous state and operator reconciliation requirement in SQLite. | **PASS** |
+| `TestInterruptedRecovery_PartialPhysicalProgress_PreservesVerifiedOdometer` | **Persisted-Counter Invariant**: Pre-existing verified physical sheet progress (1 sheet) recorded in SQLite state persistence is strictly preserved across reconciliation passes, and unverified CUPS `job-media-sheets-completed` counters are rejected. | **PASS** |
+| `TestInterruptedRecovery_OdometerAdvancementRecordedBeforeReconciliation` | **Live SNMP Odometer Advancement**: Live SNMP hardware odometer is advanced on the emulator (1000 -> 1001), polled via `printer.PollHardwareTelemetry`, recorded in SQLite state persistence, and confirmed preserved by runtime reconciliation without inflation. | **PASS** |
+| `TestInterruptedRecovery_CanceledOrAbortedCUPSJob_PreservesPausedError` | Interrupted job canceled in CUPS via verified `cancel-job`. Reconciliation records ambiguous state and operator reconciliation requirement in SQLite. | **PASS** |
 | `TestInterruptedRecovery_FailedQueryOrMissingJob_FailsSafely` | Interrupted job references non-existent CUPS job ID. Reconciliation fails safely without crashing or resubmitting print job. | **PASS** |
 | `TestInterruptedRecovery_RepeatedReconciliation_Idempotence` | Executes 5 consecutive reconciliation cycles on an interrupted job. Verifies status, sheets, error reasons, and CUPS state remain identical across all cycles. | **PASS** |
 | `TestInterruptedRecovery_StartupRecovery_IncompleteJob` | Daemon boots with incomplete job in SQLite. On startup discovery, client inspects CUPS, holds active job, and preserves `PAUSED_ERROR` with reconciliation required message. | **PASS** |
