@@ -215,7 +215,9 @@ func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPrici
 // Existing API clients may omit this field for backwards compatibility.
 func verifyAcceptedPrice(w http.ResponseWriter, r *http.Request, actual int64) bool {
 	raw := strings.TrimSpace(r.FormValue("accepted_total_price_paise"))
-	if raw == "" { return true }
+	if raw == "" {
+		return true
+	}
 	agreed, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || agreed <= 0 {
 		http.Error(w, "invalid accepted price", http.StatusBadRequest)
@@ -1409,7 +1411,9 @@ func main() {
 	}
 
 	pricingPolicy := pricing.DuplexPricingPolicy(strings.TrimSpace(os.Getenv("XEROXGO_PRICING_POLICY")))
-	if pricingPolicy == "" { pricingPolicy = pricing.PricingPerSide }
+	if pricingPolicy == "" {
+		pricingPolicy = pricing.PricingPerSide
+	}
 	if pricingPolicy != pricing.PricingPerSide && pricingPolicy != pricing.PricingPerSheet {
 		log.Fatalf("invalid XEROXGO_PRICING_POLICY %q: expected per-side or bibin-sheet", pricingPolicy)
 	}
