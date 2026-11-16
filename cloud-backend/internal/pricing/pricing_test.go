@@ -274,6 +274,7 @@ func TestDefaultTariff(t *testing.T) {
   }{
    if _,err:=QuoteDocument(tc.sides,tc.copies,tc.mode,contracts.DuplexLongEdge,tariff,true,0,tc.policy);err==nil {t.Fatalf("accepted invalid %+v",tc)}
   }
-  if _,err:=QuoteDocument(int(^uint(0)>>1),2,"BW",contracts.DuplexSimplex,tariff,true,0,PricingPerSheet);err==nil {t.Fatal("overflow accepted")}
+  bigTariff:=TariffConfig{BWSimplexPricePaise:MaxInt64,BWDuplexPricePaise:500}
+  if _,err:=QuoteDocument(2,1,"BW",contracts.DuplexSimplex,bigTariff,true,0,PricingPerSheet);err==nil {t.Fatal("overflow accepted")}
   if _,err:=QuoteDocument(3,1,"BW",contracts.DuplexLongEdge,tariff,false,0,PricingPerSheet);err==nil {t.Fatal("sheet mode without explicit tariffs accepted")}
  }
