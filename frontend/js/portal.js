@@ -522,7 +522,6 @@
       } else {
         // ready
         readyCount++;
-        const hasAuthPrice = (typeof item.authoritativePricePaise === 'number' && !isNaN(item.authoritativePricePaise));
         const itemPrice = getQuotedPrice(item, item.settings);
         item.pricePaise = itemPrice;
         if (itemPrice !== null) totalCartPaise += itemPrice;
@@ -2012,6 +2011,10 @@
       const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
 
       if (!resp.ok) {
+        if (resp.status === 409) {
+          await Promise.all(readyItems.map(requestDocumentQuote));
+          throw new Error('Pricing changed. Please review the updated total and press Place Order again.');
+        }
         const errText = await resp.text();
         throw new Error(errText || 'Failed to submit order to kiosk');
       }
