@@ -697,7 +697,29 @@ func (c *Client) Run(ctx context.Context) error {
 				if inc.PagesPrinted > 0 || inc.SheetsPrinted > 0 {
 					reason = "interrupted by daemon restart; physical output uncertain, reconciliation required"
 				}
-				log.Printf("[SPOOLER] Startup recovery: job %s potentially submitted; pausing in PAUSED_ERROR (%s)", inc.Command.JobID, reason)
+
+				if strings.TrimSpace(c.cfg.CUPSQueue) != "" && inc.SubmittedToPrinter && inc.CUPSJobID == "" {
+					candMatch, enumErr := printer.FindUnlinkedJobCandidates(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, inc.Command.JobID)
+					if enumErr != nil {
+						reason = fmt.Sprintf("interrupted during printer submission; error querying CUPS queue jobs (%v); physical output uncertain, manual reconciliation required", enumErr)
+						if inc.ErrorReason != "" && !strings.Contains(reason, inc.ErrorReason) {
+							reason = fmt.Sprintf("%s; %s", inc.ErrorReason, reason)
+						}
+						log.Printf("[SPOOLER] Startup recovery: job %s unlinked submission enumeration failed: %s", inc.Command.JobID, reason)
+					} else {
+						reason = fmt.Sprintf("interrupted during printer submission; %s", candMatch.DiagnosticMsg)
+						if inc.ErrorReason != "" && !strings.Contains(reason, inc.ErrorReason) {
+							reason = fmt.Sprintf("%s; %s", inc.ErrorReason, reason)
+						}
+						log.Printf("[SPOOLER] Startup recovery: job %s unlinked submission discovery result (%s): %s", inc.Command.JobID, candMatch.MatchingState, reason)
+					}
+				} else {
+					if inc.ErrorReason != "" && !strings.Contains(reason, inc.ErrorReason) {
+						reason = fmt.Sprintf("%s; %s", inc.ErrorReason, reason)
+					}
+					log.Printf("[SPOOLER] Startup recovery: job %s potentially submitted; pausing in PAUSED_ERROR (%s)", inc.Command.JobID, reason)
+				}
+
 				evt := contracts.JobProgressEvent{
 					JobID:         inc.Command.JobID,
 					KioskID:       inc.Command.KioskID,
@@ -708,6 +730,7 @@ func (c *Client) Run(ctx context.Context) error {
 					Timestamp:     time.Now().UTC(),
 				}
 				_ = c.persistAndSendRecoveryProgress(ctx, evt, "ambiguous unlinked submission")
+				c.SetRecoveryBarrier(true, reason)
 				hasUnresolved = true
 			}
 		}

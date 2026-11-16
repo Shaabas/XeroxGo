@@ -31,6 +31,10 @@ var (
 	ippJobStateReasonsRegex = regexp.MustCompile(`(?m)^\s*job-state-reasons\s*\([^\)]+\)\s*=\s*([^\r\n]+)`)
 	ippSheetsCompletedRegex = regexp.MustCompile(`(?m)^\s*job-media-sheets-completed\s*\([^\)]+\)\s*=\s*([0-9]+)`)
 	ippStatusCodeRegex      = regexp.MustCompile(`(?m)^\s*status-code\s*=\s*([a-zA-Z0-9_\-]+)`)
+	ippJobNameRegex         = regexp.MustCompile(`(?m)^\s*job-name\s*\([^\)]+\)\s*=\s*([^\r\n]+)`)
+	ippJobUserRegex         = regexp.MustCompile(`(?m)^\s*job-originating-user-name\s*\([^\)]+\)\s*=\s*([^\r\n]+)`)
+	ippJobIDRegex           = regexp.MustCompile(`(?m)^\s*job-id\s*\([^\)]+\)\s*=\s*([0-9]+)`)
+	ippJobURIRegex          = regexp.MustCompile(`(?m)^\s*job-uri\s*\([^\)]+\)\s*=\s*([^\r\n]+)`)
 )
 
 // CUPSJobState represents the authoritative normalized state of a CUPS/IPP print job.
@@ -53,6 +57,28 @@ type CUPSJobInfo struct {
 	Reasons         []string
 	SheetsCompleted int
 	RawStatus       string
+	JobName         string
+	User            string
+}
+
+// CUPSQueueJob represents an active or queued job enumerated from CUPS.
+type CUPSQueueJob struct {
+	ID              string
+	JobNumber       int
+	Name            string
+	State           CUPSJobState
+	User            string
+	SheetsCompleted int
+	Reasons         []string
+	RawStatus       string
+}
+
+// UnlinkedCandidateMatch holds diagnostic discovery findings for an unlinked SQLite job.
+type UnlinkedCandidateMatch struct {
+	CandidateCount int
+	Candidates     []CUPSQueueJob
+	MatchingState  string // "zero_matches", "single_match", "multiple_matches", "history_match", "enumeration_error"
+	DiagnosticMsg  string
 }
 
 // QueryCUPSJobInfo queries the authoritative state of a CUPS job.
@@ -182,32 +208,34 @@ func extractJobNumber(cupsJobID string) string {
 	return ""
 }
 
+func parseIPPStateStr(rawState string) CUPSJobState {
+	switch strings.ToLower(strings.TrimSpace(rawState)) {
+	case "pending":
+		return CUPSJobStatePending
+	case "pending-held", "held":
+		return CUPSJobStateHeld
+	case "processing":
+		return CUPSJobStateProcessing
+	case "processing-stopped":
+		return CUPSJobStateProcessingStopped
+	case "completed":
+		return CUPSJobStateCompleted
+	case "canceled", "cancelled":
+		return CUPSJobStateCanceled
+	case "aborted":
+		return CUPSJobStateAborted
+	default:
+		return CUPSJobStateUnknown
+	}
+}
+
 func parseIPPJobInfo(out []byte) (CUPSJobInfo, bool) {
 	m := ippJobStateRegex.FindSubmatch(out)
 	if len(m) < 2 {
 		return CUPSJobInfo{}, false
 	}
 
-	rawState := strings.ToLower(strings.TrimSpace(string(m[1])))
-	var state CUPSJobState
-	switch rawState {
-	case "pending":
-		state = CUPSJobStatePending
-	case "pending-held", "held":
-		state = CUPSJobStateHeld
-	case "processing":
-		state = CUPSJobStateProcessing
-	case "processing-stopped":
-		state = CUPSJobStateProcessingStopped
-	case "completed":
-		state = CUPSJobStateCompleted
-	case "canceled", "cancelled":
-		state = CUPSJobStateCanceled
-	case "aborted":
-		state = CUPSJobStateAborted
-	default:
-		state = CUPSJobStateUnknown
-	}
+	state := parseIPPStateStr(string(m[1]))
 
 	var reasons []string
 	if rm := ippJobStateReasonsRegex.FindSubmatch(out); len(rm) > 1 {
@@ -224,11 +252,23 @@ func parseIPPJobInfo(out []byte) (CUPSJobInfo, bool) {
 		sheets, _ = strconv.Atoi(string(sm[1]))
 	}
 
+	var jobName string
+	if nm := ippJobNameRegex.FindSubmatch(out); len(nm) > 1 {
+		jobName = strings.TrimSpace(string(nm[1]))
+	}
+
+	var user string
+	if um := ippJobUserRegex.FindSubmatch(out); len(um) > 1 {
+		user = strings.TrimSpace(string(um[1]))
+	}
+
 	return CUPSJobInfo{
 		State:           state,
 		Reasons:         reasons,
 		SheetsCompleted: sheets,
 		RawStatus:       string(out),
+		JobName:         jobName,
+		User:            user,
 	}, true
 }
 
@@ -246,11 +286,13 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 	// A. Check active (not-completed) queue
 	activeOut, activeErr := runner(ctx, "lpstat", "-W", "not-completed", "-o", queue)
 	if activeErr == nil && strings.Contains(string(activeOut), cupsJobID) {
+		activeUser := extractUserFromLPStat(string(activeOut), cupsJobID)
 		if strings.Contains(strings.ToLower(string(activeOut)), "held") {
 			return CUPSJobInfo{
 				State:     CUPSJobStateHeld,
 				Reasons:   []string{"job-held"},
 				RawStatus: strings.TrimSpace(string(activeOut)),
+				User:      activeUser,
 			}, nil
 		}
 		// Job is active in CUPS queue. Check if printer queue is stopped or actively printing.
@@ -263,6 +305,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 						State:     CUPSJobStateAborted,
 						Reasons:   []string{strings.TrimSpace(string(pOut))},
 						RawStatus: strings.TrimSpace(string(pOut)),
+						User:      activeUser,
 					}, nil
 				}
 				reason := "printer-stopped"
@@ -279,12 +322,14 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 					State:     CUPSJobStateProcessingStopped,
 					Reasons:   []string{reason},
 					RawStatus: strings.TrimSpace(string(pOut)),
+					User:      activeUser,
 				}, nil
 			}
 			if strings.Contains(pRaw, "now printing") {
 				return CUPSJobInfo{
 					State:     CUPSJobStateProcessing,
 					RawStatus: strings.TrimSpace(string(pOut)),
+					User:      activeUser,
 				}, nil
 			}
 		}
@@ -292,6 +337,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 		return CUPSJobInfo{
 			State:     CUPSJobStatePending,
 			RawStatus: "queued in not-completed",
+			User:      activeUser,
 		}, nil
 	}
 
@@ -302,6 +348,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 	}
 
 	if compErr == nil && strings.Contains(string(compOut), cupsJobID) {
+		compUser := extractUserFromLPStat(string(compOut), cupsJobID)
 		jobBlock := extractJobBlock(string(compOut), cupsJobID)
 		lower := strings.ToLower(jobBlock)
 		if strings.Contains(lower, "job-completed-successfully") {
@@ -309,6 +356,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 				State:     CUPSJobStateCompleted,
 				Reasons:   []string{"job-completed-successfully"},
 				RawStatus: strings.TrimSpace(jobBlock),
+				User:      compUser,
 			}, nil
 		}
 		if strings.Contains(lower, "job-canceled") || strings.Contains(lower, "canceled") || strings.Contains(lower, "cancelled") {
@@ -316,6 +364,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 				State:     CUPSJobStateCanceled,
 				Reasons:   []string{"job-canceled"},
 				RawStatus: strings.TrimSpace(jobBlock),
+				User:      compUser,
 			}, nil
 		}
 		if strings.Contains(lower, "aborted") || strings.Contains(lower, "filter failed") || strings.Contains(lower, "filter-failed") {
@@ -323,6 +372,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 				State:     CUPSJobStateAborted,
 				Reasons:   []string{"job-aborted"},
 				RawStatus: strings.TrimSpace(jobBlock),
+				User:      compUser,
 			}, nil
 		}
 
@@ -333,6 +383,7 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 				State:     CUPSJobStateCompleted,
 				Reasons:   []string{"job-completed-successfully"},
 				RawStatus: strings.TrimSpace(jobBlock),
+				User:      compUser,
 			}, nil
 		}
 
@@ -341,16 +392,19 @@ func queryLPStatJobInfo(ctx context.Context, runner CommandRunner, queue string,
 			State:     CUPSJobStateCanceled,
 			Reasons:   []string{"job ended without completion confirmation"},
 			RawStatus: strings.TrimSpace(jobBlock),
+			User:      compUser,
 		}, nil
 	}
 
 	// Check if job appears in lpstat -W successful directly
 	succOut, succErr := runner(ctx, "lpstat", "-W", "successful", "-o", queue)
 	if succErr == nil && strings.Contains(string(succOut), cupsJobID) {
+		succUser := extractUserFromLPStat(string(succOut), cupsJobID)
 		return CUPSJobInfo{
 			State:     CUPSJobStateCompleted,
 			Reasons:   []string{"job-completed-successfully"},
 			RawStatus: strings.TrimSpace(string(succOut)),
+			User:      succUser,
 		}, nil
 	}
 
@@ -391,6 +445,372 @@ func extractJobBlock(output, jobID string) string {
 		}
 	}
 	return strings.Join(block, "\n")
+}
+
+func extractUserFromLPStat(output, jobID string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, jobID) {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				return parts[1]
+			}
+		}
+	}
+	return ""
+}
+
+func parseIPPGetJobs(queue string, out []byte) ([]CUPSQueueJob, bool) {
+	if len(out) == 0 {
+		return nil, false
+	}
+	sm := ippStatusCodeRegex.FindSubmatch(out)
+	if len(sm) < 2 {
+		return nil, false
+	}
+	statusCode := strings.ToLower(strings.TrimSpace(string(sm[1])))
+	if statusCode != "successful-ok" {
+		return nil, false
+	}
+
+	lines := strings.Split(string(out), "\n")
+	var jobs []CUPSQueueJob
+	var cur *CUPSQueueJob
+	var curRaw []string
+
+	flush := func() {
+		if cur != nil && (cur.ID != "" || cur.JobNumber > 0) {
+			if cur.ID == "" && cur.JobNumber > 0 {
+				cur.ID = fmt.Sprintf("%s-%d", queue, cur.JobNumber)
+			}
+			cur.RawStatus = strings.Join(curRaw, "\n")
+			jobs = append(jobs, *cur)
+		}
+		cur = nil
+		curRaw = nil
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		isJobDelim := strings.HasPrefix(trimmed, "-- separator --") ||
+			strings.HasPrefix(trimmed, "job-uri (") ||
+			strings.HasPrefix(trimmed, "job-id (")
+
+		if isJobDelim && cur != nil && (cur.ID != "" || cur.JobNumber > 0) {
+			flush()
+		}
+
+		if cur == nil && (strings.HasPrefix(trimmed, "job-uri (") || strings.HasPrefix(trimmed, "job-id (")) {
+			cur = &CUPSQueueJob{State: CUPSJobStateUnknown}
+		}
+
+		if cur == nil {
+			continue
+		}
+
+		curRaw = append(curRaw, line)
+
+		if jm := ippJobIDRegex.FindStringSubmatch(line); len(jm) > 1 {
+			if num, err := strconv.Atoi(jm[1]); err == nil && num > 0 {
+				cur.JobNumber = num
+				cur.ID = fmt.Sprintf("%s-%d", queue, num)
+			}
+		} else if um := ippJobURIRegex.FindStringSubmatch(line); len(um) > 1 {
+			numStr := extractJobNumber(um[1])
+			if num, err := strconv.Atoi(numStr); err == nil && num > 0 && cur.JobNumber == 0 {
+				cur.JobNumber = num
+				cur.ID = fmt.Sprintf("%s-%d", queue, num)
+			}
+		}
+
+		if nm := ippJobNameRegex.FindStringSubmatch(line); len(nm) > 1 {
+			cur.Name = strings.TrimSpace(nm[1])
+		}
+
+		if usrM := ippJobUserRegex.FindStringSubmatch(line); len(usrM) > 1 {
+			cur.User = strings.TrimSpace(usrM[1])
+		}
+
+		if stm := ippJobStateRegex.FindStringSubmatch(line); len(stm) > 1 {
+			cur.State = parseIPPStateStr(stm[1])
+		}
+
+		if sm := ippSheetsCompletedRegex.FindStringSubmatch(line); len(sm) > 1 {
+			if s, err := strconv.Atoi(sm[1]); err == nil {
+				cur.SheetsCompleted = s
+			}
+		}
+
+		if rm := ippJobStateReasonsRegex.FindStringSubmatch(line); len(rm) > 1 {
+			for _, r := range strings.Split(rm[1], ",") {
+				r = strings.TrimSpace(r)
+				if r != "" && r != "none" {
+					cur.Reasons = append(cur.Reasons, r)
+				}
+			}
+		}
+	}
+	flush()
+
+	return jobs, true
+}
+
+func parseLPQJobTitle(output string, jobNumStr string) string {
+	if jobNumStr == "" || output == "" {
+		return ""
+	}
+	targetJobHeader := fmt.Sprintf("[job %s ", jobNumStr)
+	lines := strings.Split(output, "\n")
+	foundJob := false
+	for _, line := range lines {
+		if strings.Contains(line, targetJobHeader) {
+			foundJob = true
+			continue
+		}
+		if foundJob {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "    ") {
+				parts := strings.Fields(trimmed)
+				if len(parts) >= 3 && parts[len(parts)-1] == "bytes" {
+					return strings.Join(parts[:len(parts)-2], " ")
+				}
+				return parts[0]
+			}
+			break
+		}
+	}
+	return ""
+}
+
+// EnumerateCUPSQueueJobs queries CUPS jobs on the given queue for the specified job filter ("not-completed", "completed", "all").
+// It prefers authoritative IPP Get-Jobs via ipptool, falling back to lpstat and individual job inspection.
+func EnumerateCUPSQueueJobs(ctx context.Context, runner CommandRunner, queue string, whichJobs string) ([]CUPSQueueJob, error) {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(queue) == "" {
+		return nil, errors.New("queue cannot be empty")
+	}
+
+	filter := strings.ToLower(strings.TrimSpace(whichJobs))
+	if filter == "" {
+		filter = "not-completed"
+	}
+
+	// 1. Preferred: Query via IPP Get-Jobs (ipptool)
+	testFile := "get-jobs.test"
+	if filter == "completed" {
+		testFile = "get-completed-jobs.test"
+	}
+
+	ippURI := fmt.Sprintf("ipp://localhost:631/printers/%s", queue)
+	var ippArgs []string
+	if filter == "all" {
+		ippArgs = []string{"-tv", "-d", "which-jobs=all", ippURI, "get-jobs.test"}
+	} else {
+		ippArgs = []string{"-tv", ippURI, testFile}
+	}
+
+	ippOut, ippErr := runner(ctx, "ipptool", ippArgs...)
+	if ippErr == nil {
+		jobs, ok := parseIPPGetJobs(queue, ippOut)
+		if ok {
+			return jobs, nil
+		}
+	}
+
+	// 2. Fallback: Query via lpstat
+	lpstatOut, lpstatErr := runner(ctx, "lpstat", "-W", filter, "-o", queue)
+	if lpstatErr != nil {
+		if ippErr != nil {
+			return nil, fmt.Errorf("failed to enumerate CUPS queue %s jobs via IPP (%v) and lpstat (%w)", queue, ippErr, lpstatErr)
+		}
+		return nil, fmt.Errorf("failed to enumerate CUPS queue %s jobs via lpstat: %w", queue, lpstatErr)
+	}
+
+	var jobs []CUPSQueueJob
+	lines := strings.Split(string(lpstatOut), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "Alerts:") || strings.HasPrefix(trimmed, "Status:") || strings.HasPrefix(trimmed, "queued for") {
+			continue
+		}
+		parts := strings.Fields(trimmed)
+		if len(parts) < 2 {
+			continue
+		}
+		jobID := parts[0]
+		user := parts[1]
+		jobNumStr := extractJobNumber(jobID)
+		if jobNumStr == "" {
+			continue
+		}
+		jobNum, _ := strconv.Atoi(jobNumStr)
+
+		info, _ := QueryCUPSJobInfo(ctx, runner, queue, jobID)
+		state := info.State
+		if state == CUPSJobStateUnknown {
+			if filter == "not-completed" {
+				state = CUPSJobStatePending
+			} else if filter == "completed" {
+				state = CUPSJobStateCompleted
+			}
+		}
+		userName := info.User
+		if userName == "" {
+			userName = user
+		}
+		jobName := info.JobName
+		if jobName == "" {
+			if lpqOut, lpqErr := runner(ctx, "lpq", "-P", queue, "-l"); lpqErr == nil {
+				jobName = parseLPQJobTitle(string(lpqOut), jobNumStr)
+			}
+		}
+
+		jobs = append(jobs, CUPSQueueJob{
+			ID:              jobID,
+			JobNumber:       jobNum,
+			Name:            jobName,
+			State:           state,
+			User:            userName,
+			SheetsCompleted: info.SheetsCompleted,
+			Reasons:         info.Reasons,
+			RawStatus:       info.RawStatus,
+		})
+	}
+
+	return jobs, nil
+}
+
+// EnumerateActiveCUPSJobs queries active/pending/processing jobs on the given queue.
+func EnumerateActiveCUPSJobs(ctx context.Context, runner CommandRunner, queue string) ([]CUPSQueueJob, error) {
+	return EnumerateCUPSQueueJobs(ctx, runner, queue, "not-completed")
+}
+
+// EnumerateCompletedCUPSJobs queries completed/purged jobs on the given queue.
+func EnumerateCompletedCUPSJobs(ctx context.Context, runner CommandRunner, queue string) ([]CUPSQueueJob, error) {
+	return EnumerateCUPSQueueJobs(ctx, runner, queue, "completed")
+}
+
+// FindUnlinkedJobCandidates safely inspects active CUPS queue jobs (and completed history if needed)
+// for jobs matching targetJobID. It treats matches as candidates only and never modifies any CUPS job.
+func FindUnlinkedJobCandidates(ctx context.Context, runner CommandRunner, queue string, targetJobID string) (UnlinkedCandidateMatch, error) {
+	if ctx == nil {
+		return UnlinkedCandidateMatch{MatchingState: "enumeration_error", DiagnosticMsg: "context cannot be nil"}, errors.New("context cannot be nil")
+	}
+	if strings.TrimSpace(queue) == "" {
+		return UnlinkedCandidateMatch{MatchingState: "enumeration_error", DiagnosticMsg: "queue name cannot be empty"}, errors.New("queue name cannot be empty")
+	}
+	if strings.TrimSpace(targetJobID) == "" {
+		return UnlinkedCandidateMatch{MatchingState: "enumeration_error", DiagnosticMsg: "target job ID cannot be empty"}, errors.New("target job ID cannot be empty")
+	}
+
+	// 1. Enumerate active jobs on queue
+	activeJobs, err := EnumerateActiveCUPSJobs(ctx, runner, queue)
+	if err != nil {
+		diag := fmt.Sprintf("error querying CUPS queue jobs (%v); physical output uncertain, manual reconciliation required", err)
+		return UnlinkedCandidateMatch{
+			MatchingState: "enumeration_error",
+			DiagnosticMsg: diag,
+		}, err
+	}
+
+	// 2. Filter active candidates by matching title (job-name)
+	var activeMatches []CUPSQueueJob
+	for _, aj := range activeJobs {
+		if aj.Name == targetJobID {
+			activeMatches = append(activeMatches, aj)
+		}
+	}
+
+	// Case 1: Exactly 1 active candidate match
+	if len(activeMatches) == 1 {
+		cand := activeMatches[0]
+		userStr := cand.User
+		if userStr == "" {
+			userStr = "unknown"
+		}
+		diag := fmt.Sprintf("detected 1 candidate active CUPS job (id=%s, state=%s, title=%s, user=%s); ownership unverified, physical output uncertain, manual reconciliation required",
+			cand.ID, cand.State, cand.Name, userStr)
+		return UnlinkedCandidateMatch{
+			CandidateCount: 1,
+			Candidates:     activeMatches,
+			MatchingState:  "single_match",
+			DiagnosticMsg:  diag,
+		}, nil
+	}
+
+	// Case 2: Multiple active candidate matches (title collision / duplicate)
+	if len(activeMatches) > 1 {
+		var details []string
+		for _, cand := range activeMatches {
+			userStr := cand.User
+			if userStr == "" {
+				userStr = "unknown"
+			}
+			details = append(details, fmt.Sprintf("id=%s, state=%s, title=%s, user=%s", cand.ID, cand.State, cand.Name, userStr))
+		}
+		diag := fmt.Sprintf("detected %d candidate active CUPS jobs (%s); title collision/duplicate detected, ownership unverified, physical output uncertain, manual reconciliation required",
+			len(activeMatches), strings.Join(details, "; "))
+		return UnlinkedCandidateMatch{
+			CandidateCount: len(activeMatches),
+			Candidates:     activeMatches,
+			MatchingState:  "multiple_matches",
+			DiagnosticMsg:  diag,
+		}, nil
+	}
+
+	// Case 3: 0 active matches. Check completed scheduler history for evidence.
+	compJobs, compErr := EnumerateCompletedCUPSJobs(ctx, runner, queue)
+	if compErr == nil {
+		var compMatches []CUPSQueueJob
+		for _, cj := range compJobs {
+			if cj.Name == targetJobID {
+				compMatches = append(compMatches, cj)
+			}
+		}
+		if len(compMatches) > 0 {
+			var details []string
+			for _, cand := range compMatches {
+				userStr := cand.User
+				if userStr == "" {
+					userStr = "unknown"
+				}
+				details = append(details, fmt.Sprintf("id=%s, state=%s, title=%s, user=%s", cand.ID, cand.State, cand.Name, userStr))
+			}
+			diag := fmt.Sprintf("0 active candidate CUPS jobs, but detected %d candidate completed CUPS job(s) in history (%s); ownership unverified without durable CUPS ID, physical proof insufficient, manual reconciliation required",
+				len(compMatches), strings.Join(details, "; "))
+			return UnlinkedCandidateMatch{
+				CandidateCount: len(compMatches),
+				Candidates:     compMatches,
+				MatchingState:  "history_match",
+				DiagnosticMsg:  diag,
+			}, nil
+		}
+	}
+
+	// 0 matches in both active queue and completed history (or history unavailable)
+	diag := fmt.Sprintf("0 candidate CUPS jobs detected on queue %q; physical output uncertain, manual reconciliation required", queue)
+	if len(activeJobs) > 0 {
+		diag = fmt.Sprintf("0 candidate CUPS jobs matching title detected among %d active queue jobs on queue %q; physical output uncertain, manual reconciliation required", len(activeJobs), queue)
+	}
+	if compErr != nil {
+		diag = fmt.Sprintf("%s (CUPS completed history unavailable: %v)", diag, compErr)
+	}
+	return UnlinkedCandidateMatch{
+		CandidateCount: 0,
+		Candidates:     nil,
+		MatchingState:  "zero_matches",
+		DiagnosticMsg:  diag,
+	}, nil
 }
 
 type cupsContextKey string
