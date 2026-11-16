@@ -1522,3 +1522,188 @@ func TestConnectivityFault_Negative_FailedQueueCleanupPreservesMetadata(t *testi
 		t.Fatalf("failed to restore original metadata: %v", err)
 	}
 }
+
+// TestConnectivityFault_Negative_MissingStartTimeEvidenceRejected (Requirements 3, 5, 6, 11) verifies that:
+// When paused process record is missing process start-time ticks, restoration fails closed
+// and preserves diagnostic file without signaling.
+func TestConnectivityFault_Negative_MissingStartTimeEvidenceRejected(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	ippPort := getFreePort(t, "tcp")
+	emuName := fmt.Sprintf("XeroxGoMissingST_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	queueName := fmt.Sprintf("XeroxGoMissingSTQ_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	pausedFile := filepath.Join(tempDir, "ipp_paused.flag")
+
+	emuEnv := append(os.Environ(),
+		fmt.Sprintf("EMU_PORT=%d", ippPort),
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_NAME=%s", emuName),
+		fmt.Sprintf("EMU_CUPS_QUEUE=%s", queueName),
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", filepath.Join(tempDir, "ipp.pid")),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_LOCK_DIR=%s", filepath.Join(tempDir, ".ipp_lock")),
+		fmt.Sprintf("EMU_FAULT_STATE_FILE=%s", filepath.Join(tempDir, "fault_state.json")),
+		fmt.Sprintf("EMU_IPP_PAUSED_FILE=%s", pausedFile),
+	)
+	_ = os.MkdirAll(filepath.Join(tempDir, "spool"), 0755)
+
+	if out, err := runEmu(t, emuScript, emuEnv, "start"); err != nil {
+		t.Fatalf("failed to start emulator: %v (%s)", err, out)
+	}
+	t.Cleanup(func() {
+		matches, _ := filepath.Glob(pausedFile + ".diag_*")
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+		_ = os.Remove(pausedFile)
+		_ = runEmuIgnoreErr(emuScript, emuEnv, "cleanup")
+	})
+
+	// Plant an entry with missing start-time ticks (field 3 empty)
+	missingSTEntry := fmt.Sprintf("ipp:%d::ippeveprinter\n", os.Getpid())
+	if err := os.WriteFile(pausedFile, []byte(missingSTEntry), 0644); err != nil {
+		t.Fatalf("failed to write paused file: %v", err)
+	}
+
+	// Attempt restoration: must fail closed because start-time evidence is missing
+	out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "ipp")
+	if err == nil {
+		t.Errorf("expected restoration to fail for missing start-time evidence, but succeeded (output: %s)", out)
+	}
+
+	// Verify diagnostic file was preserved
+	matches, _ := filepath.Glob(pausedFile + ".diag_*")
+	if len(matches) == 0 {
+		t.Errorf("expected diagnostic dump file matching %s.diag_* to be preserved, found none", pausedFile)
+	}
+}
+
+// TestConnectivityFault_Negative_FailedSignalDoesNotRecordPausedProcess (Requirements 7, 8, 11) verifies that:
+// When SIGSTOP fails (e.g. dead process or un-signalable PID), the process is NOT recorded
+// into the paused process file and failure is reported.
+func TestConnectivityFault_Negative_FailedSignalDoesNotRecordPausedProcess(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	deadPIDFile := filepath.Join(tempDir, "dead.pid")
+	if err := os.WriteFile(deadPIDFile, []byte("999999\n"), 0644); err != nil {
+		t.Fatalf("failed to write dead PID file: %v", err)
+	}
+	pausedFile := filepath.Join(tempDir, "ipp_paused.flag")
+	_ = os.Remove(pausedFile)
+
+	emuEnv := append(os.Environ(),
+		"EMU_PORT=39999",
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_PID_FILE=%s", deadPIDFile),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_FAULT_STATE_FILE=%s", filepath.Join(tempDir, "fault_state.json")),
+		fmt.Sprintf("EMU_IPP_PAUSED_FILE=%s", pausedFile),
+	)
+
+	// Attempt fault set offline on dead PID: must fail
+	out, err := runEmu(t, emuScript, emuEnv, "fault", "set", "offline", "--target", "ipp")
+	if err == nil {
+		t.Errorf("expected fault set offline to fail on dead PID, but succeeded (output: %s)", out)
+	}
+
+	// Verify paused file was NOT created or has 0 bytes
+	if info, statErr := os.Stat(pausedFile); statErr == nil && info.Size() > 0 {
+		t.Errorf("paused process file was written despite failed SIGSTOP (size=%d)", info.Size())
+	}
+}
+
+// TestConnectivityFault_Negative_UnrecordedPausedProcessRefused (Requirements 2, 4, 10, 11) verifies that:
+// 1. If an emulator process is paused in kernel via SIGSTOP without a recorded saved identity,
+//    restoration (fault set clear) strictly refuses to send SIGCONT to it.
+// 2. Stop/cleanup also refuses unverified restoration of unrecorded paused processes.
+func TestConnectivityFault_Negative_UnrecordedPausedProcessRefused(t *testing.T) {
+	checkCUPSAndIPPDependencies(t)
+
+	emuScript := findEmulatorScript(t)
+	tempDir := t.TempDir()
+
+	ippPort := getFreePort(t, "tcp")
+	emuName := fmt.Sprintf("XeroxGoUnrec_%d_%d", os.Getpid(), time.Now().UnixNano()%100000)
+	pidFile := filepath.Join(tempDir, "ipp.pid")
+	pausedFile := filepath.Join(tempDir, "ipp_paused.flag")
+	_ = os.Remove(pausedFile)
+
+	emuEnv := append(os.Environ(),
+		fmt.Sprintf("EMU_PORT=%d", ippPort),
+		"EMU_HOST=localhost",
+		fmt.Sprintf("EMU_NAME=%s", emuName),
+		fmt.Sprintf("EMU_SPOOL_DIR=%s", filepath.Join(tempDir, "spool")),
+		fmt.Sprintf("EMU_PID_FILE=%s", pidFile),
+		fmt.Sprintf("EMU_LOG_FILE=%s", filepath.Join(tempDir, "ipp.log")),
+		fmt.Sprintf("EMU_LOCK_DIR=%s", filepath.Join(tempDir, ".ipp_lock")),
+		fmt.Sprintf("EMU_FAULT_STATE_FILE=%s", filepath.Join(tempDir, "fault_state.json")),
+		fmt.Sprintf("EMU_IPP_PAUSED_FILE=%s", pausedFile),
+	)
+	_ = os.MkdirAll(filepath.Join(tempDir, "spool"), 0755)
+
+	if out, err := runEmu(t, emuScript, emuEnv, "start"); err != nil {
+		t.Fatalf("failed to start emulator: %v (%s)", err, out)
+	}
+
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("failed to read PID file: %v", err)
+	}
+	emuPID := strings.TrimSpace(string(pidBytes))
+
+	t.Cleanup(func() {
+		// Clean up any diagnostic files left behind
+		matches, _ := filepath.Glob(pausedFile + ".diag_*")
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+		_ = os.Remove(pausedFile)
+		// Safely resume and kill before running script cleanup
+		_, _ = exec.Command("kill", "-CONT", emuPID).CombinedOutput()
+		_, _ = exec.Command("kill", "-9", emuPID).CombinedOutput()
+		_ = runEmuIgnoreErr(emuScript, emuEnv, "cleanup")
+	})
+
+	// Directly pause the emulator in kernel WITHOUT recording it in pausedFile
+	if out, err := exec.Command("kill", "-STOP", emuPID).CombinedOutput(); err != nil {
+		t.Fatalf("failed to send SIGSTOP to emulator PID %s: %v (%s)", emuPID, err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify it is in stopped state 'T'
+	statusBytes, _ := os.ReadFile(fmt.Sprintf("/proc/%s/status", emuPID))
+	if !strings.Contains(string(statusBytes), "State:\tT") {
+		t.Fatalf("process %s is not in stopped state T: %s", emuPID, string(statusBytes))
+	}
+
+	// 1. Attempt restoration (fault set clear): must fail closed and refuse to send SIGCONT
+	clearOut, clearErr := runEmu(t, emuScript, emuEnv, "fault", "set", "clear", "--target", "ipp")
+	if clearErr == nil {
+		t.Errorf("expected fault set clear to fail on unrecorded paused process, but succeeded (output: %s)", clearOut)
+	}
+
+	// Verify process is STILL in stopped state 'T' (SIGCONT was refused)
+	statusBytesAfter, _ := os.ReadFile(fmt.Sprintf("/proc/%s/status", emuPID))
+	if !strings.Contains(string(statusBytesAfter), "State:\tT") {
+		t.Errorf("unrecorded process was resumed without authorization: %s", string(statusBytesAfter))
+	}
+
+	// 2. Attempt stop: must also fail closed and refuse unverified restoration
+	stopOut, stopErr := runEmu(t, emuScript, emuEnv, "stop")
+	if stopErr == nil {
+		t.Errorf("expected stop to fail on unrecorded paused process, but succeeded (output: %s)", stopOut)
+	}
+
+	// Verify diagnostic file was created
+	matches, _ := filepath.Glob(pausedFile + ".diag_*")
+	if len(matches) == 0 {
+		t.Errorf("expected diagnostic dump file matching %s.diag_* to be preserved, found none", pausedFile)
+	}
+}

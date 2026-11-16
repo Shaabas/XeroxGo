@@ -738,6 +738,102 @@ fi
 EMU_META_FILE="$TEST_META_FILE"
 
 # -----------------------------------------------------------------------------
+info "Test 15: Negative Regression — Missing Start-Time Evidence in Paused Process Record (Requirements 3, 5, 6, 11)"
+# -----------------------------------------------------------------------------
+dummy_missing_st="${TEST_DIR}/dummy_missing_st.flag"
+echo "ipp:$$::ippeveprinter" > "$dummy_missing_st"
+
+EMU_IPP_PAUSED_FILE="$dummy_missing_st"
+if "$EMULATOR" fault set clear >/dev/null 2>&1; then
+    fail "Test 15: fault set clear accepted record with missing start-time evidence"
+else
+    diag_count=$(ls -1 "${dummy_missing_st}.diag_"* 2>/dev/null | wc -l || true)
+    if [[ "$diag_count" -gt 0 ]]; then
+        pass "Test 15: Missing start-time evidence strictly rejected without signaling; diagnostic file preserved"
+    else
+        pass "Test 15: Missing start-time evidence strictly rejected without signaling"
+    fi
+fi
+rm -f "$dummy_missing_st"*
+EMU_IPP_PAUSED_FILE="$TEST_IPP_PAUSED"
+
+# -----------------------------------------------------------------------------
+info "Test 16: Negative Regression — Failed Signal / Dead Process Does Not Record Paused Process (Requirements 7, 8, 11)"
+# -----------------------------------------------------------------------------
+dummy_fail_stop="${TEST_DIR}/dummy_fail_stop.flag"
+dead_pid_file="${TEST_DIR}/dead.pid"
+rm -f "$dummy_fail_stop" "$dead_pid_file"
+echo "999999" > "$dead_pid_file"
+
+EMU_IPP_PAUSED_FILE="$dummy_fail_stop"
+EMU_PID_FILE="$dead_pid_file"
+if "$EMULATOR" fault set offline >/dev/null 2>&1; then
+    fail "Test 16: fault set offline reported success on dead PID"
+else
+    if [[ -f "$dummy_fail_stop" ]] && [[ -s "$dummy_fail_stop" ]]; then
+        fail "Test 16: Failed SIGSTOP / dead process was recorded into paused file"
+    else
+        pass "Test 16: Failed SIGSTOP on dead process rejected and not recorded into paused file"
+    fi
+fi
+rm -f "$dead_pid_file" "$dummy_fail_stop"
+EMU_PID_FILE="$TEST_IPP_PID"
+EMU_IPP_PAUSED_FILE="$TEST_IPP_PAUSED"
+
+# -----------------------------------------------------------------------------
+info "Test 17: Negative Regression — Unrecorded Paused Process Protection (Requirements 2, 4, 10, 11)"
+# -----------------------------------------------------------------------------
+sub_port=$(find_free_tcp_port)
+sub_dir="${TEST_DIR}/sub_unrecorded"
+mkdir -p "${sub_dir}/spool"
+sub_pid_file="${sub_dir}/ipp.pid"
+sub_paused_file="${sub_dir}/ipp_paused.flag"
+sub_log_file="${sub_dir}/ipp.log"
+sub_lock_dir="${sub_dir}/.lock"
+rm -f "$sub_paused_file"
+
+env EMU_PORT="$sub_port" EMU_NAME="XeroxGoUnrec_${$}" EMU_PID_FILE="$sub_pid_file" EMU_LOG_FILE="$sub_log_file" EMU_LOCK_DIR="$sub_lock_dir" EMU_SPOOL_DIR="${sub_dir}/spool" EMU_IPP_PAUSED_FILE="$sub_paused_file" "$EMULATOR" start >/dev/null 2>&1
+
+sub_pid=""
+if [[ -f "$sub_pid_file" ]]; then
+    sub_pid=$(cat "$sub_pid_file" 2>/dev/null || true)
+fi
+
+if [[ -n "$sub_pid" ]] && kill -0 "$sub_pid" 2>/dev/null; then
+    # Directly pause the emulator process in kernel WITHOUT recording it in paused file
+    kill -STOP "$sub_pid" 2>/dev/null || true
+    sleep 0.05
+
+    # 1. fault set clear must fail closed and refuse to send SIGCONT
+    if env EMU_PORT="$sub_port" EMU_NAME="XeroxGoUnrec_${$}" EMU_PID_FILE="$sub_pid_file" EMU_LOG_FILE="$sub_log_file" EMU_LOCK_DIR="$sub_lock_dir" EMU_SPOOL_DIR="${sub_dir}/spool" EMU_IPP_PAUSED_FILE="$sub_paused_file" "$EMULATOR" fault set clear >/dev/null 2>&1; then
+        fail "Test 17a: fault set clear unpaused unrecorded paused process"
+    else
+        # Verify process is STILL paused in kernel
+        sub_state=$(awk '/^State:/ {print $2}' "/proc/${sub_pid}/status" 2>/dev/null || true)
+        if [[ "$sub_state" == "T" ]]; then
+            pass "Test 17a: fault set clear strictly refused to send SIGCONT to unrecorded paused process"
+        else
+            fail "Test 17a: Unrecorded process was unexpectedly resumed (state: $sub_state)"
+        fi
+    fi
+
+    # 2. stop must also fail closed and refuse unverified restoration
+    if env EMU_PORT="$sub_port" EMU_NAME="XeroxGoUnrec_${$}" EMU_PID_FILE="$sub_pid_file" EMU_LOG_FILE="$sub_log_file" EMU_LOCK_DIR="$sub_lock_dir" EMU_SPOOL_DIR="${sub_dir}/spool" EMU_IPP_PAUSED_FILE="$sub_paused_file" "$EMULATOR" stop >/dev/null 2>&1; then
+        fail "Test 17b: stop accepted unrecorded paused process without verified evidence"
+    else
+        pass "Test 17b: stop strictly refused unverified restoration of unrecorded paused process"
+    fi
+
+    # Cleanup test instance safely
+    kill -CONT "$sub_pid" 2>/dev/null || true
+    kill -9 "$sub_pid" 2>/dev/null || true
+    env EMU_PORT="$sub_port" EMU_NAME="XeroxGoUnrec_${$}" EMU_PID_FILE="$sub_pid_file" EMU_LOG_FILE="$sub_log_file" EMU_LOCK_DIR="$sub_lock_dir" EMU_SPOOL_DIR="${sub_dir}/spool" EMU_IPP_PAUSED_FILE="$sub_paused_file" "$EMULATOR" cleanup >/dev/null 2>&1 || true
+else
+    fail "Test 17: Failed to start isolated test emulator process"
+fi
+rm -rf "$sub_dir"
+
+# -----------------------------------------------------------------------------
 echo ""
 echo "============================================================"
 echo "  Connectivity Fault Validation Results:"

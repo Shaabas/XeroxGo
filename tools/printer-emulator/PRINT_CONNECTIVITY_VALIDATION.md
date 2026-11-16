@@ -36,21 +36,27 @@ To ensure fault injection targets only a confirmed in-flight print job, the harn
 3. **CUPS Processing State Requirement**: `QueryCUPSJobInfo` must report `CUPSJobStateProcessing` before fault injection is permitted.
 4. **Execution Gate**: `processor.sh` waits on `EMU_JOB_GATE_FILE` until `EMU_JOB_RELEASE_FILE` is touched (with a bounded safety timeout).
 
-### 2.4 Process Identity & PID Reuse Safety (Requirement 2–7)
+### 2.4 Process Identity & PID Reuse Safety (Requirement 2–10)
 
 To prevent signaling unrelated system processes or reused PIDs:
 1. **Immutable Process Start Time Tracking**: On Linux, `/proc/<pid>/stat` field 22 contains the start time of the process measured in clock ticks since boot. This value is assigned by the kernel and never changes throughout the life of that specific process instance.
-2. **Structured Identity Record**: When pausing processes (`record_and_pause_process`), the identity is recorded in `EMU_IPP_PAUSED_FILE` formatted as `ROLE:PID:STARTTIME:COMM`.
-3. **Strict Pre-Signal Verification**: Before issuing `kill -CONT`, `verify_paused_process_identity` enforces four mandatory criteria:
+2. **Fail-Closed Start Time Verification**: The `stat -c %Y` directory mtime fallback has been completely removed. If `/proc/<pid>/stat` is unavailable, unreadable, or field 22 cannot be parsed as a positive integer, start-time capture strictly fails closed.
+3. **Structured Identity Record**: When pausing processes (`record_and_pause_process`), the identity is recorded in `EMU_IPP_PAUSED_FILE` formatted as `ROLE:PID:STARTTIME:COMM`.
+4. **Checked Signal Exit Statuses**:
+   - `kill -STOP` exit status is verified, and the kernel process state is confirmed stopped (`State: T`) before writing to `EMU_IPP_PAUSED_FILE`. Failed signals are never recorded as paused.
+   - `kill -CONT` exit status is verified during restoration; any failed signal reports an error and aborts success.
+5. **Strict Pre-Signal Verification & Removal of Bypass Paths**: All direct or unverified `kill -CONT` paths (e.g. relying only on port, process name, or PID) have been eliminated. Before issuing `kill -CONT`, `verify_paused_process_identity` enforces five mandatory criteria:
    - PID is alive (`kill -0 "$pid"`).
-   - Current process start time matches the recorded start time exactly (guaranteeing immunity against PID recycling).
+   - Linux process start-time ticks match the recorded value exactly (guaranteeing immunity against PID recycling).
    - Process base name (`/proc/<pid>/comm`) matches the recorded command.
    - Role-specific validation:
-     - For `ipp`: Process must be `ippeveprinter` bound to `$EMU_PORT`.
+     - For `ipp`: Process must be `ippeveprinter` bound to `$EMU_PORT` and matching `$EMU_NAME`.
      - For `processor`: Process command line must invoke `processor.sh`.
-4. **Diagnostic Preservation on Mismatch**: If any entry fails validation, signaling is refused immediately. The paused file is preserved as `${EMU_IPP_PAUSED_FILE}.diag_<timestamp>` for forensic analysis, and the operation fails with a non-zero exit code.
+6. **Unrecorded Paused Process Protection**: If an emulator or processor process is paused in the kernel without a corresponding saved identity record in `EMU_IPP_PAUSED_FILE`, restoration and stop routines strictly refuse to signal it with `SIGCONT`, record failure diagnostics, and fail closed.
+7. **Unified Verified Restoration in Stop and Cleanup**: `cmd_stop` and `cmd_cleanup` rely solely on the verified restoration mechanism (`safe_unpause_all_paused_processes`) and fail closed if unverified paused processes remain.
+8. **Diagnostic Preservation on Mismatch**: If any entry fails validation or restoration, signaling is refused immediately. The paused file is preserved alongside `${EMU_IPP_PAUSED_FILE}.diag_<timestamp>` for forensic analysis, and the operation fails with a non-zero exit code.
 
-### 2.5 Three-Way Queue Ownership Verification for CUPS Control (Requirement 10–12)
+### 2.5 Three-Way Queue Ownership Verification for CUPS Control (Requirement 12)
 
 1. **Verified Cancel and Resume**: Direct execution of unverified `cancel` or `lp -H resume` is prohibited. All job operations route through `emulator.sh cancel-job <queue> <jobID>` and `emulator.sh resume-job <queue> <jobID>`, requiring:
    - Target queue name prefix matches the job ID.
@@ -130,18 +136,21 @@ Executed with `go test -v -race -timeout 180s ./kiosk-daemon/internal/printer -r
 
 | Test Name | Duration | Result |
 | :--- | :--- | :--- |
-| `TestConnectivityFault_SNMPOnlyOutage_ContinuedMonitoringAndCompletion` | 15.14s | **PASS** |
-| `TestConnectivityFault_IPPOnlyOutage_TimeoutPreservationAndRecovery` | 12.41s | **PASS** |
-| `TestConnectivityFault_CombinedOutage_RestoreAndComplete` | 16.29s | **PASS** |
-| `TestConnectivityFault_FailedRestoration_PreservesUncertainJob` | 9.59s | **PASS** |
-| `TestConnectivityFault_CancellationWithoutPreservation_DeletesJob` | 8.79s | **PASS** |
-| `TestConnectivityFault_ReachabilitySeparation` | 13.65s | **PASS** |
+| `TestConnectivityFault_SNMPOnlyOutage_ContinuedMonitoringAndCompletion` | 15.05s | **PASS** |
+| `TestConnectivityFault_IPPOnlyOutage_TimeoutPreservationAndRecovery` | 11.24s | **PASS** |
+| `TestConnectivityFault_CombinedOutage_RestoreAndComplete` | 15.28s | **PASS** |
+| `TestConnectivityFault_FailedRestoration_PreservesUncertainJob` | 8.18s | **PASS** |
+| `TestConnectivityFault_CancellationWithoutPreservation_DeletesJob` | 8.03s | **PASS** |
+| `TestConnectivityFault_ReachabilitySeparation` | 13.02s | **PASS** |
 | `TestConnectivityFault_Negative_StalePIDPausedEntryRejected` | 0.40s | **PASS** |
-| `TestConnectivityFault_Negative_PIDReuseUnrelatedLiveProcessRejected` | 0.39s | **PASS** |
-| `TestConnectivityFault_Negative_UnverifiedQueueCancelAndResumeRefused` | 0.03s | **PASS** |
-| `TestConnectivityFault_Negative_FailedQueueCleanupPreservesMetadata` | 6.64s | **PASS** |
+| `TestConnectivityFault_Negative_PIDReuseUnrelatedLiveProcessRejected` | 0.40s | **PASS** |
+| `TestConnectivityFault_Negative_UnverifiedQueueCancelAndResumeRefused` | 0.02s | **PASS** |
+| `TestConnectivityFault_Negative_FailedQueueCleanupPreservesMetadata` | 4.58s | **PASS** |
+| `TestConnectivityFault_Negative_MissingStartTimeEvidenceRejected` | 0.42s | **PASS** |
+| `TestConnectivityFault_Negative_FailedSignalDoesNotRecordPausedProcess` | 0.02s | **PASS** |
+| `TestConnectivityFault_Negative_UnrecordedPausedProcessRefused` | 0.36s | **PASS** |
 
-**Summary**: 10 passed, 0 failed, 0 skipped.
+**Summary**: 13 passed, 0 failed, 0 skipped.
 
 ### 4.2 Shell Integration Suite (`connectivity_fault_test.sh`)
 Executed with `./tools/printer-emulator/connectivity_fault_test.sh`:
@@ -168,8 +177,12 @@ Executed with `./tools/printer-emulator/connectivity_fault_test.sh`:
 | **Test 13a** | Negative regression: cancel-job refused on unverified queue | **PASS** |
 | **Test 13b** | Negative regression: resume-job refused on unverified queue | **PASS** |
 | **Test 14** | Negative regression: Failed CUPS queue removal preserves ownership metadata | **PASS** |
+| **Test 15** | Negative regression: Missing start-time evidence strictly rejected without signaling | **PASS** |
+| **Test 16** | Negative regression: Failed SIGSTOP on dead process rejected and not recorded | **PASS** |
+| **Test 17a** | Negative regression: fault set clear strictly refused to send SIGCONT to unrecorded paused process | **PASS** |
+| **Test 17b** | Negative regression: stop strictly refused unverified restoration of unrecorded paused process | **PASS** |
 
-**Summary**: 20 passed, 0 failed, 0 skipped.
+**Summary**: 24 passed, 0 failed, 0 skipped.
 
 ---
 
