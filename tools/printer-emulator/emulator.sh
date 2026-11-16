@@ -1043,10 +1043,6 @@ cmd_resume_job() {
 }
 
 cmd_remove_cups() {
-    if ! command -v lpadmin >/dev/null 2>&1; then
-        return 0
-    fi
-
     local target_queue="${1:-$EMU_CUPS_QUEUE}"
     if [[ -z "$target_queue" ]]; then
         echo "ERROR: Queue name cannot be empty." >&2
@@ -1056,6 +1052,12 @@ cmd_remove_cups() {
     # Requirement 4: Never modify, enable, disable or delete a queue when ownership verification fails
     if ! verify_cups_queue_ownership "$target_queue"; then
         echo "Refusing deletion of unverified CUPS queue '${target_queue}'." >&2
+        return 1
+    fi
+
+    if ! command -v lpadmin >/dev/null 2>&1; then
+        echo "ERROR: lpadmin command not found. Cannot remove CUPS queue '${target_queue}'." >&2
+        echo "Preserving ownership metadata (${EMU_META_FILE}) for safety." >&2
         return 1
     fi
 

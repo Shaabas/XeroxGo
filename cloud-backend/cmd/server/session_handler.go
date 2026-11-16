@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -578,6 +579,30 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var reqBody struct {
+		SessionID string `json:"session_id"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil && !errors.Is(err, io.EOF) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "invalid json body: " + err.Error(),
+			})
+			return
+		}
+	}
+
+	reqBody.SessionID = strings.TrimSpace(reqBody.SessionID)
+	if reqBody.SessionID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "session_id is required for paid-order release",
+		})
+		return
+	}
+
 	// Physical presence check: verify actual kiosk presence before releasing paid order
 	if s.hub != nil && !s.hub.IsConnected(kioskID) {
 		w.Header().Set("Content-Type", "application/json")
@@ -597,23 +622,6 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": condErr.Message,
 			"code":  condErr.Code,
-		})
-		return
-	}
-
-	var reqBody struct {
-		SessionID string `json:"session_id"`
-	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&reqBody)
-	}
-
-	reqBody.SessionID = strings.TrimSpace(reqBody.SessionID)
-	if reqBody.SessionID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": "session_id is required for paid-order release",
 		})
 		return
 	}
