@@ -162,7 +162,7 @@ func ResolveUnitPriceFromConfig(hasPricing bool, tariff TariffConfig, colorMode 
   if unit <= 0 {
    return DocumentQuote{}, errors.New("pricing: invalid selected tariff")
   }
-  if imposedSides > int(MaxInt64)/copies {
+  if int64(imposedSides) > MaxInt64/int64(copies) {
    return DocumentQuote{}, errors.New("pricing: billed sides overflow")
   }
   billedSides := imposedSides * copies
