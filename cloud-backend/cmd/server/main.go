@@ -1411,6 +1411,9 @@ func main() {
 		log.Fatalf("invalid XEROXGO_PRICING_POLICY %q: expected per-side or bibin-sheet", pricingPolicy)
 	}
 	if pricingPolicy == pricing.PricingPerSheet {
+		if os.Getenv("XEROXGO_BIBIN_TARIFF_REVIEWED") != "1" {
+			log.Fatal("bibin-sheet requires XEROXGO_BIBIN_TARIFF_REVIEWED=1 after reviewing and configuring existing tariffs")
+		}
 		p, err := storeDB.GetPricing(ctx)
 		if err != nil || p.BWSimplexPricePaise <= 0 || p.BWDuplexPricePaise <= 0 ||
 			p.ColorSimplexPricePaise <= 0 || p.ColorDuplexPricePaise <= 0 {
