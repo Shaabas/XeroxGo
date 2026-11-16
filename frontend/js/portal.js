@@ -28,6 +28,35 @@
   }
   const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
+  // Display-only tariff labels come from the cloud; no price calculation happens here.
+  let publishedTariffs = null;
+
+  function updateTariffLabels(mode) {
+    const color = mode === 'Color' && publishedTariffs?.color_enabled;
+    const simplex = publishedTariffs?.[color ? 'color_simplex_price_paise' : 'bw_simplex_price_paise'];
+    const duplex = publishedTariffs?.[color ? 'color_duplex_price_paise' : 'bw_duplex_price_paise'];
+    const unit = publishedTariffs?.pricing_policy === 'bibin-sheet' ? 'sheet' : 'side';
+    if (settingsSinglePriceLabel) {
+      settingsSinglePriceLabel.textContent = Number.isSafeInteger(simplex) && simplex > 0
+        ? `${formatRupees(simplex)}/side` : 'Live quote';
+    }
+    if (settingsDoublePriceLabel) {
+      settingsDoublePriceLabel.textContent = Number.isSafeInteger(duplex) && duplex > 0
+        ? `${formatRupees(duplex)}/${unit}` : 'Live quote';
+    }
+  }
+
+  async function loadPublishedTariffs() {
+    try {
+      const response = await fetch('/api/pricing', { cache: 'no-store' });
+      if (!response.ok) return;
+      publishedTariffs = await response.json();
+      if (draftSettings) updateTariffLabels(draftSettings.mode);
+    } catch (_) {
+      // Checkout still requires an authoritative per-document quote.
+    }
+  }
+
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
   const viewSettings = document.getElementById('view-settings');
@@ -1067,9 +1096,7 @@
     currentPreviewSide = 'front';
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
-    const isColor = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = 'Cloud pricing';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = 'Cloud pricing';
+    updateTariffLabels(draftSettings.mode);
 
     syncSettingsUI(doc);
     renderPreviewSheet();
@@ -1253,9 +1280,7 @@
     cardSideDouble.classList.toggle('active', draftSettings.sides === 'Double-sided');
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
-    const isColorChoice = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = 'Cloud pricing';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = 'Cloud pricing';
+    updateTariffLabels(draftSettings.mode);
 
     // 5. Orientation
     btnOrientAuto.classList.toggle('active', draftSettings.orientation === 'Auto');
@@ -2344,6 +2369,7 @@
 
   // --- Initialization ---
   function init() {
+    void loadPublishedTariffs();
     if (devMode || window.__PORTAL_TEST__ || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
       window.__portal = {
         getCartItems: () => cartItems,
