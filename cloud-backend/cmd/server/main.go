@@ -367,6 +367,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			if res.PricePaise <= 0 || totalOrderPricePaise > pricing.MaxInt64-res.PricePaise {
+				_ = os.Remove(outputPath)
+				http.Error(w, "order price overflow", http.StatusBadRequest)
+				return
+			}
 			totalOrderPricePaise += res.PricePaise
 			totalPrintedPages += res.PrintedSides
 			totalSheets += res.NormResult.TotalSheets
