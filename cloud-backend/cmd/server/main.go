@@ -37,6 +37,7 @@ type serverConfig struct {
 	dbPath             string
 	jobsDir            string
 	pricePerSheetPaise int64
+	pricingPolicy      pricing.DuplexPricingPolicy
 	devMode            bool
 	demoMode           bool
 	downloadSecret     []byte
@@ -210,6 +211,23 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
 	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
 }
+// verifyAcceptedPrice rejects a stale frontend quote before persisting the order.
+// Existing API clients may omit this field for backwards compatibility.
+func verifyAcceptedPrice(w http.ResponseWriter, r *http.Request, actual int64) bool {
+	raw := strings.TrimSpace(r.FormValue("accepted_total_price_paise"))
+	if raw == "" { return true }
+	agreed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || agreed <= 0 {
+		http.Error(w, "invalid accepted price", http.StatusBadRequest)
+		return false
+	}
+	if agreed != actual {
+		http.Error(w, "Price changed. Please review the updated quote before placing an order.", http.StatusConflict)
+		return false
+	}
+	return true
+}
+
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -439,7 +457,15 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			ClaimToken:   claimToken,
 		}
 
-		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
+		if !verifyAcceptedPrice(w, r, totalOrderPricePaise) {
+			_ = os.Remove(outputPath)
+			return
+		}
+		if !verifyAcceptedPrice(w, r, res.PricePaise) {
+		_ = os.Remove(outputPath)
+		return
+	}
+	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 			_ = os.Remove(outputPath)
 			http.Error(w, "failed to persist order", http.StatusInternalServerError)
 			return
@@ -1379,11 +1405,25 @@ func main() {
 		log.Fatalf("XEROXGO_KIOSK_SECRET required in production mode")
 	}
 
+	pricingPolicy := pricing.DuplexPricingPolicy(strings.TrimSpace(os.Getenv("XEROXGO_PRICING_POLICY")))
+	if pricingPolicy == "" { pricingPolicy = pricing.PricingPerSide }
+	if pricingPolicy != pricing.PricingPerSide && pricingPolicy != pricing.PricingPerSheet {
+		log.Fatalf("invalid XEROXGO_PRICING_POLICY %q: expected per-side or bibin-sheet", pricingPolicy)
+	}
+	if pricingPolicy == pricing.PricingPerSheet {
+		p, err := storeDB.GetPricing(ctx)
+		if err != nil || p.BWSimplexPricePaise <= 0 || p.BWDuplexPricePaise <= 0 ||
+			p.ColorSimplexPricePaise <= 0 || p.ColorDuplexPricePaise <= 0 {
+			log.Fatal("bibin-sheet pricing requires complete configured tariffs; configure existing database before enabling")
+		}
+		log.Print("[PRICING] bibin-sheet policy enabled; configured duplex tariffs are interpreted per complete sheet")
+	}
 	cfg := &serverConfig{
 		addr:               addr,
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: pricePaise,
+		pricingPolicy:      pricingPolicy,
 		devMode:            devMode,
 		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
