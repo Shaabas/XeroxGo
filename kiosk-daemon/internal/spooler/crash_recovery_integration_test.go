@@ -2141,15 +2141,22 @@ func TestCrashRecovery_MultipleIncompleteJobs_DocumentsSingleRowLimit(t *testing
 
 	time.Sleep(1 * time.Second)
 
-	// Verify Job 1 was completely unrecovered by startup recovery (its error reason remains untouched)
+	// In D4c-3a, verify both Job 1 and Job 2 are examined and safely reconciled
 	j1, _ := store.GetJob(context.Background(), cmd1.JobID)
-	if j1 == nil || j1.ErrorReason != "older fault" {
-		t.Errorf("unexpected mutation of older unrecovered Job 1: %+v", j1)
+	if j1 == nil || j1.Status != contracts.JobStatusPausedError || j1.CUPSJobID != queueName+"-1111" {
+		t.Fatalf("unexpected state for Job 1: %+v", j1)
+	}
+	if !strings.Contains(j1.ErrorReason, "interrupted job in PAUSED_ERROR") {
+		t.Errorf("expected Job 1 to be reconciled into PAUSED_ERROR with CUPS state, got: %s", j1.ErrorReason)
 	}
 
-	t.Logf("CONFIRMED DEFECT 2: Multiple incomplete jobs in SQLite: GetIncompleteJob returned only Job 2 (%s) due to LIMIT 1. "+
-		"Older incomplete Job 1 (%s) remained completely unaddressed and un-reconciled.",
-		cmd2.JobID, cmd1.JobID)
+	j2, _ := store.GetJob(context.Background(), cmd2.JobID)
+	if j2 == nil || j2.Status != contracts.JobStatusPausedError || j2.CUPSJobID != queueName+"-2222" {
+		t.Fatalf("unexpected state for Job 2: %+v", j2)
+	}
+
+	t.Logf("FIXED DEFECT 2: Multiple incomplete jobs in SQLite: GetIncompleteJob preserves single newest row for legacy callers (%s), while GetIncompleteJobs and startup recovery examine and safely reconcile ALL incomplete records (%s and %s).",
+		cmd2.JobID, cmd1.JobID, cmd2.JobID)
 }
 
 // -----------------------------------------------------------------------------
