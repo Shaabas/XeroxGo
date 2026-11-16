@@ -598,6 +598,13 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	displayCode := order.Command.DisplayCode
 
+	// A complete duplex sheet has no uniform per-side rate under Bibin's
+	// policy; the trailing occupied side is charged separately.
+	perSideRate := res.UnitPrice
+	if s.cfg.pricingPolicy == pricing.PricingPerSheet && opts.Duplex != contracts.DuplexSimplex {
+		perSideRate = 0
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"order_id":              orderID,
@@ -612,7 +619,8 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"copies":                opts.Copies,
 		"duplex":                string(opts.Duplex),
 		"price_per_sheet_paise": res.UnitPrice,
-		"price_per_side_paise":  res.UnitPrice,
+		"price_per_side_paise":  perSideRate,
+		"pricing_policy":        string(s.cfg.pricingPolicy),
 		"unit_price_paise":      res.UnitPrice,
 		"total_price_paise":     res.PricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
@@ -783,6 +791,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 			"total_sheets":     res.NormResult.TotalSheets,
 			"copies":           opts.Copies,
 			"total_price_paise": res.PricePaise,
+			"pricing_policy":    string(s.cfg.pricingPolicy),
 			"normalized_pages": res.NormResult.TotalPages,
 			"padded_pages":     res.NormResult.PaddedPages,
 			"sha256_checksum":  res.NormResult.SHA256Checksum,
