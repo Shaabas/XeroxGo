@@ -458,6 +458,7 @@ type InFlightProcessEvidence struct {
 	Comm           string `json:"comm"`
 	Exe            string `json:"exe"`
 	StartTimeTicks uint64 `json:"start_time_ticks"`
+	State          string `json:"state,omitempty"`
 }
 
 // readLinuxProcessEvidence reads live process identity and immutable start time
@@ -487,6 +488,7 @@ func readLinuxProcessEvidence(pid int) (*InFlightProcessEvidence, error) {
 	if len(fields) < 20 {
 		return nil, fmt.Errorf("malformed /proc/%d/stat: insufficient fields (%d)", pid, len(fields))
 	}
+	state := fields[0]
 	ppid, err := strconv.Atoi(fields[1])
 	if err != nil {
 		return nil, fmt.Errorf("malformed ppid in /proc/%d/stat: %w", pid, err)
@@ -502,6 +504,7 @@ func readLinuxProcessEvidence(pid int) (*InFlightProcessEvidence, error) {
 		Comm:           comm,
 		Exe:            exe,
 		StartTimeTicks: startTicks,
+		State:          state,
 	}, nil
 }
 
@@ -531,10 +534,17 @@ func pidfdSendSignal(pidfd int, sig syscall.Signal) error {
 	return nil
 }
 
-// verifyAndTerminateInFlightProcess safely verifies process identity, start time ticks,
-// and parentage before delivering SIGKILL via pidfd or child-scoped signal.
-// Returns terminated=true if verified and killed, alreadyExited=true if process already exited (ESRCH),
-// and fails closed with error if any identity or start-time verification check fails.
+var openPidfdFn = openPidfd
+
+// verifyAndTerminateInFlightProcess safely pins the in-flight process using a Linux pidfd handle
+// BEFORE verifying process identity, start-time ticks, executable path, and test parentage.
+// It delivers SIGKILL exclusively via the pinned pidfd handle (SYS_pidfd_send_signal).
+// Numeric-PID SIGKILL fallback is strictly prohibited.
+// Returns:
+//   - terminated=true if the process was verified and successfully killed via pidfd.
+//   - alreadyExited=true if the process already exited (ESRCH) or is a zombie (state 'Z'/'X').
+//   - fails closed with an error (and sends ZERO signals) if pidfd cannot be opened,
+//     kernel support is unavailable, or any identity/start-time/parentage check mismatches.
 func verifyAndTerminateInFlightProcess(t *testing.T, ev *InFlightProcessEvidence, expectedParentPID int) (terminated bool, alreadyExited bool, err error) {
 	if ev == nil || ev.PID <= 1 {
 		return false, false, fmt.Errorf("invalid in-flight evidence: nil or pid <= 1")
@@ -543,64 +553,75 @@ func verifyAndTerminateInFlightProcess(t *testing.T, ev *InFlightProcessEvidence
 		return false, false, fmt.Errorf("safety boundary violation: in-flight PID %d cannot be test supervisor or init", ev.PID)
 	}
 
-	// Requirement 5: Ensure a normally exited lp subprocess cannot cause an unrelated process to be signaled.
-	// Probe whether the process is alive. If ESRCH, it already exited normally.
-	if probeErr := syscall.Kill(ev.PID, 0); probeErr != nil {
-		if errors.Is(probeErr, syscall.ESRCH) {
-			return false, true, nil
-		}
-		return false, false, fmt.Errorf("kill(pid, 0) failed: %w", probeErr)
-	}
-
-	// Read live process identity from /proc/<pid>/stat and /proc/<pid>/exe
-	liveEv, liveErr := readLinuxProcessEvidence(ev.PID)
-	if liveErr != nil {
-		if errors.Is(liveErr, os.ErrNotExist) || strings.Contains(liveErr.Error(), "no such file or directory") {
-			return false, true, nil
-		}
-		return false, false, fmt.Errorf("failed to read live process evidence for PID %d: %w", ev.PID, liveErr)
-	}
-
-	// Requirement 4: Verify exact subprocess identity and start time, failing closed if uncertain
-	if liveEv.Comm != ev.Comm {
-		return false, false, fmt.Errorf("identity mismatch for PID %d: expected comm %q, got %q", ev.PID, ev.Comm, liveEv.Comm)
-	}
-	if liveEv.StartTimeTicks != ev.StartTimeTicks {
-		return false, false, fmt.Errorf("start time mismatch for PID %d: expected ticks %d, got %d (PID reuse detected)", ev.PID, ev.StartTimeTicks, liveEv.StartTimeTicks)
-	}
-	if ev.Exe != "" && liveEv.Exe != "" && liveEv.Exe != ev.Exe && !strings.HasSuffix(liveEv.Exe, "/"+ev.Comm) {
-		return false, false, fmt.Errorf("executable mismatch for PID %d: expected %q, got %q", ev.PID, ev.Exe, liveEv.Exe)
-	}
 	// Verify that when spawned, the process was a direct child of expectedParentPID
 	if expectedParentPID > 0 && ev.PPID != expectedParentPID {
 		return false, false, fmt.Errorf("recorded parent PID mismatch for PID %d: expected %d, got %d", ev.PID, expectedParentPID, ev.PPID)
 	}
 
-	// Requirement 3: Use a retained OS process handle or Linux pidfd where practical.
-	pfd, pfdErr := openPidfd(ev.PID)
-	if pfdErr == nil && pfd >= 0 {
-		defer syscall.Close(pfd)
-		if sigErr := pidfdSendSignal(pfd, syscall.SIGKILL); sigErr != nil {
-			if errors.Is(sigErr, syscall.ESRCH) {
-				return false, true, nil
-			}
-			return false, false, fmt.Errorf("pidfd_send_signal(SIGKILL) failed: %w", sigErr)
+	// Requirement 3 & 4: Require a valid Linux pidfd and pin the process BEFORE final identity verification.
+	pfd, pfdErr := openPidfdFn(ev.PID)
+	if pfdErr != nil {
+		if errors.Is(pfdErr, syscall.ESRCH) || strings.Contains(pfdErr.Error(), "no such process") {
+			// Process already exited and was reaped before pidfd could be opened.
+			return false, true, nil
 		}
-	} else {
-		// Fallback to verified child-scoped signal when pidfd is unsupported
-		if sigErr := syscall.Kill(ev.PID, syscall.SIGKILL); sigErr != nil {
-			if errors.Is(sigErr, syscall.ESRCH) {
-				return false, true, nil
-			}
-			return false, false, fmt.Errorf("syscall.Kill(SIGKILL) failed for PID %d: %w", ev.PID, sigErr)
+		// Requirement 6: If pidfd opening fails or support is unavailable, fail closed without signaling.
+		return false, false, fmt.Errorf("pidfd_open required for safe process signaling but failed for PID %d: %w", ev.PID, pfdErr)
+	}
+	defer syscall.Close(pfd)
+
+	// Requirement 4 & 5: Process is now pinned by pfd. Read live process identity while pinned.
+	liveEv, liveErr := readLinuxProcessEvidence(ev.PID)
+	if liveErr != nil {
+		if errors.Is(liveErr, os.ErrNotExist) || strings.Contains(liveErr.Error(), "no such file or directory") {
+			// Process exited and /proc/<pid> was unlinked
+			return false, true, nil
 		}
+		return false, false, fmt.Errorf("failed to read live process evidence for pinned PID %d: %w", ev.PID, liveErr)
 	}
 
-	// Wait until in-flight process has terminated
+	// Requirement 7: Handle already-exited and zombie processes without treating them as successfully killed.
+	if liveEv.State == "Z" || liveEv.State == "X" {
+		return false, true, nil
+	}
+
+	// Requirement 5 & 6: Verify the pinned process matches recorded PID, comm, start time ticks, and executable.
+	if liveEv.PID != ev.PID {
+		return false, false, fmt.Errorf("pinned PID mismatch: expected %d, got %d", ev.PID, liveEv.PID)
+	}
+	if liveEv.Comm != ev.Comm {
+		return false, false, fmt.Errorf("identity mismatch for pinned PID %d: expected comm %q, got %q", ev.PID, ev.Comm, liveEv.Comm)
+	}
+	if liveEv.StartTimeTicks != ev.StartTimeTicks {
+		return false, false, fmt.Errorf("start time mismatch for pinned PID %d: expected ticks %d, got %d (PID reuse detected)", ev.PID, ev.StartTimeTicks, liveEv.StartTimeTicks)
+	}
+	if ev.Exe != "" && liveEv.Exe != "" && liveEv.Exe != ev.Exe && !strings.HasSuffix(liveEv.Exe, "/"+ev.Comm) {
+		return false, false, fmt.Errorf("executable mismatch for pinned PID %d: expected %q, got %q", ev.PID, ev.Exe, liveEv.Exe)
+	}
+
+	// Requirement 2 & 3: Signal ONLY via pidfd handle. Zero numeric-PID fallback.
+	if sigErr := pidfdSendSignal(pfd, syscall.SIGKILL); sigErr != nil {
+		if errors.Is(sigErr, syscall.ESRCH) {
+			return false, true, nil
+		}
+		return false, false, fmt.Errorf("pidfd_send_signal(SIGKILL) failed for PID %d: %w", ev.PID, sigErr)
+	}
+
+	// Wait until in-flight process has terminated or transitioned to zombie
 	terminatedCleanly := false
 	for i := 0; i < 50; i++ {
 		if checkErr := syscall.Kill(ev.PID, 0); checkErr != nil {
 			if errors.Is(checkErr, syscall.ESRCH) {
+				terminatedCleanly = true
+				break
+			}
+		} else {
+			if checkEv, err := readLinuxProcessEvidence(ev.PID); err == nil {
+				if checkEv.State == "Z" || checkEv.State == "X" {
+					terminatedCleanly = true
+					break
+				}
+			} else {
 				terminatedCleanly = true
 				break
 			}
@@ -727,15 +748,15 @@ func spawnAndKillChild(
 		if err := json.Unmarshal([]byte(readyContent), &inFlightEv); err == nil && inFlightEv.PID > 0 {
 			term, exited, termErr := verifyAndTerminateInFlightProcess(t, &inFlightEv, childPID)
 			if termErr != nil {
-				t.Fatalf("safe in-flight process termination failed: %v", termErr)
+				t.Fatalf("safe in-flight process termination failed: %v. Subprocess Output:\n%s", termErr, childOut.String())
 			}
 			if term {
-				t.Logf("Verified in-flight subprocess PID %d (%s) safely terminated by SIGKILL via pidfd/handle", inFlightEv.PID, inFlightEv.Comm)
+				t.Logf("Verified in-flight subprocess PID %d (%s) safely terminated by SIGKILL via pinned pidfd", inFlightEv.PID, inFlightEv.Comm)
 			} else if exited {
-				t.Logf("In-flight subprocess PID %d (%s) had already exited normally before signal (no signal sent)", inFlightEv.PID, inFlightEv.Comm)
+				t.Logf("In-flight subprocess PID %d (%s) had already exited normally or was zombie before signal (no signal sent)", inFlightEv.PID, inFlightEv.Comm)
 			}
 		} else if err != nil {
-			t.Fatalf("failed to parse in-flight process evidence JSON: %v (raw: %q)", err, readyContent)
+			t.Fatalf("failed to parse in-flight process evidence JSON: %v (raw: %q). Subprocess Output:\n%s", err, readyContent, childOut.String())
 		}
 	}
 
@@ -2252,15 +2273,18 @@ exit 0
 }
 
 // -----------------------------------------------------------------------------
-// Negative Regression: In-Flight Process Verification Safety (Requirements 2, 4, 5, 7)
+// Negative Regression: In-Flight Process Verification Safety (Requirements 2, 3, 4, 5, 6, 7, 9)
 // -----------------------------------------------------------------------------
 // Verifies that in-flight subprocess supervision:
-// 1. Refuses to signal an already-exited or stale process (ESRCH), reporting alreadyExited==true.
-// 2. Refuses to signal a live process when start time ticks do not match (PID reuse protection).
-// 3. Refuses to signal a process when comm or executable identity mismatches.
-// 4. Refuses forbidden PIDs (PID <= 1 or parent test supervisor PID).
+// 1. Refuses to signal an already-exited or reaped process (ESRCH), reporting alreadyExited==true.
+// 2. Detects zombie processes ('Z'/'X') and returns alreadyExited==true without treating them as killed.
+// 3. Fails closed without signaling when pidfd_open fails or is unsupported (ENOSYS), with ZERO numeric fallback.
+// 4. Refuses to signal a live pinned process when start-time ticks mismatch (PID reuse protection).
+// 5. Refuses to signal a process when comm or executable identity mismatches.
+// 6. Refuses to signal a process when test-child parentage mismatches.
+// 7. Refuses forbidden PIDs (PID <= 1, 0, -1, or test supervisor PID).
 func TestCrashRecovery_InFlightProcessVerification_NegativeSafety(t *testing.T) {
-	// Case 1: Exited process (ESRCH)
+	// Case 1: Exited process (reaped, ESRCH on pidfd_open)
 	dummyCmd := exec.Command("true")
 	if err := dummyCmd.Run(); err != nil {
 		t.Fatalf("failed to run dummy command: %v", err)
@@ -2286,29 +2310,97 @@ func TestCrashRecovery_InFlightProcessVerification_NegativeSafety(t *testing.T) 
 		t.Errorf("expected alreadyExited == true for dead PID %d", deadPID)
 	}
 
-	// Case 2: Stale process identity / PID reuse (start time mismatch)
-	sleepCmd := exec.Command("sleep", "30")
-	if err := sleepCmd.Start(); err != nil {
-		t.Fatalf("failed to start sleep process: %v", err)
+	// Case 2: Zombie process (exited, not yet reaped by parent; state 'Z')
+	zombieCmd := exec.Command("true")
+	if err := zombieCmd.Start(); err != nil {
+		t.Fatalf("failed to start command for zombie test: %v", err)
 	}
-	livePID := sleepCmd.Process.Pid
+	zombiePID := zombieCmd.Process.Pid
+	// Wait briefly for `true` to finish executing in the kernel so it enters zombie state
+	time.Sleep(50 * time.Millisecond)
+
+	zombieEv, err := readLinuxProcessEvidence(zombiePID)
+	if err != nil {
+		_ = zombieCmd.Wait()
+		t.Fatalf("failed to read process evidence for zombie test PID %d: %v", zombiePID, err)
+	}
+	if zombieEv.State != "Z" && zombieEv.State != "X" {
+		t.Logf("Warning: process %d state is %q rather than 'Z' (timing jitter)", zombiePID, zombieEv.State)
+	}
+
+	term, exited, err = verifyAndTerminateInFlightProcess(t, zombieEv, os.Getpid())
+	_ = zombieCmd.Wait() // reap zombie now
+	if err != nil {
+		t.Errorf("expected no error for zombie process, got: %v", err)
+	}
+	if term {
+		t.Errorf("safety violation: claimed to terminate zombie process %d", zombiePID)
+	}
+	if !exited {
+		t.Errorf("expected alreadyExited == true for zombie PID %d", zombiePID)
+	}
+
+	// Case 3: pidfd failure / kernel support unavailable (fails closed without signaling; zero numeric fallback)
+	sleepCmd1 := exec.Command("sleep", "30")
+	if err := sleepCmd1.Start(); err != nil {
+		t.Fatalf("failed to start sleep process 1: %v", err)
+	}
+	livePID1 := sleepCmd1.Process.Pid
 	defer func() {
-		_ = sleepCmd.Process.Kill()
-		_ = sleepCmd.Wait()
+		_ = sleepCmd1.Process.Kill()
+		_ = sleepCmd1.Wait()
 	}()
 
-	liveEv, err := readLinuxProcessEvidence(livePID)
+	liveEv1, err := readLinuxProcessEvidence(livePID1)
+	if err != nil {
+		t.Fatalf("failed to read live process evidence: %v", err)
+	}
+
+	// Temporarily simulate pidfd_open failure (e.g. syscall unsupported ENOSYS)
+	origOpenPidfd := openPidfdFn
+	openPidfdFn = func(pid int) (int, error) {
+		return -1, fmt.Errorf("pidfd_open failed for pid %d: %w", pid, syscall.ENOSYS)
+	}
+	term, exited, err = verifyAndTerminateInFlightProcess(t, liveEv1, os.Getpid())
+	openPidfdFn = origOpenPidfd // restore immediately
+
+	if err == nil {
+		t.Errorf("safety violation: expected failure when pidfd_open returns ENOSYS, but got nil error")
+	}
+	if term {
+		t.Errorf("safety violation: claimed termination despite pidfd failure")
+	}
+	if exited {
+		t.Errorf("safety violation: live process reported as alreadyExited")
+	}
+	// Verify that the live process was NOT signaled and remains alive (proving no numeric SIGKILL fallback was sent)
+	if checkErr := syscall.Kill(livePID1, 0); checkErr != nil {
+		t.Errorf("safety violation: live process %d was signaled despite pidfd_open failure: %v", livePID1, checkErr)
+	}
+
+	// Case 4: Stale process identity / PID reuse (start time mismatch on pinned process)
+	sleepCmd2 := exec.Command("sleep", "30")
+	if err := sleepCmd2.Start(); err != nil {
+		t.Fatalf("failed to start sleep process 2: %v", err)
+	}
+	livePID2 := sleepCmd2.Process.Pid
+	defer func() {
+		_ = sleepCmd2.Process.Kill()
+		_ = sleepCmd2.Wait()
+	}()
+
+	liveEv2, err := readLinuxProcessEvidence(livePID2)
 	if err != nil {
 		t.Fatalf("failed to read live process evidence: %v", err)
 	}
 
 	// Forge mismatched start time ticks
 	staleEv := &InFlightProcessEvidence{
-		PID:            livePID,
-		PPID:           liveEv.PPID,
-		Comm:           liveEv.Comm,
-		Exe:            liveEv.Exe,
-		StartTimeTicks: liveEv.StartTimeTicks + 999999, // Mismatched ticks
+		PID:            livePID2,
+		PPID:           liveEv2.PPID,
+		Comm:           liveEv2.Comm,
+		Exe:            liveEv2.Exe,
+		StartTimeTicks: liveEv2.StartTimeTicks + 999999, // Mismatched ticks
 	}
 
 	term, exited, err = verifyAndTerminateInFlightProcess(t, staleEv, os.Getpid())
@@ -2319,17 +2411,17 @@ func TestCrashRecovery_InFlightProcessVerification_NegativeSafety(t *testing.T) 
 		t.Errorf("safety violation: signaled process despite start time mismatch")
 	}
 	// Verify sleep process was NOT signaled and remains alive
-	if err := syscall.Kill(livePID, 0); err != nil {
-		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID, err)
+	if checkErr := syscall.Kill(livePID2, 0); checkErr != nil {
+		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID2, checkErr)
 	}
 
-	// Case 3: Identity / executable mismatch
+	// Case 5: Identity / executable mismatch on pinned process
 	mismatchEv := &InFlightProcessEvidence{
-		PID:            livePID,
-		PPID:           liveEv.PPID,
+		PID:            livePID2,
+		PPID:           liveEv2.PPID,
 		Comm:           "lp", // Live process is "sleep", not "lp"
 		Exe:            "/usr/bin/lp",
-		StartTimeTicks: liveEv.StartTimeTicks,
+		StartTimeTicks: liveEv2.StartTimeTicks,
 	}
 	term, exited, err = verifyAndTerminateInFlightProcess(t, mismatchEv, os.Getpid())
 	if err == nil {
@@ -2338,11 +2430,23 @@ func TestCrashRecovery_InFlightProcessVerification_NegativeSafety(t *testing.T) 
 	if term {
 		t.Errorf("safety violation: signaled process despite comm mismatch")
 	}
-	if err := syscall.Kill(livePID, 0); err != nil {
-		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID, err)
+	if checkErr := syscall.Kill(livePID2, 0); checkErr != nil {
+		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID2, checkErr)
 	}
 
-	// Case 4: Forbidden PID (supervisor PID or init)
+	// Case 6: Parentage mismatch
+	term, exited, err = verifyAndTerminateInFlightProcess(t, liveEv2, 999999) // Mismatched expected parent PID
+	if err == nil {
+		t.Errorf("safety violation: expected error on parentage mismatch, got nil")
+	}
+	if term {
+		t.Errorf("safety violation: signaled process despite parentage mismatch")
+	}
+	if checkErr := syscall.Kill(livePID2, 0); checkErr != nil {
+		t.Errorf("safety violation: live process %d died or was signaled prematurely: %v", livePID2, checkErr)
+	}
+
+	// Case 7: Forbidden PIDs (supervisor PID, init, 0, -1)
 	selfEv := &InFlightProcessEvidence{
 		PID:            os.Getpid(),
 		PPID:           os.Getppid(),
@@ -2355,5 +2459,30 @@ func TestCrashRecovery_InFlightProcessVerification_NegativeSafety(t *testing.T) 
 	}
 	if term {
 		t.Errorf("safety violation: signaled supervisor PID")
+	}
+
+	initEv := &InFlightProcessEvidence{
+		PID:            1,
+		PPID:           0,
+		Comm:           "systemd",
+		StartTimeTicks: 1,
+	}
+	term, exited, err = verifyAndTerminateInFlightProcess(t, initEv, 0)
+	if err == nil {
+		t.Errorf("safety violation: expected error for init PID 1, got nil")
+	}
+	if term {
+		t.Errorf("safety violation: signaled init PID 1")
+	}
+
+	invalidEv := &InFlightProcessEvidence{
+		PID: -1,
+	}
+	term, exited, err = verifyAndTerminateInFlightProcess(t, invalidEv, 0)
+	if err == nil {
+		t.Errorf("safety violation: expected error for PID -1, got nil")
+	}
+	if term {
+		t.Errorf("safety violation: signaled PID -1")
 	}
 }
