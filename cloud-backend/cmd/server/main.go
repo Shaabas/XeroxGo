@@ -1353,6 +1353,9 @@ func main() {
 	ctx := context.Background()
 	var pricePaise int64
 	priceEnv := os.Getenv("XEROXGO_PRICE_PER_SHEET_PAISE")
+	if strings.TrimSpace(os.Getenv("XEROXGO_PRICING_POLICY")) == string(pricing.PricingPerSheet) && priceEnv != "" {
+		log.Fatal("XEROXGO_PRICE_PER_SHEET_PAISE would overwrite reviewed sheet tariffs; remove it before enabling bibin-sheet")
+	}
 	if priceEnv != "" {
 		p, err := strconv.ParseInt(priceEnv, 10, 64)
 		if err != nil || p <= 0 {
