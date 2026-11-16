@@ -223,58 +223,84 @@ func TestDefaultTariff(t *testing.T) {
 }
 
 
- 
- // These cases preserve Bibin's 50e1a24 price policy without requiring an
- // unsafe silent migration of existing persisted per-side tariff values.
- func TestQuoteDocument_BibinSheetPolicy(t *testing.T) {
-  tariff := TariffConfig{
-   BWSimplexPricePaise:300, BWDuplexPricePaise:500,
-   ColorSimplexPricePaise:800, ColorDuplexPricePaise:1000,
-   ColorEnabled:true,
-  }
-  cases := []struct {
-   name string
-   sides, copies int
-   mode string
-   duplex contracts.DuplexMode
-   want int64
-  }{
-   {"one BW simplex",1,1,"BW",contracts.DuplexSimplex,300},
-   {"two BW duplex",2,1,"BW",contracts.DuplexLongEdge,500},
-   {"three BW duplex",3,1,"BW",contracts.DuplexLongEdge,800},
-   {"four BW duplex",4,1,"BW",contracts.DuplexLongEdge,1000},
-   {"five BW duplex",5,1,"BW",contracts.DuplexLongEdge,1300},
-   {"three BW duplex copies",3,2,"BW",contracts.DuplexShortEdge,1600},
-   {"three COLOR duplex",3,1,"COLOR",contracts.DuplexLongEdge,1800},
-   {"two COLOR duplex",2,1,"COLOR",contracts.DuplexLongEdge,1000},
-   {"one COLOR duplex",1,1,"COLOR",contracts.DuplexLongEdge,800},
-   {"three COLOR simplex",3,1,"COLOR",contracts.DuplexSimplex,2400},
-   {"two imposed BW sides (3 pages 2-up) duplex",2,1,"BW",contracts.DuplexLongEdge,500},
-  }
-  for _, tc := range cases {
-   t.Run(tc.name,func(t *testing.T) {
-    got,err := QuoteDocument(tc.sides,tc.copies,tc.mode,tc.duplex,tariff,true,0,PricingPerSheet)
-    if err!=nil {t.Fatal(err)}
-    if got.TotalPaise!=tc.want {t.Fatalf("total=%d want=%d",got.TotalPaise,tc.want)}
-    if got.BilledSides!=tc.sides*tc.copies {t.Fatalf("billed sides=%d",got.BilledSides)}
-   })
-  }
- }
- func TestQuoteDocument_LegacyPolicyUnchanged(t *testing.T) {
-  tariff:=TariffConfig{BWSimplexPricePaise:200,BWDuplexPricePaise:150}
-  got,err:=QuoteDocument(3,2,"BW",contracts.DuplexLongEdge,tariff,true,0,PricingPerSide)
-  if err!=nil {t.Fatal(err)}
-  if got.TotalPaise!=900 {t.Fatalf("legacy pricing changed: got %d want 900",got.TotalPaise)}
- }
- func TestQuoteDocument_RejectInvalidAndOverflow(t *testing.T) {
-  tariff:=TariffConfig{BWSimplexPricePaise:300,BWDuplexPricePaise:500}
-  for _,tc:=range []struct{sides,copies int;mode string;policy DuplexPricingPolicy}{
-   {0,1,"BW",PricingPerSheet},{1,0,"BW",PricingPerSheet},
-   {1,1,"UNKNOWN",PricingPerSheet},{1,1,"BW","unknown"},
-  }{
-   if _,err:=QuoteDocument(tc.sides,tc.copies,tc.mode,contracts.DuplexLongEdge,tariff,true,0,tc.policy);err==nil {t.Fatalf("accepted invalid %+v",tc)}
-  }
-  bigTariff:=TariffConfig{BWSimplexPricePaise:MaxInt64,BWDuplexPricePaise:500}
-  if _,err:=QuoteDocument(2,1,"BW",contracts.DuplexSimplex,bigTariff,true,0,PricingPerSheet);err==nil {t.Fatal("overflow accepted")}
-  if _,err:=QuoteDocument(3,1,"BW",contracts.DuplexLongEdge,tariff,false,0,PricingPerSheet);err==nil {t.Fatal("sheet mode without explicit tariffs accepted")}
- }
+// These cases preserve Bibin's 50e1a24 pricing policy without silently
+// migrating stored per-side tariffs.
+func TestQuoteDocument_BibinSheetPolicy(t *testing.T) {
+	tariff := TariffConfig{
+		BWSimplexPricePaise:    300,
+		BWDuplexPricePaise:     500,
+		ColorSimplexPricePaise: 800,
+		ColorDuplexPricePaise:  1000,
+		ColorEnabled:           true,
+	}
+	cases := []struct {
+		name          string
+		sides, copies int
+		mode          string
+		duplex        contracts.DuplexMode
+		want          int64
+	}{
+		{"one BW simplex", 1, 1, "BW", contracts.DuplexSimplex, 300},
+		{"two BW duplex", 2, 1, "BW", contracts.DuplexLongEdge, 500},
+		{"three BW duplex", 3, 1, "BW", contracts.DuplexLongEdge, 800},
+		{"four BW duplex", 4, 1, "BW", contracts.DuplexLongEdge, 1000},
+		{"five BW duplex", 5, 1, "BW", contracts.DuplexLongEdge, 1300},
+		{"three BW duplex copies", 3, 2, "BW", contracts.DuplexShortEdge, 1600},
+		{"three COLOR duplex", 3, 1, "COLOR", contracts.DuplexLongEdge, 1800},
+		{"two COLOR duplex", 2, 1, "COLOR", contracts.DuplexLongEdge, 1000},
+		{"one COLOR duplex", 1, 1, "COLOR", contracts.DuplexLongEdge, 800},
+		{"three COLOR simplex", 3, 1, "COLOR", contracts.DuplexSimplex, 2400},
+		{"two imposed sides (three original pages at two-up)", 2, 1, "BW", contracts.DuplexLongEdge, 500},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := QuoteDocument(tc.sides, tc.copies, tc.mode, tc.duplex, tariff, true, 0, PricingPerSheet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.TotalPaise != tc.want {
+				t.Fatalf("total=%d want=%d", got.TotalPaise, tc.want)
+			}
+			if got.BilledSides != tc.sides*tc.copies {
+				t.Fatalf("billed sides=%d", got.BilledSides)
+			}
+		})
+	}
+}
+
+func TestQuoteDocument_LegacyPolicyUnchanged(t *testing.T) {
+	tariff := TariffConfig{BWSimplexPricePaise: 200, BWDuplexPricePaise: 150}
+	got, err := QuoteDocument(3, 2, "BW", contracts.DuplexLongEdge, tariff, true, 0, PricingPerSide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TotalPaise != 900 {
+		t.Fatalf("legacy pricing changed: got %d want 900", got.TotalPaise)
+	}
+}
+
+func TestQuoteDocument_RejectInvalidAndOverflow(t *testing.T) {
+	tariff := TariffConfig{BWSimplexPricePaise: 300, BWDuplexPricePaise: 500}
+	cases := []struct {
+		sides, copies int
+		mode          string
+		policy        DuplexPricingPolicy
+	}{
+		{0, 1, "BW", PricingPerSheet},
+		{1, 0, "BW", PricingPerSheet},
+		{1, 1, "UNKNOWN", PricingPerSheet},
+		{1, 1, "BW", "unknown"},
+	}
+	for _, tc := range cases {
+		if _, err := QuoteDocument(tc.sides, tc.copies, tc.mode, contracts.DuplexLongEdge, tariff, true, 0, tc.policy); err == nil {
+			t.Fatalf("accepted invalid %+v", tc)
+		}
+	}
+	bigTariff := TariffConfig{BWSimplexPricePaise: MaxInt64, BWDuplexPricePaise: 500}
+	if _, err := QuoteDocument(2, 1, "BW", contracts.DuplexSimplex, bigTariff, true, 0, PricingPerSheet); err == nil {
+		t.Fatal("overflow accepted")
+	}
+	if _, err := QuoteDocument(3, 1, "BW", contracts.DuplexLongEdge, tariff, false, 0, PricingPerSheet); err == nil {
+		t.Fatal("sheet mode without explicit tariffs accepted")
+	}
+}
