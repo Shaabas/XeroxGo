@@ -2,6 +2,7 @@ package spooler
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
+	_ "modernc.org/sqlite"
 
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/pkg/contracts"
@@ -1145,5 +1150,531 @@ func TestMultiJobRecovery_Negative_MultipleActiveCUPSJobs_HoldFailure_BlocksFres
 	storedFresh, _ := store.GetJob(ctx, freshCmd.JobID)
 	if storedFresh != nil {
 		t.Errorf("security violation: fresh command accepted during uncontained barrier: %+v", storedFresh)
+	}
+}
+
+// TestMultiJobRecovery_Negative_PersistenceFailure_WhilePausing_BlocksFreshPrinting verifies Requirements 1-9:
+// When SQLite write fails while persisting paused state:
+// 1. Recovery barrier is activated fail-closed.
+// 2. Cloud is NOT sent an unpersisted progress update.
+// 3. Unsubmitted jobs are deferred, NOT submitted.
+// 4. Fresh print commands are blocked.
+// 5. Active reservations are not leaked.
+// 6. Original CUPS ID, print settings and counters are preserved in SQLite.
+func TestMultiJobRecovery_Negative_PersistenceFailure_WhilePausing_BlocksFreshPrinting(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "pause_persist_fail.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	queueName := "DCPT310"
+
+	// Job 1: Incomplete job requiring pause in recovery
+	cmd1 := sampleCommand("job-pause-err-1")
+	cmd1.TotalSheets = 2
+	cmd1.TotalPages = 2
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	_ = store.MarkJobSubmitting(ctx, cmd1.JobID)
+	_ = store.RecordJobSubmission(ctx, cmd1.JobID, queueName+"-701")
+
+	// Job 2: Definitely unsubmitted job
+	cmd2 := sampleCommand("job-unsubmitted-2")
+	if err := store.SaveJob(ctx, cmd2, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob failed for cmd2: %v", err)
+	}
+
+	// Capture cloud WebSocket messages
+	var receivedMsgs []wireMessage
+	var msgsMu sync.Mutex
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+			msgsMu.Lock()
+			receivedMsgs = append(receivedMsgs, msg)
+			msgsMu.Unlock()
+		}
+	}))
+	defer wsServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	// Install SQLite trigger to fail update on Job 1
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite: %v", err)
+	}
+	defer rawDB.Close()
+	_, err = rawDB.Exec(`CREATE TRIGGER fail_pause_update BEFORE UPDATE ON jobs WHEN NEW.job_id = 'job-pause-err-1' BEGIN SELECT RAISE(ABORT, 'injected sqlite error on pause update'); END;`)
+	if err != nil {
+		t.Fatalf("failed to create sqlite trigger: %v", err)
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			return []byte("job-state (enum) = pending-held\njob-media-sheets-completed (integer) = 0\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            wsURL,
+		KioskID:             "kiosk-pause-fail-test",
+		StateStore:          store,
+		CUPSQueue:           queueName,
+		CUPSRunner:          runner,
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRecov()
+	go func() {
+		_ = client.Run(recovCtx)
+	}()
+
+	// Wait for recovery barrier to activate fail-closed
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Wait for unsubmitted job to be deferred in Phase 2
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.deferredMu.Lock()
+		deferCount := len(client.deferredJobs)
+		client.deferredMu.Unlock()
+		if deferCount > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. Recovery barrier activated fail-closed
+	blocked, reason := client.IsRecoveryBarrierActive()
+	if !blocked {
+		t.Fatalf("expected recovery barrier to be active after pause persistence failure")
+	}
+	if !strings.Contains(reason, "database error") {
+		t.Errorf("expected barrier reason mentioning database error, got: %s", reason)
+	}
+
+	// 2. Cloud was NOT sent an unpersisted progress event for cmd1
+	msgsMu.Lock()
+	for _, m := range receivedMsgs {
+		if m.Progress != nil && m.Progress.JobID == cmd1.JobID {
+			t.Errorf("safety violation: cloud received progress event for job %s despite SQLite persistence failure: %+v", cmd1.JobID, m.Progress)
+		}
+	}
+	msgsMu.Unlock()
+
+	// 3. Unsubmitted job was deferred, NOT admitted to queue or submitted
+	client.deferredMu.Lock()
+	foundDeferred := false
+	for _, dj := range client.deferredJobs {
+		if dj.JobID == cmd2.JobID {
+			foundDeferred = true
+			break
+		}
+	}
+	client.deferredMu.Unlock()
+	if !foundDeferred {
+		t.Errorf("expected unsubmitted job %s to be deferred", cmd2.JobID)
+	}
+	if len(client.jobQueue) > 0 {
+		t.Errorf("safety violation: unsubmitted job admitted to jobQueue despite persistence barrier")
+	}
+
+	// 4. Fresh command blocked by barrier
+	freshCmd := sampleCommand("job-fresh-blocked")
+	client.handleIncomingJob(freshCmd)
+	storedFresh, _ := store.GetJob(ctx, freshCmd.JobID)
+	if storedFresh != nil {
+		t.Fatalf("safety violation: fresh command saved to database while barrier active")
+	}
+
+	// 5. Active reservations empty
+	client.activeMu.Lock()
+	activeCount := len(client.activeJobs)
+	client.activeMu.Unlock()
+	if activeCount != 0 {
+		t.Errorf("expected 0 active reservations, got %d", activeCount)
+	}
+
+	// 6. Original CUPS ID and settings preserved in SQLite
+	stored1, _ := store.GetJob(ctx, cmd1.JobID)
+	if stored1 == nil || stored1.CUPSJobID != queueName+"-701" {
+		t.Errorf("expected original CUPS ID %s preserved, got: %+v", queueName+"-701", stored1)
+	}
+}
+
+// TestMultiJobRecovery_Negative_PersistenceFailure_WhileHolding_BlocksFreshPrinting verifies Requirements 1-10:
+// When an extra active CUPS job is placed on hold but SQLite persistence of held state fails:
+// 1. Recovery barrier is activated fail-closed.
+// 2. Primary candidate is NOT resumed into monitoring; it is safely paused/held as well.
+// 3. Cloud is NOT sent progress for the unpersisted hold.
+// 4. No new jobs submitted and fresh incoming commands blocked.
+// 5. Active reservations are not leaked.
+func TestMultiJobRecovery_Negative_PersistenceFailure_WhileHolding_BlocksFreshPrinting(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "hold_persist_fail.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	queueName := "DCPT310"
+
+	// Job 1: Primary active processing job
+	cmd1 := sampleCommand("job-primary-act-1")
+	cmd1.TotalSheets = 2
+	cmd1.TotalPages = 2
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusPrinting)
+	_ = store.MarkJobSubmitting(ctx, cmd1.JobID)
+	_ = store.RecordJobSubmission(ctx, cmd1.JobID, queueName+"-801")
+
+	// Job 2: Extra active job that needs hold containment
+	cmd2 := sampleCommand("job-extra-act-2")
+	cmd2.TotalSheets = 2
+	cmd2.TotalPages = 2
+	_ = store.SaveJob(ctx, cmd2, contracts.JobStatusPrinting)
+	_ = store.MarkJobSubmitting(ctx, cmd2.JobID)
+	_ = store.RecordJobSubmission(ctx, cmd2.JobID, queueName+"-802")
+
+	// Capture cloud WebSocket messages
+	var receivedMsgs []wireMessage
+	var msgsMu sync.Mutex
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+			msgsMu.Lock()
+			receivedMsgs = append(receivedMsgs, msg)
+			msgsMu.Unlock()
+		}
+	}))
+	defer wsServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	// Install SQLite trigger to fail update specifically for Job 2
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite: %v", err)
+	}
+	defer rawDB.Close()
+	_, err = rawDB.Exec(`CREATE TRIGGER fail_hold_update BEFORE UPDATE ON jobs WHEN NEW.job_id = 'job-extra-act-2' BEGIN SELECT RAISE(ABORT, 'injected sqlite error on hold update'); END;`)
+	if err != nil {
+		t.Fatalf("failed to create sqlite trigger: %v", err)
+	}
+
+	var is802Held atomic.Bool
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			for i, arg := range args {
+				if arg == "-H" && i+1 < len(args) && args[i+1] == "hold" {
+					is802Held.Store(true)
+					return []byte(""), nil
+				}
+			}
+		}
+		if name == "ipptool" {
+			for _, arg := range args {
+				if strings.Contains(arg, "/jobs/801") {
+					return []byte("job-state (enum) = processing\njob-media-sheets-completed (integer) = 0\n"), nil
+				}
+				if strings.Contains(arg, "/jobs/802") {
+					if is802Held.Load() {
+						return []byte("job-state (enum) = pending-held\njob-media-sheets-completed (integer) = 0\n"), nil
+					}
+					return []byte("job-state (enum) = processing\njob-media-sheets-completed (integer) = 0\n"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            wsURL,
+		KioskID:             "kiosk-hold-fail-test",
+		StateStore:          store,
+		CUPSQueue:           queueName,
+		CUPSRunner:          runner,
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRecov()
+	go func() {
+		_ = client.Run(recovCtx)
+	}()
+
+	// Wait for recovery barrier to activate fail-closed
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. Recovery barrier is active
+	blocked, reason := client.IsRecoveryBarrierActive()
+	if !blocked {
+		t.Fatalf("expected recovery barrier to be active after hold persistence failure")
+	}
+	if !strings.Contains(reason, "database error") {
+		t.Errorf("expected barrier reason mentioning database error, got: %s", reason)
+	}
+
+	// 2. Primary candidate was NOT resumed into monitoring
+	client.activeMu.Lock()
+	isJob1Active := client.activeJobs[cmd1.JobID]
+	client.activeMu.Unlock()
+	if isJob1Active {
+		t.Fatalf("safety violation: primary active job 1 was resumed despite unpersisted hold on extra active job")
+	}
+
+	// 3. Cloud received NO unpersisted progress for job 2
+	msgsMu.Lock()
+	for _, m := range receivedMsgs {
+		if m.Progress != nil && m.Progress.JobID == cmd2.JobID {
+			t.Errorf("safety violation: cloud received progress for extra job %s despite SQLite failure: %+v", cmd2.JobID, m.Progress)
+		}
+	}
+	msgsMu.Unlock()
+
+	// 4. Active reservations empty
+	client.activeMu.Lock()
+	activeCount := len(client.activeJobs)
+	client.activeMu.Unlock()
+	if activeCount != 0 {
+		t.Errorf("expected 0 active reservations, got %d", activeCount)
+	}
+
+	// 5. Fresh commands blocked
+	freshCmd := sampleCommand("job-fresh-blocked-hold")
+	client.handleIncomingJob(freshCmd)
+	storedFresh, _ := store.GetJob(ctx, freshCmd.JobID)
+	if storedFresh != nil {
+		t.Fatalf("safety violation: fresh command saved while hold barrier active")
+	}
+}
+
+// TestMultiJobRecovery_Negative_PersistenceFailure_WhileCompleting_BlocksFreshPrinting verifies Requirements 1-9:
+// When a job has full physical proof and CUPS completed, but SQLite fails during completeJob:
+// 1. Recovery barrier is activated fail-closed.
+// 2. Job is NOT marked resolved in startup scheduling.
+// 3. Cloud is NOT sent JobStatusCompleted (no false completions!).
+// 4. Definitely unsubmitted jobs are deferred, NOT submitted.
+// 5. Fresh commands are blocked.
+// 6. Active reservations are not leaked.
+func TestMultiJobRecovery_Negative_PersistenceFailure_WhileCompleting_BlocksFreshPrinting(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "complete_persist_fail.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	queueName := "DCPT310"
+
+	// Job 1: Has full physical proof (2/2 sheets printed) and CUPS completed
+	cmd1 := sampleCommand("job-complete-fail-1")
+	cmd1.TotalSheets = 2
+	cmd1.TotalPages = 2
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusPrinting)
+	_ = store.MarkJobSubmitting(ctx, cmd1.JobID)
+	_ = store.RecordJobSubmission(ctx, cmd1.JobID, queueName+"-901")
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd1.JobID,
+		KioskID:       cmd1.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  2,
+		SheetsPrinted: 2,
+		Timestamp:     time.Now().UTC(),
+	})
+
+	// Job 2: Definitely unsubmitted job
+	cmd2 := sampleCommand("job-unsubmitted-def-2")
+	_ = store.SaveJob(ctx, cmd2, contracts.JobStatusSpooling)
+
+	// Capture cloud WebSocket messages
+	var receivedMsgs []wireMessage
+	var msgsMu sync.Mutex
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+				return
+			}
+			msgsMu.Lock()
+			receivedMsgs = append(receivedMsgs, msg)
+			msgsMu.Unlock()
+		}
+	}))
+	defer wsServer.Close()
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	// Install SQLite trigger to fail update when status becomes COMPLETED
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open raw sqlite: %v", err)
+	}
+	defer rawDB.Close()
+	_, err = rawDB.Exec(`CREATE TRIGGER fail_complete_update BEFORE UPDATE ON jobs WHEN NEW.status = 'COMPLETED' BEGIN SELECT RAISE(ABORT, 'injected sqlite error on complete'); END;`)
+	if err != nil {
+		t.Fatalf("failed to create sqlite trigger: %v", err)
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			return []byte("printer DCPT310 is idle. enabled since Thu Jan 01 00:00:00 1970"), nil
+		}
+		if name == "ipptool" {
+			return []byte("job-state (enum) = completed\njob-media-sheets-completed (integer) = 2\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:            wsURL,
+		KioskID:             "kiosk-complete-fail-test",
+		StateStore:          store,
+		CUPSQueue:           queueName,
+		CUPSRunner:          runner,
+		DownloadDir:         tmpDir,
+		IdleQRContent:       "https://example.com/qr",
+		ScreenSink:          noopSink,
+		EnableCloudRecovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRecov()
+	go func() {
+		_ = client.Run(recovCtx)
+	}()
+
+	// Wait for recovery barrier to activate fail-closed
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Wait for unsubmitted job to be deferred in Phase 2
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.deferredMu.Lock()
+		deferCount := len(client.deferredJobs)
+		client.deferredMu.Unlock()
+		if deferCount > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. Recovery barrier is active
+	blocked, reason := client.IsRecoveryBarrierActive()
+	if !blocked {
+		t.Fatalf("expected recovery barrier to be active after completion persistence failure")
+	}
+	if !strings.Contains(reason, "database error") {
+		t.Errorf("expected barrier reason mentioning database error, got: %s", reason)
+	}
+
+	// 2. Cloud was NEVER sent JobStatusCompleted (Requirement 4: no false completions!)
+	msgsMu.Lock()
+	for _, m := range receivedMsgs {
+		if m.Progress != nil && m.Progress.JobID == cmd1.JobID && m.Progress.Status == contracts.JobStatusCompleted {
+			t.Fatalf("safety violation: cloud received JobStatusCompleted despite SQLite completion failure: %+v", m.Progress)
+		}
+	}
+	msgsMu.Unlock()
+
+	// 3. Job is NOT marked COMPLETED in SQLite
+	stored1, _ := store.GetJob(ctx, cmd1.JobID)
+	if stored1 != nil && stored1.Status == contracts.JobStatusCompleted {
+		t.Fatalf("safety violation: job 1 marked COMPLETED in SQLite despite trigger failure")
+	}
+
+	// 4. Unsubmitted job was deferred, NOT admitted to queue or submitted
+	client.deferredMu.Lock()
+	foundDeferred := false
+	for _, dj := range client.deferredJobs {
+		if dj.JobID == cmd2.JobID {
+			foundDeferred = true
+			break
+		}
+	}
+	client.deferredMu.Unlock()
+	if !foundDeferred {
+		t.Errorf("expected unsubmitted job %s to be deferred", cmd2.JobID)
+	}
+	if len(client.jobQueue) > 0 {
+		t.Errorf("safety violation: unsubmitted job admitted to jobQueue despite persistence failure")
+	}
+
+	// 5. Active reservations empty
+	client.activeMu.Lock()
+	activeCount := len(client.activeJobs)
+	client.activeMu.Unlock()
+	if activeCount != 0 {
+		t.Errorf("expected 0 active reservations, got %d", activeCount)
+	}
+
+	// 6. Fresh commands blocked by barrier
+	freshCmd := sampleCommand("job-fresh-blocked-complete")
+	client.handleIncomingJob(freshCmd)
+	storedFresh, _ := store.GetJob(ctx, freshCmd.JobID)
+	if storedFresh != nil {
+		t.Fatalf("safety violation: fresh command saved while complete barrier active")
 	}
 }

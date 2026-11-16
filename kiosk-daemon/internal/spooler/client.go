@@ -594,8 +594,7 @@ func (c *Client) Run(ctx context.Context) error {
 						ErrorReason:   reason,
 						Timestamp:     time.Now().UTC(),
 					}
-					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-					c.sendProgress(ctx, evt)
+					_ = c.persistAndSendRecoveryProgress(ctx, evt, "preserving paused job")
 					hasUnresolved = true
 				} else if qErr == nil && cupsInfo.State == printer.CUPSJobStateCompleted {
 					// Verify printer hardware health before assuming completed physical output
@@ -615,8 +614,7 @@ func (c *Client) Run(ctx context.Context) error {
 							ErrorReason:   reason,
 							Timestamp:     time.Now().UTC(),
 						}
-						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-						c.sendProgress(ctx, evt)
+						_ = c.persistAndSendRecoveryProgress(ctx, evt, "printer in error on completed job")
 						hasUnresolved = true
 					} else {
 						// Physical printing finished in CUPS while daemon was stopped/restarting and printer is healthy.
@@ -624,7 +622,11 @@ func (c *Client) Run(ctx context.Context) error {
 						if inc.SheetsPrinted >= inc.Command.TotalSheets {
 							log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) confirmed COMPLETED with physical proof (%d/%d sheets) and printer healthy",
 								inc.Command.JobID, inc.CUPSJobID, inc.SheetsPrinted, inc.Command.TotalSheets)
-							c.completeJob(ctx, inc.Command)
+							if err := c.completeJob(ctx, inc.Command); err != nil {
+								log.Printf("[SPOOLER] Startup reconciliation: failed to complete job %s due to persistence error: %v", inc.Command.JobID, err)
+								c.SetRecoveryBarrier(true, fmt.Sprintf("database error completing job %s: %v", inc.Command.JobID, err))
+								hasUnresolved = true
+							}
 						} else {
 							reason := fmt.Sprintf("interrupted by daemon restart; CUPS completed queue without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), physical evidence insufficient, manual reconciliation required",
 								cupsInfo.SheetsCompleted, inc.SheetsPrinted, inc.Command.TotalSheets)
@@ -638,8 +640,7 @@ func (c *Client) Run(ctx context.Context) error {
 								ErrorReason:   reason,
 								Timestamp:     time.Now().UTC(),
 							}
-							_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-							c.sendProgress(ctx, evt)
+							_ = c.persistAndSendRecoveryProgress(ctx, evt, "insufficient physical sheets for completed queue")
 							hasUnresolved = true
 						}
 					}
@@ -666,8 +667,7 @@ func (c *Client) Run(ctx context.Context) error {
 						ErrorReason:   reason,
 						Timestamp:     time.Now().UTC(),
 					}
-					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-					c.sendProgress(ctx, evt)
+					_ = c.persistAndSendRecoveryProgress(ctx, evt, "held or stopped CUPS job")
 					hasUnresolved = true
 				} else {
 					// Reconciliation uncertain or job aborted/canceled in CUPS.
@@ -687,8 +687,7 @@ func (c *Client) Run(ctx context.Context) error {
 						ErrorReason:   reason,
 						Timestamp:     time.Now().UTC(),
 					}
-					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-					c.sendProgress(ctx, evt)
+					_ = c.persistAndSendRecoveryProgress(ctx, evt, "uncertain or aborted CUPS job")
 					hasUnresolved = true
 				}
 			} else {
@@ -708,8 +707,7 @@ func (c *Client) Run(ctx context.Context) error {
 					ErrorReason:   reason,
 					Timestamp:     time.Now().UTC(),
 				}
-				_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-				c.sendProgress(ctx, evt)
+				_ = c.persistAndSendRecoveryProgress(ctx, evt, "ambiguous unlinked submission")
 				hasUnresolved = true
 			}
 		}
@@ -718,14 +716,38 @@ func (c *Client) Run(ctx context.Context) error {
 		// Requirement 8: Do not spawn resumed monitoring for the first active CUPS job before examining and containing the other active jobs.
 		// Requirement 9: Attempt verified holds on additional active jobs before allowing continued monitoring.
 		// Requirement 10: If an additional hold fails or the job remains processing, block fresh submissions and flag physical-output uncertainty.
+		barrierActive, _ := c.IsRecoveryBarrierActive()
 		if len(activeCandidates) == 1 {
 			cand := activeCandidates[0]
-			log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) is %s in CUPS; resuming monitoring", cand.storedJob.Command.JobID, cand.storedJob.CUPSJobID, cand.cupsInfo.State)
-			activeMonitoringStarted = true
-			c.activeMu.Lock()
-			c.activeJobs[cand.storedJob.Command.JobID] = true
-			c.activeMu.Unlock()
-			go c.resumeCUPSMonitoring(ctx, cand.storedJob)
+			if barrierActive {
+				log.Printf("[SPOOLER] Startup reconciliation: recovery barrier active; pausing active job %s (CUPS ID %s) instead of resuming monitoring", cand.storedJob.Command.JobID, cand.storedJob.CUPSJobID)
+				holdCtx, holdCancel := context.WithTimeout(ctx, 2*time.Second)
+				holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cand.storedJob.CUPSJobID)
+				holdCancel()
+
+				reason := formatCUPSHoldOutcomeReason("interrupted by daemon restart; recovery barrier active, placed on hold to prevent unmonitored printing, operator reconciliation required", cand.storedJob.CUPSJobID, holdRes)
+				if cand.storedJob.ErrorReason != "" && !strings.Contains(reason, cand.storedJob.ErrorReason) {
+					reason = fmt.Sprintf("%s; %s", cand.storedJob.ErrorReason, reason)
+				}
+				evt := contracts.JobProgressEvent{
+					JobID:         cand.storedJob.Command.JobID,
+					KioskID:       cand.storedJob.Command.KioskID,
+					Status:        contracts.JobStatusPausedError,
+					PagesPrinted:  cand.reconciledPages,
+					SheetsPrinted: cand.reconciledSheets,
+					ErrorReason:   reason,
+					Timestamp:     time.Now().UTC(),
+				}
+				_ = c.persistAndSendRecoveryProgress(ctx, evt, "active candidate containment under active barrier")
+				hasUnresolved = true
+			} else {
+				log.Printf("[SPOOLER] Startup reconciliation: job %s (CUPS ID %s) is %s in CUPS; resuming monitoring", cand.storedJob.Command.JobID, cand.storedJob.CUPSJobID, cand.cupsInfo.State)
+				activeMonitoringStarted = true
+				c.activeMu.Lock()
+				c.activeJobs[cand.storedJob.Command.JobID] = true
+				c.activeMu.Unlock()
+				go c.resumeCUPSMonitoring(ctx, cand.storedJob)
+			}
 		} else if len(activeCandidates) > 1 {
 			primaryCand := activeCandidates[0]
 			additionalHoldFailed := false
@@ -750,8 +772,9 @@ func (c *Client) Run(ctx context.Context) error {
 					ErrorReason:   reason,
 					Timestamp:     time.Now().UTC(),
 				}
-				_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-				c.sendProgress(ctx, evt)
+				if err := c.persistAndSendRecoveryProgress(ctx, evt, "extra active CUPS job hold"); err != nil {
+					additionalHoldFailed = true
+				}
 				hasUnresolved = true
 
 				if holdRes.HoldErr != nil || holdRes.StillProcessing || (holdRes.State != printer.CUPSJobStateHeld && holdRes.State != printer.CUPSJobStateCompleted) {
@@ -760,10 +783,13 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 
 			// Step 2: Decide whether primary job can resume monitoring
-			if additionalHoldFailed {
+			barrierActive, _ := c.IsRecoveryBarrierActive()
+			if additionalHoldFailed || barrierActive {
 				// Requirement 10: If an additional hold fails or the job remains processing, block fresh submissions and flag physical-output uncertainty.
-				barrierReason := "uncontained active CUPS jobs detected during startup recovery; hold failed or job remains processing; physical output uncertain, manual reconciliation required"
-				c.SetRecoveryBarrier(true, barrierReason)
+				if !barrierActive {
+					barrierReason := "uncontained active CUPS jobs detected during startup recovery; hold failed or job remains processing; physical output uncertain, manual reconciliation required"
+					c.SetRecoveryBarrier(true, barrierReason)
+				}
 
 				// Contain primary job as well - cannot safely resume when another uncontained job is active in CUPS
 				holdCtx, holdCancel := context.WithTimeout(ctx, 2*time.Second)
@@ -784,8 +810,7 @@ func (c *Client) Run(ctx context.Context) error {
 					ErrorReason:   reason,
 					Timestamp:     time.Now().UTC(),
 				}
-				_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-				c.sendProgress(ctx, evt)
+				_ = c.persistAndSendRecoveryProgress(ctx, evt, "primary candidate containment on uncontained active jobs")
 				hasUnresolved = true
 			} else {
 				// All additional active jobs successfully contained; resume monitoring for primary job
@@ -1579,7 +1604,7 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 	}
 
 	if curSheets >= cmd.TotalSheets {
-		c.completeJob(ctx, cmd)
+		_ = c.completeJob(ctx, cmd)
 	} else {
 		reason := fmt.Sprintf("CUPS completed queue, but physical output incomplete (verified physical: %d/%d); physical evidence insufficient, manual reconciliation required", curSheets, cmd.TotalSheets)
 		if curSheets == 0 {
@@ -1735,6 +1760,22 @@ func (c *Client) checkPrintBarrier(ctx context.Context) error {
 		}
 	}
 
+	return nil
+}
+
+// persistAndSendRecoveryProgress durably records job progress in the state store
+// and forwards the event to the cloud only upon successful persistence.
+// If persistence fails, it activates the fail-closed recovery barrier and suppresses the cloud update.
+func (c *Client) persistAndSendRecoveryProgress(ctx context.Context, evt contracts.JobProgressEvent, contextDesc string) error {
+	if c.cfg.StateStore != nil {
+		if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
+			barrierReason := fmt.Sprintf("database error persisting recovery state (%s) for job %s: %v", contextDesc, evt.JobID, err)
+			log.Printf("[SPOOLER] %s", barrierReason)
+			c.SetRecoveryBarrier(true, barrierReason)
+			return err
+		}
+	}
+	c.sendProgress(ctx, evt)
 	return nil
 }
 
@@ -1950,7 +1991,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 	if startPage > cmd.TotalPages {
 		if sheetsPrinted >= cmd.TotalSheets {
-			c.completeJob(ctx, cmd)
+			_ = c.completeJob(ctx, cmd)
 		} else {
 			reason := fmt.Sprintf("pages already printed, but physical sheets incomplete (verified physical: %d/%d); manual reconciliation required", sheetsPrinted, cmd.TotalSheets)
 			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
@@ -2227,7 +2268,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 	// 9. Complete Job
 	if curSheets >= cmd.TotalSheets {
-		c.completeJob(ctx, cmd)
+		_ = c.completeJob(ctx, cmd)
 	} else {
 		reason := fmt.Sprintf("CUPS completed queue, but physical output incomplete (verified physical: %d/%d); physical evidence insufficient, manual reconciliation required", curSheets, cmd.TotalSheets)
 		if curSheets == 0 {
@@ -2238,7 +2279,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 }
 
-func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) {
+func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) error {
 	log.Printf("[SPOOLER] Job %s successfully printed (%d pages, %d sheets)", cmd.JobID, cmd.TotalPages, cmd.TotalSheets)
 
 	evt := contracts.JobProgressEvent{
@@ -2249,16 +2290,20 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 		SheetsPrinted: cmd.TotalSheets,
 		Timestamp:     time.Now().UTC(),
 	}
-	if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
-		log.Printf("[SPOOLER] Failed to record completion for job %s: %v", cmd.JobID, err)
-		lastPages := 0
-		lastSheets := 0
-		if existingJob, _ := c.cfg.StateStore.GetJob(ctx, cmd.JobID); existingJob != nil {
-			lastPages = existingJob.PagesPrinted
-			lastSheets = existingJob.SheetsPrinted
+	if c.cfg.StateStore != nil {
+		if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
+			barrierReason := fmt.Sprintf("database error persisting completion for job %s: %v", cmd.JobID, err)
+			log.Printf("[SPOOLER] %s", barrierReason)
+			c.SetRecoveryBarrier(true, barrierReason)
+			lastPages := 0
+			lastSheets := 0
+			if existingJob, _ := c.cfg.StateStore.GetJob(ctx, cmd.JobID); existingJob != nil {
+				lastPages = existingJob.PagesPrinted
+				lastSheets = existingJob.SheetsPrinted
+			}
+			c.handleJobError(ctx, cmd, lastPages, lastSheets, fmt.Sprintf("failed to record completion: %v", err))
+			return err
 		}
-		c.handleJobError(ctx, cmd, lastPages, lastSheets, fmt.Sprintf("failed to record completion: %v", err))
-		return
 	}
 
 	// Post-print cleanup: remove downloaded PDF payload from local disk
@@ -2288,6 +2333,7 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 	})
 
 	c.scheduleResetToIdle(c.cfg.CompletedDisplayDuration)
+	return nil
 }
 
 func formatCustomerError(cmd contracts.PrintJobCommand, pagesPrinted int, reason string) (string, string) {
@@ -2329,8 +2375,18 @@ func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobComma
 		ErrorReason:   reason,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-	c.sendProgress(ctx, evt)
+	dbErr := false
+	if c.cfg.StateStore != nil {
+		if err := c.cfg.StateStore.RecordSheetProgress(ctx, evt); err != nil {
+			barrierReason := fmt.Sprintf("database error recording error state for job %s: %v", cmd.JobID, err)
+			log.Printf("[SPOOLER] %s", barrierReason)
+			c.SetRecoveryBarrier(true, barrierReason)
+			dbErr = true
+		}
+	}
+	if !dbErr {
+		c.sendProgress(ctx, evt)
+	}
 
 	customerMsg, customerDetail := formatCustomerError(cmd, pagesPrinted, reason)
 
@@ -2763,8 +2819,7 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 				ErrorReason:   reason,
 				Timestamp:     time.Now().UTC(),
 			}
-			_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-			c.sendProgress(ctx, evt)
+			_ = c.persistAndSendRecoveryProgress(ctx, evt, "reconcile active job on printer recovery")
 
 		case printer.CUPSJobStateCompleted:
 			// Printer recovered independently and CUPS reports completed.
@@ -2781,8 +2836,7 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 				ErrorReason:   reason,
 				Timestamp:     time.Now().UTC(),
 			}
-			_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-			c.sendProgress(ctx, evt)
+			_ = c.persistAndSendRecoveryProgress(ctx, evt, "reconcile completed job without physical proof on printer recovery")
 
 		case printer.CUPSJobStateHeld:
 			log.Printf("[SPOOLER] Interrupted CUPS job %s is safely held in CUPS (buffered sheets may continue printing)", inc.CUPSJobID)
@@ -2796,8 +2850,7 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 					ErrorReason:   inc.ErrorReason,
 					Timestamp:     time.Now().UTC(),
 				}
-				_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-				c.sendProgress(ctx, evt)
+				_ = c.persistAndSendRecoveryProgress(ctx, evt, "reconcile held job progress on printer recovery")
 			}
 
 		default:
@@ -2813,8 +2866,7 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 				ErrorReason:   reason,
 				Timestamp:     time.Now().UTC(),
 			}
-			_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-			c.sendProgress(ctx, evt)
+			_ = c.persistAndSendRecoveryProgress(ctx, evt, "reconcile ambiguous job on printer recovery")
 		}
 	}
 }
