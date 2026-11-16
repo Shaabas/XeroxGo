@@ -165,3 +165,32 @@ To ensure complete scientific integrity, the test methodology explicitly disting
 ### 5.3 Remaining Uncertainty & Engineering Limitations
 - **In-Flight `lp` Kernel Timing Jitter (CW-5):** In a real unexpected power cut or `SIGKILL` during `lp` execution, whether CUPS accepted the spool file depends on exact microsecond scheduling between the `lp` client and `cupsd` socket buffer. The test harness proves that whether CUPS accepted the job (unlinked) or rejected/missed it (unsubmitted), XeroxGo startup recovery safely fails closed to `PAUSED_ERROR` with zero duplicate submissions.
 - **Purged CUPS History Telemetry Loss:** When CUPS history has been purged (`MaxJobTime 0` or daemon restart with empty spool), XeroxGo cannot determine whether the job aborted in the spooler or finished printing. The system safely fails closed to `PAUSED_ERROR`, but requires operator manual reconciliation.
+
+---
+
+## 6. Multi-Job Startup Recovery (Task D4c-3a)
+
+### 6.1 Architecture & Behavioral Principles
+Prior to D4c-3a, `GetIncompleteJob` fetched a single incomplete record using `LIMIT 1`, which created Defect 2: older incomplete jobs were ignored if a newer incomplete job existed. D4c-3a introduces `GetIncompleteJobs` and updates startup recovery:
+
+1. **Deterministic Ordering (`ORDER BY updated_at_ns ASC, job_id ASC`):**
+   `GetIncompleteJobs(ctx)` retrieves all incomplete jobs (`status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')`) ordered deterministically by timestamp ascending, with `job_id` tie-breaker. `GetIncompleteJob(ctx)` is preserved with `LIMIT 1` for existing single-job callers.
+2. **Two-Phase Startup Reconciliation:**
+   - **Phase 1 (Submitted / Ambiguous / Error Records):** All jobs with submission intent (`submitted_to_printer = 1`), CUPS job IDs, prior physical progress, or error status are examined first.
+     - Interrupted / Paused jobs remain in `PAUSED_ERROR` with verified CUPS state reasons.
+     - Held jobs in CUPS remain held and preserved in `PAUSED_ERROR` (never automatically released).
+     - Active jobs (`processing` or `pending` in CUPS): At most **one** active job resumes live monitoring. Any additional active CUPS jobs are placed on hold via `printer.HoldAndVerifyCUPSJob` and preserved in `PAUSED_ERROR` to guarantee zero concurrent print jobs during startup.
+     - Ambiguous submission jobs (crash during submission or unlinked) fail closed to `PAUSED_ERROR`.
+   - **Phase 2 (Definitely-Unsubmitted Records):** Jobs that were definitely not submitted (`status == 'SPOOLING'`, `submitted_to_printer == 0`, `cups_job_id == ""`, `sheets_printed == 0`, `error_reason == ""`).
+     - If any unresolved job exists or active monitoring is running, definitely-unsubmitted jobs are safely deferred to `c.deferredJobs` rather than dispatched to the active queue.
+     - If no unresolved or active jobs exist, at most one unsubmitted job is admitted to the active print queue, and any subsequent unsubmitted jobs are deferred for sequential execution.
+3. **Preservation of Identity, Settings & Diagnostics:**
+   Each job's original CUPS ID, immutable print settings, verified sheet counts, and error diagnostic reasons are strictly preserved across restarts.
+4. **Resilience to Job-Level Failures & Database Errors:**
+   Failure to query or hold one CUPS job does not halt reconciliation of remaining records. If SQLite query errors occur during startup, recovery fails closed safely.
+5. **Idempotency & Replay Safety:**
+   Repeated startup recovery runs on identical SQLite databases are completely idempotent. Duplicate commands replayed post-recovery for completed or paused jobs are safely acknowledged via `job_ack` without re-submitting or altering state. Conflicting duplicate commands are rejected.
+
+### 6.2 Remaining Limitations
+- **Operator Reconciliation Required:** Interrupted, ambiguous, or held jobs preserved in `PAUSED_ERROR` require manual operator or cloud reconciliation before they can be cleared or re-queued.
+- **Sequential Deferral Gate:** Unsubmitted jobs placed in `deferredJobs` remain gated and will not automatically print until all unresolved jobs in SQLite are reconciled.

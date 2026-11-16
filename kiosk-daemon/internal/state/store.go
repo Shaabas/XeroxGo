@@ -573,6 +573,83 @@ LIMIT 1;`
 	return &job, nil
 }
 
+// GetIncompleteJobs returns all incomplete job records (SPOOLING, PRINTING, PAUSED_ERROR)
+// in deterministic order (ORDER BY updated_at_ns ASC, job_id ASC).
+// It returns an empty slice if no incomplete jobs exist.
+func (s *Store) GetIncompleteJobs(
+	ctx context.Context,
+) ([]*StoredJob, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+SELECT job_id, kiosk_id, display_code, download_url, sha256_checksum,
+       total_pages, total_sheets, copies, duplex, start_from_page,
+       status, pages_printed, sheets_printed, error_reason,
+       cups_job_id, submitted_to_printer, updated_at_ns
+FROM jobs
+WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+ORDER BY updated_at_ns ASC, job_id ASC;`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query incomplete jobs: %w", err)
+	}
+	defer rows.Close()
+
+	jobs := make([]*StoredJob, 0)
+	for rows.Next() {
+		var job StoredJob
+		var duplexStr string
+		var statusStr string
+		var updatedAtNS int64
+		var submittedInt int
+
+		err := rows.Scan(
+			&job.Command.JobID,
+			&job.Command.KioskID,
+			&job.Command.DisplayCode,
+			&job.Command.DownloadURL,
+			&job.Command.SHA256Checksum,
+			&job.Command.TotalPages,
+			&job.Command.TotalSheets,
+			&job.Command.Copies,
+			&duplexStr,
+			&job.Command.StartFromPage,
+			&statusStr,
+			&job.PagesPrinted,
+			&job.SheetsPrinted,
+			&job.ErrorReason,
+			&job.CUPSJobID,
+			&submittedInt,
+			&updatedAtNS,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan incomplete job row: %w", err)
+		}
+
+		job.Command.Duplex = contracts.DuplexMode(duplexStr)
+		job.Status = contracts.JobStatus(statusStr)
+		job.SubmittedToPrinter = submittedInt != 0
+		job.UpdatedAt = time.Unix(0, updatedAtNS).UTC()
+
+		jobs = append(jobs, &job)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error for incomplete jobs: %w", err)
+	}
+
+	return jobs, nil
+}
+
 func (s *Store) GetJob(
 	ctx context.Context,
 	jobID string,

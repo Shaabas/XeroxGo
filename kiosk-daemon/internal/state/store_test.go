@@ -311,6 +311,121 @@ func TestGetIncompleteJobExcludesTerminalAndPendingJobs(t *testing.T) {
 	}
 }
 
+func TestGetIncompleteJobs_ReturnsAllIncompleteInDeterministicOrder(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. When empty, returns empty slice (len 0, not nil, nil error)
+	emptyJobs, err := s.GetIncompleteJobs(ctx)
+	if err != nil {
+		t.Fatalf("GetIncompleteJobs on empty store failed: %v", err)
+	}
+	if emptyJobs == nil {
+		t.Fatalf("expected non-nil slice, got nil")
+	}
+	if len(emptyJobs) != 0 {
+		t.Fatalf("expected 0 jobs, got %d", len(emptyJobs))
+	}
+
+	// 2. Insert 4 jobs with controlled timestamps
+	baseTime := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+
+	cmd1 := sampleCommand("job-1-paused")
+	if err := s.SaveJob(ctx, cmd1, contracts.JobStatusPausedError); err != nil {
+		t.Fatalf("SaveJob 1 failed: %v", err)
+	}
+	_ = s.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID:     cmd1.JobID,
+		KioskID:   cmd1.KioskID,
+		Status:    contracts.JobStatusPausedError,
+		Timestamp: baseTime.Add(10 * time.Minute),
+	})
+
+	cmd2 := sampleCommand("job-2-spooling")
+	if err := s.SaveJob(ctx, cmd2, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob 2 failed: %v", err)
+	}
+	_ = s.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID:     cmd2.JobID,
+		KioskID:   cmd2.KioskID,
+		Status:    contracts.JobStatusSpooling,
+		Timestamp: baseTime.Add(20 * time.Minute),
+	})
+
+	cmd3 := sampleCommand("job-3-completed")
+	if err := s.SaveJob(ctx, cmd3, contracts.JobStatusCompleted); err != nil {
+		t.Fatalf("SaveJob 3 failed: %v", err)
+	}
+	_ = s.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID:     cmd3.JobID,
+		KioskID:   cmd3.KioskID,
+		Status:    contracts.JobStatusCompleted,
+		Timestamp: baseTime.Add(30 * time.Minute),
+	})
+
+	cmd4 := sampleCommand("job-4-printing")
+	if err := s.SaveJob(ctx, cmd4, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob 4 failed: %v", err)
+	}
+	_ = s.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID:     cmd4.JobID,
+		KioskID:   cmd4.KioskID,
+		Status:    contracts.JobStatusPrinting,
+		Timestamp: baseTime.Add(40 * time.Minute),
+	})
+
+	// 3. Query all incomplete jobs: must return job-1, job-2, job-4 (excluding completed job-3)
+	// Deterministic order: updated_at_ns ASC -> job-1 (T+10m), job-2 (T+20m), job-4 (T+40m)
+	incomplete, err := s.GetIncompleteJobs(ctx)
+	if err != nil {
+		t.Fatalf("GetIncompleteJobs failed: %v", err)
+	}
+	if len(incomplete) != 3 {
+		t.Fatalf("expected 3 incomplete jobs, got %d", len(incomplete))
+	}
+
+	expectedIDs := []string{"job-1-paused", "job-2-spooling", "job-4-printing"}
+	for i, expID := range expectedIDs {
+		if incomplete[i].Command.JobID != expID {
+			t.Errorf("job at index %d: got %s, want %s", i, incomplete[i].Command.JobID, expID)
+		}
+	}
+
+	// 4. Verify GetIncompleteJob still returns the single most recently updated job (job-4-printing)
+	single, err := s.GetIncompleteJob(ctx)
+	if err != nil {
+		t.Fatalf("GetIncompleteJob failed: %v", err)
+	}
+	if single == nil || single.Command.JobID != "job-4-printing" {
+		t.Fatalf("expected GetIncompleteJob to return single most recent job-4-printing, got: %+v", single)
+	}
+}
+
+func TestGetIncompleteJobs_ErrorAndContextHandling(t *testing.T) {
+	// 1. Nil store
+	var nilStore *Store
+	if _, err := nilStore.GetIncompleteJobs(context.Background()); err == nil {
+		t.Error("expected error for nilStore.GetIncompleteJobs, got nil")
+	}
+
+	s, _ := newTestStore(t)
+	defer s.Close()
+
+	// 2. Nil context
+	if _, err := s.GetIncompleteJobs(nil); err == nil {
+		t.Error("expected error for nil context, got nil")
+	}
+
+	// 3. Canceled context
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.GetIncompleteJobs(cancelCtx); err == nil {
+		t.Error("expected error for canceled context, got nil")
+	}
+}
+
 func TestUpdateProgressRejectsUnknownJob(t *testing.T) {
 	s, _ := newTestStore(t)
 	defer s.Close()
