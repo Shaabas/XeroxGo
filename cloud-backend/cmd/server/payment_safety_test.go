@@ -1025,6 +1025,73 @@ func TestPaymentSafety_ReleaseRequiresExplicitSessionID(t *testing.T) {
 	}
 }
 
+func TestPaymentSafety_ReleaseValidationPrecedesOfflineCheck(t *testing.T) {
+	kioskID := "kiosk-relval-1"
+	orderID := "ord_relval_001"
+	pin := "1234"
+	pricePaise := int64(1000)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	app, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+	defer ts.Close()
+	defer st.Close()
+
+	hub := ws.NewHub(st)
+	hub.SetKioskSecret([]byte(kSec))
+	app.hub = hub
+
+	// Pay the order (moves to PAID_WAITING since no kiosk session exists)
+	body, sig := generateSignedWebhookPayload(orderID, "pay_relval_evt", "", kioskID, pricePaise, whSec)
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq.Header.Set("Content-Type", "application/json")
+	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whResp, _ := http.DefaultClient.Do(whReq)
+	whResp.Body.Close()
+
+	relURL := fmt.Sprintf("%s/api/k/%s/orders/%s/release", ts.URL, kioskID, orderID)
+
+	// Note: Kiosk is NOT connected to WebSocket (offline)
+
+	// 1. Empty session_id must return 400 Bad Request, NOT 503
+	reqEmpty, _ := http.NewRequest(http.MethodPost, relURL, strings.NewReader(`{"session_id": ""}`))
+	reqEmpty.Header.Set("Authorization", "Bearer "+kSec)
+	reqEmpty.Header.Set("Content-Type", "application/json")
+	respEmpty, err := http.DefaultClient.Do(reqEmpty)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer respEmpty.Body.Close()
+	if respEmpty.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for empty session_id even when kiosk offline, got %d", respEmpty.StatusCode)
+	}
+
+	// 2. Malformed JSON body must return 400 Bad Request, NOT 503
+	reqBadJSON, _ := http.NewRequest(http.MethodPost, relURL, strings.NewReader(`{invalid-json`))
+	reqBadJSON.Header.Set("Authorization", "Bearer "+kSec)
+	reqBadJSON.Header.Set("Content-Type", "application/json")
+	respBadJSON, err := http.DefaultClient.Do(reqBadJSON)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer respBadJSON.Body.Close()
+	if respBadJSON.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for malformed JSON even when kiosk offline, got %d", respBadJSON.StatusCode)
+	}
+
+	// 3. Valid session_id with offline kiosk must return 503 Service Unavailable
+	reqValid, _ := http.NewRequest(http.MethodPost, relURL, strings.NewReader(`{"session_id": "sess_some_valid_id"}`))
+	reqValid.Header.Set("Authorization", "Bearer "+kSec)
+	reqValid.Header.Set("Content-Type", "application/json")
+	respValid, err := http.DefaultClient.Do(reqValid)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer respValid.Body.Close()
+	if respValid.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable for valid session_id when kiosk offline, got %d", respValid.StatusCode)
+	}
+}
+
 func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
 	kioskID := "kiosk-cancel-reconn-1"
 	orderID := "ord_cancel_reconn_001"

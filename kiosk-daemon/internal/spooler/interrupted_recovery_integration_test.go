@@ -1707,3 +1707,44 @@ func TestInterruptedRecovery_TeardownPreservesMetadataOnFailedCleanup(t *testing
 	}
 	t.Log("Verified: Ownership metadata strictly preserved when queue cleanup fails")
 }
+
+// -----------------------------------------------------------------------------
+// Test 13: Regression — remove-cups fails closed and preserves metadata when lpadmin is unavailable
+// -----------------------------------------------------------------------------
+func TestInterruptedRecovery_RemoveCupsFailsWhenLpadminUnavailableAndPreservesMetadata(t *testing.T) {
+	emuScript := findEmulatorScript(t)
+	metaFile := filepath.Join(os.TempDir(), fmt.Sprintf("xeroxgo_mock_nolpadmin_meta_%d.meta", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(metaFile) })
+
+	content := fmt.Sprintf("QUEUE_NAME=MockNoLpadmin_%d\nDEVICE_URI=ipp://localhost:8631/ipp/print\nCREATED_AT=%s\n",
+		os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if err := os.WriteFile(metaFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write mock metadata file: %v", err)
+	}
+
+	// Create a temporary bin directory with standard shell utilities, omitting lpadmin
+	tempBin := t.TempDir()
+	for _, tool := range []string{"sh", "bash", "grep", "cat", "rm", "stat", "chmod", "cut", "echo", "date", "dirname", "basename", "sed", "tr", "awk"} {
+		if path, err := exec.LookPath(tool); err == nil {
+			_ = os.Symlink(path, filepath.Join(tempBin, tool))
+		}
+	}
+
+	env := []string{
+		fmt.Sprintf("PATH=%s", tempBin),
+		fmt.Sprintf("EMU_META_FILE=%s", metaFile),
+		"EMU_HOST=localhost",
+		"EMU_PORT=8631",
+	}
+	queueName := fmt.Sprintf("MockNoLpadmin_%d", os.Getpid())
+
+	out, err := runEmu(t, emuScript, env, "remove-cups", queueName)
+	if err == nil {
+		t.Fatalf("expected remove-cups to fail when lpadmin is unavailable, but succeeded: %s", out)
+	}
+
+	if _, err := os.Stat(metaFile); os.IsNotExist(err) {
+		t.Fatalf("CRITICAL FAILURE: ownership metadata file was deleted despite lpadmin unavailability!")
+	}
+	t.Log("Verified: remove-cups fails closed and preserves metadata when lpadmin is unavailable")
+}
