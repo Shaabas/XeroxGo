@@ -907,7 +907,22 @@ func (s *Store) Close() error {
 }
 
 // CreateOrder persists an order and its associated print configuration atomically.
+// Legacy callers are unaffected; activated sheet pricing uses the guarded variant.
 func (s *Store) CreateOrder(ctx context.Context, order Order) error {
+	return s.createOrderWithRevision(ctx, order, 0)
+}
+
+// CreateOrderWithTariffRevision ensures the accepted tariff is still active
+// within the order transaction, preventing a concurrent admin update from
+// silently changing pricing between confirmation and order creation.
+func (s *Store) CreateOrderWithTariffRevision(ctx context.Context, order Order, expectedRevision int64) error {
+	if expectedRevision <= 0 {
+		return fmt.Errorf("create order: expected tariff revision must be positive")
+	}
+	return s.createOrderWithRevision(ctx, order, expectedRevision)
+}
+
+func (s *Store) createOrderWithRevision(ctx context.Context, order Order, expectedRevision int64) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("create order: store is closed or nil")
 	}
@@ -987,6 +1002,22 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("create order: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if expectedRevision > 0 {
+		// PostgreSQL's row lock serializes this check with admin activation.
+		// SQLite uses its transaction snapshot and refuses a stale write.
+		query := "SELECT active_revision FROM sheet_tariff_state WHERE id = 1"
+		if s.dialect == "postgres" {
+			query += " FOR SHARE"
+		}
+		var currentRevision int64
+		if err := tx.QueryRowContext(ctx, query).Scan(&currentRevision); err != nil {
+			return fmt.Errorf("create order: read tariff revision: %w", err)
+		}
+		if currentRevision != expectedRevision {
+			return ErrSheetTariffRevisionConflict
+		}
+	}
 
 	// 1. Prune expired PIN reservations on this kiosk atomically
 	_, err = tx.ExecContext(ctx, s.rebind(`
