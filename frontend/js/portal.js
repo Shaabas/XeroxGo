@@ -66,11 +66,46 @@
     return { revision, acceptedTotal: total };
   }
 
+  // XHR supplies actual network upload progress; receiving HTTP response can take
+  // longer because the cloud still normalizes PDFs and commits the order.
+  function uploadOrderWithProgress(url, formData, onProgress) {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open('POST', url);
+      request.upload.addEventListener('progress', event => {
+        if (event.lengthComputable && event.total > 0) {
+          const percent = Math.min(100, Math.round(event.loaded * 100 / event.total));
+          onProgress(percent === 100 ? 'processing' : 'upload', percent);
+        }
+      });
+      request.upload.addEventListener('load', () => onProgress('processing', null));
+      request.addEventListener('load', () => {
+        resolve({
+          ok: request.status >= 200 && request.status < 300,
+          status: request.status,
+          text: async () => request.responseText,
+          json: async () => JSON.parse(request.responseText)
+        });
+      });
+      request.addEventListener('error', () => reject(new Error(
+        'Connection interrupted. The order might have been created; check your kiosk or existing orders before trying again.'
+      )));
+      request.addEventListener('abort', () => reject(new Error(
+        'Upload interrupted. Check whether an order was created before retrying.'
+      )));
+      request.addEventListener('timeout', () => reject(new Error(
+        'Order response timed out. Check whether an order was created before retrying.'
+      )));
+      request.send(formData);
+    });
+  }
+
+
   // --- Configuration from DOM ---
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
-      module.exports = { convertDocumentOnServer, calculateEstimatedPrice, confirmedOrderQuote };
+      module.exports = { convertDocumentOnServer, calculateEstimatedPrice, confirmedOrderQuote, uploadOrderWithProgress };
     }
     return;
   }
@@ -2073,39 +2108,6 @@
     }
   }
 
-  // XHR supplies actual network upload progress; receiving HTTP response can take
-  // longer because the cloud still normalizes PDFs and commits the order.
-  function uploadOrderWithProgress(url, formData) {
-    return new Promise((resolve, reject) => {
-      const request = new XMLHttpRequest();
-      request.open('POST', url);
-      request.upload.addEventListener('progress', event => {
-        if (event.lengthComputable && event.total > 0) {
-          const percent = Math.min(100, Math.round(event.loaded * 100 / event.total));
-          updateCheckoutProgress(percent === 100 ? 'processing' : 'upload', percent);
-        }
-      });
-      request.upload.addEventListener('load', () => updateCheckoutProgress('processing', null));
-      request.addEventListener('load', () => {
-        resolve({
-          ok: request.status >= 200 && request.status < 300,
-          status: request.status,
-          text: async () => request.responseText,
-          json: async () => JSON.parse(request.responseText)
-        });
-      });
-      request.addEventListener('error', () => reject(new Error(
-        'Connection interrupted. The order might have been created; check your kiosk or existing orders before trying again.'
-      )));
-      request.addEventListener('abort', () => reject(new Error(
-        'Upload interrupted. Check whether an order was created before retrying.'
-      )));
-      request.addEventListener('timeout', () => reject(new Error(
-        'Order response timed out. Check whether an order was created before retrying.'
-      )));
-      request.send(formData);
-    });
-  }
 
   async function submitOrder() {
     if (orderSubmitting || (btnReviewOrder && btnReviewOrder.disabled)) return;
@@ -2202,7 +2204,7 @@
       }
 
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;
-      const resp = await uploadOrderWithProgress(uploadUrl, formData);
+      const resp = await uploadOrderWithProgress(uploadUrl, formData, updateCheckoutProgress);
 
       if (!resp.ok) {
         const errText = await resp.text();
