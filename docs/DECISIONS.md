@@ -1,0 +1,22 @@
+# XeroxGo — architecture decisions
+
+Record decisions with rationale, consequences, and approval status. The code and dated ADRs (when created) supersede guesses from old audit reports.
+
+## Approved / established design constraints
+- **Cloud-owned document processing.** A single canonical cloud PDF normalization/imposition path determines printable output and billable sides. No independent JavaScript or Pi imposition/pricing engine.
+- **Canonical tariff revisions.** The cloud controls pricing in paise; a single revision applies to a quote/order, and stale accepted amounts/revisions are rejected. Existing persisted order prices must not be recalculated after admin rate changes.
+- **Sheet billing.** Full duplex sheets use a duplex-sheet rate; an odd last printed side uses a simplex rate. Blank artificial duplex padding is not billed.
+- **Order safety.** A customer order has a PIN and payment state; retries and crash recovery must avoid accidental duplicate prints. Cloud and Pi coordinate through durable job state.
+- **Pi printer integration.** Prioritize IP/IPP/CUPS; SNMP augments hardware telemetry, and emulator testing is not equivalent to physical printer acceptance.
+- **User experience.** Mobile-first existing visual language (spacing, blue branding, roundness), mixed file uploads, document-specific options; avoid major UI redesign during backend hardening.
+- **Review before significant architecture changes.** Present changes, why, impact/trade-offs and get an opportunity for human review.
+
+## Not yet approved
+- Whether mixed simplex/duplex documents should be represented as separate CUPS tasks, a specially padded merged PDF, or multiple durable print tasks per order. **Do not implement until audited and approved.**
+- Production tariff values and initial activation. Admin API template defaults are **not** active rates.
+- Broad RLS remediation for the 16 pre-existing tables. Needs access-model review and phased tests before migration.
+
+## Decision record template
+`ADR-ID | date | status | context | options | decision | consequences | approving person | supporting PR/commit`
+
+Keep this file concise. Preserve deep specifications in code/tests or links to the technical design, not duplicated prose.
