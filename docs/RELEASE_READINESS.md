@@ -18,7 +18,7 @@
 - User explicitly chose development/testing deployment with NO real payments, not production launch.
 
 ## Testing deployment order (pending approvals)
-1. Verify `PAYMENT_PROVIDER=mock` on Render, then capture startup confirmation from currently deployed backend (if missing, plan a safe config-only update and retest). Avoid changing other variables.
+1. **Observed:** `PAYMENT_PROVIDER` absent in Render, user confirmed on 2026-11-17. Set explicit `PAYMENT_PROVIDER=mock` in Render (config save may trigger deployment) and then capture startup log `Initialized Mock payment provider`. This must be verified before merging PR #9; avoid changing other variables.
 2. Verify the database referenced by Render is the intended testing Supabase database (without revealing the connection string). Otherwise do not activate tariffs in the wrong environment.
 3. Obtain approval of test rates and `color_enabled` flag; no rates have been approved simply by choosing testing mode. Current active revision is zero.
 4. Verify code deployment prerequisites and choose a rollback mechanism. Because `main` auto-deploys after CI, use a maintenance window or temporarily disable auto-deploy through approved dashboard action if necessary.
