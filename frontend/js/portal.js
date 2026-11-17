@@ -91,6 +91,11 @@
   const cartDocsCount = document.getElementById('cart-docs-count');
   const cartTotalAmount = document.getElementById('cart-total-amount');
   const btnReviewOrder = document.getElementById('btn-review-order');
+  const checkoutProgress = document.getElementById('checkout-progress');
+  const checkoutProgressLabel = document.getElementById('checkout-progress-label');
+  const checkoutProgressTrack = document.getElementById('checkout-progress-track');
+  const checkoutProgressBar = document.getElementById('checkout-progress-bar');
+  let orderSubmitting = false;
 
   // Banner Carousel DOM
   const bannerTrack = document.getElementById('banner-track');
@@ -748,12 +753,12 @@
     }
 
     if (btnReviewOrder) {
-      btnReviewOrder.innerHTML = `
+      if (!orderSubmitting) btnReviewOrder.innerHTML = `
         <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
       const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && itemHasCurrentQuote(it));
-      btnReviewOrder.disabled = !canProceed;
+      btnReviewOrder.disabled = orderSubmitting || !canProceed;
     }
   }
 
@@ -2030,8 +2035,63 @@
   }
 
   // --- View 4: Checkout & Order Submission Implementation ---
+  function updateCheckoutProgress(stage, percent) {
+    if (!checkoutProgress) return;
+    checkoutProgress.classList.remove('hidden');
+    const uploading = stage === 'upload';
+    checkoutProgressLabel.textContent = uploading
+      ? (percent === null ? 'Uploading documents…' : 'Uploading documents… ' + percent + '%')
+      : 'Preparing print job and creating PIN…';
+    checkoutProgressTrack.setAttribute('aria-valuetext', uploading
+      ? (percent === null ? 'Uploading documents' : 'Uploading documents ' + percent + ' percent')
+      : 'Processing documents on server');
+    if (uploading && percent !== null) {
+      checkoutProgressTrack.setAttribute('aria-valuenow', String(percent));
+      checkoutProgressBar.style.width = percent + '%';
+      checkoutProgressBar.classList.remove('checkout-progress-indeterminate');
+    } else {
+      checkoutProgressTrack.removeAttribute('aria-valuenow');
+      checkoutProgressBar.style.width = '';
+      checkoutProgressBar.classList.add('checkout-progress-indeterminate');
+    }
+  }
+
+  // XHR supplies actual network upload progress; receiving HTTP response can take
+  // longer because the cloud still normalizes PDFs and commits the order.
+  function uploadOrderWithProgress(url, formData) {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open('POST', url);
+      request.upload.addEventListener('progress', event => {
+        if (event.lengthComputable && event.total > 0) {
+          const percent = Math.min(100, Math.round(event.loaded * 100 / event.total));
+          updateCheckoutProgress(percent === 100 ? 'processing' : 'upload', percent);
+        }
+      });
+      request.upload.addEventListener('load', () => updateCheckoutProgress('processing', null));
+      request.addEventListener('load', () => {
+        resolve({
+          ok: request.status >= 200 && request.status < 300,
+          status: request.status,
+          text: async () => request.responseText,
+          json: async () => JSON.parse(request.responseText)
+        });
+      });
+      request.addEventListener('error', () => reject(new Error(
+        'Connection interrupted. The order might have been created; check your kiosk or existing orders before trying again.'
+      )));
+      request.addEventListener('abort', () => reject(new Error(
+        'Upload interrupted. Check whether an order was created before retrying.'
+      )));
+      request.addEventListener('timeout', () => reject(new Error(
+        'Order response timed out. Check whether an order was created before retrying.'
+      )));
+      request.send(formData);
+    });
+  }
+
   async function submitOrder() {
-    if (btnReviewOrder && btnReviewOrder.disabled) return;
+    if (orderSubmitting || (btnReviewOrder && btnReviewOrder.disabled)) return;
     const readyItems = cartItems.filter(it => it.status === 'ready');
     const processingItems = cartItems.filter(it => it.status === 'processing');
     if (processingItems.length > 0) {
@@ -2043,38 +2103,28 @@
       return;
     }
 
-    btnReviewOrder.disabled = true;
-    const originalText = btnReviewOrder.innerHTML;
-    btnReviewOrder.innerHTML = `<span>Generating PIN...</span>`;
+    // Each document must already have a confirmed cloud quote for its current
+    // settings and tariff. The server will revalidate the submitted price,
+    // revision and final normalized PDF during the one order upload.
+    const revision = activeTariff?.revision;
+    if (!Number.isSafeInteger(revision) || revision < 1 ||
+        readyItems.some(item => !itemHasCurrentQuote(item) ||
+          !Number.isSafeInteger(item.authoritativePricePaise) ||
+          item.authoritativePricePaise <= 0 || !!item.quoteError)) {
+      showCartError('A document price is not confirmed yet. Please review the quotation before ordering.');
+      return;
+    }
+    const acceptedTotal = readyItems.reduce((sum, item) => sum + item.authoritativePricePaise, 0);
+    if (!Number.isSafeInteger(acceptedTotal) || acceptedTotal <= 0) {
+      showCartError('The confirmed quotation is invalid.');
+      return;
+    }
 
+    orderSubmitting = true;
+    renderCart();
+    updateCheckoutProgress('upload', null);
+    const orderStartedAt = performance.now();
     try {
-      // A new cloud quote is required immediately before order creation.
-      // Do not accept stale prices or quietly substitute a different revision.
-      const confirmed = [];
-      for (const item of readyItems) {
-        const quote = await fetchDocumentQuote(item, item.settings);
-        const prior = item.authoritativePricePaise;
-        if (!Number.isSafeInteger(prior) || prior <= 0 ||
-            quote.total_price_paise !== prior || quote.tariff_revision !== item.tariffRevision) {
-          item.authoritativePricePaise = quote.total_price_paise;
-          item.pricePaise = quote.total_price_paise;
-          item.tariffRevision = quote.tariff_revision;
-          item.totalSheets = quote.total_sheets;
-          throw new Error('Print prices changed. Please review the updated quotation and place your order again.');
-        }
-        confirmed.push(quote);
-      }
-      const revision = confirmed[0].tariff_revision;
-      if (confirmed.some(quote => quote.tariff_revision !== revision)) {
-        for (const item of readyItems) item.authoritativePricePaise = null;
-        readyItems.forEach(item => refreshDocumentQuote(item));
-        throw new Error('Prices changed while preparing your order. Review the new quotation and try again.');
-      }
-      const acceptedTotal = confirmed.reduce((sum, quote) => sum + quote.total_price_paise, 0);
-      if (!Number.isSafeInteger(acceptedTotal) || acceptedTotal <= 0) {
-        throw new Error('The confirmed quotation is invalid.');
-      }
-
       const formData = new FormData();
       formData.append('accepted_total_price_paise', String(acceptedTotal));
       formData.append('accepted_tariff_revision', String(revision));
@@ -2142,7 +2192,7 @@
       }
 
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;
-      const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
+      const resp = await uploadOrderWithProgress(uploadUrl, formData);
 
       if (!resp.ok) {
         const errText = await resp.text();
@@ -2188,10 +2238,13 @@
       startOrderStatusPolling(activeOrderId);
 
       switchView('checkout');
+      console.info('Order submitted in', Math.round(performance.now() - orderStartedAt), 'ms');
     } catch (orderErr) {
       console.error('Order submission error:', orderErr);
       showCartError(`Could not create order: ${orderErr.message || orderErr}`);
     } finally {
+      orderSubmitting = false;
+      if (checkoutProgress) checkoutProgress.classList.add('hidden');
       renderCart();
     }
   }
