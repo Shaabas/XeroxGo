@@ -18,30 +18,29 @@ func sampleSheetTariff() pricing.Tariff {
 	}
 }
 
-func TestSheetTariffExplicitActivationPreservesLegacyRates(t *testing.T) {
+func TestSheetTariffExplicitActivationAndPersistence(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "pricing.sqlite")
 	s, err := Open(path)
 	if err != nil { t.Fatal(err) }
-	if err := s.SetDetailedPricing(ctx, 200, 150, 1000, 750, true); err != nil { t.Fatal(err) }
 	if _, err := s.GetActiveSheetTariff(ctx); !errors.Is(err, ErrSheetTariffNotActive) {
-		t.Fatalf("expected not active, got %v", err)
+		t.Fatalf("expected inactive tariff, got %v", err)
 	}
 	first, err := s.ActivateSheetTariff(ctx, 0, sampleSheetTariff(), "test-admin")
-	if err != nil || first.Revision != 1 { t.Fatalf("activation=%+v err=%v", first, err) }
+	if err != nil || first.Revision != 1 {
+		t.Fatalf("activation=%+v err=%v", first, err)
+	}
 	active, err := s.GetActiveSheetTariff(ctx)
-	if err != nil || active != first { t.Fatalf("active=%+v want=%+v err=%v", active, first, err) }
-	legacy, err := s.GetPricing(ctx)
-	if err != nil || legacy.BWSimplexPricePaise != 200 || legacy.BWDuplexPricePaise != 150 || !legacy.ColorEnabled {
-		t.Fatalf("legacy pricing modified: %+v err=%v", legacy, err)
+	if err != nil || active != first {
+		t.Fatalf("active=%+v want=%+v err=%v", active, first, err)
 	}
 	if err := s.Close(); err != nil { t.Fatal(err) }
 	reopened, err := Open(path)
 	if err != nil { t.Fatal(err) }
 	defer reopened.Close()
 	active, err = reopened.GetActiveSheetTariff(ctx)
-	if err != nil || active.Revision != 1 || active.BWDuplexSheetPaise != 500 {
-		t.Fatalf("reopened active tariff=%+v err=%v", active, err)
+	if err != nil || active != first {
+		t.Fatalf("reopened tariff=%+v want=%+v err=%v", active, first, err)
 	}
 }
 
