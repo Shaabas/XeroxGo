@@ -13,7 +13,6 @@ import (
 
 	"xeroxgo/cloud-backend/internal/pdf"
 	"xeroxgo/cloud-backend/internal/pricing"
-	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -227,68 +226,42 @@ func prepareInputPDF(
 	}, nil
 }
 
-// normalizedDocResult contains the authoritative output from normalization, pricing, and sheet accounting.
+// normalizedDocResult contains the canonical normalization and billing result.
 type normalizedDocResult struct {
-	NormResult   *pdf.NormalizedResult
-	UnitPrice    int64
-	PrintedSides int
-	PricePaise   int64
+	NormResult    *pdf.NormalizedResult
+	PrintedSides  int
+	PricePaise    int64
 	TariffRevision int64
 }
 
-// executeNormalizationAndPricing executes canonical normalization on the prepared input PDF
-// and calculates authoritative unit price and total price in integer paise.
+// executeNormalizationAndPricing is the only PDF-to-money calculation path.
+// NormalizedResult.TotalPages excludes artificial duplex blank padding.
 func (s *appServer) executeNormalizationAndPricing(
 	ctx context.Context,
 	inputPDFPath string,
 	outputPath string,
 	opts docPrintOptions,
-	pricingConfig store.PricingConfig,
-	hasPricing bool,
-	sheetTariff ...pricing.Tariff,
+	tariff pricing.Tariff,
 ) (*normalizedDocResult, error) {
 	normRes, err := pdf.NormalizeAndCountWithOptions(ctx, inputPDFPath, outputPath, pdf.NormalizeOptions{
-		Copies:        opts.Copies,
-		Duplex:        opts.Duplex,
-		ColorMode:     opts.ColorMode,
-		PageRange:     opts.PageRange,
-		Orientation:   opts.Orientation,
+		Copies: opts.Copies, Duplex: opts.Duplex, ColorMode: opts.ColorMode,
+		PageRange: opts.PageRange, Orientation: opts.Orientation,
 		PagesPerSheet: opts.PagesPerSheet,
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	// The normalizer's TotalPages is the number of occupied imposed sides
-	// BEFORE artificial duplex padding. Never bill PaddedPages.
-	if len(sheetTariff) > 1 {
-		return nil, errors.New("multiple sheet tariff snapshots provided")
-	}
-	if len(sheetTariff) == 1 {
-		t := sheetTariff[0]
-		quote, err := pricing.CalculateOrder(t, []pricing.Document{{
-			ImposedSidesPerCopy: int64(normRes.TotalPages),
-			Copies: int64(opts.Copies),
-			Duplex: opts.Duplex != contracts.DuplexSimplex,
-			Color: strings.EqualFold(opts.ColorMode, "COLOR"),
-		}})
-		if err != nil { return nil, fmt.Errorf("calculate sheet quote: %w", err) }
-		if quote.BilledSides > int64(int(^uint(0)>>1)) {
-			return nil, errors.New("billed sides exceed platform range")
-		}
-		return &normalizedDocResult{
-			NormResult: normRes, PrintedSides: int(quote.BilledSides),
-			PricePaise: quote.TotalPaise, TariffRevision: t.Revision,
-		}, nil
-	}
-	unitPrice := s.resolveUnitPrice(pricingConfig, hasPricing, opts.ColorMode, opts.Duplex)
-	printedSides := normRes.TotalPages * opts.Copies
-	docPrice, err := pricing.CalculatePricePaise(printedSides, unitPrice)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calculate price: %w", err)
+	if err != nil { return nil, err }
+	quote, err := pricing.CalculateOrder(tariff, []pricing.Document{{
+		ImposedSidesPerCopy: int64(normRes.TotalPages),
+		Copies: int64(opts.Copies),
+		Duplex: opts.Duplex != contracts.DuplexSimplex,
+		Color: strings.EqualFold(opts.ColorMode, "COLOR"),
+	}})
+	if err != nil { return nil, fmt.Errorf("calculate document price: %w", err) }
+	if quote.BilledSides > int64(int(^uint(0)>>1)) {
+		return nil, errors.New("billed sides exceed platform range")
 	}
 	return &normalizedDocResult{
-		NormResult: normRes, UnitPrice: unitPrice,
-		PrintedSides: printedSides, PricePaise: docPrice,
+		NormResult: normRes,
+		PrintedSides: int(quote.BilledSides),
+		PricePaise: quote.TotalPaise, TariffRevision: quote.TariffRevision,
 	}, nil
 }
