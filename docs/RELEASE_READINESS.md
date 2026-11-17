@@ -15,10 +15,10 @@
 - `XEROXGO_DEV_MODE=1` currently; development mode forces `demoMode=true`.
 - `DATABASE_URL`, admin password, download/webhook secrets are present (masked); 3 Vercel secrets reported configured. Do not infer values or sufficiency.
 - **Important:** Demo mode does NOT force the mock payment provider. The server independently chooses Razorpay if `PAYMENT_PROVIDER=razorpay`, or if `PAYMENT_PROVIDER` is unset and both Razorpay credentials exist. For testing require **`PAYMENT_PROVIDER=mock`** and verify startup log "Initialized Mock payment provider". Do not expose real Razorpay key values.
-- User explicitly chose development/testing deployment with NO real payments, not production launch.
+- User explicitly chose development/testing deployment with NO real payments, not production launch. User further confirmed Razorpay is not configured and requested **payment setup be deferred**. Do not spend the active workstream on payment integration.
 
 ## Testing deployment order (pending approvals)
-1. **Observed:** `PAYMENT_PROVIDER` absent in Render, user confirmed on 2026-11-17. Set explicit `PAYMENT_PROVIDER=mock` in Render (config save may trigger deployment) and then capture startup log `Initialized Mock payment provider`. This must be verified before merging PR #9; avoid changing other variables.
+1. **Payments deferred by user.** Razorpay is not configured; do not work on payment-provider setup during this task. Before any test checkout that could initiate a payment, verify it cannot trigger real charges; keep that verification as a narrow pre-test safety check, not an integration project.
 2. Verify the database referenced by Render is the intended testing Supabase database (without revealing the connection string). Otherwise do not activate tariffs in the wrong environment.
 3. Obtain approval of test rates and `color_enabled` flag; no rates have been approved simply by choosing testing mode. Current active revision is zero.
 4. Verify code deployment prerequisites and choose a rollback mechanism. Because `main` auto-deploys after CI, use a maintenance window or temporarily disable auto-deploy through approved dashboard action if necessary.
