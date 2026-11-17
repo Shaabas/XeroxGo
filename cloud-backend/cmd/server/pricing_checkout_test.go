@@ -120,7 +120,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 	// Configure explicit 4-tier pricing in database:
 	// BW Simplex: 200 paise, BW Duplex: 150 paise
 	// Color Simplex: 1000 paise, Color Duplex: 750 paise
-	ctx := context.Background()
 	activateTestPricing(t, app, 300, 500, 800, 1000, true, 0)
 
 	doc1p := createTestPDFWithPages(t, tmpDir, 1)
