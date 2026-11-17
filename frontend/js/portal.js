@@ -10,11 +10,50 @@
 (function () {
   'use strict';
 
+  // A fast, untrusted display estimate using the server-published tariff.
+  // This must never determine the amount charged or stored in an order.
+  function calculateEstimatedPrice(totalPages, settings, tariff) {
+    if (!Number.isSafeInteger(totalPages) || totalPages < 1 || !settings ||
+        !tariff || !Number.isSafeInteger(tariff.revision) || tariff.revision < 1) return null;
+    let count = totalPages;
+    if (settings.pageSelection === 'Custom Range') {
+      const from = Number(settings.rangeFrom);
+      const to = Number(settings.rangeTo);
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
+          from < 1 || to < from || to > totalPages) return null;
+      count = to - from + 1;
+    } else if (settings.pageSelection === 'Selection') {
+      const selected = settings.selectedPages;
+      if (!Array.isArray(selected) || selected.length === 0 ||
+          selected.some(p => !Number.isSafeInteger(p) || p < 1 || p > totalPages)) return null;
+      count = new Set(selected).size;
+    } else if (settings.customPageRange) {
+      const parsed = parseCustomPages(settings.customPageRange, totalPages);
+      if (!parsed.valid || !parsed.pages.length) return null;
+      count = parsed.pages.length;
+    }
+    const nup = Number(settings.pagesPerSheet || 1);
+    const copies = Number(settings.copies || 1);
+    if (![1, 2, 4, 6].includes(nup) || !Number.isSafeInteger(copies) ||
+        copies < 1 || copies > 999) return null;
+    const color = settings.mode === 'Color';
+    if (color && tariff.color_enabled !== true) return null;
+    const simplex = color ? tariff.color_simplex_paise : tariff.bw_simplex_paise;
+    const duplexSheet = color ? tariff.color_duplex_sheet_paise : tariff.bw_duplex_sheet_paise;
+    if (![simplex, duplexSheet].every(v => Number.isSafeInteger(v) && v > 0)) return null;
+    const imposedSides = Math.ceil(count / nup);
+    const perCopy = settings.sides === 'Double-sided'
+      ? Math.floor(imposedSides / 2) * duplexSheet + (imposedSides % 2) * simplex
+      : imposedSides * simplex;
+    const total = perCopy * copies;
+    return Number.isSafeInteger(total) && total > 0 ? total : null;
+  }
+
   // --- Configuration from DOM ---
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
-      module.exports = { convertDocumentOnServer };
+      module.exports = { convertDocumentOnServer, calculateEstimatedPrice };
     }
     return;
   }
@@ -28,11 +67,9 @@
   }
   const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
-  // The server owns prices. The public tariff is used only for displaying rate labels.
+  // The backend owns billing; this public tariff also powers instant UI estimates.
   let activeTariff = null;
   let pricingRequestError = null;
-  let draftQuoteTimer = null;
-  let draftQuoteSerial = 0;
 
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
@@ -331,7 +368,7 @@
   async function refreshDocumentQuote(item) {
     const settingsKey = JSON.stringify(item.settings);
     item.authoritativePricePaise = null;
-    item.pricePaise = 0;
+    item.pricePaise = calculateEstimatedPrice(item.totalPages, item.settings, activeTariff) || 0;
     item.quotePending = true;
     renderCart();
     try {
@@ -364,10 +401,14 @@
       activeTariff = tariff;
       pricingRequestError = null;
       updateRateLabels();
+      renderCart();
+      if (draftSettings) scheduleDraftQuote();
     } catch (error) {
       activeTariff = null;
       pricingRequestError = error.message;
       updateRateLabels();
+      renderCart();
+      if (draftSettings) scheduleDraftQuote();
     }
   }
 
@@ -386,19 +427,9 @@
 
   function scheduleDraftQuote() {
     const item = cartItems.find(it => it.id === activeSettingsDocId);
-    if (!item || !draftSettings || !item.file) return;
-    clearTimeout(draftQuoteTimer);
-    const serial = ++draftQuoteSerial;
-    const settings = JSON.parse(JSON.stringify(draftSettings));
-    if (saveSettingsPrice) saveSettingsPrice.textContent = '…';
-    draftQuoteTimer = setTimeout(async () => {
-      try {
-        const quote = await fetchDocumentQuote(item, settings);
-        if (serial === draftQuoteSerial && saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(quote.total_price_paise);
-      } catch (_) {
-        if (serial === draftQuoteSerial && saveSettingsPrice) saveSettingsPrice.textContent = '—';
-      }
-    }, 350);
+    if (!item || !draftSettings || !saveSettingsPrice) return;
+    const estimate = calculateEstimatedPrice(item.totalPages, draftSettings, activeTariff);
+    saveSettingsPrice.textContent = estimate === null ? '—' : formatRupees(estimate);
   }
 
   function getDocSelectedPages(totalPages, settings) {
@@ -460,6 +491,10 @@
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   }
 
+  function itemHasCurrentQuote(item) {
+    return !item.quotePending && item.tariffRevision === activeTariff?.revision;
+  }
+
   function renderCart() {
     if (!cartDocList) return;
 
@@ -474,6 +509,7 @@
     if (cartBottomBar) cartBottomBar.classList.remove('hidden');
 
     let totalCartPaise = 0;
+    let hasEstimatedTotal = false;
     let readyCount = 0;
     let processingCount = 0;
 
@@ -573,9 +609,12 @@
       } else {
         // ready
         readyCount++;
-        const hasAuthPrice = (typeof item.authoritativePricePaise === 'number' && !isNaN(item.authoritativePricePaise));
-        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : 0;
+        const hasAuthPrice = Number.isSafeInteger(item.authoritativePricePaise) &&
+          item.authoritativePricePaise > 0 && item.tariffRevision === activeTariff?.revision;
+        const estimated = calculateEstimatedPrice(item.totalPages, item.settings, activeTariff);
+        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : (estimated || 0);
         item.pricePaise = itemPrice;
+        if (!hasAuthPrice) hasEstimatedTotal = true;
         totalCartPaise += itemPrice;
 
         let pageCountText = `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
@@ -605,7 +644,8 @@
           metaText += ` · ${item.totalSheets} sheet${item.totalSheets > 1 ? 's' : ''}`;
         }
 
-        const priceDisplayHtml = hasAuthPrice ? formatRupees(itemPrice) : (item.quoteError ? 'Quote unavailable' : '…');
+        const priceDisplayHtml = hasAuthPrice ? formatRupees(itemPrice) :
+          (item.quoteError ? 'Quote unavailable' : estimated !== null ? '≈' + formatRupees(estimated) : '…');
 
         card.innerHTML = `
           <div class="doc-card-top">
@@ -666,7 +706,7 @@
       if (isProcessing && readyCount === 0) {
         cartTotalAmount.innerHTML = `<span class="price-loading-dots" role="status" aria-label="Calculating price"><span class="price-dot"></span><span class="price-dot"></span><span class="price-dot"></span></span>`;
       } else if (readyCount > 0 && totalCartPaise > 0) {
-        cartTotalAmount.textContent = formatRupees(totalCartPaise);
+        cartTotalAmount.textContent = (hasEstimatedTotal ? '≈' : '') + formatRupees(totalCartPaise);
       } else if (readyCount === 0 && cartItems.length > 0) {
         cartTotalAmount.textContent = '--';
       } else {
@@ -679,7 +719,7 @@
         <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
-      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && !it.quotePending);
+      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && itemHasCurrentQuote(it));
       btnReviewOrder.disabled = !canProceed;
     }
   }
@@ -994,7 +1034,7 @@
       item.previewPending = false;
       item.authoritativePricePaise = null;
       item.totalSheets = Math.ceil(totalPages / (defaultSides === 'Double-sided' ? 2 : 1));
-      item.pricePaise = 0;
+      item.pricePaise = calculateEstimatedPrice(item.totalPages, item.settings, activeTariff) || 0;
       renderCart();
       refreshDocumentQuote(item);
     } catch (err) {
@@ -1642,7 +1682,7 @@
       const nup = parseInt(doc.settings.pagesPerSheet, 10) || 1;
       const count = doc.selectedPages.length;
       doc.totalSheets = Math.max(1, isDuplex ? Math.ceil(count / (nup * 2)) : Math.ceil(count / nup));
-      doc.pricePaise = 0;
+      doc.pricePaise = calculateEstimatedPrice(doc.totalPages, doc.settings, activeTariff) || 0;
       doc.authoritativePricePaise = null;
       refreshDocumentQuote(doc);
 
