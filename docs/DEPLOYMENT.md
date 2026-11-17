@@ -1,22 +1,30 @@
 # XeroxGo — deployment and database safety
 
-**Operational guardrail:** At last review Render automatically deploys from `main`. Therefore a GitHub merge may trigger a production release. Verify current settings before action.
+**Verified GitHub snapshot:** 2026-11-17. Latest main at review: `c3baa56e4955f7715371fae991811287b040a610` (PR #14). [GitHub Actions 44108533141](https://github.com/Shaabas/XeroxGo/actions/runs/44108533141) reports verification and **Vercel frontend deployment successful**. This does not establish the Render backend's live commit, environment, or end-to-end order readiness.
 
 ## Pre-merge checklist
-- Verify current PR head/target, all checks and approvals. Do not trust old reports.
-- Identify deployment trigger (Render/Vercel), production environment variables, health checks and rollback target.
-- Confirm Supabase migrations are present and compatible; migrations are not automatically safe to rerun.
-- Validate active tariff: the canonical pricing API returns 503 until an admin activates revision 1. At last direct check, `active_revision=0`.
-- Check the public API route in code (`/api/pricing` at the verified snapshot); correct stale PR/documentation references.
-- Establish backup/rollback plan and smoke tests (pricing, preview, upload, payment/PIN, kiosk dispatch).
-- Obtain explicit human approval for merging into an auto-deploy branch and for any tariff activation.
+1. Verify current PR head, target, changed-file scope, required checks and approval.
+2. Inspect actual Vercel/Render deployment triggers; main-branch merges can trigger releases.
+3. Confirm relevant Supabase migrations/configuration are already compatible. Never blindly reapply live migrations.
+4. Verify server tariff revision, admin/public pricing routes and accepted-quote contract when changing pricing.
+5. Confirm payment mode without exposing secrets or inadvertently initiating real payments.
+6. Preserve an identified rollback build and run post-deploy smoke checks for the affected system.
+7. Distinguish `GitHub CI passed`, `frontend deploy succeeded`, `backend deploy verified`, and `end-to-end smoke tested`.
 
-## Supabase snapshot at 2026-11-17
-- Canonical tariff migrations and security migration recorded remotely.
-- Two new pricing tables have RLS and client-access revocations; service role access retained.
-- 16 older public tables still need grants/RLS review — do not fix blindly without backend dependency analysis.
+## Pricing and database state
+- The canonical tariff tables `sheet_tariff_versions` and `sheet_tariff_state` were previously created and secured in connected Supabase.
+- Revision 1 was previously activated with BW simplex/duplex 300/500 paise, color simplex/duplex 800/1000 paise, color disabled. **Do not assume these are still the live rates; admin can update them.**
+- Existing order prices are recorded; quote/order revision mismatches must be rejected.
+- Older table RLS/grants require a separate analysis. Avoid broad security migrations without dependency inspection.
 
-## Release records
-For each deployment record: date, commit, environment, migration versions, tariff revision, verification, rollback reference, operator approval, and outcome.
+## Changes and operational ownership
+- ChatGPT: GitHub, architecture, reviews, approved remote edits.
+- Antigravity: focused implementation and local tests.
+- Human: approves architecture, payments, database mutation and deployment-sensitive changes.
+- Render mode/deployed SHA and Raspberry Pi hardware readiness require independent verification.
 
-Do not commit credentials or copy real customer records into development tests.
+## Rollback
+Document previous successful frontend/backend builds, database migration compatibility, and current order state before a production-affecting change. A Git revert is not proof of a safe database or print-session rollback.
+
+## Release record
+`date | PR + merge SHA | environment | migration/tariff revision | CI | frontend deploy | backend deploy | smoke results | approval | rollback target`.
