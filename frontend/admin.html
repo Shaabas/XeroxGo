@@ -117,32 +117,78 @@
         </div>
       </section>
 
-      <!-- Canonical tariff controls -->
+      <!-- Pricing settings and read-only calculator -->
       <section id="view-pricing" class="admin-view hidden">
-        <div class="panel-card">
-          <div class="panel-header"><div>
-            <h2 class="panel-title">Printing Prices</h2>
-            <p id="pricing-revision" style="color:var(--text-muted);font-size:0.85rem;margin-top:0.4rem;">Loading current tariff…</p>
-          </div></div>
-          <form id="pricing-form" style="max-width:560px;">
-            <div class="form-group"><label class="form-label" for="pricing-bw-simplex">B&W single-sided (₹ per side)</label>
-              <input class="form-input" id="pricing-bw-simplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
-            <div class="form-group"><label class="form-label" for="pricing-bw-duplex">B&W double-sided (₹ per full sheet)</label>
-              <input class="form-input" id="pricing-bw-duplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
-            <div class="form-group"><label class="form-label" for="pricing-color-simplex">Color single-sided (₹ per side)</label>
-              <input class="form-input" id="pricing-color-simplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
-            <div class="form-group"><label class="form-label" for="pricing-color-duplex">Color double-sided (₹ per full sheet)</label>
-              <input class="form-input" id="pricing-color-duplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
-            <div class="form-group"><label class="form-label" for="pricing-color-enabled"><input id="pricing-color-enabled" type="checkbox" /> Enable color printing</label></div>
-            <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:1rem;">An odd final duplex side uses the single-sided rate. Saving creates a new tariff revision; existing orders keep their prices.</p>
-            <div id="pricing-message" role="status" style="font-size:0.85rem;margin-bottom:0.75rem;"></div>
-            <button id="pricing-save" type="submit" class="btn-primary">Save Prices</button>
-            <button id="pricing-reload" type="button" class="btn-secondary">Reload</button>
-          </form>
+        <div class="pricing-grid">
+          <div class="panel-card">
+            <div class="panel-header"><div>
+              <h2 class="panel-title">Printing Prices</h2>
+              <p id="pricing-revision" style="color:var(--text-muted);font-size:0.85rem;margin-top:0.4rem;">Loading current prices…</p>
+            </div></div>
+            <form id="pricing-form">
+              <div class="form-group"><label class="form-label" for="pricing-bw-simplex">B&W single-sided (₹ per side)</label>
+                <input class="form-input" id="pricing-bw-simplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+              <div class="form-group"><label class="form-label" for="pricing-bw-duplex">B&W double-sided (₹ per full sheet)</label>
+                <input class="form-input" id="pricing-bw-duplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+              <div class="form-group"><label class="form-label" for="pricing-color-simplex">Color single-sided (₹ per side)</label>
+                <input class="form-input" id="pricing-color-simplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+              <div class="form-group"><label class="form-label" for="pricing-color-duplex">Color double-sided (₹ per full sheet)</label>
+                <input class="form-input" id="pricing-color-duplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+              <div class="form-group"><label class="form-label" for="pricing-color-enabled"><input id="pricing-color-enabled" type="checkbox" /> Enable color printing</label></div>
+              <p class="pricing-helper">An odd final duplex side uses the single-sided rate. Existing orders keep their original prices.</p>
+              <div id="pricing-message" role="status" style="font-size:0.85rem;margin-bottom:0.75rem;"></div>
+              <button id="pricing-save" type="submit" class="btn-primary">Save Prices</button>
+              <button id="pricing-reload" type="button" class="btn-secondary">Reload</button>
+            </form>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-header"><div>
+              <h2 class="panel-title">Price Calculator</h2>
+              <p class="pricing-helper">Try a print job using the prices on the left.</p>
+            </div></div>
+            <div class="pricing-calc-fields">
+              <div class="form-group">
+                <label class="form-label" for="calc-pages">Document pages</label>
+                <input class="form-input" id="calc-pages" type="number" min="1" max="100000" step="1" value="5" />
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="calc-copies">Copies</label>
+                <input class="form-input" id="calc-copies" type="number" min="1" max="999" step="1" value="1" />
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="calc-nup">Pages per side (N-Up)</label>
+                <select class="form-input" id="calc-nup">
+                  <option value="1">1-up</option><option value="2">2-up</option>
+                  <option value="4">4-up</option><option value="6">6-up</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="calc-sides">Printing sides</label>
+                <select class="form-input" id="calc-sides">
+                  <option value="simplex">Single-sided</option>
+                  <option value="duplex">Double-sided</option>
+                </select>
+              </div>
+              <div class="form-group pricing-calc-wide">
+                <label class="form-label" for="calc-color">Print mode</label>
+                <select class="form-input" id="calc-color">
+                  <option value="bw">Black &amp; white</option>
+                  <option value="color">Color</option>
+                </select>
+              </div>
+            </div>
+            <div class="pricing-calc-result" aria-live="polite">
+              <div class="pricing-calc-detail"><span>Printed sides per copy</span><strong id="calc-imposed">—</strong></div>
+              <div class="pricing-calc-detail"><span>Sheets (all copies)</span><strong id="calc-sheets">—</strong></div>
+              <div class="pricing-calc-total"><span>Calculated total</span><strong id="calc-total">—</strong></div>
+              <p id="calc-note" class="pricing-helper">Enter valid printing prices to calculate.</p>
+            </div>
+          </div>
         </div>
       </section>
 
-      <!-- 2. ORDERS VIEW -->
+            <!-- 2. ORDERS VIEW -->
       <section id="view-orders" class="admin-view hidden">
         <div class="panel-card">
           <div class="table-toolbar">
@@ -452,6 +498,6 @@
     </div>
   </template>
 
-  <script src="/js/admin.js?v=6"></script>
+  <script src="/js/admin.js?v=7"></script>
 </body>
 </html>
