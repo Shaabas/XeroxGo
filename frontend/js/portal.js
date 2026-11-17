@@ -298,7 +298,7 @@
   function preparedFile(item) {
     if (item.pdfBytes && (item.isImage || item.isOffice)) {
       const blob = new Blob([item.pdfBytes], { type: 'application/pdf' });
-      return new File([blob], item.name.replace(/\\.[^.]+$/, '') + '.pdf', { type: 'application/pdf' });
+      return new File([blob], item.name.replace(/\.[^.]+$/, '') + '.pdf', { type: 'application/pdf' });
     }
     return item.file;
   }
