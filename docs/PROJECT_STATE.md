@@ -1,36 +1,33 @@
 # XeroxGo — current project checkpoint
 
-**Snapshot:** 2026-11-17, verified via connected GitHub and Supabase tools. **Update this file after the next integration milestone.** Information may become stale; confirm live branch and CI before action.
+**Verified:** 2026-11-17 using the connected GitHub repository. This is a GitHub snapshot, not proof of the Render backend's deployed image or the local Antigravity worktree.
 
-## Current source of truth
+## Repository and integration
 - Repository: https://github.com/Shaabas/XeroxGo
-- Stable branch: `main`.
-- Feature branch: `feat/cloud-pricing-unification`, verified head `764e91a45a100674c195444cfa33de040b0ee385`.
-- PR: [#9 — centralize cloud sheet pricing and tariff security](https://github.com/Shaabas/XeroxGo/pull/9), **merged into main** at commit `3b22fe3ba62a9a8a1a5f7b988be9e75c97535d64` on 2026-11-17. Main-branch CI run [44069655745](https://github.com/Shaabas/XeroxGo/actions/runs/44069655745) was in progress at last inspection; **Render deployment not yet verified**.
-- Feature branch was 85 commits ahead of old `main` prior to merge; this comparison is historical. New `main` merge commit: `3b22fe3`.
-- GitHub verification gates 1–6: **success** for head `764e91a` in [run 44060583198](https://github.com/Shaabas/XeroxGo/actions/runs/44060583198).
-- Antigravity reported checkpoint `checkpoint/pre-consolidation` at `0b6716b`; verify its current existence and any uncommitted local work in the local repository.
+- Stable remote branch: `main`, checked at `c3baa56e4955f7715371fae991811287b040a610` (PR #14 merge).
+- Merged: [PR #9](https://github.com/Shaabas/XeroxGo/pull/9) central pricing, [PR #11](https://github.com/Shaabas/XeroxGo/pull/11) Vercel workflow correction, [PR #12](https://github.com/Shaabas/XeroxGo/pull/12) instant price estimates, [PR #13](https://github.com/Shaabas/XeroxGo/pull/13) pricing refresh and parity tests, [PR #14](https://github.com/Shaabas/XeroxGo/pull/14) admin price calculator.
+- The latest main verification and Vercel deployment workflow [44108533141](https://github.com/Shaabas/XeroxGo/actions/runs/44108533141) completed successfully. A GitHub Actions deploy success is **not** independent proof of a Render backend rollout or live smoke tests.
+- [PR #10](https://github.com/Shaabas/XeroxGo/pull/10) is the outstanding docs/dual-agent workspace integration, now targeting `main`. Check its final merge state and CI after any edits.
+- Branch inventory on 2026-11-17: all other 31 non-main remote branches are ancestors of `main` (0 ahead); they need no new merges. Local Antigravity changes were not accessible or inspected.
 
-## Supabase / pricing
-- Connected Supabase project: XeroxGo (`ftqtagndujzquonpjmfx`).
-- Migrations recorded remotely: `20261117082548 canonical_sheet_pricing`; `20261117085500 secure_canonical_sheet_pricing_rls`.
-- Pricing tables `sheet_tariff_versions` and `sheet_tariff_state` exist; RLS enabled, `anon`/`authenticated` access revoked, service role retains access.
-- **Verified live 2026-11-17:** `sheet_tariff_state.active_revision = 1`, exactly one tariff version, BW 300/500 paise (simplex side/duplex sheet), color 800/1000 paise and `color_enabled=0`. Revision 1 was activated in connected Supabase project after explicit human approval. This is a DB configuration change only; PR #9 still not deployed.
-- 16 other public tables were flagged by Supabase advisor for missing RLS; separate security work is required.
-- Do not assume the two pricing migrations still need applying; confirm remote migration history first.
-- Canonical tariff revision 1 is now active and verified. Deployment still requires PR #9 merge approval and rollout/rollback verification.
+## Active architecture
+- Frontend: `frontend/index.html`, `frontend/js/portal.js` and admin UI, deployed to Vercel.
+- Go cloud: `cloud-backend/cmd/server/`; canonical PDF normalization, pricing and order/PIN creation.
+- Printer host: Raspberry Pi with CUPS/IP printing; device emulator and recovery work live under the same repo.
+- Pricing: admin sets four integer-paise rates through `/api/admin/pricing`; `/api/pricing` publishes the active revision. Instant JavaScript calculation is display-only, Go enforces billing, no artificial duplex padding billed.
+- Previously approved initial tariff: BW 300/500 paise; color 800/1000 paise, initially disabled. **Current live rates and deployment must be rechecked before any release decision.**
+- Supabase pricing migrations were previously applied; do not reapply or edit live tariffs without a fresh database verification and approval.
+- Payment provider integration has been deferred by the user. Do not infer actual payment configuration from documentation.
 
-## Immediate priorities
-1. **XG-001**: Workspace foundation committed on PR #10, pending local Antigravity skill discovery and integration; old docs retained for later audit.
-2. **XG-002**: Development/testing rollout chosen. Render uses `main` / After CI Checks Pass / `./Dockerfile`; `XEROXGO_DEV_MODE=1`. Razorpay is not configured per user; **payment setup deferred**. Prioritize test DB identity, approved tariff activation procedure, rollout order and rollback. See [release readiness](RELEASE_READINESS.md).
-3. **XG-003**: Human approved and PR #9 merged to `main`; pending main-branch CI outcome, Render deployed SHA and smoke tests.
-4. **XG-004**: Audit mixed per-document simplex/duplex execution and Pi/CUPS recovery before implementing changes.
+## Current priority
+**XG-CHECKOUT-FAST-1** (analysis complete, implementation not started): reduce PIN-generation wait by eliminating redundant synchronous `fetchDocumentQuote()` calls inside `submitOrder()`, while retaining final server PDF normalization, price acceptance, tariff revision protection and order/PIN durability. Add real upload progress and an indeterminate server-processing state, not fake percentages. Benchmark before/after and add regression tests. Architectural scope must be reviewed before changes.
 
-## Open issues / cautions
-- Render may auto-deploy merges to `main`; Git merge is a deployment-affecting action.
-- PR #9 description mentioned `/api/tariffs/active`, while inspected frontend/backend code used `/api/pricing`; correct documentation after verifying current code.
-- Merged multi-document PDFs carry one aggregate duplex job flag; per-document print setting fidelity is unverified. Architecture audit required.
-- The active task is **post-merge CI and Render verification**. Razorpay/payment integration deferred; PR #10 remains draft and must be retargeted to `main` after stabilization.
+## Open risks / verification needed
+- Checkout currently re-uploads/re-normalizes each PDF serially for final quotes, then uploads/re-normalizes again in `/api/k/{id}/upload` before generating PIN. No production latency measurements yet.
+- Mixed per-document simplex/duplex settings are aggregated into a single cloud/Pi print job; verify physical print fidelity before changing execution.
+- Review Supabase legacy-table RLS/grants separately, with a dependency assessment.
+- Verify Render active commit, live API health, mock-vs-real payment configuration and safe rollback before production-affecting backend changes.
+- Document changes on this branch must not silently authorize payment, tariff, printer, or deployment changes.
 
-## Hand-off
-Read `AGENTS.md` and `docs/TASKS.md`, verify GitHub branch/PR and local pending changes, then continue the highest priority unblocked task. Never infer that a checkpoint proves current runtime state.
+## Agent handoff
+Read `AGENTS.md`, `docs/TASKS.md`, `docs/ARCHITECTURE.md`, and `docs/DECISIONS.md`. Verify current GitHub SHA and local worktree before starting. ChatGPT leads architecture/planning/review; Antigravity performs narrowly scoped local implementation/testing.
