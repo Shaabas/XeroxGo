@@ -37,6 +37,7 @@ type serverConfig struct {
 	dbPath             string
 	jobsDir            string
 	pricePerSheetPaise int64
+	pricingPolicy      pricing.DuplexPricingPolicy
 	devMode            bool
 	demoMode           bool
 	downloadSecret     []byte
@@ -210,6 +211,25 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
 	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
 }
+// verifyAcceptedPrice rejects a stale frontend quote before persisting the order.
+// Existing API clients may omit this field for backwards compatibility.
+func verifyAcceptedPrice(w http.ResponseWriter, r *http.Request, actual int64) bool {
+	raw := strings.TrimSpace(r.FormValue("accepted_total_price_paise"))
+	if raw == "" {
+		return true
+	}
+	agreed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || agreed <= 0 {
+		http.Error(w, "invalid accepted price", http.StatusBadRequest)
+		return false
+	}
+	if agreed != actual {
+		http.Error(w, "Price changed. Please review the updated quote before placing an order.", http.StatusConflict)
+		return false
+	}
+	return true
+}
+
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -347,6 +367,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			if res.PricePaise <= 0 || totalOrderPricePaise > pricing.MaxInt64-res.PricePaise {
+				_ = os.Remove(outputPath)
+				http.Error(w, "order price overflow", http.StatusBadRequest)
+				return
+			}
 			totalOrderPricePaise += res.PricePaise
 			totalPrintedPages += res.PrintedSides
 			totalSheets += res.NormResult.TotalSheets
@@ -439,6 +464,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			ClaimToken:   claimToken,
 		}
 
+		if !verifyAcceptedPrice(w, r, totalOrderPricePaise) {
+			_ = os.Remove(outputPath)
+			return
+		}
 		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 			_ = os.Remove(outputPath)
 			http.Error(w, "failed to persist order", http.StatusInternalServerError)
@@ -558,12 +587,23 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
+	if !verifyAcceptedPrice(w, r, res.PricePaise) {
+		_ = os.Remove(outputPath)
+		return
+	}
 	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, "failed to persist order", http.StatusInternalServerError)
 		return
 	}
 	displayCode := order.Command.DisplayCode
+
+	// A complete duplex sheet has no uniform per-side rate under the sheet policy's
+	// policy; the trailing occupied side is charged separately.
+	perSideRate := res.UnitPrice
+	if s.cfg.pricingPolicy == pricing.PricingPerSheet && opts.Duplex != contracts.DuplexSimplex {
+		perSideRate = 0
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -579,7 +619,8 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"copies":                opts.Copies,
 		"duplex":                string(opts.Duplex),
 		"price_per_sheet_paise": res.UnitPrice,
-		"price_per_side_paise":  res.UnitPrice,
+		"price_per_side_paise":  perSideRate,
+		"pricing_policy":        string(s.cfg.pricingPolicy),
 		"unit_price_paise":      res.UnitPrice,
 		"total_price_paise":     res.PricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
@@ -750,6 +791,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 			"total_sheets":     res.NormResult.TotalSheets,
 			"copies":           opts.Copies,
 			"total_price_paise": res.PricePaise,
+			"pricing_policy":    string(s.cfg.pricingPolicy),
 			"normalized_pages": res.NormResult.TotalPages,
 			"padded_pages":     res.NormResult.PaddedPages,
 			"sha256_checksum":  res.NormResult.SHA256Checksum,
@@ -1327,6 +1369,9 @@ func main() {
 	ctx := context.Background()
 	var pricePaise int64
 	priceEnv := os.Getenv("XEROXGO_PRICE_PER_SHEET_PAISE")
+	if strings.TrimSpace(os.Getenv("XEROXGO_PRICING_POLICY")) == string(pricing.PricingPerSheet) && priceEnv != "" {
+		log.Fatal("XEROXGO_PRICE_PER_SHEET_PAISE would overwrite reviewed sheet tariffs; remove it before enabling per-sheet")
+	}
 	if priceEnv != "" {
 		p, err := strconv.ParseInt(priceEnv, 10, 64)
 		if err != nil || p <= 0 {
@@ -1379,11 +1424,30 @@ func main() {
 		log.Fatalf("XEROXGO_KIOSK_SECRET required in production mode")
 	}
 
+	pricingPolicy := pricing.DuplexPricingPolicy(strings.TrimSpace(os.Getenv("XEROXGO_PRICING_POLICY")))
+	if pricingPolicy == "" {
+		pricingPolicy = pricing.PricingPerSide
+	}
+	if pricingPolicy != pricing.PricingPerSide && pricingPolicy != pricing.PricingPerSheet {
+		log.Fatalf("invalid XEROXGO_PRICING_POLICY %q: expected per-side or per-sheet", pricingPolicy)
+	}
+	if pricingPolicy == pricing.PricingPerSheet {
+		if os.Getenv("XEROXGO_SHEET_TARIFF_REVIEWED") != "1" {
+			log.Fatal("per-sheet requires XEROXGO_SHEET_TARIFF_REVIEWED=1 after reviewing and configuring existing tariffs")
+		}
+		p, err := storeDB.GetPricing(ctx)
+		if err != nil || p.BWSimplexPricePaise <= 0 || p.BWDuplexPricePaise <= 0 ||
+			p.ColorSimplexPricePaise <= 0 || p.ColorDuplexPricePaise <= 0 {
+			log.Fatal("per-sheet pricing requires complete configured tariffs; configure existing database before enabling")
+		}
+		log.Print("[PRICING] per-sheet policy enabled; configured duplex tariffs are interpreted per complete sheet")
+	}
 	cfg := &serverConfig{
 		addr:               addr,
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: pricePaise,
+		pricingPolicy:      pricingPolicy,
 		devMode:            devMode,
 		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
