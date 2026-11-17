@@ -13,7 +13,7 @@ This is an orientation map, **not** a replacement for code-level contracts. Conf
 `Browser upload → Cloud PDF normalizer and authoritative quote → accepted quote/revision → order+PIN → kiosk claim/payment → durable dispatch → Pi spooler/CUPS → completion/reconciliation`.
 
 ## Non-negotiable invariants
-- Do not invent frontend-side billed prices or re-impose pages independently on Pi.
+- Frontend may show instant estimates using the server-published rates, but may not authorize or persist billed amounts. Only canonical cloud PDF normalization and pricing determine billable sides and accepted order prices; do not re-impose pages independently on Pi.
 - Order creation validates the currently active tariff revision within the DB transaction.
 - Enforce immutable accepted order price; no retroactive repricing.
 - Preserve checksum / job provenance and idempotent printing/recovery behavior.
