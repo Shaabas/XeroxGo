@@ -13,12 +13,12 @@ const MaxRatePaise int64 = 1_000_000
 // Tariff is one immutable snapshot of the four configured billing rates.
 // Duplex rates describe a FULL two-sided sheet; an odd final side uses simplex.
 type Tariff struct {
-	Revision              int64
-	BWSimplexPaise        int64
-	BWDuplexSheetPaise    int64
-	ColorSimplexPaise     int64
-	ColorDuplexSheetPaise int64
-	ColorEnabled          bool
+	Revision              int64 `json:"revision"`
+	BWSimplexPaise        int64 `json:"bw_simplex_paise"`
+	BWDuplexSheetPaise    int64 `json:"bw_duplex_sheet_paise"`
+	ColorSimplexPaise     int64 `json:"color_simplex_paise"`
+	ColorDuplexSheetPaise int64 `json:"color_duplex_sheet_paise"`
+	ColorEnabled          bool  `json:"color_enabled"`
 }
 
 // Document quantities must originate from the canonical PDF normalizer.
