@@ -1,0 +1,251 @@
+[
+  {
+    "name": "bw simplex 1up",
+    "total_pages": 9,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "1",
+      "copies": 1,
+      "mode": "B&W",
+      "sides": "Single-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 2700
+  },
+  {
+    "name": "bw duplex odd side",
+    "total_pages": 5,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "1",
+      "copies": 1,
+      "mode": "B&W",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 1300
+  },
+  {
+    "name": "bw duplex nup2 copies",
+    "total_pages": 11,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "2",
+      "copies": 2,
+      "mode": "B&W",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 3000
+  },
+  {
+    "name": "bw duplex nup4 odd",
+    "total_pages": 9,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "4",
+      "copies": 3,
+      "mode": "B&W",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 2400
+  },
+  {
+    "name": "bw simplex nup6",
+    "total_pages": 13,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "6",
+      "copies": 4,
+      "mode": "B&W",
+      "sides": "Single-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 3600
+  },
+  {
+    "name": "color duplex odd",
+    "total_pages": 7,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "2",
+      "copies": 2,
+      "mode": "Color",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 4000
+  },
+  {
+    "name": "color simplex",
+    "total_pages": 6,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "1",
+      "copies": 1,
+      "mode": "Color",
+      "sides": "Single-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 4800
+  },
+  {
+    "name": "custom range duplex",
+    "total_pages": 17,
+    "settings": {
+      "pageSelection": "Custom Range",
+      "rangeFrom": 3,
+      "rangeTo": 12,
+      "pagesPerSheet": "4",
+      "copies": 2,
+      "mode": "B&W",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 1600
+  },
+  {
+    "name": "selected pages color nup",
+    "total_pages": 12,
+    "settings": {
+      "pageSelection": "Selection",
+      "selectedPages": [
+        2,
+        4,
+        6,
+        8,
+        10
+      ],
+      "pagesPerSheet": "2",
+      "copies": 3,
+      "mode": "Color",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 5400
+  },
+  {
+    "name": "alternate rates bw odd",
+    "total_pages": 3,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "1",
+      "copies": 3,
+      "mode": "B&W",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 2,
+      "bw_simplex_paise": 400,
+      "bw_duplex_sheet_paise": 650,
+      "color_simplex_paise": 900,
+      "color_duplex_sheet_paise": 1200,
+      "color_enabled": true
+    },
+    "expected_paise": 3150
+  },
+  {
+    "name": "alternate rates color nup6",
+    "total_pages": 13,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "6",
+      "copies": 2,
+      "mode": "Color",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 2,
+      "bw_simplex_paise": 400,
+      "bw_duplex_sheet_paise": 650,
+      "color_simplex_paise": 900,
+      "color_duplex_sheet_paise": 1200,
+      "color_enabled": true
+    },
+    "expected_paise": 4200
+  },
+  {
+    "name": "single page duplex",
+    "total_pages": 1,
+    "settings": {
+      "pageSelection": "All",
+      "pagesPerSheet": "1",
+      "copies": 1,
+      "mode": "B&W",
+      "sides": "Double-sided"
+    },
+    "tariff": {
+      "revision": 1,
+      "bw_simplex_paise": 300,
+      "bw_duplex_sheet_paise": 500,
+      "color_simplex_paise": 800,
+      "color_duplex_sheet_paise": 1000,
+      "color_enabled": true
+    },
+    "expected_paise": 300
+  }
+]
