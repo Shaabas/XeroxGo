@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"xeroxgo/cloud-backend/internal/payments"
-	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -211,9 +210,6 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 	}
 }
 
-func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
-	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
-}
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -261,7 +257,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal([]byte(metadataRaw), &metaItems)
 		}
 
-		tariffs, err := s.loadRequestTariffs(r.Context())
+		tariff, err := s.loadRequestTariff(r.Context())
 		if err != nil {
 			http.Error(w, "pricing unavailable", http.StatusServiceUnavailable)
 			return
@@ -308,9 +304,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 			var docOpts docPrintOptions
 			if idx < len(metaItems) {
-				docOpts, err = parseMetadataPrintOptions(metaItems[idx], tariffs.colorEnabled(), idx+1)
+				docOpts, err = parseMetadataPrintOptions(metaItems[idx], tariff.ColorEnabled, idx+1)
 			} else {
-				docOpts, err = parseFormPrintOptions(r, tariffs.colorEnabled(), idx+1)
+				docOpts, err = parseFormPrintOptions(r, tariff.ColorEnabled, idx+1)
 			}
 			if err != nil {
 				_ = f.Close()
@@ -319,7 +315,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			if tariffs.sheet != nil && !tariffs.colorEnabled() &&
+			if  !tariff.ColorEnabled &&
 				((idx < len(metaItems) && strings.EqualFold(metaItems[idx].ColorMode, "COLOR")) ||
 				 (idx >= len(metaItems) && strings.EqualFold(r.FormValue("color_mode"), "COLOR"))) {
 				_ = f.Close()
@@ -352,7 +348,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = tmpNorm.Close()
 			intermediateNormPDFs = append(intermediateNormPDFs, tmpNormPath)
 
-			res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpNormPath, docOpts, tariffs.legacy, tariffs.hasLegacy, tariffs.sheetArgs()...)
+			res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpNormPath, docOpts, tariff)
 			if err != nil {
 				_ = os.Remove(outputPath)
 				http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
@@ -455,12 +451,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			ClaimToken:   claimToken,
 		}
 
-		if !s.verifyAcceptedSheetQuote(w, r, tariffs, totalOrderPricePaise) {
+		if !s.verifyAcceptedSheetQuote(w, r, tariff, totalOrderPricePaise) {
 			_ = os.Remove(outputPath)
 			return
 		}
-		var revision int64
-		if tariffs.sheet != nil { revision = tariffs.sheet.Revision }
+		revision := tariff.Revision
 		if err := s.createOrderWithPINRetry(r.Context(), &order, 25, revision); err != nil {
 			_ = os.Remove(outputPath)
 			if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
@@ -487,7 +482,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			"duplex":                string(overallDuplex),
 			"documents_count":       len(fileHeaders),
 			"total_price_paise":     totalOrderPricePaise,
-			"tariff_revision":       func() int64 { if tariffs.sheet != nil { return tariffs.sheet.Revision }; return 0 }(),
+			"tariff_revision":       tariff.Revision,
 			"status":                string(contracts.JobStatusPendingPayment),
 		})
 		return
@@ -503,19 +498,19 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	originalFilename := fileHeader.Filename
 
-	tariffs, err := s.loadRequestTariffs(r.Context())
+	tariff, err := s.loadRequestTariff(r.Context())
 	if err != nil {
 		http.Error(w, "pricing unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	colorEnabled := tariffs.colorEnabled()
+	colorEnabled := tariff.ColorEnabled
 
 	opts, err := parseFormPrintOptions(r, colorEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if tariffs.sheet != nil && !colorEnabled && strings.EqualFold(r.FormValue("color_mode"), "COLOR") {
+	if  !colorEnabled && strings.EqualFold(r.FormValue("color_mode"), "COLOR") {
 		http.Error(w, "color printing is disabled", http.StatusBadRequest)
 		return
 	}
@@ -544,7 +539,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	h := sha256.Sum256([]byte(orderID))
 	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
-	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, outputPath, opts, tariffs.legacy, tariffs.hasLegacy, tariffs.sheetArgs()...)
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, outputPath, opts, tariff)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
@@ -592,12 +587,11 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
-	if !s.verifyAcceptedSheetQuote(w, r, tariffs, res.PricePaise) {
+	if !s.verifyAcceptedSheetQuote(w, r, tariff, res.PricePaise) {
 		_ = os.Remove(outputPath)
 		return
 	}
-	var revision int64
-	if tariffs.sheet != nil { revision = tariffs.sheet.Revision }
+	revision := tariff.Revision
 	if err := s.createOrderWithPINRetry(r.Context(), &order, 25, revision); err != nil {
 		_ = os.Remove(outputPath)
 		if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
@@ -622,10 +616,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"total_sheets":          res.NormResult.TotalSheets,
 		"copies":                opts.Copies,
 		"duplex":                string(opts.Duplex),
-		"price_per_sheet_paise": res.UnitPrice,
-		"price_per_side_paise":  res.UnitPrice,
 		"tariff_revision":       res.TariffRevision,
-		"unit_price_paise":      res.UnitPrice,
 		"total_price_paise":     res.PricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
 	})
@@ -747,18 +738,18 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}
 	defer file.Close()
 
-	tariffs, err := s.loadRequestTariffs(r.Context())
+	tariff, err := s.loadRequestTariff(r.Context())
 	if err != nil {
 		http.Error(w, "pricing unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	opts, err := parseFormPrintOptions(r, tariffs.colorEnabled(), 0)
+	opts, err := parseFormPrintOptions(r, tariff.ColorEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if tariffs.sheet != nil && !tariffs.colorEnabled() && strings.EqualFold(r.FormValue("color_mode"), "COLOR") {
+	if  !tariff.ColorEnabled && strings.EqualFold(r.FormValue("color_mode"), "COLOR") {
 		http.Error(w, "color printing is disabled", http.StatusBadRequest)
 		return
 	}
@@ -782,7 +773,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}()
 	_ = tmpOutput.Close()
 
-	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, tariffs.legacy, tariffs.hasLegacy, tariffs.sheetArgs()...)
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, tariff)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("preview generation failed: %v", err), http.StatusBadRequest)
 		return
