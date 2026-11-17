@@ -52,3 +52,12 @@
 Rollback must be tied to **verified** previous deployed image/commit and a concrete operational test. Git revert alone does not prove transaction safety, tariff compatibility, or printer delivery recovery.
 
 **Current approval state:** no production deploy or tariff activation authorized.
+
+## Final pre-merge verification — 2026-11-17
+- PR #9 verified open, mergeable, non-draft, head `764e91a45a100674c195444cfa33de040b0ee385`; 85 commits ahead of `main`, 0 behind. GitHub Actions gates 1–6 succeeded at that head; frontend Vercel deployment check was skipped.
+- PR #10 is still draft, open, and based on the pricing branch; do not merge it prematurely.
+- User confirmed Render uses `main`, after-CI auto-deploy, Dockerfile `./Dockerfile`, development mode `1`, correct connected DB, and no Razorpay configuration. Payment integration remains deferred; no payment setup was changed.
+- Connected Supabase revision 1 has been activated and independently read back at BW 300/500, color 800/1000 paise and color disabled.
+- Render rollback documentation: service **Deploys** page → identify previous successful deploy → **Rollback** → confirm. Dashboard rollback disables auto-deploy; rollback restores the previous build but does **not** roll back external database changes. See https://render.com/docs/rollbacks .
+- **Outstanding:** user must verify in Render Deploys page that a previous successful deployment is still available for rollback and capture its commit SHA; live deployed SHA and backend health remain unconfirmed. Web request for `https://xeroxgo-cloud.onrender.com/healthz` could not be evaluated by available web tool. Do not infer availability.
+- Next approval gate: after previous successful deploy SHA is identified, authorize PR #9 merge and monitor Render until live. The pricing schema changes are additive; beware runtime compatibility when rolling back.
