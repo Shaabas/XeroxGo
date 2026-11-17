@@ -15,10 +15,10 @@
 - Connected Supabase project: XeroxGo (`ftqtagndujzquonpjmfx`).
 - Migrations recorded remotely: `20261117082548 canonical_sheet_pricing`; `20261117085500 secure_canonical_sheet_pricing_rls`.
 - Pricing tables `sheet_tariff_versions` and `sheet_tariff_state` exist; RLS enabled, `anon`/`authenticated` access revoked, service role retains access.
-- At last direct verification: tariff versions empty; `sheet_tariff_state.active_revision = 0`. **No active tariff.** Human approved production rates on 2026-11-17: BW 300/500 paise (simplex side/duplex sheet); color 800/1000 paise, color disabled initially. Rates approved; DB activation and release still pending.
+- **Verified live 2026-11-17:** `sheet_tariff_state.active_revision = 1`, exactly one tariff version, BW 300/500 paise (simplex side/duplex sheet), color 800/1000 paise and `color_enabled=0`. Revision 1 was activated in connected Supabase project after explicit human approval. This is a DB configuration change only; PR #9 still not deployed.
 - 16 other public tables were flagged by Supabase advisor for missing RLS; separate security work is required.
 - Do not assume the two pricing migrations still need applying; confirm remote migration history first.
-- Backend intentionally returns 503 for unconfigured pricing. **Do not deploy pricing-dependent backend before activation and rollout readiness review.**
+- Canonical tariff revision 1 is now active and verified. Deployment still requires PR #9 merge approval and rollout/rollback verification.
 
 ## Immediate priorities
 1. **XG-001**: Workspace foundation committed on PR #10, pending local Antigravity skill discovery and integration; old docs retained for later audit.
