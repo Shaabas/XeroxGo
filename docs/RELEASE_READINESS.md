@@ -1,6 +1,6 @@
 # PR #9 — release readiness assessment
 
-**Assessment date:** 2026-11-17. **Decision: NOT YET READY TO DEPLOY.** This is a read-only release assessment, not deployment approval.
+**Assessment date:** 2026-11-17. **Decision: TESTING ROLLOUT PLANNED; NOT YET AUTHORIZED TO MERGE.** This is a read-only release assessment, not deployment approval.
 
 ## Verified source state
 - Pricing PR: [#9](https://github.com/Shaabas/XeroxGo/pull/9), head `764e91a45a100674c195444cfa33de040b0ee385`, open and not merged.
@@ -9,6 +9,23 @@
 - Confirmed code routes: `GET /api/pricing` and `GET/PUT /api/admin/pricing`. Frontend preview: `POST /api/documents/preview`. PR #9 description corrected.
 - Supabase project recorded two canonical pricing migrations: `20261117082548` and `20261117085500`. Canonical tariff tables have RLS on and public client privileges revoked.
 - Supabase tariff state: **active_revision = 0**, **version count = 0**. The new backend will reject pricing-dependent requests until activation; admin GET provides *form defaults*, not active prices.
+
+## Confirmed testing configuration (user dashboard inspection)
+- Render service is linked to `main`, auto-deploys **After CI Checks Pass**, Dockerfile `./Dockerfile`.
+- `XEROXGO_DEV_MODE=1` currently; development mode forces `demoMode=true`.
+- `DATABASE_URL`, admin password, download/webhook secrets are present (masked); 3 Vercel secrets reported configured. Do not infer values or sufficiency.
+- **Important:** Demo mode does NOT force the mock payment provider. The server independently chooses Razorpay if `PAYMENT_PROVIDER=razorpay`, or if `PAYMENT_PROVIDER` is unset and both Razorpay credentials exist. For testing require **`PAYMENT_PROVIDER=mock`** and verify startup log "Initialized Mock payment provider". Do not expose real Razorpay key values.
+- User explicitly chose development/testing deployment with NO real payments, not production launch.
+
+## Testing deployment order (pending approvals)
+1. Verify `PAYMENT_PROVIDER=mock` on Render, then capture startup confirmation from currently deployed backend (if missing, plan a safe config-only update and retest). Avoid changing other variables.
+2. Verify the database referenced by Render is the intended testing Supabase database (without revealing the connection string). Otherwise do not activate tariffs in the wrong environment.
+3. Obtain approval of test rates and `color_enabled` flag; no rates have been approved simply by choosing testing mode. Current active revision is zero.
+4. Verify code deployment prerequisites and choose a rollback mechanism. Because `main` auto-deploys after CI, use a maintenance window or temporarily disable auto-deploy through approved dashboard action if necessary.
+5. Activate the first tariff revision using the authenticated admin API in a verified compatible backend or a separately reviewed transactional method; do not use unreviewed SQL.
+6. After explicit release authorization, merge PR #9; observe Render deploy at exact SHA and smoke test /healthz, /api/pricing, quote, stale quote, demo checkout, and PIN/job flow. Avoid actual physical prints unless specifically approved.
+7. If regressions occur, stop new test orders and execute a verified rollback; watch for schema and order-format compatibility.
+8. When stable, integrate PR #10 and refresh all state/commit references.
 
 ## Deployment configuration and unknowns
 - `render.yaml` checked into branch specifies Docker service `xeroxgo-cloud` with `XEROXGO_DEV_MODE=1` and `DEMO_MODE=true`. **Actual Render dashboard values and deployed commit were not verified.** These defaults should not be considered a production-safe configuration without an explicit decision.
