@@ -65,6 +65,8 @@ func TestMultiFileUploadAndOrderCreation(t *testing.T) {
 		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW", "page_range": ""}
 	]`
 	_ = writer.WriteField("metadata", metaJSON)
+	_ = writer.WriteField("accepted_total_price_paise", "1700")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	_ = writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-multi-test/upload", body)
@@ -111,8 +113,8 @@ func TestMultiFileUploadAndOrderCreation(t *testing.T) {
 	if totalSheets != 5 {
 		t.Errorf("total_sheets = %d, want 5", totalSheets)
 	}
-	if totalPricePaise != 1050 {
-		t.Errorf("total_price_paise = %d, want 1050", totalPricePaise)
+	if totalPricePaise != 1700 {
+		t.Errorf("total_price_paise = %d, want 1700", totalPricePaise)
 	}
 
 	// Verify the merged PDF can be verified by qpdf
@@ -234,6 +236,12 @@ func TestSingleFileUploadWithMetadataAndDuplexFormats(t *testing.T) {
 			if tc.formCopies != "" {
 				_ = writer.WriteField("copies", tc.formCopies)
 			}
+			if !tc.expectReject {
+				amount := "600"
+				if tc.wantDuplex != "SIMPLEX" { amount = "500" }
+				_ = writer.WriteField("accepted_total_price_paise", amount)
+				_ = writer.WriteField("accepted_tariff_revision", "1")
+			}
 			_ = writer.Close()
 
 			req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-duplex-test/upload", body)
@@ -278,13 +286,15 @@ func TestMultiFileUploadWithOrientationAndNUp(t *testing.T) {
 	p2, _ := writer.CreateFormFile("files", "Doc2_6p.pdf")
 	_, _ = p2.Write(doc2Bytes)
 
-	// Doc 1: 4 pages, 2-up, landscape, simplex -> 2 imposed sides, 2 sheets, 400 paise
-	// Doc 2: 6 pages, 4-up, auto, duplex -> 2 imposed sides, 1 sheet, 300 paise
+	// Doc 1: 4 pages, 2-up, landscape, simplex -> 2 imposed sides, 2 sheets, 600 paise
+	// Doc 2: 6 pages, 4-up, auto, duplex -> 2 imposed sides, 1 sheet, 500 paise
 	metaJSON := `[
 		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW", "page_range": "", "orientation": "LANDSCAPE", "pages_per_sheet": 2},
 		{"copies": 1, "duplex": "DUPLEX_LONG_EDGE", "color_mode": "BW", "page_range": "", "orientation": "AUTO", "pages_per_sheet": 4}
 	]`
 	_ = writer.WriteField("metadata", metaJSON)
+	_ = writer.WriteField("accepted_total_price_paise", "1100")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	_ = writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-nup-test/upload", body)
@@ -316,8 +326,8 @@ func TestMultiFileUploadWithOrientationAndNUp(t *testing.T) {
 	if totalSheets != 3 {
 		t.Errorf("total_sheets = %d, want 3", totalSheets)
 	}
-	if totalPricePaise != 700 {
-		t.Errorf("total_price_paise = %d, want 700", totalPricePaise)
+	if totalPricePaise != 1100 {
+		t.Errorf("total_price_paise = %d, want 1100", totalPricePaise)
 	}
 
 	orderID, _ := resp["order_id"].(string)
