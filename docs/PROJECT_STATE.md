@@ -22,7 +22,7 @@
 
 ## Immediate priorities
 1. **XG-001**: Workspace foundation committed on PR #10, pending local Antigravity skill discovery and integration; old docs retained for later audit.
-2. **XG-002**: Release readiness investigation performed, but deployment **BLOCKED** pending environment inspection, rate approval, activation and rollback plan. See [release readiness](RELEASE_READINESS.md).
+2. **XG-002**: Development/testing rollout chosen. Render uses `main` / After CI Checks Pass / `./Dockerfile`; `XEROXGO_DEV_MODE=1`. **Must verify `PAYMENT_PROVIDER=mock` (demo mode alone does not prevent Razorpay), test DB identity, approve test tariff and rollback**. See [release readiness](RELEASE_READINESS.md).
 3. **XG-003**: Obtain explicit approval then merge PR #9 to `main` and verify deployment.
 4. **XG-004**: Audit mixed per-document simplex/duplex execution and Pi/CUPS recovery before implementing changes.
 
