@@ -1,5 +1,8 @@
 # XeroxGo — verification policy
 
+> **Verification note — 2026-11-17:** The PR #9 head and CI details cited below are historical. More recent merged pricing/admin work includes PRs #11–#14. Main commit `c3baa56` passed verification and Vercel deployment in [run 44108533141](https://github.com/Shaabas/XeroxGo/actions/runs/44108533141). Live Render backend deployment and checkout latency were not independently timed; see [PROJECT_STATE.md](PROJECT_STATE.md).
+
+
 ## Existing gate
 The current repository uses `./scripts/verify_gate.sh`. At the verified 2026-11-17 PR #9 head `764e91a`, GitHub CI gates 1–6 passed in [run 44060583198](https://github.com/Shaabas/XeroxGo/actions/runs/44060583198). Run again for subsequent commits.
 
