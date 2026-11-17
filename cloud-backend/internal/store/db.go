@@ -1004,11 +1004,12 @@ func (s *Store) createOrderWithRevision(ctx context.Context, order Order, expect
 	defer func() { _ = tx.Rollback() }()
 
 	if expectedRevision > 0 {
-		// PostgreSQL's row lock serializes this check with admin activation.
-		// SQLite uses its transaction snapshot and refuses a stale write.
+		// FOR UPDATE conflicts with the administrator's UPDATE of this row.
+		// FOR SHARE would not block PostgreSQL's non-key UPDATE lock.
+		// SQLite serializes writers and rejects stale transaction snapshots.
 		query := "SELECT active_revision FROM sheet_tariff_state WHERE id = 1"
 		if s.dialect == "postgres" {
-			query += " FOR SHARE"
+			query += " FOR UPDATE"
 		}
 		var currentRevision int64
 		if err := tx.QueryRowContext(ctx, query).Scan(&currentRevision); err != nil {
