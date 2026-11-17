@@ -64,7 +64,6 @@ func setupRecoveryTestApp(t *testing.T) (*appServer, *http.ServeMux, string, fun
 		addr:               ":0",
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
 		devMode:            true,
 		downloadSecret:     []byte("test-dl-secret-key-1234"),
 		webhookSecret:      []byte("test-wh-secret-key-1234"),
