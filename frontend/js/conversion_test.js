@@ -415,7 +415,7 @@ test('Instant estimate honors selected pages and validates rates and options', (
   const base = { pageSelection: 'Custom Range', rangeFrom: 2, rangeTo: 6,
     pagesPerSheet: '2', copies: 2, mode: 'B&W', sides: 'Double-sided' };
   assert.equal(calculateEstimatedPrice(10, base, tariff), 2000); // 3 sides; 600 + 400 per copy
-  assert.equal(calculateEstimatedPrice(10, { ...base, pageSelection: 'Selection', selectedPages: [1, 3, 3, 5] }, tariff), 2000);
+  assert.equal(calculateEstimatedPrice(10, { ...base, pageSelection: 'Selection', selectedPages: [1, 3, 3, 5] }, tariff), 1200);
   assert.equal(calculateEstimatedPrice(10, { ...base, mode: 'Color' }, tariff), 4200);
   assert.equal(calculateEstimatedPrice(10, { ...base, mode: 'Color' }, { ...tariff, color_enabled: false }), null);
   assert.equal(calculateEstimatedPrice(10, base, null), null);
