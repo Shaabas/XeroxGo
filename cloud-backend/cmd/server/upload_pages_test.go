@@ -398,6 +398,8 @@ func TestUpload_10PagePDF_Select_2_4_6_Duplex(t *testing.T) {
 	_ = writer.WriteField("copies", "2")
 	_ = writer.WriteField("duplex", "DUPLEX_LONG_EDGE")
 	_ = writer.WriteField("page_range", "2,4,6")
+	_ = writer.WriteField("accepted_total_price_paise", "1600")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
