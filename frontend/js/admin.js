@@ -375,7 +375,7 @@
 
     function inputPaise(id) {
       const value = document.getElementById(id).value.trim();
-      if (!/^(?:\\d+)(?:\\.\\d{1,2})?$/.test(value)) throw new Error('Enter amounts with at most two decimal places');
+      if (!/^(?:\d+)(?:\.\d{1,2})?$/.test(value)) throw new Error('Enter amounts with at most two decimal places');
       const [rupees, decimals = ''] = value.split('.');
       const paise = Number(rupees) * 100 + Number(decimals.padEnd(2, '0'));
       if (!Number.isSafeInteger(paise) || paise < 1 || paise > 1000000) {
