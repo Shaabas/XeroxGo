@@ -49,11 +49,68 @@
     return Number.isSafeInteger(total) && total > 0 ? total : null;
   }
 
+  // Reuse a server-confirmed quote, never a local display estimate. The final
+  // upload independently normalizes every PDF and rejects incorrect amounts.
+  function confirmedOrderQuote(items, tariff) {
+    const revision = tariff?.revision;
+    if (!Array.isArray(items) || items.length === 0 ||
+        !Number.isSafeInteger(revision) || revision < 1) return null;
+    let total = 0;
+    for (const item of items) {
+      if (!item || item.status !== 'ready' || item.quotePending || item.quoteError ||
+          item.tariffRevision !== revision || !Number.isSafeInteger(item.authoritativePricePaise) ||
+          item.authoritativePricePaise <= 0) return null;
+      total += item.authoritativePricePaise;
+      if (!Number.isSafeInteger(total)) return null;
+    }
+    return { revision, acceptedTotal: total };
+  }
+
+  // XHR supplies actual network upload progress; receiving HTTP response can take
+  // longer because the cloud still normalizes PDFs and commits the order.
+  function uploadOrderWithProgress(url, formData, onProgress) {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open('POST', url);
+      request.upload.addEventListener('progress', event => {
+        if (event.lengthComputable && event.total > 0) {
+          const percent = Math.min(100, Math.round(event.loaded * 100 / event.total));
+          onProgress(percent === 100 ? 'processing' : 'upload', percent);
+        }
+      });
+      request.upload.addEventListener('load', () => onProgress('processing', null));
+      request.addEventListener('load', () => {
+        resolve({
+          ok: request.status >= 200 && request.status < 300,
+          status: request.status,
+          text: async () => request.responseText,
+          json: async () => JSON.parse(request.responseText)
+        });
+      });
+      const ambiguousFailure = message => {
+        const error = new Error(message);
+        error.orderOutcomeUncertain = true;
+        reject(error);
+      };
+      request.addEventListener('error', () => ambiguousFailure(
+        'Connection interrupted. The order might have been created. Check your kiosk before starting a new order.'
+      ));
+      request.addEventListener('abort', () => ambiguousFailure(
+        'Upload interrupted. Check whether an order was created before starting a new order.'
+      ));
+      request.addEventListener('timeout', () => ambiguousFailure(
+        'Order response timed out. Check whether an order was created before starting a new order.'
+      ));
+      request.send(formData);
+    });
+  }
+
+
   // --- Configuration from DOM ---
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
-      module.exports = { convertDocumentOnServer, calculateEstimatedPrice };
+      module.exports = { convertDocumentOnServer, calculateEstimatedPrice, confirmedOrderQuote, uploadOrderWithProgress };
     }
     return;
   }
@@ -91,6 +148,12 @@
   const cartDocsCount = document.getElementById('cart-docs-count');
   const cartTotalAmount = document.getElementById('cart-total-amount');
   const btnReviewOrder = document.getElementById('btn-review-order');
+  const orderUploadProgress = document.getElementById('order-upload-progress');
+  const orderUploadProgressLabel = document.getElementById('order-upload-progress-label');
+  const orderUploadProgressTrack = document.getElementById('order-upload-progress-track');
+  const orderUploadProgressBar = document.getElementById('order-upload-progress-bar');
+  let orderSubmitting = false;
+  let orderOutcomeUncertain = false;
 
   // Banner Carousel DOM
   const bannerTrack = document.getElementById('banner-track');
@@ -748,12 +811,12 @@
     }
 
     if (btnReviewOrder) {
-      btnReviewOrder.innerHTML = `
+      if (!orderSubmitting) btnReviewOrder.innerHTML = `
         <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
       const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && itemHasCurrentQuote(it));
-      btnReviewOrder.disabled = !canProceed;
+      btnReviewOrder.disabled = orderSubmitting || orderOutcomeUncertain || !canProceed;
     }
   }
 
@@ -2030,8 +2093,30 @@
   }
 
   // --- View 4: Checkout & Order Submission Implementation ---
+  function updateCheckoutProgress(stage, percent) {
+    if (!orderUploadProgress) return;
+    orderUploadProgress.classList.remove('hidden');
+    const uploading = stage === 'upload';
+    orderUploadProgressLabel.textContent = uploading
+      ? (percent === null ? 'Uploading documents…' : 'Uploading documents… ' + percent + '%')
+      : 'Preparing print job and creating PIN…';
+    orderUploadProgressTrack.setAttribute('aria-valuetext', uploading
+      ? (percent === null ? 'Uploading documents' : 'Uploading documents ' + percent + ' percent')
+      : 'Processing documents on server');
+    if (uploading && percent !== null) {
+      orderUploadProgressTrack.setAttribute('aria-valuenow', String(percent));
+      orderUploadProgressBar.style.width = percent + '%';
+      orderUploadProgressBar.classList.remove('checkout-progress-indeterminate');
+    } else {
+      orderUploadProgressTrack.removeAttribute('aria-valuenow');
+      orderUploadProgressBar.style.width = '';
+      orderUploadProgressBar.classList.add('checkout-progress-indeterminate');
+    }
+  }
+
+
   async function submitOrder() {
-    if (btnReviewOrder && btnReviewOrder.disabled) return;
+    if (orderSubmitting || orderOutcomeUncertain || (btnReviewOrder && btnReviewOrder.disabled)) return;
     const readyItems = cartItems.filter(it => it.status === 'ready');
     const processingItems = cartItems.filter(it => it.status === 'processing');
     if (processingItems.length > 0) {
@@ -2043,38 +2128,21 @@
       return;
     }
 
-    btnReviewOrder.disabled = true;
-    const originalText = btnReviewOrder.innerHTML;
-    btnReviewOrder.innerHTML = `<span>Generating PIN...</span>`;
+    // Each document must already have a confirmed cloud quote for its current
+    // settings and tariff. The server will revalidate the submitted price,
+    // revision and final normalized PDF during the one order upload.
+    const confirmed = confirmedOrderQuote(readyItems, activeTariff);
+    if (!confirmed) {
+      showCartError('A document price is not confirmed yet. Please review the quotation before ordering.');
+      return;
+    }
+    const { revision, acceptedTotal } = confirmed;
 
+    orderSubmitting = true;
+    renderCart();
+    updateCheckoutProgress('upload', null);
+    const orderStartedAt = performance.now();
     try {
-      // A new cloud quote is required immediately before order creation.
-      // Do not accept stale prices or quietly substitute a different revision.
-      const confirmed = [];
-      for (const item of readyItems) {
-        const quote = await fetchDocumentQuote(item, item.settings);
-        const prior = item.authoritativePricePaise;
-        if (!Number.isSafeInteger(prior) || prior <= 0 ||
-            quote.total_price_paise !== prior || quote.tariff_revision !== item.tariffRevision) {
-          item.authoritativePricePaise = quote.total_price_paise;
-          item.pricePaise = quote.total_price_paise;
-          item.tariffRevision = quote.tariff_revision;
-          item.totalSheets = quote.total_sheets;
-          throw new Error('Print prices changed. Please review the updated quotation and place your order again.');
-        }
-        confirmed.push(quote);
-      }
-      const revision = confirmed[0].tariff_revision;
-      if (confirmed.some(quote => quote.tariff_revision !== revision)) {
-        for (const item of readyItems) item.authoritativePricePaise = null;
-        readyItems.forEach(item => refreshDocumentQuote(item));
-        throw new Error('Prices changed while preparing your order. Review the new quotation and try again.');
-      }
-      const acceptedTotal = confirmed.reduce((sum, quote) => sum + quote.total_price_paise, 0);
-      if (!Number.isSafeInteger(acceptedTotal) || acceptedTotal <= 0) {
-        throw new Error('The confirmed quotation is invalid.');
-      }
-
       const formData = new FormData();
       formData.append('accepted_total_price_paise', String(acceptedTotal));
       formData.append('accepted_tariff_revision', String(revision));
@@ -2142,7 +2210,7 @@
       }
 
       const uploadUrl = `/api/k/${encodeURIComponent(kioskID)}/upload`;
-      const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
+      const resp = await uploadOrderWithProgress(uploadUrl, formData, updateCheckoutProgress);
 
       if (!resp.ok) {
         const errText = await resp.text();
@@ -2188,10 +2256,14 @@
       startOrderStatusPolling(activeOrderId);
 
       switchView('checkout');
+      console.info('Order submitted in', Math.round(performance.now() - orderStartedAt), 'ms');
     } catch (orderErr) {
+      if (orderErr.orderOutcomeUncertain) orderOutcomeUncertain = true;
       console.error('Order submission error:', orderErr);
       showCartError(`Could not create order: ${orderErr.message || orderErr}`);
     } finally {
+      orderSubmitting = false;
+      if (orderUploadProgress) orderUploadProgress.classList.add('hidden');
       renderCart();
     }
   }
