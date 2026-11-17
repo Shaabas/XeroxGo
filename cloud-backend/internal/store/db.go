@@ -427,6 +427,11 @@ SELECT COUNT(1) FROM (
 			}
 		}
 
+		if err := initSheetTariffSchema(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: postgres sheet tariffs: %w", err)
+		}
+
 		return &Store{db: db, dialect: "postgres"}, nil
 	}
 
@@ -617,6 +622,11 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 	if err := migrateSQLiteSchema(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("open store: sqlite migration: %w", err)
+	}
+
+	if err := initSheetTariffSchema(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: sqlite sheet tariffs: %w", err)
 	}
 
 	return &Store{db: db, dialect: "sqlite"}, nil
