@@ -40,7 +40,6 @@ func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Ser
 		addr:               ":0",
 		dbPath:             dbPath,
 		jobsDir:            filepath.Join(tempDir, "jobs"),
-		pricePerSheetPaise: 500,
 		devMode:            true,
 		demoMode:           demoMode,
 		downloadSecret:     []byte("dev_secret_download_1234567890"),
