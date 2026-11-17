@@ -75,7 +75,7 @@ func signRazorpayPayload(payload []byte, secret string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func uploadDocForPricing(t *testing.T, mux *http.ServeMux, pdfPath string, copies string, duplex string, colorMode string, pageRange string) map[string]interface{} {
+func uploadDocForPricing(t *testing.T, mux *http.ServeMux, pdfPath string, copies string, duplex string, colorMode string, pageRange string, amount int64, revision int64) map[string]interface{} {
 	t.Helper()
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -89,6 +89,8 @@ func uploadDocForPricing(t *testing.T, mux *http.ServeMux, pdfPath string, copie
 	_ = writer.WriteField("copies", copies)
 	_ = writer.WriteField("duplex", duplex)
 	_ = writer.WriteField("color_mode", colorMode)
+	_ = writer.WriteField("accepted_total_price_paise", fmt.Sprint(amount))
+	_ = writer.WriteField("accepted_tariff_revision", fmt.Sprint(revision))
 	if pageRange != "" {
 		_ = writer.WriteField("page_range", pageRange)
 	}
@@ -119,9 +121,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 	// BW Simplex: 200 paise, BW Duplex: 150 paise
 	// Color Simplex: 1000 paise, Color Duplex: 750 paise
 	ctx := context.Background()
-	if err := app.db.SetDetailedPricing(ctx, 200, 150, 1000, 750, true); err != nil {
-		t.Fatalf("SetDetailedPricing failed: %v", err)
-	}
+	activateTestPricing(t, app, 300, 500, 800, 1000, true, 0)
 
 	doc1p := createTestPDFWithPages(t, tmpDir, 1)
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
@@ -136,7 +136,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 		pageRange     string
 		wantPages     int
 		wantSheets    int
-		wantUnitPrice int64
 		wantTotalCost int64
 	}{
 		{
@@ -147,8 +146,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "BW",
 			wantPages:     1,
 			wantSheets:    1,
-			wantUnitPrice: 200,
-			wantTotalCost: 200, // 1 * 1 * 200
+			wantTotalCost: 300,
 		},
 		{
 			name:          "3-page B&W Duplex 2 copies",
@@ -158,8 +156,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "BW",
 			wantPages:     3,
 			wantSheets:    4,   // ceil(3/2) * 2 = 4
-			wantUnitPrice: 150, // Duplex rate
-			wantTotalCost: 900, // 6 printed sides * 150 paise = 900 paise (₹9.00)
+			wantTotalCost: 1600,
 		},
 		{
 			name:          "5-page Color Simplex 1 copy",
@@ -169,8 +166,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "COLOR",
 			wantPages:     5,
 			wantSheets:    5,
-			wantUnitPrice: 1000,
-			wantTotalCost: 5000, // 5 * 1 * 1000
+			wantTotalCost: 4000,
 		},
 		{
 			name:          "5-page Color Duplex 2 copies",
@@ -180,8 +176,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "COLOR",
 			wantPages:     5,
 			wantSheets:    6,    // ceil(5/2) * 2 = 6
-			wantUnitPrice: 750,  // Color duplex rate
-			wantTotalCost: 7500, // 10 printed sides * 750 paise = 7500 paise (₹75.00)
+			wantTotalCost: 5600,
 		},
 		{
 			name:          "5-page custom range 1,3,5 B&W Duplex 2 copies",
@@ -192,18 +187,16 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			pageRange:     "1,3,5",
 			wantPages:     3,
 			wantSheets:    4,   // ceil(3/2) * 2 = 4
-			wantUnitPrice: 150, // B&W duplex rate
-			wantTotalCost: 900, // 3 pages * 2 copies = 6 sides * 150 = 900 paise
+			wantTotalCost: 1600,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := uploadDocForPricing(t, mux, tc.pdfPath, tc.copies, tc.duplex, tc.colorMode, tc.pageRange)
+			resp := uploadDocForPricing(t, mux, tc.pdfPath, tc.copies, tc.duplex, tc.colorMode, tc.pageRange, tc.wantTotalCost, 1)
 
 			gotPages := int(resp["total_pages"].(float64))
 			gotSheets := int(resp["total_sheets"].(float64))
-			gotUnitPrice := int64(resp["unit_price_paise"].(float64))
 			gotTotalCost := int64(resp["total_price_paise"].(float64))
 
 			if gotPages != tc.wantPages {
@@ -211,9 +204,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			}
 			if gotSheets != tc.wantSheets {
 				t.Errorf("total_sheets = %d, want %d", gotSheets, tc.wantSheets)
-			}
-			if gotUnitPrice != tc.wantUnitPrice {
-				t.Errorf("unit_price_paise = %d, want %d", gotUnitPrice, tc.wantUnitPrice)
 			}
 			if gotTotalCost != tc.wantTotalCost {
 				t.Errorf("total_price_paise = %d, want %d", gotTotalCost, tc.wantTotalCost)
@@ -229,21 +219,15 @@ func TestPricing_FractionalRupeesCalculation(t *testing.T) {
 
 	ctx := context.Background()
 	// Set BW Simplex to 150 paise (₹1.50 per side)
-	if err := app.db.SetDetailedPricing(ctx, 150, 100, 500, 400, false); err != nil {
-		t.Fatalf("SetDetailedPricing failed: %v", err)
-	}
+	activateTestPricing(t, app, 150, 100, 500, 400, false, 0)
 
 	// 3 content pages, 1 copy simplex = 3 sides * 150 paise = 450 paise (₹4.50)
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
-	resp := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "")
+	resp := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "", 450, 1)
 
 	orderID := resp["order_id"].(string)
 	totalCost := int64(resp["total_price_paise"].(float64))
-	unitPrice := int64(resp["unit_price_paise"].(float64))
 
-	if unitPrice != 150 {
-		t.Fatalf("unit_price_paise = %d, want 150", unitPrice)
-	}
 	if totalCost != 450 {
 		t.Fatalf("total_price_paise = %d, want 450 (₹4.50)", totalCost)
 	}
@@ -265,22 +249,18 @@ func TestPricing_PreservesAgreedPriceWhenAdminPricingChanges(t *testing.T) {
 
 	ctx := context.Background()
 	// Initial admin pricing: BW Simplex = 200 paise
-	if err := app.db.SetDetailedPricing(ctx, 200, 150, 1000, 750, false); err != nil {
-		t.Fatalf("SetDetailedPricing failed: %v", err)
-	}
+	activateTestPricing(t, app, 300, 500, 800, 1000, false, 0)
 
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
 	// Order 1: 3 pages * 1 copy * 200 paise = 600 paise
-	resp1 := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "")
+	resp1 := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "", 900, 1)
 	orderID1 := resp1["order_id"].(string)
-	if int64(resp1["total_price_paise"].(float64)) != 600 {
-		t.Fatalf("order 1 total_price_paise = %v, want 600", resp1["total_price_paise"])
+	if int64(resp1["total_price_paise"].(float64)) != 900 {
+		t.Fatalf("order 1 total_price_paise = %v, want 900", resp1["total_price_paise"])
 	}
 
 	// Now admin changes rate: BW Simplex doubled to 400 paise!
-	if err := app.db.SetDetailedPricing(ctx, 400, 300, 2000, 1500, false); err != nil {
-		t.Fatalf("admin price change failed: %v", err)
-	}
+	activateTestPricing(t, app, 400, 600, 2000, 1500, false, 1)
 
 	// Order 1's price MUST NOT CHANGE: query status endpoint
 	req := httptest.NewRequest(http.MethodGet, "/api/orders/"+orderID1+"/status", nil)
@@ -292,7 +272,7 @@ func TestPricing_PreservesAgreedPriceWhenAdminPricingChanges(t *testing.T) {
 
 	var statusResp map[string]interface{}
 	_ = json.Unmarshal(rr.Body.Bytes(), &statusResp)
-	if int64(statusResp["price_paise"].(float64)) != 600 {
+	if int64(statusResp["price_paise"].(float64)) != 900 {
 		t.Errorf("Order 1 price_paise after admin rate increase = %v, want preserved 600", statusResp["price_paise"])
 	}
 
@@ -301,13 +281,13 @@ func TestPricing_PreservesAgreedPriceWhenAdminPricingChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrder failed: %v", err)
 	}
-	if order1.PricePaise != 600 {
-		t.Errorf("Order 1 DB price_paise = %d, want 600", order1.PricePaise)
+	if order1.PricePaise != 900 {
+		t.Errorf("Order 1 DB price_paise = %d, want 900", order1.PricePaise)
 	}
 
 	// New Order 2 created after admin update uses the new 400 paise rate:
 	// 3 pages * 1 copy * 400 paise = 1200 paise
-	resp2 := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "")
+	resp2 := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "", 1200, 2)
 	if int64(resp2["total_price_paise"].(float64)) != 1200 {
 		t.Errorf("Order 2 total_price_paise = %v, want 1200", resp2["total_price_paise"])
 	}
@@ -319,13 +299,11 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	ctx := context.Background()
-	if err := app.db.SetDetailedPricing(ctx, 200, 150, 1000, 750, false); err != nil {
-		t.Fatalf("SetDetailedPricing failed: %v", err)
-	}
+	activateTestPricing(t, app, 300, 500, 800, 1000, false, 0)
 
 	// Create order for 3 pages simplex = 600 paise
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
-	resp := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "")
+	resp := uploadDocForPricing(t, mux, doc3p, "1", "SIMPLEX", "BW", "", 900, 1)
 	orderID := resp["order_id"].(string)
 
 	sess, err := app.db.CreateOrGetKioskSession(ctx, "kiosk_test", orderID, 15*time.Minute, time.Now())
@@ -339,7 +317,7 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 		SessionID:       sess.SessionID,
 		Provider:        "razorpay",
 		ProviderOrderID: orderID,
-		AmountPaise:     600,
+		AmountPaise:     900,
 		Currency:        "INR",
 		Status:          "CREATED",
 		ExpiresAt:       time.Now().Add(15 * time.Minute),
@@ -387,7 +365,7 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 				"entity": {
 					"id": "pay_exact_456",
 					"order_id": "%s",
-					"amount": 600,
+					"amount": 900,
 					"status": "captured",
 					"notes": { "order_id": "%s" }
 				}
