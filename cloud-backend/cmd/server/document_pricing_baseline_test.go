@@ -20,6 +20,22 @@ import (
 	"xeroxgo/cloud-backend/internal/ws"
 )
 
+// activateTestPricing explicitly configures a revision for integration tests.
+// No default or legacy pricing is assumed by the test server.
+func activateTestPricing(t *testing.T, app *appServer, bwSimplex, bwDuplex, colorSimplex, colorDuplex int64, enabled bool, expectedRevision int64) {
+	t.Helper()
+	_, err := app.db.ActivateSheetTariff(t.Context(), expectedRevision, pricing.Tariff{
+		BWSimplexPaise: bwSimplex,
+		BWDuplexSheetPaise: bwDuplex,
+		ColorSimplexPaise: colorSimplex,
+		ColorDuplexSheetPaise: colorDuplex,
+		ColorEnabled: enabled,
+	}, "pricing-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // setupDocPricingBaselineServer sets up an isolated test server with all
 // document ingestion, preview, upload, order, and pricing routes registered.
 func setupDocPricingBaselineServer(t *testing.T) (*appServer, *http.ServeMux) {
@@ -428,7 +444,7 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 	doc4Path := createNamedDocPDF(t, tmpDir, "TierDoc", 4)
 	doc4Bytes, _ := os.ReadFile(doc4Path)
 
-	uploadTest := func(colorMode, duplex string, copies int) int64 {
+	uploadTest := func(colorMode, duplex string, copies, wantStatus int) int64 {
 		body := &bytes.Buffer{}
 		writer := multipart.NewWriter(body)
 		part, _ := writer.CreateFormFile("file", "tier_doc.pdf")
@@ -436,14 +452,14 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		_ = writer.WriteField("copies", strconv.Itoa(copies))
 		_ = writer.WriteField("duplex", duplex)
 		_ = writer.WriteField("color_mode", colorMode)
-		sides := int64(4)
-		var rate int64
-		if colorMode == "COLOR" {
-			if duplex == "SIMPLEX" { rate = 1250 } else { rate = 900 / 2 }
+		// Four imposed sides: four simplex sides or two full duplex sheets.
+		amount := int64(0)
+		if duplex == "SIMPLEX" {
+			if colorMode == "COLOR" { amount = 4 * 1250 } else { amount = 4 * 250 }
 		} else {
-			if duplex == "SIMPLEX" { rate = 250 } else { rate = 175 / 2 }
+			if colorMode == "COLOR" { amount = 2 * 900 } else { amount = 2 * 175 }
 		}
-		amount := sides * int64(copies) * rate
+		amount *= int64(copies)
 		_ = writer.WriteField("accepted_total_price_paise", strconv.FormatInt(amount, 10))
 		_ = writer.WriteField("accepted_tariff_revision", strconv.FormatInt(1, 10))
 		_ = writer.Close()
@@ -453,52 +469,43 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("upload failed: %d: %s", rec.Code, rec.Body.String())
+		if rec.Code != wantStatus {
+			t.Fatalf("upload status = %d, want %d: %s", rec.Code, wantStatus, rec.Body.String())
 		}
+		if wantStatus != http.StatusOK { return 0 }
 		var resp map[string]interface{}
 		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 		return int64(resp["total_price_paise"].(float64))
 	}
 
 	// 1. BW Simplex: 4 pages * 1 copy * 250 paise = 1000 paise
-	pBwSimp := uploadTest("BW", "SIMPLEX", 1)
+	pBwSimp := uploadTest("BW", "SIMPLEX", 1, http.StatusOK)
 	if pBwSimp != 1000 {
 		t.Errorf("BW Simplex price = %d, want 1000", pBwSimp)
 	}
 
 	// 2. BW Duplex: 4 pages * 1 copy * 175 paise = 700 paise
-	pBwDup := uploadTest("BW", "DUPLEX_LONG_EDGE", 1)
+	pBwDup := uploadTest("BW", "DUPLEX_LONG_EDGE", 1, http.StatusOK)
 	if pBwDup != 350 {
 		t.Errorf("BW Duplex price = %d, want 350", pBwDup)
 	}
 
 	// 3. Color Simplex: 4 pages * 1 copy * 1250 paise = 5000 paise
-	pColSimp := uploadTest("COLOR", "SIMPLEX", 1)
+	pColSimp := uploadTest("COLOR", "SIMPLEX", 1, http.StatusOK)
 	if pColSimp != 5000 {
 		t.Errorf("Color Simplex price = %d, want 5000", pColSimp)
 	}
 
 	// 4. Color Duplex: 4 pages * 1 copy * 900 paise = 3600 paise
-	pColDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1)
+	pColDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1, http.StatusOK)
 	if pColDup != 1800 {
 		t.Errorf("Color Duplex price = %d, want 1800", pColDup)
 	}
 
-	// 5. Disable Color in DB: test graceful fallback to B&W rates
+	// A disabled color option is an invalid request, never silent B&W fallback.
 	activateTestPricing(t, app, 250, 175, 1250, 900, false, 1)
-
-	// Request Color Simplex with Color disabled -> should be charged BW Simplex (1000 paise)
-	pFallbackSimp := uploadTest("COLOR", "SIMPLEX", 1)
-	if pFallbackSimp != 1000 {
-		t.Errorf("Color disabled Simplex price = %d, want BW fallback 1000", pFallbackSimp)
-	}
-
-	// Request Color Duplex with Color disabled -> should be charged BW Duplex (700 paise)
-	pFallbackDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1)
-	if pFallbackDup != 700 {
-		t.Errorf("Color disabled Duplex price = %d, want BW fallback 700", pFallbackDup)
-	}
+	uploadTest("COLOR", "SIMPLEX", 1, http.StatusBadRequest)
+	uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1, http.StatusBadRequest)
 }
 
 // TestDocumentPricing_PriceImmutabilityPostCreation verifies that an agreed order price
