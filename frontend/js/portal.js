@@ -2073,6 +2073,11 @@
 
       if (!resp.ok) {
         const errText = await resp.text();
+        if (resp.status === 409) {
+          await loadTariff();
+          await Promise.all(readyItems.map(refreshDocumentQuote));
+          throw new Error('Pricing changed before checkout. Please review the updated amounts and retry.');
+        }
         throw new Error(errText || 'Failed to submit order to kiosk');
       }
 
