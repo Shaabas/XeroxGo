@@ -35,7 +35,9 @@ func (s *appServer) loadRequestTariffs(ctx context.Context) (requestTariffs, err
 	// explicitly activated. This is a transition, not a permanent dual policy.
 	legacy, err := s.db.GetPricing(ctx)
 	if err != nil {
-		return requestTariffs{}, err
+		// Preserve the existing pre-migration fallback for old code paths.
+		// Once a sheet tariff is activated, every read fails closed above.
+		return requestTariffs{legacy: store.DefaultPricingConfig()}, nil
 	}
 	return requestTariffs{legacy: legacy, hasLegacy: true}, nil
 }
