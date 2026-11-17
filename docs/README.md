@@ -1,6 +1,6 @@
 # XeroxGo — project documentation
 
-**Start here:** [agent contract](../AGENTS.md) · [current checkpoint](PROJECT_STATE.md) · [task queue](TASKS.md) · [architecture](ARCHITECTURE.md) · [decisions](DECISIONS.md) · [verification](TESTING.md) · [deployment](DEPLOYMENT.md).
+**Start here:** [agent contract](../AGENTS.md) · [current checkpoint](PROJECT_STATE.md) · [task queue](TASKS.md) · [architecture](ARCHITECTURE.md) · [decisions](DECISIONS.md) · [verification](TESTING.md) · [deployment](DEPLOYMENT.md) · [release readiness](RELEASE_READINESS.md).
 
 These seven focused documents are the **working navigation layer** for ChatGPT, Antigravity, and human maintainers. Exact repository/CI state must always be verified; the checkpoint is dated.
 
