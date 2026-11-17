@@ -257,17 +257,18 @@ func (s *appServer) executeNormalizationAndPricing(
 		return nil, err
 	}
 
-	unitPrice := s.resolveUnitPrice(pricingConfig, hasPricing, opts.ColorMode, opts.Duplex)
-	printedSides := normRes.TotalPages * opts.Copies
-	docPrice, err := pricing.CalculatePricePaise(printedSides, unitPrice)
+	quote, err := pricing.QuoteDocument(
+		normRes.TotalPages, opts.Copies, opts.ColorMode, opts.Duplex,
+		pricingConfig, hasPricing, s.cfg.pricePerSheetPaise, s.cfg.pricingPolicy,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate price: %w", err)
 	}
 
 	return &normalizedDocResult{
 		NormResult:   normRes,
-		UnitPrice:    unitPrice,
-		PrintedSides: printedSides,
-		PricePaise:   docPrice,
+		UnitPrice:    quote.UnitPricePaise,
+		PrintedSides: quote.BilledSides,
+		PricePaise:   quote.TotalPaise,
 	}, nil
 }
