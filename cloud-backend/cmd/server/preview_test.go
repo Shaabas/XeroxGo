@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 )
@@ -27,6 +27,14 @@ func setupPreviewTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	// Preview fixtures use the same explicit tariff contract as production.
+	if _, err := s.ActivateSheetTariff(t.Context(), 0, pricing.Tariff{
+		BWSimplexPaise: 300, BWDuplexSheetPaise: 500,
+		ColorSimplexPaise: 800, ColorDuplexSheetPaise: 1000,
+		ColorEnabled: true,
+	}, "preview-test"); err != nil {
+		t.Fatal(err)
+	}
 
 	jobsDir := filepath.Join(tmpDir, "jobs")
 	if err := os.MkdirAll(jobsDir, 0700); err != nil {
@@ -123,9 +131,7 @@ func verifyPDFStructureAndPages(t *testing.T, pdfBytes []byte, wantPages int) {
 
 // TestDocumentPreview_NUpModes tests 1-up, 2-up, 4-up, and 6-up imposition via POST /api/documents/preview.
 func TestDocumentPreview_NUpModes(t *testing.T) {
-	app, mux := setupPreviewTestServer(t)
-	// Configure pricing in DB: BW Simplex 200, BW Duplex 150
-	_ = app.db.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, true)
+	_, mux := setupPreviewTestServer(t)
 
 	tmpDir := t.TempDir()
 	doc6p := createTestPDFWithPages(t, tmpDir, 6)
@@ -154,7 +160,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   6,
 			wantNormalizedPgs: 6,
 			wantPaddedPgs:     6,
-			wantPricePaise:    1200, // 6 * 200
+				wantPricePaise: 1800,
 		},
 		{
 			name:              "2-up Simplex 1 copy (6 / 2 = 3 sides)",
@@ -165,7 +171,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   3,
 			wantNormalizedPgs: 3,
 			wantPaddedPgs:     3,
-			wantPricePaise:    600, // 3 * 200
+				wantPricePaise: 900,
 		},
 		{
 			name:              "2-up Duplex 1 copy (3 sides -> 2 sheets, 1 blank pad)",
@@ -176,7 +182,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   2,   // ceil(3/2) = 2 physical sheets
 			wantNormalizedPgs: 3,
 			wantPaddedPgs:     4,   // 3 sides + 1 blank padding page
-			wantPricePaise:    450, // 3 * 150 paise
+				wantPricePaise: 800,
 		},
 		{
 			name:              "4-up Simplex 1 copy (ceil(6/4) = 2 sides)",
@@ -187,7 +193,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   2,
 			wantNormalizedPgs: 2,
 			wantPaddedPgs:     2,
-			wantPricePaise:    400, // 2 * 200
+				wantPricePaise: 600,
 		},
 		{
 			name:              "4-up Duplex 1 copy (2 sides -> 1 sheet, no pad needed)",
@@ -198,7 +204,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   1, // ceil(2/2) = 1 sheet
 			wantNormalizedPgs: 2,
 			wantPaddedPgs:     2,
-			wantPricePaise:    300, // 2 * 150 paise
+				wantPricePaise: 500,
 		},
 		{
 			name:              "6-up Simplex 1 copy (ceil(6/6) = 1 side)",
@@ -209,7 +215,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   1,
 			wantNormalizedPgs: 1,
 			wantPaddedPgs:     1,
-			wantPricePaise:    200, // 1 * 200
+				wantPricePaise: 300,
 		},
 		{
 			name:              "6-up Duplex 1 copy (1 side -> 1 sheet, 1 blank pad)",
@@ -220,7 +226,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   1,   // ceil(1/2) = 1 sheet
 			wantNormalizedPgs: 1,
 			wantPaddedPgs:     2,   // 1 content side + 1 blank padding page
-			wantPricePaise:    150, // 1 * 150 paise
+				wantPricePaise: 300,
 		},
 	}
 
@@ -268,9 +274,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 // TestDocumentPreview_PricingAndDuplexBlankPadding verifies backend-authoritative pricing
 // and that duplex blank padding is excluded from billed sides across multiple copies.
 func TestDocumentPreview_PricingAndDuplexBlankPadding(t *testing.T) {
-	app, mux := setupPreviewTestServer(t)
-	// Explicit 4-tier pricing: BW Simplex 200, BW Duplex 150
-	_ = app.db.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, true)
+	_, mux := setupPreviewTestServer(t)
 
 	tmpDir := t.TempDir()
 	doc3p := createTestPDFWithPages(t, tmpDir, 3)
@@ -290,7 +294,7 @@ func TestDocumentPreview_PricingAndDuplexBlankPadding(t *testing.T) {
 		// Billed sides = 3
 		// Total sheets = ceil(3/2) = 2
 		// Padded pages = 4 (reverse side of 2nd sheet has blank page)
-		// Total price = 3 * 150 = 450 paise (not 600 paise)
+		// Total price = one full duplex sheet (500) plus one simplex side (300) = 800 paise
 		if bs := rr.Header().Get("X-Billed-Sides"); bs != "3" {
 			t.Errorf("X-Billed-Sides = %q, want 3", bs)
 		}
@@ -300,8 +304,8 @@ func TestDocumentPreview_PricingAndDuplexBlankPadding(t *testing.T) {
 		if pp := rr.Header().Get("X-Padded-Pages"); pp != "4" {
 			t.Errorf("X-Padded-Pages = %q, want 4", pp)
 		}
-		if tp := rr.Header().Get("X-Total-Price-Paise"); tp != "450" {
-			t.Errorf("X-Total-Price-Paise = %q, want 450", tp)
+		if tp := rr.Header().Get("X-Total-Price-Paise"); tp != "800" {
+			t.Errorf("X-Total-Price-Paise = %q, want 800", tp)
 		}
 
 		verifyPDFStructureAndPages(t, rr.Body.Bytes(), 4)
@@ -329,15 +333,15 @@ func TestDocumentPreview_PricingAndDuplexBlankPadding(t *testing.T) {
 
 		// 3 content pages * 2 copies = 6 billed sides
 		// Total sheets = ceil(3/2) * 2 = 4 sheets
-		// Price = 6 * 150 = 900 paise
+		// Price = (500 + 300) * 2 = 1600 paise
 		if bs := int(resp["billed_sides"].(float64)); bs != 6 {
 			t.Errorf("billed_sides = %d, want 6", bs)
 		}
 		if ts := int(resp["total_sheets"].(float64)); ts != 4 {
 			t.Errorf("total_sheets = %d, want 4", ts)
 		}
-		if tp := int64(resp["total_price_paise"].(float64)); tp != 900 {
-			t.Errorf("total_price_paise = %d, want 900", tp)
+		if tp := int64(resp["total_price_paise"].(float64)); tp != 1600 {
+			t.Errorf("total_price_paise = %d, want 1600", tp)
 		}
 		if pp := int(resp["padded_pages"].(float64)); pp != 4 {
 			t.Errorf("padded_pages = %d, want 4", pp)
