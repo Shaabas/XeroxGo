@@ -15,14 +15,14 @@
 - Connected Supabase project: XeroxGo (`ftqtagndujzquonpjmfx`).
 - Migrations recorded remotely: `20261117082548 canonical_sheet_pricing`; `20261117085500 secure_canonical_sheet_pricing_rls`.
 - Pricing tables `sheet_tariff_versions` and `sheet_tariff_state` exist; RLS enabled, `anon`/`authenticated` access revoked, service role retains access.
-- At last direct verification: tariff versions empty; `sheet_tariff_state.active_revision = 0`. **No active tariff.**
+- At last direct verification: tariff versions empty; `sheet_tariff_state.active_revision = 0`. **No active tariff.** Human approved production rates on 2026-11-17: BW 300/500 paise (simplex side/duplex sheet); color 800/1000 paise, color disabled initially. Rates approved; DB activation and release still pending.
 - 16 other public tables were flagged by Supabase advisor for missing RLS; separate security work is required.
 - Do not assume the two pricing migrations still need applying; confirm remote migration history first.
 - Backend intentionally returns 503 for unconfigured pricing. **Do not deploy pricing-dependent backend before activation and rollout readiness review.**
 
 ## Immediate priorities
 1. **XG-001**: Workspace foundation committed on PR #10, pending local Antigravity skill discovery and integration; old docs retained for later audit.
-2. **XG-002**: Development/testing rollout chosen. Render uses `main` / After CI Checks Pass / `./Dockerfile`; `XEROXGO_DEV_MODE=1`. Razorpay is not configured per user; **payment setup deferred**. Prioritize test DB identity, approved test tariff, rollout order and rollback. See [release readiness](RELEASE_READINESS.md).
+2. **XG-002**: Development/testing rollout chosen. Render uses `main` / After CI Checks Pass / `./Dockerfile`; `XEROXGO_DEV_MODE=1`. Razorpay is not configured per user; **payment setup deferred**. Prioritize test DB identity, approved tariff activation procedure, rollout order and rollback. See [release readiness](RELEASE_READINESS.md).
 3. **XG-003**: Obtain explicit approval then merge PR #9 to `main` and verify deployment.
 4. **XG-004**: Audit mixed per-document simplex/duplex execution and Pi/CUPS recovery before implementing changes.
 
