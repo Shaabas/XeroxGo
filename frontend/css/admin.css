@@ -892,3 +892,48 @@ input:checked + .slider:before {
   }
 }
 
+
+/* Admin pricing editor and instant price simulator */
+.pricing-grid { align-items: start; }
+.pricing-grid > .panel-card { min-width: 0; }
+.pricing-helper {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 0.45rem 0 1rem;
+}
+.pricing-calc-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.25rem 1rem;
+}
+.pricing-calc-wide { grid-column: 1 / -1; }
+.pricing-calc-result {
+  margin-top: 0.5rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-slate);
+}
+.pricing-calc-detail, .pricing-calc-total {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+.pricing-calc-detail {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  margin-bottom: 0.75rem;
+}
+.pricing-calc-detail strong { color: var(--text-main); }
+.pricing-calc-total {
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+  font-weight: 600;
+}
+.pricing-calc-total strong { color: var(--primary); font-size: 1.65rem; }
+.pricing-calc-result .pricing-helper { margin: 0.5rem 0 0; }
+@media (max-width: 440px) {
+  .pricing-calc-fields { grid-template-columns: 1fr; }
+  .pricing-calc-wide { grid-column: auto; }
+}
