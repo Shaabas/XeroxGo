@@ -423,3 +423,23 @@ test('Instant estimate honors selected pages and validates rates and options', (
   assert.equal(calculateEstimatedPrice(10, { ...base, pagesPerSheet: '3' }, tariff), null);
   assert.equal(calculateEstimatedPrice(10, { ...base, rangeFrom: 8, rangeTo: 2 }, tariff), null);
 });
+
+test('Shared pricing vectors match the instant frontend estimator', () => {
+  const vectors = require('./pricing_parity_vectors.json');
+  for (const vector of vectors) {
+    assert.equal(
+      calculateEstimatedPrice(vector.total_pages, vector.settings, vector.tariff),
+      vector.expected_paise,
+      vector.name,
+    );
+  }
+});
+
+test('Malformed or disabled tariffs cannot silently yield a price', () => {
+  const tariff = { revision: 1, bw_simplex_paise: 300, bw_duplex_sheet_paise: 500,
+    color_simplex_paise: 800, color_duplex_sheet_paise: 1000, color_enabled: false };
+  const settings = { pageSelection: 'All', pagesPerSheet: '2', copies: 1, mode: 'B&W', sides: 'Double-sided' };
+  assert.equal(calculateEstimatedPrice(5, settings, { ...tariff, bw_simplex_paise: -10 }), null);
+  assert.equal(calculateEstimatedPrice(5, { ...settings, mode: 'Color' }, tariff), null);
+  assert.equal(calculateEstimatedPrice(5, { ...settings, copies: 1000 }, tariff), null);
+});

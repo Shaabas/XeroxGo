@@ -70,6 +70,8 @@
   // The backend owns billing; this public tariff also powers instant UI estimates.
   let activeTariff = null;
   let pricingRequestError = null;
+  let tariffLoadSerial = 0;
+  let lastTariffCheckAt = 0;
 
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
@@ -367,25 +369,31 @@
 
   async function refreshDocumentQuote(item) {
     const settingsKey = JSON.stringify(item.settings);
+    const requestSerial = (item.quoteRequestSerial || 0) + 1;
+    item.quoteRequestSerial = requestSerial;
+    const tariffRevision = activeTariff?.revision;
     item.authoritativePricePaise = null;
     item.pricePaise = calculateEstimatedPrice(item.totalPages, item.settings, activeTariff) || 0;
     item.quotePending = true;
     renderCart();
     try {
       const quote = await fetchDocumentQuote(item, item.settings);
-      if (!cartItems.includes(item) || JSON.stringify(item.settings) !== settingsKey) return;
+      if (!cartItems.includes(item) || JSON.stringify(item.settings) !== settingsKey ||
+          item.quoteRequestSerial !== requestSerial || quote.tariff_revision !== activeTariff?.revision) return;
       item.authoritativePricePaise = quote.total_price_paise;
       item.pricePaise = quote.total_price_paise;
       item.tariffRevision = quote.tariff_revision;
       item.totalSheets = quote.total_sheets;
       item.quoteError = '';
     } catch (error) {
-      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey) {
+      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey &&
+          item.quoteRequestSerial === requestSerial && tariffRevision === activeTariff?.revision) {
         item.quoteError = error.message;
         item.authoritativePricePaise = null;
       }
     } finally {
-      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey) {
+      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey &&
+          item.quoteRequestSerial === requestSerial && tariffRevision === activeTariff?.revision) {
         item.quotePending = false;
         renderCart();
       }
@@ -393,23 +401,50 @@
   }
 
   async function loadTariff() {
+    const serial = ++tariffLoadSerial;
+    lastTariffCheckAt = Date.now();
     try {
-      const response = await fetch('/api/pricing');
+      const response = await fetch('/api/pricing', { cache: 'no-store' });
       if (!response.ok) throw new Error('Pricing is not configured');
       const tariff = await response.json();
+      if (serial !== tariffLoadSerial) return;
       if (!Number.isSafeInteger(tariff.revision) || tariff.revision < 1) throw new Error('Invalid tariff');
+      const previousRevision = activeTariff?.revision;
       activeTariff = tariff;
       pricingRequestError = null;
+      if (previousRevision !== tariff.revision) {
+        // A newly published tariff invalidates all previously accepted quotes.
+        for (const item of cartItems) {
+          if (item.status !== 'ready') continue;
+          item.quoteRequestSerial = (item.quoteRequestSerial || 0) + 1;
+          item.authoritativePricePaise = null;
+          item.tariffRevision = null;
+          item.quotePending = true;
+          item.quoteError = '';
+        }
+      }
       updateRateLabels();
       renderCart();
       if (draftSettings) scheduleDraftQuote();
+      if (previousRevision !== tariff.revision) {
+        cartItems.filter(item => item.status === 'ready').forEach(item => {
+          void refreshDocumentQuote(item);
+        });
+      }
     } catch (error) {
+      if (serial !== tariffLoadSerial) return;
+      // An unavailable tariff must not allow an old confirmed quote through checkout.
       activeTariff = null;
       pricingRequestError = error.message;
       updateRateLabels();
       renderCart();
       if (draftSettings) scheduleDraftQuote();
     }
+  }
+
+  function refreshTariffIfStale() {
+    if (document.hidden || Date.now() - lastTariffCheckAt < 30000) return;
+    void loadTariff();
   }
 
   function updateRateLabels() {
@@ -509,7 +544,6 @@
     if (cartBottomBar) cartBottomBar.classList.remove('hidden');
 
     let totalCartPaise = 0;
-    let hasEstimatedTotal = false;
     let readyCount = 0;
     let processingCount = 0;
 
@@ -614,7 +648,6 @@
         const estimated = calculateEstimatedPrice(item.totalPages, item.settings, activeTariff);
         const itemPrice = hasAuthPrice ? item.authoritativePricePaise : (estimated || 0);
         item.pricePaise = itemPrice;
-        if (!hasAuthPrice) hasEstimatedTotal = true;
         totalCartPaise += itemPrice;
 
         let pageCountText = `${item.totalPages} page${item.totalPages > 1 ? 's' : ''}`;
@@ -645,7 +678,7 @@
         }
 
         const priceDisplayHtml = hasAuthPrice ? formatRupees(itemPrice) :
-          (item.quoteError ? 'Quote unavailable' : estimated !== null ? '≈' + formatRupees(estimated) : '…');
+          (item.quoteError ? 'Quote unavailable' : estimated !== null ? formatRupees(estimated) : '…');
 
         card.innerHTML = `
           <div class="doc-card-top">
@@ -706,7 +739,7 @@
       if (isProcessing && readyCount === 0) {
         cartTotalAmount.innerHTML = `<span class="price-loading-dots" role="status" aria-label="Calculating price"><span class="price-dot"></span><span class="price-dot"></span><span class="price-dot"></span></span>`;
       } else if (readyCount > 0 && totalCartPaise > 0) {
-        cartTotalAmount.textContent = (hasEstimatedTotal ? '≈' : '') + formatRupees(totalCartPaise);
+        cartTotalAmount.textContent = formatRupees(totalCartPaise);
       } else if (readyCount === 0 && cartItems.length > 0) {
         cartTotalAmount.textContent = '--';
       } else {
@@ -2469,7 +2502,10 @@
     setupPreviewEventListeners();
     setupCheckoutEventListeners();
     renderCart();
-    loadTariff();
+    void loadTariff();
+    document.addEventListener('visibilitychange', refreshTariffIfStale);
+    window.addEventListener('focus', refreshTariffIfStale);
+    window.setInterval(refreshTariffIfStale, 60000);
   }
 
   if (document.readyState === 'loading') {
