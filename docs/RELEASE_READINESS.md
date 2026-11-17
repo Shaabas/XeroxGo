@@ -1,5 +1,8 @@
 # PR #9 — release readiness assessment
 
+> **HISTORICAL RECORD — PR #9 pre-merge assessment (2026-11-17).** This file captures a previous deployment decision and is **not** current release status. PR #9 was subsequently merged; PRs #11–#14 also merged. See [PROJECT_STATE.md](PROJECT_STATE.md), [TASKS.md](TASKS.md), and the current GitHub checks for the active state. Statements below such as “PR #9 open”, “tariff not activated”, and “merge not authorized” describe the point in time when this record was written. Do not follow its numbered release checklist as current instructions.
+
+
 **Assessment date:** 2026-11-17. **Decision: TARIFF ACTIVATED; TESTING ROLLOUT NOT YET AUTHORIZED TO MERGE.** This is a read-only release assessment, not deployment approval.
 
 ## Verified source state
