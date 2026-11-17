@@ -20,7 +20,7 @@
 ## Testing deployment order (pending approvals)
 1. **Payments deferred by user.** Razorpay is not configured; do not work on payment-provider setup during this task. Before any test checkout that could initiate a payment, verify it cannot trigger real charges; keep that verification as a narrow pre-test safety check, not an integration project.
 2. Verify the database referenced by Render is the intended testing Supabase database (without revealing the connection string). Otherwise do not activate tariffs in the wrong environment.
-3. Obtain approval of test rates and `color_enabled` flag; no rates have been approved simply by choosing testing mode. Current active revision is zero.
+3. **Rates approved on 2026-11-17:** BW simplex 300 paise per side; BW duplex 500 paise per sheet; color simplex 800 paise per side; color duplex 1000 paise per sheet; color initially disabled. These are intended for production and development. **Database activation remains a separate unapproved operation.** Current active revision is zero.
 4. Verify code deployment prerequisites and choose a rollback mechanism. Because `main` auto-deploys after CI, use a maintenance window or temporarily disable auto-deploy through approved dashboard action if necessary.
 5. Activate the first tariff revision using the authenticated admin API in a verified compatible backend or a separately reviewed transactional method; do not use unreviewed SQL.
 6. After explicit release authorization, merge PR #9; observe Render deploy at exact SHA and smoke test /healthz, /api/pricing, quote, stale quote, demo checkout, and PIN/job flow. Avoid actual physical prints unless specifically approved.
@@ -36,7 +36,7 @@
 
 ## Release sequence requiring human approval
 1. Verify live Render/Vercel environment settings, current deploy SHA, auto-deploy behavior, required secrets and payment mode **without revealing secret values**.
-2. Approve initial canonical rates and whether color is enabled. The code's template defaults are B&W 300/500 paise and color 800/1000 paise but **none are active**.
+2. Initial canonical tariff rates approved by human (B&W 300/500 paise and color 800/1000 paise); color initially disabled. **None are active** in the verified database. Verify destination and authorize activation separately.
 3. Establish a tested rollback path: Render previous deploy/commit; confirm legacy pricing interactions and that rollback remains compatible with additive schema and any newly accepted orders. Document interruption risks.
 4. Decide safe tariff activation window relative to backend release. Prefer staging compatibility verification first. A first revision may be activated using the authenticated admin PUT on the new backend, or a separately reviewed database method with the same invariants. **Do not improvise production SQL or silently enable rates.**
 5. Smoke test `/healthz`, `/api/pricing`, preview/quote, upload, stale quote rejection, admin auth, payment order/PIN and Pi dispatch in a suitable staging/test environment. No real payment or real printer job without authorization.
