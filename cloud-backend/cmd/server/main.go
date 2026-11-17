@@ -120,7 +120,7 @@ func (s *appServer) generateUniquePIN(ctx context.Context, kioskID string) (stri
 	return "", errors.New("unable to generate unique PIN after max attempts")
 }
 
-func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int) error {
+func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int, tariffRevision ...int64) error {
 	if s.db == nil {
 		return errors.New("database not initialized")
 	}
@@ -133,7 +133,11 @@ func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Or
 			return fmt.Errorf("generate pin: %w", err)
 		}
 		order.Command.DisplayCode = pin
-		err = s.db.CreateOrder(ctx, *order)
+		if len(tariffRevision) == 1 && tariffRevision[0] > 0 {
+			err = s.db.CreateOrderWithTariffRevision(ctx, *order, tariffRevision[0])
+		} else {
+			err = s.db.CreateOrder(ctx, *order)
+		}
 		if err == nil {
 			return nil
 		}
@@ -455,9 +459,15 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = os.Remove(outputPath)
 			return
 		}
-		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
+		var revision int64
+		if tariffs.sheet != nil { revision = tariffs.sheet.Revision }
+		if err := s.createOrderWithPINRetry(r.Context(), &order, 25, revision); err != nil {
 			_ = os.Remove(outputPath)
-			http.Error(w, "failed to persist order", http.StatusInternalServerError)
+			if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
+				http.Error(w, "Price changed. Please review the new quote.", http.StatusConflict)
+			} else {
+				http.Error(w, "failed to persist order", http.StatusInternalServerError)
+			}
 			return
 		}
 		displayCode := order.Command.DisplayCode
@@ -586,9 +596,15 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		_ = os.Remove(outputPath)
 		return
 	}
-	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
+	var revision int64
+	if tariffs.sheet != nil { revision = tariffs.sheet.Revision }
+	if err := s.createOrderWithPINRetry(r.Context(), &order, 25, revision); err != nil {
 		_ = os.Remove(outputPath)
-		http.Error(w, "failed to persist order", http.StatusInternalServerError)
+		if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
+			http.Error(w, "Price changed. Please review the new quote.", http.StatusConflict)
+		} else {
+			http.Error(w, "failed to persist order", http.StatusInternalServerError)
+		}
 		return
 	}
 	displayCode := order.Command.DisplayCode
