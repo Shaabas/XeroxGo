@@ -1525,6 +1525,7 @@
     });
 
     cardModeColor.addEventListener('click', () => {
+      if (activeTariff?.color_enabled !== true) return;
       draftSettings.mode = 'Color';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (doc) {
