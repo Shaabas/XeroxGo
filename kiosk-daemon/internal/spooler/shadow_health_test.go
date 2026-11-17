@@ -638,7 +638,13 @@ func TestShadowHealth_PeriodicLoopExecution(t *testing.T) {
 	}()
 
 	// Wait for ticker to fire multiple times
-	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if checkCount.Load() >= 2 && client.LatestShadowReport() != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	cancel()
 	<-runDone
 
