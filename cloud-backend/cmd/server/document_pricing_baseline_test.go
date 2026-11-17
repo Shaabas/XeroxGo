@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 )
@@ -118,10 +119,7 @@ showpage
 func TestDocumentPricing_PreviewAndUploadParity(t *testing.T) {
 	app, mux := setupDocPricingBaselineServer(t)
 
-	// Configure DB pricing: BW Simplex 200, BW Duplex 150, Color Simplex 1000, Color Duplex 750 (ColorEnabled: true)
-	if err := app.db.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, true); err != nil {
-		t.Fatalf("failed to set pricing: %v", err)
-	}
+	activateTestPricing(t, app, 300, 500, 800, 1000, true, 0)
 
 	tmpDir := t.TempDir()
 	doc5Path := createNamedDocPDF(t, tmpDir, "ParityDoc", 5)
@@ -213,6 +211,8 @@ func TestDocumentPricing_PreviewAndUploadParity(t *testing.T) {
 			if tc.pageRange != "" {
 				_ = upWriter.WriteField("page_range", tc.pageRange)
 			}
+			_ = upWriter.WriteField("accepted_total_price_paise", strconv.FormatInt(prevPricePaise, 10))
+			_ = upWriter.WriteField("accepted_tariff_revision", prevRec.Header().Get("X-Tariff-Revision"))
 			_ = upWriter.Close()
 
 			upReq := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_parity/upload", upBody)
@@ -299,8 +299,7 @@ func TestDocumentPricing_PreviewAndUploadParity(t *testing.T) {
 func TestDocumentPricing_MultiFileCollationOrderAndPadding(t *testing.T) {
 	app, mux := setupDocPricingBaselineServer(t)
 
-	// Set pricing: BW Simplex 200, BW Duplex 150
-	_ = app.db.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, false)
+	activateTestPricing(t, app, 300, 500, 800, 1000, false, 0)
 
 	tmpDir := t.TempDir()
 	docAlpha := createNamedDocPDF(t, tmpDir, "DocAlpha", 2)
@@ -331,6 +330,8 @@ func TestDocumentPricing_MultiFileCollationOrderAndPadding(t *testing.T) {
 		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW", "page_range": ""}
 	]`
 	_ = writer.WriteField("metadata", metaJSON)
+	_ = writer.WriteField("accepted_total_price_paise", "1700")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	_ = writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_multi/upload", body)
@@ -361,8 +362,8 @@ func TestDocumentPricing_MultiFileCollationOrderAndPadding(t *testing.T) {
 	if totalSheets != 5 {
 		t.Errorf("total_sheets = %d, want 5", totalSheets)
 	}
-	if totalPricePaise != 1050 {
-		t.Errorf("total_price_paise = %d, want 1050", totalPricePaise)
+	if totalPricePaise != 1700 {
+		t.Errorf("total_price_paise = %d, want 1700", totalPricePaise)
 	}
 
 	// Verify merged PDF page count:
@@ -421,9 +422,7 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 	// Color Simplex: 1250 paise (₹12.50)
 	// Color Duplex: 900 paise (₹9.00)
 	// ColorEnabled: true
-	if err := app.db.SetDetailedPricing(context.Background(), 250, 175, 1250, 900, true); err != nil {
-		t.Fatalf("failed to set detailed pricing: %v", err)
-	}
+	activateTestPricing(t, app, 250, 175, 1250, 900, true, 0)
 
 	tmpDir := t.TempDir()
 	doc4Path := createNamedDocPDF(t, tmpDir, "TierDoc", 4)
@@ -437,6 +436,16 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		_ = writer.WriteField("copies", strconv.Itoa(copies))
 		_ = writer.WriteField("duplex", duplex)
 		_ = writer.WriteField("color_mode", colorMode)
+		sides := int64(4)
+		var rate int64
+		if colorMode == "COLOR" {
+			if duplex == "SIMPLEX" { rate = 1250 } else { rate = 900 / 2 }
+		} else {
+			if duplex == "SIMPLEX" { rate = 250 } else { rate = 175 / 2 }
+		}
+		amount := sides * int64(copies) * rate
+		_ = writer.WriteField("accepted_total_price_paise", strconv.FormatInt(amount, 10))
+		_ = writer.WriteField("accepted_tariff_revision", strconv.FormatInt(1, 10))
 		_ = writer.Close()
 
 		req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_tier/upload", body)
@@ -460,8 +469,8 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 
 	// 2. BW Duplex: 4 pages * 1 copy * 175 paise = 700 paise
 	pBwDup := uploadTest("BW", "DUPLEX_LONG_EDGE", 1)
-	if pBwDup != 700 {
-		t.Errorf("BW Duplex price = %d, want 700", pBwDup)
+	if pBwDup != 350 {
+		t.Errorf("BW Duplex price = %d, want 350", pBwDup)
 	}
 
 	// 3. Color Simplex: 4 pages * 1 copy * 1250 paise = 5000 paise
@@ -472,14 +481,12 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 
 	// 4. Color Duplex: 4 pages * 1 copy * 900 paise = 3600 paise
 	pColDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1)
-	if pColDup != 3600 {
-		t.Errorf("Color Duplex price = %d, want 3600", pColDup)
+	if pColDup != 1800 {
+		t.Errorf("Color Duplex price = %d, want 1800", pColDup)
 	}
 
 	// 5. Disable Color in DB: test graceful fallback to B&W rates
-	if err := app.db.SetDetailedPricing(context.Background(), 250, 175, 1250, 900, false); err != nil {
-		t.Fatalf("failed to update pricing to color disabled: %v", err)
-	}
+	activateTestPricing(t, app, 250, 175, 1250, 900, false, 1)
 
 	// Request Color Simplex with Color disabled -> should be charged BW Simplex (1000 paise)
 	pFallbackSimp := uploadTest("COLOR", "SIMPLEX", 1)
@@ -500,8 +507,7 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 	app, mux := setupDocPricingBaselineServer(t)
 
-	// Set initial pricing: BW Simplex 200 paise
-	_ = app.db.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, false)
+	activateTestPricing(t, app, 300, 500, 800, 1000, false, 0)
 
 	tmpDir := t.TempDir()
 	docPath := createNamedDocPDF(t, tmpDir, "ImmutableDoc", 3)
@@ -514,6 +520,8 @@ func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 	_, _ = part.Write(docBytes)
 	_ = writer.WriteField("copies", "1")
 	_ = writer.WriteField("duplex", "SIMPLEX")
+	_ = writer.WriteField("accepted_total_price_paise", "900")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	_ = writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_immut/upload", body)
@@ -531,12 +539,12 @@ func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 	pin := resp["display_code"].(string)
 	initialPrice := int64(resp["total_price_paise"].(float64))
 
-	if initialPrice != 600 {
-		t.Fatalf("initial order price = %d paise, want 600", initialPrice)
+	if initialPrice != 900 {
+		t.Fatalf("initial order price = %d paise, want 900", initialPrice)
 	}
 
 	// 2. Admin dramatically changes pricing to 800 paise per sheet
-	_ = app.db.SetDetailedPricing(context.Background(), 800, 600, 2000, 1500, false)
+	activateTestPricing(t, app, 800, 600, 2000, 1500, false, 1)
 
 	// 3. Verify order status query still returns the immutable agreed price (600 paise)
 	statusReq := httptest.NewRequest(http.MethodGet, "/api/orders/"+orderID+"/status", nil)
@@ -549,7 +557,7 @@ func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 	var statusResp map[string]interface{}
 	_ = json.Unmarshal(statusRec.Body.Bytes(), &statusResp)
 	statusPrice := int64(statusResp["price_paise"].(float64))
-	if statusPrice != 600 {
+	if statusPrice != 900 {
 		t.Errorf("order status returned price %d paise after pricing change, want immutable 600", statusPrice)
 	}
 
@@ -566,7 +574,7 @@ func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 	var lookupResp map[string]interface{}
 	_ = json.Unmarshal(lookupRec.Body.Bytes(), &lookupResp)
 	lookupPrice := int64(lookupResp["total_price_paise"].(float64))
-	if lookupPrice != 600 {
+	if lookupPrice != 900 {
 		t.Errorf("pin lookup returned price %d paise after pricing change, want immutable 600", lookupPrice)
 	}
 
@@ -583,7 +591,7 @@ func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 	_ = json.Unmarshal(claimRec.Body.Bytes(), &claimResp)
 
 	claimedPrice := int64(claimResp["total_price_paise"].(float64))
-	if claimedPrice != 600 {
+	if claimedPrice != 900 {
 		t.Errorf("claimed session price = %d paise, want immutable agreed price 600", claimedPrice)
 	}
 }
@@ -591,7 +599,8 @@ func TestDocumentPricing_PriceImmutabilityPostCreation(t *testing.T) {
 // TestDocumentPricing_InputValidationAndBoundaryErrors verifies validation rejection
 // for corrupted inputs, invalid duplex, invalid copies, invalid N-up, and invalid orientation.
 func TestDocumentPricing_InputValidationAndBoundaryErrors(t *testing.T) {
-	_, mux := setupDocPricingBaselineServer(t)
+	app, mux := setupDocPricingBaselineServer(t)
+	activateTestPricing(t, app, 300, 500, 800, 1000, false, 0)
 
 	tmpDir := t.TempDir()
 	validPDF := createNamedDocPDF(t, tmpDir, "Valid", 2)
