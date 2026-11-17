@@ -118,9 +118,12 @@ func (s *appServer) generateUniquePIN(ctx context.Context, kioskID string) (stri
 	return "", errors.New("unable to generate unique PIN after max attempts")
 }
 
-func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int, tariffRevision ...int64) error {
+func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int, tariffRevision int64) error {
 	if s.db == nil {
 		return errors.New("database not initialized")
+	}
+	if tariffRevision < 1 {
+		return errors.New("tariff revision is required")
 	}
 	if maxAttempts < 1 {
 		maxAttempts = 25
@@ -131,11 +134,7 @@ func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Or
 			return fmt.Errorf("generate pin: %w", err)
 		}
 		order.Command.DisplayCode = pin
-		if len(tariffRevision) == 1 && tariffRevision[0] > 0 {
-			err = s.db.CreateOrderWithTariffRevision(ctx, *order, tariffRevision[0])
-		} else {
-			err = s.db.CreateOrder(ctx, *order)
-		}
+		err = s.db.CreateOrderWithTariffRevision(ctx, *order, tariffRevision)
 		if err == nil {
 			return nil
 		}
