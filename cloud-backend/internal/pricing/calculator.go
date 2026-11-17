@@ -30,17 +30,10 @@ type Document struct {
 	Color               bool
 }
 
-type Line struct {
-	TotalPaise    int64
-	BilledSides   int64
-	SheetsPerCopy int64
-}
-
 type Quote struct {
 	TariffRevision int64
 	TotalPaise     int64
 	BilledSides    int64
-	Lines          []Line
 }
 
 func ValidateTariff(t Tariff) error {
@@ -90,7 +83,7 @@ func CalculateOrder(t Tariff, docs []Document) (Quote, error) {
 		return Quote{}, errors.New("too many documents")
 	}
 
-	q := Quote{TariffRevision: t.Revision, Lines: make([]Line, 0, len(docs))}
+	q := Quote{TariffRevision: t.Revision}
 	for i, d := range docs {
 		if d.ImposedSidesPerCopy < 1 || d.Copies < 1 || d.Copies > 999 {
 			return Quote{}, fmt.Errorf("document %d: invalid quantities", i+1)
@@ -104,11 +97,9 @@ func CalculateOrder(t Tariff, docs []Document) (Quote, error) {
 			simplex, duplex = t.ColorSimplexPaise, t.ColorDuplexSheetPaise
 		}
 
-		sheets := d.ImposedSidesPerCopy
 		var perCopy int64
 		var err error
 		if d.Duplex {
-			sheets = d.ImposedSidesPerCopy/2 + d.ImposedSidesPerCopy%2
 			perCopy, err = checkedMul(d.ImposedSidesPerCopy/2, duplex)
 			if err != nil {
 				return Quote{}, fmt.Errorf("document %d: %w", i+1, err)
@@ -139,7 +130,6 @@ func CalculateOrder(t Tariff, docs []Document) (Quote, error) {
 		if err != nil {
 			return Quote{}, err
 		}
-		q.Lines = append(q.Lines, Line{TotalPaise: linePrice, BilledSides: billedSides, SheetsPerCopy: sheets})
 	}
 	return q, nil
 }
