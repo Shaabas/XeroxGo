@@ -705,11 +705,16 @@ func TestMultiJobRecovery_DefinitelyUnsubmittedWithNoUnresolvedJobs_AdmitsSequen
 		Timestamp: time.Now().Add(-5 * time.Minute),
 	})
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-seq-test",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -726,15 +731,19 @@ func TestMultiJobRecovery_DefinitelyUnsubmittedWithNoUnresolvedJobs_AdmitsSequen
 		_ = client.Run(recovCtx)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
-
-	// Check active and deferred:
-	// Job A was admitted to queue
-	client.activeMu.Lock()
-	isJobAActive := client.activeJobs[cmdA.JobID]
-	isJobBActive := client.activeJobs[cmdB.JobID]
-	totalActive := len(client.activeJobs)
-	client.activeMu.Unlock()
+	// Wait for Job A admission to active queue
+	var isJobAActive, isJobBActive bool
+	var totalActive int
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		client.activeMu.Lock()
+		isJobAActive = client.activeJobs[cmdA.JobID]
+		isJobBActive = client.activeJobs[cmdB.JobID]
+		totalActive = len(client.activeJobs)
+		client.activeMu.Unlock()
+		if isJobAActive {
+			break
+		}
+	}
 
 	if totalActive > 1 {
 		t.Fatalf("concurrency violation: expected at most 1 active job, got %d", totalActive)
@@ -747,15 +756,21 @@ func TestMultiJobRecovery_DefinitelyUnsubmittedWithNoUnresolvedJobs_AdmitsSequen
 	}
 
 	// Job B is deferred in c.deferredJobs
-	client.deferredMu.Lock()
 	jobBDeferred := false
-	for _, dj := range client.deferredJobs {
-		if dj.JobID == cmdB.JobID {
-			jobBDeferred = true
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		client.deferredMu.Lock()
+		jobBDeferred = false
+		for _, dj := range client.deferredJobs {
+			if dj.JobID == cmdB.JobID {
+				jobBDeferred = true
+				break
+			}
+		}
+		client.deferredMu.Unlock()
+		if jobBDeferred {
 			break
 		}
 	}
-	client.deferredMu.Unlock()
 
 	if !jobBDeferred {
 		t.Errorf("expected Job B to be deferred for sequential processing")
