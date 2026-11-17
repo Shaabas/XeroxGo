@@ -21,8 +21,8 @@
 - Backend intentionally returns 503 for unconfigured pricing. **Do not deploy pricing-dependent backend before activation and rollout readiness review.**
 
 ## Immediate priorities
-1. **XG-001**: Establish this dual-agent workspace and safely rationalize documentation, without altering PR #9 or production.
-2. **XG-002**: Complete release readiness for PR #9 (tariff activation procedure, 16-table RLS exposure audit, deployment order, rollback, endpoint accuracy, CI and branch verification).
+1. **XG-001**: Workspace foundation committed on PR #10, pending local Antigravity skill discovery and integration; old docs retained for later audit.
+2. **XG-002**: Release readiness investigation performed, but deployment **BLOCKED** pending environment inspection, rate approval, activation and rollback plan. See [release readiness](RELEASE_READINESS.md).
 3. **XG-003**: Obtain explicit approval then merge PR #9 to `main` and verify deployment.
 4. **XG-004**: Audit mixed per-document simplex/duplex execution and Pi/CUPS recovery before implementing changes.
 
@@ -30,7 +30,7 @@
 - Render may auto-deploy merges to `main`; Git merge is a deployment-affecting action.
 - PR #9 description mentioned `/api/tariffs/active`, while inspected frontend/backend code used `/api/pricing`; correct documentation after verifying current code.
 - Merged multi-document PDFs carry one aggregate duplex job flag; per-document print setting fidelity is unverified. Architecture audit required.
-- The active task is **workspace setup**, not Pi redesign or tariff activation.
+- The active task is **PR #9 release readiness**, not Pi redesign or tariff activation. PR #9 text corrected; PR #10 remains a draft with workspace files.
 
 ## Hand-off
 Read `AGENTS.md` and `docs/TASKS.md`, verify GitHub branch/PR and local pending changes, then continue the highest priority unblocked task. Never infer that a checkpoint proves current runtime state.
