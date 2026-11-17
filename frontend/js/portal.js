@@ -49,11 +49,28 @@
     return Number.isSafeInteger(total) && total > 0 ? total : null;
   }
 
+  // Reuse a server-confirmed quote, never a local display estimate. The final
+  // upload independently normalizes every PDF and rejects incorrect amounts.
+  function confirmedOrderQuote(items, tariff) {
+    const revision = tariff?.revision;
+    if (!Array.isArray(items) || items.length === 0 ||
+        !Number.isSafeInteger(revision) || revision < 1) return null;
+    let total = 0;
+    for (const item of items) {
+      if (!item || item.status !== 'ready' || item.quotePending || item.quoteError ||
+          item.tariffRevision !== revision || !Number.isSafeInteger(item.authoritativePricePaise) ||
+          item.authoritativePricePaise <= 0) return null;
+      total += item.authoritativePricePaise;
+      if (!Number.isSafeInteger(total)) return null;
+    }
+    return { revision, acceptedTotal: total };
+  }
+
   // --- Configuration from DOM ---
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
-      module.exports = { convertDocumentOnServer, calculateEstimatedPrice };
+      module.exports = { convertDocumentOnServer, calculateEstimatedPrice, confirmedOrderQuote };
     }
     return;
   }
@@ -2106,19 +2123,12 @@
     // Each document must already have a confirmed cloud quote for its current
     // settings and tariff. The server will revalidate the submitted price,
     // revision and final normalized PDF during the one order upload.
-    const revision = activeTariff?.revision;
-    if (!Number.isSafeInteger(revision) || revision < 1 ||
-        readyItems.some(item => !itemHasCurrentQuote(item) ||
-          !Number.isSafeInteger(item.authoritativePricePaise) ||
-          item.authoritativePricePaise <= 0 || !!item.quoteError)) {
+    const confirmed = confirmedOrderQuote(readyItems, activeTariff);
+    if (!confirmed) {
       showCartError('A document price is not confirmed yet. Please review the quotation before ordering.');
       return;
     }
-    const acceptedTotal = readyItems.reduce((sum, item) => sum + item.authoritativePricePaise, 0);
-    if (!Number.isSafeInteger(acceptedTotal) || acceptedTotal <= 0) {
-      showCartError('The confirmed quotation is invalid.');
-      return;
-    }
+    const { revision, acceptedTotal } = confirmed;
 
     orderSubmitting = true;
     renderCart();
