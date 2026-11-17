@@ -60,9 +60,9 @@ jobs:
       - name: Cache Busting Asset Tagging
         run: |
           BUILD_TAG="${GITHUB_SHA::8}"
-          sed -i "s|portal\\.css?v=[^\\"]*|portal.css?v=${BUILD_TAG}|g" index.html
-          sed -i "s|portal\\.js?v=[^\\"]*|portal.js?v=${BUILD_TAG}|g" index.html
-          sed -i "s|admin\\.js?v=[^\\"]*|admin.js?v=${BUILD_TAG}|g" admin.html
+          sed -i 's|portal[.]css?v=[^"]*|portal.css?v='"${BUILD_TAG}"'|g' index.html
+          sed -i 's|portal[.]js?v=[^"]*|portal.js?v='"${BUILD_TAG}"'|g' index.html
+          sed -i 's|admin[.]js?v=[^"]*|admin.js?v='"${BUILD_TAG}"'|g' admin.html
 
       - name: Load Vercel production project settings
         run: npx --yes vercel@latest pull --yes --environment=production
