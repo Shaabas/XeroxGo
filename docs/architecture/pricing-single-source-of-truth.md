@@ -13,7 +13,7 @@
 The new pricing package supports two interpretations:
 
 1. `per-side` (default): exactly preserves previous deployment behavior. A duplex rate is per **printed side**; the billed side count excludes padding.
-2. `per-sheet` (opt-in): uses the model from the sheet-based tariff model: a complete two-sided sheet costs the duplex tariff, a trailing one-sided sheet costs the simplex tariff, and blank padding is not billed.
+2. `per-sheet` (opt-in): uses the sheet-based tariff model: a complete two-sided sheet costs the duplex tariff, a trailing one-sided sheet costs the simplex tariff, and blank padding is not billed.
 
 The target rates are B&W simplex **300 paise per side**, B&W duplex **500 paise per full sheet**, color simplex **800 paise per side**, and color duplex **1000 paise per full sheet**.
 
