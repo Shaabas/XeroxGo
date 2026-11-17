@@ -172,26 +172,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
     color_mode TEXT NOT NULL DEFAULT 'BW'
 );
 
-CREATE TABLE IF NOT EXISTS pricing (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
-        CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
-        CHECK (color_duplex_price_paise > 0),
-    color_enabled INTEGER NOT NULL DEFAULT 0,
-    updated_at_ns BIGINT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS payment_webhooks (
     webhook_id TEXT PRIMARY KEY,
     received_at_ns BIGINT NOT NULL
@@ -363,13 +343,6 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 		}
 
 		pgMigrations := []string{
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
 			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS pin_expires_at_ns BIGINT NOT NULL DEFAULT 0;",
 			"CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);",
@@ -515,26 +488,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
     color_mode TEXT NOT NULL DEFAULT 'BW'
 );
 
-CREATE TABLE IF NOT EXISTS pricing (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
-        CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
-        CHECK (color_duplex_price_paise > 0),
-    color_enabled INTEGER NOT NULL DEFAULT 0,
-    updated_at_ns BIGINT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS payment_webhooks (
     webhook_id TEXT PRIMARY KEY,
     received_at_ns BIGINT NOT NULL
@@ -633,42 +586,6 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 }
 
 func migrateSQLiteSchema(db *sql.DB) error {
-	colsPricing := make(map[string]bool)
-	rows, err := db.Query("PRAGMA table_info(pricing);")
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsPricing[name] = true
-			}
-		}
-		_ = rows.Close()
-	}
-	if !colsPricing["bw_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["color_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["bw_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["bw_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 150;")
-	}
-	if !colsPricing["color_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["color_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 750;")
-	}
-	if !colsPricing["color_enabled"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_enabled INTEGER NOT NULL DEFAULT 0;")
-	}
-
 	colsConfigs := make(map[string]bool)
 	rowsCfg, err := db.Query("PRAGMA table_info(print_configs);")
 	if err == nil {
