@@ -629,11 +629,16 @@ func TestMultiJobRecovery_DatabaseErrorHandling(t *testing.T) {
 	// Close store immediately to induce database error on query
 	store.Close()
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-dberr-test",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -651,7 +656,14 @@ func TestMultiJobRecovery_DatabaseErrorHandling(t *testing.T) {
 		_ = client.Run(recovCtx)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for startup recovery to process database error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	client.activeMu.Lock()
 	activeCount := len(client.activeJobs)
@@ -705,11 +717,16 @@ func TestMultiJobRecovery_DefinitelyUnsubmittedWithNoUnresolvedJobs_AdmitsSequen
 		Timestamp: time.Now().Add(-5 * time.Minute),
 	})
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-seq-test",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -726,15 +743,19 @@ func TestMultiJobRecovery_DefinitelyUnsubmittedWithNoUnresolvedJobs_AdmitsSequen
 		_ = client.Run(recovCtx)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
-
-	// Check active and deferred:
-	// Job A was admitted to queue
-	client.activeMu.Lock()
-	isJobAActive := client.activeJobs[cmdA.JobID]
-	isJobBActive := client.activeJobs[cmdB.JobID]
-	totalActive := len(client.activeJobs)
-	client.activeMu.Unlock()
+	// Wait for Job A admission to active queue
+	var isJobAActive, isJobBActive bool
+	var totalActive int
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		client.activeMu.Lock()
+		isJobAActive = client.activeJobs[cmdA.JobID]
+		isJobBActive = client.activeJobs[cmdB.JobID]
+		totalActive = len(client.activeJobs)
+		client.activeMu.Unlock()
+		if isJobAActive {
+			break
+		}
+	}
 
 	if totalActive > 1 {
 		t.Fatalf("concurrency violation: expected at most 1 active job, got %d", totalActive)
@@ -747,15 +768,21 @@ func TestMultiJobRecovery_DefinitelyUnsubmittedWithNoUnresolvedJobs_AdmitsSequen
 	}
 
 	// Job B is deferred in c.deferredJobs
-	client.deferredMu.Lock()
 	jobBDeferred := false
-	for _, dj := range client.deferredJobs {
-		if dj.JobID == cmdB.JobID {
-			jobBDeferred = true
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		client.deferredMu.Lock()
+		jobBDeferred = false
+		for _, dj := range client.deferredJobs {
+			if dj.JobID == cmdB.JobID {
+				jobBDeferred = true
+				break
+			}
+		}
+		client.deferredMu.Unlock()
+		if jobBDeferred {
 			break
 		}
 	}
-	client.deferredMu.Unlock()
 
 	if !jobBDeferred {
 		t.Errorf("expected Job B to be deferred for sequential processing")
@@ -801,11 +828,16 @@ func TestMultiJobRecovery_CommandReplayPostRecovery(t *testing.T) {
 		Timestamp:   time.Now().UTC(),
 	})
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-replay-test",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -868,11 +900,16 @@ func TestMultiJobRecovery_Negative_NewCommandDuringUnresolvedRecovery(t *testing
 		Timestamp:   time.Now().UTC(),
 	})
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-barrier-test",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -923,11 +960,16 @@ func TestMultiJobRecovery_Negative_StartupDBFailure_EntersFailClosedBarrier(t *t
 	// Close database to force startup query failure
 	store.Close()
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-db-fail",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -937,12 +979,22 @@ func TestMultiJobRecovery_Negative_StartupDBFailure_EntersFailClosedBarrier(t *t
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
-	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	recovCtx, cancelRecov := context.WithCancel(context.Background())
 	defer cancelRecov()
-	_ = client.Run(recovCtx)
+	go func() {
+		_ = client.Run(recovCtx)
+	}()
 
 	// Assert: durable in-process fail-closed recovery barrier is active
-	blocked, reason := client.IsRecoveryBarrierActive()
+	var blocked bool
+	var reason string
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		blocked, reason = client.IsRecoveryBarrierActive()
+		if blocked {
+			break
+		}
+	}
+	cancelRecov()
 	if !blocked {
 		t.Fatalf("expected recovery barrier to be active on startup DB failure")
 	}
@@ -981,11 +1033,16 @@ func TestMultiJobRecovery_Negative_FullJobQueue_ReleasesReservationAndDefers(t *
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(""), nil
+	}
+
 	client, err := NewClient(ClientConfig{
 		CloudURL:            "ws://127.0.0.1:8080/ws",
 		KioskID:             "kiosk-full-queue",
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
+		CUPSRunner:          runner,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
@@ -1000,10 +1057,28 @@ func TestMultiJobRecovery_Negative_FullJobQueue_ReleasesReservationAndDefers(t *
 		client.jobQueue <- sampleCommand(fmt.Sprintf("dummy-queue-blocker-%d", len(client.jobQueue)))
 	}
 
-	// Run startup recovery with canceled context so workers don't drain the dummy job
-	recovCtx, cancelRecov := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	recovCtx, cancelRecov := context.WithCancel(context.Background())
 	defer cancelRecov()
-	_ = client.Run(recovCtx)
+	go func() {
+		_ = client.Run(recovCtx)
+	}()
+
+	// Wait until unadmitted job is preserved in deferredJobs
+	foundInDeferred := false
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		client.deferredMu.Lock()
+		for _, dj := range client.deferredJobs {
+			if dj.JobID == cmd1.JobID {
+				foundInDeferred = true
+				break
+			}
+		}
+		client.deferredMu.Unlock()
+		if foundInDeferred {
+			break
+		}
+	}
+	cancelRecov()
 
 	// Verify Requirement 7:
 	// 1. Active reservation was RELEASED
@@ -1023,15 +1098,6 @@ func TestMultiJobRecovery_Negative_FullJobQueue_ReleasesReservationAndDefers(t *
 		t.Errorf("expected stored status to remain retryable SPOOLING, got: %s", stored.Status)
 	}
 
-	client.deferredMu.Lock()
-	foundInDeferred := false
-	for _, dj := range client.deferredJobs {
-		if dj.JobID == cmd1.JobID {
-			foundInDeferred = true
-			break
-		}
-	}
-	client.deferredMu.Unlock()
 	if !foundInDeferred {
 		t.Errorf("expected unadmitted job %s to be preserved in deferredJobs for retry", cmd1.JobID)
 	}
@@ -1108,7 +1174,14 @@ func TestMultiJobRecovery_Negative_MultipleActiveCUPSJobs_HoldFailure_BlocksFres
 		_ = client.Run(recovCtx)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for startup recovery to process database error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// 1. Requirement 10: Fresh submissions blocked by recovery barrier
 	blocked, reason := client.IsRecoveryBarrierActive()

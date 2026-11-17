@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"xeroxgo/cloud-backend/internal/store"
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -217,12 +217,15 @@ func TestDocPrep_ExecuteNormalizationAndPricing(t *testing.T) {
 		PagesPerSheet: 1,
 	}
 
-	pricing := store.PricingConfig{
-		BWSimplexPricePaise: 200,
-		BWDuplexPricePaise:  150,
+	tariff := pricing.Tariff{
+		Revision: 1,
+		BWSimplexPaise: 300,
+		BWDuplexSheetPaise: 500,
+		ColorSimplexPaise: 800,
+		ColorDuplexSheetPaise: 1000,
 	}
 
-	res, err := app.executeNormalizationAndPricing(context.Background(), pdfPath, outPath, opts, pricing, true)
+	res, err := app.executeNormalizationAndPricing(context.Background(), pdfPath, outPath, opts, tariff)
 	if err != nil {
 		t.Fatalf("executeNormalizationAndPricing failed: %v", err)
 	}
@@ -237,12 +240,9 @@ func TestDocPrep_ExecuteNormalizationAndPricing(t *testing.T) {
 	if res.PrintedSides != 4 {
 		t.Fatalf("expected 4 printed sides, got %d", res.PrintedSides)
 	}
-	if res.UnitPrice != 200 {
-		t.Fatalf("expected unit price 200, got %d", res.UnitPrice)
-	}
-	// 4 sides * 200 paise = 800 paise
-	if res.PricePaise != 800 {
-		t.Fatalf("expected price 800 paise, got %d", res.PricePaise)
+	// Two occupied sides per copy, two copies, simplex at 300 paise.
+	if res.PricePaise != 1200 || res.TariffRevision != 1 {
+		t.Fatalf("price=%d revision=%d, want 1200 and 1", res.PricePaise, res.TariffRevision)
 	}
 	if _, err := os.Stat(outPath); err != nil {
 		t.Fatalf("expected output file to exist: %v", err)

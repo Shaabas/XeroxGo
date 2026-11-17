@@ -10,67 +10,6 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-func TestPricingDual(t *testing.T) {
-	ctx := context.Background()
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "pricing_test.db")
-
-	s, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer s.Close()
-
-	// 1. Initial pricing unconfigured error
-	if _, err := s.GetPricing(ctx); err == nil {
-		t.Fatalf("expected error for unconfigured pricing, got nil")
-	}
-
-	// 2. Set custom dual pricing
-	if err := s.SetPricing(ctx, 350, 1500); err != nil {
-		t.Fatalf("SetPricing failed: %v", err)
-	}
-
-	p2, err := s.GetPricing(ctx)
-	if err != nil {
-		t.Fatalf("GetPricing after set failed: %v", err)
-	}
-	if p2.BWPricePerSheetPaise != 350 || p2.ColorPricePerSheetPaise != 1500 {
-		t.Fatalf("expected (350, 1500), got (%d, %d)", p2.BWPricePerSheetPaise, p2.ColorPricePerSheetPaise)
-	}
-
-	// 3. Legacy bridge check
-	legacyBW, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil {
-		t.Fatalf("GetPricePerSheetPaise failed: %v", err)
-	}
-	if legacyBW != 350 {
-		t.Fatalf("expected legacy BW price 350, got %d", legacyBW)
-	}
-
-	// 4. Validation: reject negative/zero prices
-	if err := s.SetPricing(ctx, 0, 1000); err == nil {
-		t.Fatalf("expected error for bwPrice=0, got nil")
-	}
-	if err := s.SetPricing(ctx, 200, -50); err == nil {
-		t.Fatalf("expected error for colorPrice < 0, got nil")
-	}
-
-	// 5. Test detailed 4-tier pricing and colorEnabled flag
-	if err := s.SetDetailedPricing(ctx, 200, 150, 1000, 750, true); err != nil {
-		t.Fatalf("SetDetailedPricing failed: %v", err)
-	}
-	p3, err := s.GetPricing(ctx)
-	if err != nil {
-		t.Fatalf("GetPricing failed: %v", err)
-	}
-	if p3.BWSimplexPricePaise != 200 || p3.BWDuplexPricePaise != 150 ||
-		p3.ColorSimplexPricePaise != 1000 || p3.ColorDuplexPricePaise != 750 ||
-		!p3.ColorEnabled {
-		t.Fatalf("unexpected p3: %+v", p3)
-	}
-}
-
 func TestAnalyticsAndOrderHistory(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()

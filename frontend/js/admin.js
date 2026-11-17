@@ -148,11 +148,7 @@
     let activePreviewTab = 'mobile';
     let isEditingInModal = false;
 
-    let currentBWSimplexPaise = 200;
-    let currentBWDuplexPaise = 150;
-    let currentColorSimplexPaise = 1000;
-    let currentColorDuplexPaise = 750;
-    let currentColorEnabled = false;
+    let activeTariffRevision = null;
 
     let ordersFilter = {
       page: 0,
@@ -171,10 +167,12 @@
 
     const tabNavOverview = document.getElementById('tab-nav-overview');
     const tabNavOrders = document.getElementById('tab-nav-orders');
+    const tabNavPricing = document.getElementById('tab-nav-pricing');
     const tabNavAds = document.getElementById('tab-nav-ads');
 
     const viewOverview = document.getElementById('view-overview');
     const viewOrders = document.getElementById('view-orders');
+    const viewPricing = document.getElementById('view-pricing');
     const viewAds = document.getElementById('view-ads');
 
     // Toast element
@@ -303,10 +301,10 @@
     // --- Tab Navigation ---
     function switchNavTab(tabName) {
       activeNavTab = tabName;
-      [tabNavOverview, tabNavOrders, tabNavAds].forEach(btn => {
+      [tabNavOverview, tabNavOrders, tabNavAds, tabNavPricing].forEach(btn => {
         if (btn) btn.classList.remove('active');
       });
-      [viewOverview, viewOrders, viewAds].forEach(view => {
+      [viewOverview, viewOrders, viewAds, viewPricing].forEach(view => {
         if (view) view.classList.add('hidden');
       });
 
@@ -318,6 +316,10 @@
         if (tabNavOrders) tabNavOrders.classList.add('active');
         if (viewOrders) viewOrders.classList.remove('hidden');
         loadOrders();
+      } else if (tabName === 'pricing') {
+        if (tabNavPricing) tabNavPricing.classList.add('active');
+        if (viewPricing) viewPricing.classList.remove('hidden');
+        loadPricing();
       } else if (tabName === 'ads') {
         if (tabNavAds) tabNavAds.classList.add('active');
         if (viewAds) viewAds.classList.remove('hidden');
@@ -328,6 +330,88 @@
     if (tabNavOverview) tabNavOverview.addEventListener('click', () => switchNavTab('overview'));
     if (tabNavOrders) tabNavOrders.addEventListener('click', () => switchNavTab('orders'));
     if (tabNavAds) tabNavAds.addEventListener('click', () => switchNavTab('ads'));
+    if (tabNavPricing) tabNavPricing.addEventListener('click', () => switchNavTab('pricing'));
+
+    // Canonical tariff editor: all rates are stored in integer paise.
+    const pricingForm = document.getElementById('pricing-form');
+    const pricingMessage = document.getElementById('pricing-message');
+    const pricingRevision = document.getElementById('pricing-revision');
+    const pricingSave = document.getElementById('pricing-save');
+    const pricingFields = [
+      ['bw_simplex_paise', 'pricing-bw-simplex'],
+      ['bw_duplex_sheet_paise', 'pricing-bw-duplex'],
+      ['color_simplex_paise', 'pricing-color-simplex'],
+      ['color_duplex_sheet_paise', 'pricing-color-duplex']
+    ];
+
+    function displayPricingMessage(message) {
+      if (pricingMessage) pricingMessage.textContent = message;
+    }
+
+    async function loadPricing() {
+      if (!pricingForm) return;
+      if (pricingSave) pricingSave.disabled = true;
+      displayPricingMessage('');
+      try {
+        const res = await apiRequest('/api/admin/pricing');
+        const data = await parseResponseJSON(res);
+        if (!res.ok) throw new Error(data.error || 'Pricing unavailable');
+        activeTariffRevision = data.revision;
+        if (!Number.isSafeInteger(activeTariffRevision) || activeTariffRevision < 0) throw new Error('Invalid tariff revision');
+        for (const [key, id] of pricingFields) {
+          document.getElementById(id).value = (data[key] / 100).toFixed(2);
+        }
+        document.getElementById('pricing-color-enabled').checked = data.color_enabled === true;
+        if (pricingRevision) pricingRevision.textContent = activeTariffRevision === 0
+          ? 'Not activated — save to publish the first tariff'
+          : 'Current tariff revision ' + activeTariffRevision;
+      } catch (err) {
+        activeTariffRevision = null;
+        displayPricingMessage('Could not load pricing: ' + err.message);
+      } finally {
+        if (pricingSave) pricingSave.disabled = activeTariffRevision === null;
+      }
+    }
+
+    function inputPaise(id) {
+      const value = document.getElementById(id).value.trim();
+      if (!/^(?:\d+)(?:\.\d{1,2})?$/.test(value)) throw new Error('Enter amounts with at most two decimal places');
+      const [rupees, decimals = ''] = value.split('.');
+      const paise = Number(rupees) * 100 + Number(decimals.padEnd(2, '0'));
+      if (!Number.isSafeInteger(paise) || paise < 1 || paise > 1000000) {
+        throw new Error('Each price must be between ₹0.01 and ₹10,000');
+      }
+      return paise;
+    }
+
+    if (pricingForm) pricingForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (activeTariffRevision === null) return;
+      if (pricingSave) pricingSave.disabled = true;
+      displayPricingMessage('');
+      try {
+        const payload = { expected_revision: activeTariffRevision,
+          color_enabled: document.getElementById('pricing-color-enabled').checked };
+        for (const [key, id] of pricingFields) payload[key] = inputPaise(id);
+        const res = await apiRequest('/api/admin/pricing', { method: 'PUT', body: payload });
+        const data = await parseResponseJSON(res);
+        if (res.status === 409) {
+          displayPricingMessage('Prices were changed by another admin. Reload the current tariff before saving.');
+          activeTariffRevision = null;
+          return;
+        }
+        if (!res.ok) throw new Error(data.error || 'Unable to save prices');
+        activeTariffRevision = data.revision;
+        if (pricingRevision) pricingRevision.textContent = 'Current tariff revision ' + data.revision;
+        displayPricingMessage('Prices saved successfully.');
+      } catch (err) {
+        displayPricingMessage(err.message);
+      } finally {
+        if (pricingSave) pricingSave.disabled = activeTariffRevision === null;
+      }
+    });
+    const pricingReload = document.getElementById('pricing-reload');
+    if (pricingReload) pricingReload.addEventListener('click', loadPricing);
 
     // ==========================================
     // 1. OVERVIEW & ANALYTICS

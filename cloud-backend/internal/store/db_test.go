@@ -243,67 +243,6 @@ func TestUpdateOrderStatus(t *testing.T) {
 	}
 }
 
-// Test E — TestPricingPersistence
-func TestPricingPersistence(t *testing.T) {
-	s, dbPath := newTestStore(t)
-	ctx := context.Background()
-
-	// 1. Error before pricing configured
-	if _, err := s.GetPricePerSheetPaise(ctx); err == nil {
-		t.Fatalf("expected error for unconfigured pricing, got nil")
-	}
-
-	// 2. Set valid positive integer price
-	if err := s.SetPricePerSheetPaise(ctx, 350); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(350) failed: %v", err)
-	}
-
-	// 3. Read back price
-	price, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil {
-		t.Fatalf("GetPricePerSheetPaise failed: %v", err)
-	}
-	if price != 350 {
-		t.Fatalf("expected price 350, got %d", price)
-	}
-
-	// 4. Replace price
-	if err := s.SetPricePerSheetPaise(ctx, 400); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(400) failed: %v", err)
-	}
-	price, err = s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("expected price 400, got %d (err: %v)", price, err)
-	}
-
-	// 5. Reopen preserves configured price
-	_ = s.Close()
-	s2, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("reopen store failed: %v", err)
-	}
-	defer s2.Close()
-
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price after reopen mismatch: got %d (err: %v)", price, err)
-	}
-
-	// 6. Zero and negative prices rejected
-	if err := s2.SetPricePerSheetPaise(ctx, 0); err == nil {
-		t.Fatalf("expected error for price=0, got nil")
-	}
-	if err := s2.SetPricePerSheetPaise(ctx, -50); err == nil {
-		t.Fatalf("expected error for negative price, got nil")
-	}
-
-	// 7. Failed update did not change previous price
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price changed after rejected updates: got %d, want 400", price)
-	}
-}
-
 // Test F — TestRecordWebhookIdempotency
 func TestRecordWebhookIdempotency(t *testing.T) {
 	s, dbPath := newTestStore(t)
@@ -705,12 +644,6 @@ func TestRejectsInvalidInput(t *testing.T) {
 	}
 	if err := s.UpdateOrderStatus(nil, "some-order", contracts.JobStatusPrinting); err == nil {
 		t.Fatalf("expected error for nil context in UpdateOrderStatus, got nil")
-	}
-	if err := s.SetPricePerSheetPaise(nil, 100); err == nil {
-		t.Fatalf("expected error for nil context in SetPricePerSheetPaise, got nil")
-	}
-	if _, err := s.GetPricePerSheetPaise(nil); err == nil {
-		t.Fatalf("expected error for nil context in GetPricePerSheetPaise, got nil")
 	}
 	if _, err := s.RecordWebhook(nil, "evt-nil"); err == nil {
 		t.Fatalf("expected error for nil context in RecordWebhook, got nil")

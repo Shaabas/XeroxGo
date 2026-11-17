@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/pkg/contracts"
 )
@@ -122,7 +123,14 @@ func TestPIN_AtomicUniquenessAndCollisionRetry(t *testing.T) {
 		PINExpiresAt: time.Now().UTC().Add(15 * time.Minute),
 	}
 
-	if err := app.createOrderWithPINRetry(ctx, &newOrd, 25); err != nil {
+	tariff, err := db.ActivateSheetTariff(ctx, 0, pricing.Tariff{
+		BWSimplexPaise: 300, BWDuplexSheetPaise: 500,
+		ColorSimplexPaise: 800, ColorDuplexSheetPaise: 1000,
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.createOrderWithPINRetry(ctx, &newOrd, 25, tariff.Revision); err != nil {
 		t.Fatalf("createOrderWithPINRetry failed: %v", err)
 	}
 	if newOrd.Command.DisplayCode == "1234" {

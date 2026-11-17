@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
+	"io"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -12,88 +14,82 @@ import (
 	"xeroxgo/cloud-backend/internal/store"
 )
 
-// handlePublicPricing handles GET /api/pricing for the public portal
+// handlePublicPricing exposes only the currently active canonical tariff.
+// An unconfigured database returns 503 rather than legacy or default prices.
 func (app *appServer) handlePublicPricing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-
-	pricingConfig, err := app.db.GetPricing(r.Context())
+	tariff, err := app.db.GetActiveSheetTariff(r.Context())
 	if err != nil {
-		pricingConfig = store.DefaultPricingConfig()
+		writeJSONError(w, http.StatusServiceUnavailable, "pricing not configured")
+		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(pricingConfig)
+	_ = json.NewEncoder(w).Encode(tariff)
 }
 
-// handleAdminPricing handles GET and PUT /api/admin/pricing
+// handleAdminPricing exposes one four-rate pricing policy.
+// ExpectedRevision provides optimistic concurrency protection on updates.
 func (app *appServer) handleAdminPricing(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.authenticateAdminRequest(r); !ok {
+	actor, ok := app.authenticateAdminRequest(r)
+	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-
 	switch r.Method {
 	case http.MethodGet:
-		pricingConfig, err := app.db.GetPricing(r.Context())
-		if err != nil {
-			pricingConfig = store.DefaultPricingConfig()
+		tariff, err := app.db.GetActiveSheetTariff(r.Context())
+		if errors.Is(err, store.ErrSheetTariffNotActive) {
+			// Defaults here are a form template, NOT silently active tariffs.
+			tariff = pricing.Tariff{
+				BWSimplexPaise: 300, BWDuplexSheetPaise: 500,
+				ColorSimplexPaise: 800, ColorDuplexSheetPaise: 1000,
+				ColorEnabled: false,
+			}
+		} else if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "pricing unavailable")
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(pricingConfig)
-
+		_ = json.NewEncoder(w).Encode(tariff)
 	case http.MethodPut:
 		var req struct {
-			BWSimplexPricePaise    int64 `json:"bw_simplex_price_paise"`
-			BWDuplexPricePaise     int64 `json:"bw_duplex_price_paise"`
-			ColorSimplexPricePaise int64 `json:"color_simplex_price_paise"`
-			ColorDuplexPricePaise  int64 `json:"color_duplex_price_paise"`
-			ColorEnabled           bool  `json:"color_enabled"`
-			// Backwards compatibility for single-price payloads
-			BWPricePerSheetPaise    int64 `json:"bw_price_per_sheet_paise"`
-			ColorPricePerSheetPaise int64 `json:"color_price_per_sheet_paise"`
+			ExpectedRevision int64 `json:"expected_revision"`
+			BWSimplexPaise int64 `json:"bw_simplex_paise"`
+			BWDuplexSheetPaise int64 `json:"bw_duplex_sheet_paise"`
+			ColorSimplexPaise int64 `json:"color_simplex_paise"`
+			ColorDuplexSheetPaise int64 `json:"color_duplex_sheet_paise"`
+			ColorEnabled bool `json:"color_enabled"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid pricing payload")
 			return
 		}
-		if req.BWSimplexPricePaise <= 0 && req.BWPricePerSheetPaise > 0 {
-			req.BWSimplexPricePaise = req.BWPricePerSheetPaise
-		}
-		if req.BWDuplexPricePaise <= 0 {
-			req.BWDuplexPricePaise = pricing.ComputeDuplexDiscount(req.BWSimplexPricePaise, pricing.DefaultBWDuplexPaise)
-		}
-		if req.ColorSimplexPricePaise <= 0 && req.ColorPricePerSheetPaise > 0 {
-			req.ColorSimplexPricePaise = req.ColorPricePerSheetPaise
-		}
-		if req.ColorDuplexPricePaise <= 0 {
-			req.ColorDuplexPricePaise = pricing.ComputeDuplexDiscount(req.ColorSimplexPricePaise, pricing.DefaultColorDuplexPaise)
-		}
-
-		if req.BWSimplexPricePaise <= 0 || req.BWDuplexPricePaise <= 0 || req.ColorSimplexPricePaise <= 0 || req.ColorDuplexPricePaise <= 0 {
-			writeJSONError(w, http.StatusBadRequest, "prices must be greater than zero")
+		if err := decoder.Decode(new(interface{})); !errors.Is(err, io.EOF) {
+			writeJSONError(w, http.StatusBadRequest, "multiple JSON values")
 			return
 		}
-
-		if err := app.db.SetDetailedPricing(r.Context(), req.BWSimplexPricePaise, req.BWDuplexPricePaise, req.ColorSimplexPricePaise, req.ColorDuplexPricePaise, req.ColorEnabled); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save pricing: %v", err))
+		next, err := app.db.ActivateSheetTariff(r.Context(), req.ExpectedRevision, pricing.Tariff{
+			BWSimplexPaise: req.BWSimplexPaise,
+			BWDuplexSheetPaise: req.BWDuplexSheetPaise,
+			ColorSimplexPaise: req.ColorSimplexPaise,
+			ColorDuplexSheetPaise: req.ColorDuplexSheetPaise,
+			ColorEnabled: req.ColorEnabled,
+		}, actor)
+		if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
+			writeJSONError(w, http.StatusConflict, "pricing was changed; reload before saving")
 			return
 		}
-
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid or unavailable pricing configuration")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":                      "ok",
-			"bw_simplex_price_paise":    req.BWSimplexPricePaise,
-			"bw_duplex_price_paise":     req.BWDuplexPricePaise,
-			"color_simplex_price_paise": req.ColorSimplexPricePaise,
-			"color_duplex_price_paise":  req.ColorDuplexPricePaise,
-			"color_enabled":             req.ColorEnabled,
-			"bw_price_per_sheet_paise":    req.BWSimplexPricePaise,
-			"color_price_per_sheet_paise": req.ColorSimplexPricePaise,
-		})
-
+		_ = json.NewEncoder(w).Encode(next)
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}

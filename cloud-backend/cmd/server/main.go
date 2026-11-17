@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"xeroxgo/cloud-backend/internal/payments"
-	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -36,7 +35,6 @@ type serverConfig struct {
 	addr               string
 	dbPath             string
 	jobsDir            string
-	pricePerSheetPaise int64
 	devMode            bool
 	demoMode           bool
 	downloadSecret     []byte
@@ -120,9 +118,12 @@ func (s *appServer) generateUniquePIN(ctx context.Context, kioskID string) (stri
 	return "", errors.New("unable to generate unique PIN after max attempts")
 }
 
-func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int) error {
+func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int, tariffRevision int64) error {
 	if s.db == nil {
 		return errors.New("database not initialized")
+	}
+	if tariffRevision < 1 {
+		return errors.New("tariff revision is required")
 	}
 	if maxAttempts < 1 {
 		maxAttempts = 25
@@ -133,7 +134,7 @@ func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Or
 			return fmt.Errorf("generate pin: %w", err)
 		}
 		order.Command.DisplayCode = pin
-		err = s.db.CreateOrder(ctx, *order)
+		err = s.db.CreateOrderWithTariffRevision(ctx, *order, tariffRevision)
 		if err == nil {
 			return nil
 		}
@@ -207,9 +208,6 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 	}
 }
 
-func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
-	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
-}
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -257,9 +255,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal([]byte(metadataRaw), &metaItems)
 		}
 
-		pricing, err := s.db.GetPricing(r.Context())
+		tariff, err := s.loadRequestTariff(r.Context())
 		if err != nil {
-			pricing = store.DefaultPricingConfig()
+			http.Error(w, "pricing unavailable", http.StatusServiceUnavailable)
+			return
 		}
 
 		orderHex, err := randomHex(12)
@@ -303,9 +302,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 			var docOpts docPrintOptions
 			if idx < len(metaItems) {
-				docOpts, err = parseMetadataPrintOptions(metaItems[idx], pricing.ColorEnabled, idx+1)
+				docOpts, err = parseMetadataPrintOptions(metaItems[idx], tariff.ColorEnabled, idx+1)
 			} else {
-				docOpts, err = parseFormPrintOptions(r, pricing.ColorEnabled, idx+1)
+				docOpts, err = parseFormPrintOptions(r, tariff.ColorEnabled, idx+1)
 			}
 			if err != nil {
 				_ = f.Close()
@@ -314,6 +313,13 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			if  !tariff.ColorEnabled &&
+				((idx < len(metaItems) && strings.EqualFold(metaItems[idx].ColorMode, "COLOR")) ||
+				 (idx >= len(metaItems) && strings.EqualFold(r.FormValue("color_mode"), "COLOR"))) {
+				_ = f.Close()
+				http.Error(w, "color printing is disabled", http.StatusBadRequest)
+				return
+			}
 			prep, err := prepareInputPDF(r.Context(), f, originalFilename, s.cfg.jobsDir, "upload_in_*", idx+1)
 			_ = f.Close()
 			if err != nil {
@@ -340,13 +346,17 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = tmpNorm.Close()
 			intermediateNormPDFs = append(intermediateNormPDFs, tmpNormPath)
 
-			res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpNormPath, docOpts, pricing, true)
+			res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpNormPath, docOpts, tariff)
 			if err != nil {
 				_ = os.Remove(outputPath)
 				http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
 				return
 			}
 
+			if res.PricePaise <= 0 || totalOrderPricePaise > (int64(1<<63-1))-res.PricePaise {
+				http.Error(w, "order price exceeds supported range", http.StatusBadRequest)
+				return
+			}
 			totalOrderPricePaise += res.PricePaise
 			totalPrintedPages += res.PrintedSides
 			totalSheets += res.NormResult.TotalSheets
@@ -439,9 +449,18 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			ClaimToken:   claimToken,
 		}
 
-		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
+		if !s.verifyAcceptedSheetQuote(w, r, tariff, totalOrderPricePaise) {
 			_ = os.Remove(outputPath)
-			http.Error(w, "failed to persist order", http.StatusInternalServerError)
+			return
+		}
+		revision := tariff.Revision
+		if err := s.createOrderWithPINRetry(r.Context(), &order, 25, revision); err != nil {
+			_ = os.Remove(outputPath)
+			if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
+				http.Error(w, "Price changed. Please review the new quote.", http.StatusConflict)
+			} else {
+				http.Error(w, "failed to persist order", http.StatusInternalServerError)
+			}
 			return
 		}
 		displayCode := order.Command.DisplayCode
@@ -461,6 +480,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			"duplex":                string(overallDuplex),
 			"documents_count":       len(fileHeaders),
 			"total_price_paise":     totalOrderPricePaise,
+			"tariff_revision":       tariff.Revision,
 			"status":                string(contracts.JobStatusPendingPayment),
 		})
 		return
@@ -476,13 +496,20 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	originalFilename := fileHeader.Filename
 
-	pricing, err := s.db.GetPricing(r.Context())
-	hasPricing := err == nil
-	colorEnabled := hasPricing && pricing.ColorEnabled
+	tariff, err := s.loadRequestTariff(r.Context())
+	if err != nil {
+		http.Error(w, "pricing unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	colorEnabled := tariff.ColorEnabled
 
 	opts, err := parseFormPrintOptions(r, colorEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if  !colorEnabled && strings.EqualFold(r.FormValue("color_mode"), "COLOR") {
+		http.Error(w, "color printing is disabled", http.StatusBadRequest)
 		return
 	}
 
@@ -510,7 +537,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	h := sha256.Sum256([]byte(orderID))
 	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
-	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, outputPath, opts, pricing, hasPricing)
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, outputPath, opts, tariff)
 	if err != nil {
 		_ = os.Remove(outputPath)
 		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
@@ -558,9 +585,18 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
-	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
+	if !s.verifyAcceptedSheetQuote(w, r, tariff, res.PricePaise) {
 		_ = os.Remove(outputPath)
-		http.Error(w, "failed to persist order", http.StatusInternalServerError)
+		return
+	}
+	revision := tariff.Revision
+	if err := s.createOrderWithPINRetry(r.Context(), &order, 25, revision); err != nil {
+		_ = os.Remove(outputPath)
+		if errors.Is(err, store.ErrSheetTariffRevisionConflict) {
+			http.Error(w, "Price changed. Please review the new quote.", http.StatusConflict)
+		} else {
+			http.Error(w, "failed to persist order", http.StatusInternalServerError)
+		}
 		return
 	}
 	displayCode := order.Command.DisplayCode
@@ -578,9 +614,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"total_sheets":          res.NormResult.TotalSheets,
 		"copies":                opts.Copies,
 		"duplex":                string(opts.Duplex),
-		"price_per_sheet_paise": res.UnitPrice,
-		"price_per_side_paise":  res.UnitPrice,
-		"unit_price_paise":      res.UnitPrice,
+		"tariff_revision":       res.TariffRevision,
 		"total_price_paise":     res.PricePaise,
 		"status":                string(contracts.JobStatusPendingPayment),
 	})
@@ -702,14 +736,19 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}
 	defer file.Close()
 
-	pricing, err := s.db.GetPricing(r.Context())
+	tariff, err := s.loadRequestTariff(r.Context())
 	if err != nil {
-		pricing = store.DefaultPricingConfig()
+		http.Error(w, "pricing unavailable", http.StatusServiceUnavailable)
+		return
 	}
 
-	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, 0)
+	opts, err := parseFormPrintOptions(r, tariff.ColorEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if  !tariff.ColorEnabled && strings.EqualFold(r.FormValue("color_mode"), "COLOR") {
+		http.Error(w, "color printing is disabled", http.StatusBadRequest)
 		return
 	}
 
@@ -732,7 +771,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}()
 	_ = tmpOutput.Close()
 
-	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, pricing, true)
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, tariff)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("preview generation failed: %v", err), http.StatusBadRequest)
 		return
@@ -750,6 +789,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 			"total_sheets":     res.NormResult.TotalSheets,
 			"copies":           opts.Copies,
 			"total_price_paise": res.PricePaise,
+			"tariff_revision":   res.TariffRevision,
 			"normalized_pages": res.NormResult.TotalPages,
 			"padded_pages":     res.NormResult.PaddedPages,
 			"sha256_checksum":  res.NormResult.SHA256Checksum,
@@ -773,6 +813,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-Total-Sheets", strconv.Itoa(res.NormResult.TotalSheets))
 	w.Header().Set("X-Copies", strconv.Itoa(opts.Copies))
 	w.Header().Set("X-Total-Price-Paise", strconv.FormatInt(res.PricePaise, 10))
+	w.Header().Set("X-Tariff-Revision", strconv.FormatInt(res.TariffRevision, 10))
 	w.Header().Set("X-Normalized-Pages", strconv.Itoa(res.NormResult.TotalPages))
 	w.Header().Set("X-Padded-Pages", strconv.Itoa(res.NormResult.PaddedPages))
 	w.Header().Set("X-SHA256-Checksum", res.NormResult.SHA256Checksum)
@@ -1324,30 +1365,6 @@ func main() {
 	}
 	defer storeDB.Close()
 
-	ctx := context.Background()
-	var pricePaise int64
-	priceEnv := os.Getenv("XEROXGO_PRICE_PER_SHEET_PAISE")
-	if priceEnv != "" {
-		p, err := strconv.ParseInt(priceEnv, 10, 64)
-		if err != nil || p <= 0 {
-			log.Fatalf("invalid XEROXGO_PRICE_PER_SHEET_PAISE: %s", priceEnv)
-		}
-		if err := storeDB.SetPricePerSheetPaise(ctx, p); err != nil {
-			log.Fatalf("failed to persist price per sheet: %v", err)
-		}
-		pricePaise = p
-	} else {
-		p, err := storeDB.GetPricePerSheetPaise(ctx)
-		if err == nil && p > 0 {
-			pricePaise = p
-		} else if devMode {
-			pricePaise = 500
-			_ = storeDB.SetPricePerSheetPaise(ctx, pricePaise)
-		} else {
-			log.Fatalf("pricing unconfigured in production mode")
-		}
-	}
-
 	// Initialize default promo ads & bootstrap admin user
 	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer bootstrapCancel()
@@ -1383,7 +1400,6 @@ func main() {
 		addr:               addr,
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
-		pricePerSheetPaise: pricePaise,
 		devMode:            devMode,
 		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
@@ -1442,7 +1458,7 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v, price=%d paise)", addr, devMode, pricePaise)
+		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v)", addr, devMode)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrCh <- err
 		}

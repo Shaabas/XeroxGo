@@ -172,26 +172,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
     color_mode TEXT NOT NULL DEFAULT 'BW'
 );
 
-CREATE TABLE IF NOT EXISTS pricing (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
-        CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
-        CHECK (color_duplex_price_paise > 0),
-    color_enabled INTEGER NOT NULL DEFAULT 0,
-    updated_at_ns BIGINT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS payment_webhooks (
     webhook_id TEXT PRIMARY KEY,
     received_at_ns BIGINT NOT NULL
@@ -363,13 +343,6 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 		}
 
 		pgMigrations := []string{
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
 			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS pin_expires_at_ns BIGINT NOT NULL DEFAULT 0;",
 			"CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);",
@@ -425,6 +398,11 @@ SELECT COUNT(1) FROM (
 				_ = db.Close()
 				return nil, fmt.Errorf("open store: postgres migration: %w", err)
 			}
+		}
+
+		if err := initSheetTariffSchema(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: postgres sheet tariffs: %w", err)
 		}
 
 		return &Store{db: db, dialect: "postgres"}, nil
@@ -508,26 +486,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
     duplex TEXT NOT NULL,
     start_from_page INTEGER NOT NULL CHECK (start_from_page >= 1),
     color_mode TEXT NOT NULL DEFAULT 'BW'
-);
-
-CREATE TABLE IF NOT EXISTS pricing (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
-        CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
-        CHECK (color_duplex_price_paise > 0),
-    color_enabled INTEGER NOT NULL DEFAULT 0,
-    updated_at_ns BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS payment_webhooks (
@@ -619,46 +577,15 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 		return nil, fmt.Errorf("open store: sqlite migration: %w", err)
 	}
 
+	if err := initSheetTariffSchema(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: sqlite sheet tariffs: %w", err)
+	}
+
 	return &Store{db: db, dialect: "sqlite"}, nil
 }
 
 func migrateSQLiteSchema(db *sql.DB) error {
-	colsPricing := make(map[string]bool)
-	rows, err := db.Query("PRAGMA table_info(pricing);")
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsPricing[name] = true
-			}
-		}
-		_ = rows.Close()
-	}
-	if !colsPricing["bw_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["color_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["bw_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["bw_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 150;")
-	}
-	if !colsPricing["color_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["color_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 750;")
-	}
-	if !colsPricing["color_enabled"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_enabled INTEGER NOT NULL DEFAULT 0;")
-	}
-
 	colsConfigs := make(map[string]bool)
 	rowsCfg, err := db.Query("PRAGMA table_info(print_configs);")
 	if err == nil {
@@ -897,7 +824,22 @@ func (s *Store) Close() error {
 }
 
 // CreateOrder persists an order and its associated print configuration atomically.
+// Legacy callers are unaffected; activated sheet pricing uses the guarded variant.
 func (s *Store) CreateOrder(ctx context.Context, order Order) error {
+	return s.createOrderWithRevision(ctx, order, 0)
+}
+
+// CreateOrderWithTariffRevision ensures the accepted tariff is still active
+// within the order transaction, preventing a concurrent admin update from
+// silently changing pricing between confirmation and order creation.
+func (s *Store) CreateOrderWithTariffRevision(ctx context.Context, order Order, expectedRevision int64) error {
+	if expectedRevision <= 0 {
+		return fmt.Errorf("create order: expected tariff revision must be positive")
+	}
+	return s.createOrderWithRevision(ctx, order, expectedRevision)
+}
+
+func (s *Store) createOrderWithRevision(ctx context.Context, order Order, expectedRevision int64) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("create order: store is closed or nil")
 	}
@@ -977,6 +919,23 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("create order: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if expectedRevision > 0 {
+		// FOR UPDATE conflicts with the administrator's UPDATE of this row.
+		// FOR SHARE would not block PostgreSQL's non-key UPDATE lock.
+		// SQLite serializes writers and rejects stale transaction snapshots.
+		query := "SELECT active_revision FROM sheet_tariff_state WHERE id = 1"
+		if s.dialect == "postgres" {
+			query += " FOR UPDATE"
+		}
+		var currentRevision int64
+		if err := tx.QueryRowContext(ctx, query).Scan(&currentRevision); err != nil {
+			return fmt.Errorf("create order: read tariff revision: %w", err)
+		}
+		if currentRevision != expectedRevision {
+			return ErrSheetTariffRevisionConflict
+		}
+	}
 
 	// 1. Prune expired PIN reservations on this kiosk atomically
 	_, err = tx.ExecContext(ctx, s.rebind(`
@@ -1754,25 +1713,6 @@ WHERE order_id = ?;
 	}
 
 	return nil
-}
-
-// SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.
-func (s *Store) SetPricePerSheetPaise(ctx context.Context, pricePaise int64) error {
-	cfg, _ := s.GetPricing(ctx)
-	colorPrice := cfg.ColorPricePerSheetPaise
-	if colorPrice <= 0 {
-		colorPrice = 1000
-	}
-	return s.SetPricing(ctx, pricePaise, colorPrice)
-}
-
-// GetPricePerSheetPaise retrieves the configured per-sheet pricing.
-func (s *Store) GetPricePerSheetPaise(ctx context.Context) (int64, error) {
-	cfg, err := s.GetPricing(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return cfg.BWPricePerSheetPaise, nil
 }
 
 // RecordWebhook atomically attempts to record a webhook ID.

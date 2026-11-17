@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
@@ -57,6 +58,12 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	if _, err := s.ActivateSheetTariff(t.Context(), 0, pricing.Tariff{
+		BWSimplexPaise: 300, BWDuplexSheetPaise: 500,
+		ColorSimplexPaise: 800, ColorDuplexSheetPaise: 1000,
+	}, "upload-test"); err != nil {
+		t.Fatal(err)
+	}
 
 	jobsDir := filepath.Join(tmpDir, "jobs")
 	if err := os.MkdirAll(jobsDir, 0700); err != nil {
@@ -67,7 +74,6 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		addr:               "localhost:0",
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
 		downloadSecret:     []byte("test_secret_key_1234567890"),
 	}
 
@@ -102,7 +108,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 		wantPages     int
 		wantSheets    int
 		wantCopies    int
-		wantTotalCost int64 // 200 paise per page
+		wantTotalCost int64 // canonical sheet tariff
 	}{
 		{
 			name:          "simplex_3p_2copies",
@@ -113,7 +119,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    6, // 3 * 2
 			wantCopies:    2,
-			wantTotalCost: 1200, // 3 pages * 2 copies * 200 paise = 1200
+				wantTotalCost: 1800,
 		},
 		{
 			name:          "duplex_3p_2copies_example_from_spec",
@@ -125,7 +131,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    4, // ceil(3/2) * 2 = 4 sheets
 			wantCopies:    2,
-			wantTotalCost: 1200, // 6 printed sides * 200 paise = 1200
+				wantTotalCost: 1600,
 		},
 		{
 			name:          "duplex_3p_1copy",
@@ -136,7 +142,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    2, // ceil(3/2) * 1 = 2 sheets
 			wantCopies:    1,
-			wantTotalCost: 600, // 3 printed sides * 200 paise = 600
+				wantTotalCost: 800,
 		},
 		{
 			name:          "custom_range_1_3_5_on_5p_simplex_2copies",
@@ -148,7 +154,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    6, // 3 * 2
 			wantCopies:    2,
-			wantTotalCost: 1200,
+				wantTotalCost: 1800,
 		},
 		{
 			name:          "custom_range_1_3_5_on_5p_duplex_2copies",
@@ -160,7 +166,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    4, // ceil(3/2) * 2 = 4
 			wantCopies:    2,
-			wantTotalCost: 1200,
+				wantTotalCost: 1600,
 		},
 		{
 			name:       "invalid_custom_range_out_of_bounds",
@@ -192,6 +198,10 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 
 			_ = writer.WriteField("copies", tt.copies)
 			_ = writer.WriteField("duplex", tt.duplex)
+			if tt.wantStatus == http.StatusOK {
+				_ = writer.WriteField("accepted_total_price_paise", strconv.FormatInt(tt.wantTotalCost, 10))
+				_ = writer.WriteField("accepted_tariff_revision", "1")
+			}
 			if tt.pageRange != "" {
 				_ = writer.WriteField("page_range", tt.pageRange)
 			}
@@ -244,6 +254,8 @@ func TestUpload_DuplexOddPagesFinalSheetBlankBackInPDF(t *testing.T) {
 	_, _ = part.Write(fileBytes)
 	_ = writer.WriteField("copies", "2")
 	_ = writer.WriteField("duplex", "DUPLEX_LONG_EDGE")
+	_ = writer.WriteField("accepted_total_price_paise", "1600")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
@@ -321,6 +333,8 @@ func TestUpload_10PagePDF_Select_2_4_6_Simplex(t *testing.T) {
 	_ = writer.WriteField("copies", "1")
 	_ = writer.WriteField("duplex", "SIMPLEX")
 	_ = writer.WriteField("page_range", "2,4,6")
+	_ = writer.WriteField("accepted_total_price_paise", "900")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
@@ -384,6 +398,8 @@ func TestUpload_10PagePDF_Select_2_4_6_Duplex(t *testing.T) {
 	_ = writer.WriteField("copies", "2")
 	_ = writer.WriteField("duplex", "DUPLEX_LONG_EDGE")
 	_ = writer.WriteField("page_range", "2,4,6")
+	_ = writer.WriteField("accepted_total_price_paise", "1600")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)
@@ -409,8 +425,8 @@ func TestUpload_10PagePDF_Select_2_4_6_Duplex(t *testing.T) {
 	if int(resp["copies"].(float64)) != 2 {
 		t.Errorf("copies = %v, want 2", resp["copies"])
 	}
-	if int64(resp["total_price_paise"].(float64)) != 1200 {
-		t.Errorf("total_price_paise = %v, want 1200 (6 printed sides * 200 paise)", resp["total_price_paise"])
+	if int64(resp["total_price_paise"].(float64)) != 1600 {
+		t.Errorf("total_price_paise = %v, want 1600 (2 duplex copies at 800 paise each)", resp["total_price_paise"])
 	}
 
 	orderID := resp["order_id"].(string)
@@ -463,6 +479,8 @@ func TestUpload_OfficeConvertedPDF_WithPageRange(t *testing.T) {
 	_ = writer.WriteField("copies", "1")
 	_ = writer.WriteField("duplex", "SIMPLEX")
 	_ = writer.WriteField("page_range", "1")
+	_ = writer.WriteField("accepted_total_price_paise", "300")
+	_ = writer.WriteField("accepted_tariff_revision", "1")
 	writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_test_1/upload", body)

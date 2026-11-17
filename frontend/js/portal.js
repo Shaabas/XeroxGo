@@ -28,15 +28,11 @@
   }
   const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
-  // Rates in paise (Authoritative default fixed rates in code)
-  // 3 for single side b&w (300p)
-  // 5 for double side b&w (500p per 2 pages)
-  // 8 for single side colour (800p)
-  // 10 for double side colour (1000p per 2 pages)
-  const RATE_BW_SINGLE_PAISE = 300;
-  const RATE_BW_DOUBLE_PAISE = 500;
-  const RATE_COLOR_SINGLE_PAISE = 800;
-  const RATE_COLOR_DOUBLE_PAISE = 1000;
+  // The server owns prices. The public tariff is used only for displaying rate labels.
+  let activeTariff = null;
+  let pricingRequestError = null;
+  let draftQuoteTimer = null;
+  let draftQuoteSerial = 0;
 
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
@@ -287,56 +283,122 @@
     return { valid: true, error: null, pages: selected };
   }
 
-  // Per-document price calculation in integer paise
-  // Rates:
-  // - 3 for single side b&w (₹3 per page)
-  // - 5 for double side b&w (₹5 per 2 pages)
-  // - 8 for single side colour (₹8 per page)
-  // - 10 for double side colour (₹10 per 2 pages)
-  // Odd trailing page on double side: charged at single side rate (₹3 for B&W, ₹8 for Colour)
-  function calculateDocPrice(totalPages, settings) {
-    if (!settings || totalPages <= 0) return 0;
-    let pagesCount = totalPages;
+  function selectedPageRange(totalPages, settings) {
     if (settings.pageSelection === 'Custom Range') {
-      const from = Math.max(1, Math.min(settings.rangeFrom || 1, totalPages));
-      const to = Math.max(from, Math.min(settings.rangeTo || totalPages, totalPages));
-      pagesCount = Math.max(1, to - from + 1);
-    } else if (settings.pageSelection === 'Selection') {
-      const sel = Array.isArray(settings.selectedPages) ? settings.selectedPages : [];
-      pagesCount = sel.length;
-    } else if (settings.customPageRange) {
-      const parsed = parseCustomPages(settings.customPageRange, totalPages);
-      if (parsed.valid && parsed.pages.length > 0) {
-        pagesCount = parsed.pages.length;
+      const from = settings.rangeFrom || 1;
+      const to = settings.rangeTo || totalPages;
+      return from === to ? String(from) : `${from}-${to}`;
+    }
+    if (settings.pageSelection === 'Selection') {
+      return (settings.selectedPages || []).slice().sort((a, b) => a - b).join(',');
+    }
+    return settings.customPageRange || '';
+  }
+
+  function preparedFile(item) {
+    if (item.pdfBytes && (item.isImage || item.isOffice)) {
+      const blob = new Blob([item.pdfBytes], { type: 'application/pdf' });
+      return new File([blob], item.name.replace(/\.[^.]+$/, '') + '.pdf', { type: 'application/pdf' });
+    }
+    return item.file;
+  }
+
+  function appendPrintOptions(form, item, settings) {
+    form.append('copies', String(settings.copies || 1));
+    form.append('duplex', settings.sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
+    form.append('color_mode', settings.mode === 'Color' ? 'COLOR' : 'BW');
+    form.append('orientation', (settings.orientation || 'Auto').toUpperCase());
+    form.append('pages_per_sheet', String(parseInt(settings.pagesPerSheet, 10) || 1));
+    const range = selectedPageRange(item.totalPages, settings);
+    if (range) form.append('page_range', range);
+  }
+
+  async function fetchDocumentQuote(item, settings) {
+    const form = new FormData();
+    form.append('file', preparedFile(item));
+    appendPrintOptions(form, item, settings);
+    form.append('format', 'json');
+    const response = await fetch('/api/documents/preview', { method: 'POST', body: form });
+    if (!response.ok) throw new Error((await response.text()).trim() || 'Could not calculate document price');
+    const quote = await response.json();
+    if (!Number.isSafeInteger(quote.total_price_paise) || quote.total_price_paise < 1 ||
+        !Number.isSafeInteger(quote.tariff_revision) || quote.tariff_revision < 1) {
+      throw new Error('Invalid quotation from server');
+    }
+    return quote;
+  }
+
+  async function refreshDocumentQuote(item) {
+    const settingsKey = JSON.stringify(item.settings);
+    item.authoritativePricePaise = null;
+    item.pricePaise = 0;
+    item.quotePending = true;
+    renderCart();
+    try {
+      const quote = await fetchDocumentQuote(item, item.settings);
+      if (!cartItems.includes(item) || JSON.stringify(item.settings) !== settingsKey) return;
+      item.authoritativePricePaise = quote.total_price_paise;
+      item.pricePaise = quote.total_price_paise;
+      item.tariffRevision = quote.tariff_revision;
+      item.totalSheets = quote.total_sheets;
+      item.quoteError = '';
+    } catch (error) {
+      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey) {
+        item.quoteError = error.message;
+        item.authoritativePricePaise = null;
+      }
+    } finally {
+      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey) {
+        item.quotePending = false;
+        renderCart();
       }
     }
+  }
 
-    if (pagesCount <= 0) return 0;
-
-    const nup = parseInt(settings.pagesPerSheet, 10) || 1;
-    const imposedPages = Math.ceil(pagesCount / nup);
-    const isColor = (settings.mode === 'Color');
-    const isDuplex = (settings.sides === 'Double-sided');
-    const copies = Math.max(1, parseInt(settings.copies, 10) || 1);
-
-    let singleCopyPricePaise = 0;
-    if (isDuplex) {
-      const fullSheets = Math.floor(imposedPages / 2);
-      const hasOddPage = (imposedPages % 2 !== 0);
-      if (isColor) {
-        singleCopyPricePaise = (fullSheets * RATE_COLOR_DOUBLE_PAISE) + (hasOddPage ? RATE_COLOR_SINGLE_PAISE : 0);
-      } else {
-        singleCopyPricePaise = (fullSheets * RATE_BW_DOUBLE_PAISE) + (hasOddPage ? RATE_BW_SINGLE_PAISE : 0);
-      }
-    } else {
-      if (isColor) {
-        singleCopyPricePaise = imposedPages * RATE_COLOR_SINGLE_PAISE;
-      } else {
-        singleCopyPricePaise = imposedPages * RATE_BW_SINGLE_PAISE;
-      }
+  async function loadTariff() {
+    try {
+      const response = await fetch('/api/pricing');
+      if (!response.ok) throw new Error('Pricing is not configured');
+      const tariff = await response.json();
+      if (!Number.isSafeInteger(tariff.revision) || tariff.revision < 1) throw new Error('Invalid tariff');
+      activeTariff = tariff;
+      pricingRequestError = null;
+      updateRateLabels();
+    } catch (error) {
+      activeTariff = null;
+      pricingRequestError = error.message;
+      updateRateLabels();
     }
+  }
 
-    return singleCopyPricePaise * copies;
+  function updateRateLabels() {
+    const color = draftSettings?.mode === 'Color';
+    const first = activeTariff ? (color ? activeTariff.color_simplex_paise : activeTariff.bw_simplex_paise) : null;
+    const second = activeTariff ? (color ? activeTariff.color_duplex_sheet_paise : activeTariff.bw_duplex_sheet_paise) : null;
+    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = first === null ? '—' : formatRupees(first) + '/side';
+    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = second === null ? '—' : formatRupees(second) + '/full sheet';
+    if (cardModeColor) {
+      const enabled = activeTariff?.color_enabled === true;
+      cardModeColor.style.opacity = enabled ? '' : '0.5';
+      cardModeColor.setAttribute('aria-disabled', String(!enabled));
+    }
+  }
+
+  function scheduleDraftQuote() {
+    const item = cartItems.find(it => it.id === activeSettingsDocId);
+    if (!item || !draftSettings || !item.file) return;
+    clearTimeout(draftQuoteTimer);
+    const serial = ++draftQuoteSerial;
+    const settings = JSON.parse(JSON.stringify(draftSettings));
+    if (saveSettingsPrice) saveSettingsPrice.textContent = '…';
+    draftQuoteTimer = setTimeout(async () => {
+      try {
+        const quote = await fetchDocumentQuote(item, settings);
+        if (serial === draftQuoteSerial && saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(quote.total_price_paise);
+      } catch (_) {
+        if (serial === draftQuoteSerial && saveSettingsPrice) saveSettingsPrice.textContent = '—';
+      }
+    }, 350);
   }
 
   function getDocSelectedPages(totalPages, settings) {
@@ -512,7 +574,7 @@
         // ready
         readyCount++;
         const hasAuthPrice = (typeof item.authoritativePricePaise === 'number' && !isNaN(item.authoritativePricePaise));
-        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : calculateDocPrice(item.totalPages, item.settings);
+        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : 0;
         item.pricePaise = itemPrice;
         totalCartPaise += itemPrice;
 
@@ -543,7 +605,7 @@
           metaText += ` · ${item.totalSheets} sheet${item.totalSheets > 1 ? 's' : ''}`;
         }
 
-        const priceDisplayHtml = formatRupees(itemPrice);
+        const priceDisplayHtml = hasAuthPrice ? formatRupees(itemPrice) : (item.quoteError ? 'Quote unavailable' : '…');
 
         card.innerHTML = `
           <div class="doc-card-top">
@@ -617,7 +679,7 @@
         <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
-      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0;
+      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && !it.quotePending);
       btnReviewOrder.disabled = !canProceed;
     }
   }
@@ -932,8 +994,9 @@
       item.previewPending = false;
       item.authoritativePricePaise = null;
       item.totalSheets = Math.ceil(totalPages / (defaultSides === 'Double-sided' ? 2 : 1));
-      item.pricePaise = calculateDocPrice(totalPages, item.settings);
+      item.pricePaise = 0;
       renderCart();
+      refreshDocumentQuote(item);
     } catch (err) {
       if (item.abortController?.signal?.aborted) {
         return;
@@ -1054,9 +1117,7 @@
     currentPreviewSide = 'front';
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
-    const isColor = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColor ? '₹8.00/sheet' : '₹3.00/sheet';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColor ? '₹10.00/sheet' : '₹5.00/sheet';
+    updateRateLabels();
 
     syncSettingsUI(doc);
     renderPreviewSheet();
@@ -1083,10 +1144,7 @@
       });
     }
 
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) {
-      saveSettingsPrice.textContent = formatRupees(livePrice);
-    }
+    scheduleDraftQuote();
   }
 
   function renderSelectionSeats(doc) {
@@ -1185,10 +1243,7 @@
       rangeErrorText.classList.add('hidden');
     }
 
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) {
-      saveSettingsPrice.textContent = formatRupees(livePrice);
-    }
+    scheduleDraftQuote();
   }
 
   function syncSettingsUI(doc) {
@@ -1240,9 +1295,7 @@
     cardSideDouble.classList.toggle('active', draftSettings.sides === 'Double-sided');
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
-    const isColorChoice = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColorChoice ? '₹8.00/sheet' : '₹3.00/sheet';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColorChoice ? '₹10.00/sheet' : '₹5.00/sheet';
+    updateRateLabels();
 
     // 5. Orientation
     btnOrientAuto.classList.toggle('active', draftSettings.orientation === 'Auto');
@@ -1257,8 +1310,7 @@
     if (cardNup6) cardNup6.classList.toggle('active', curNup === '6');
 
     // Live bottom price button
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+    scheduleDraftQuote();
 
     if (previewSideToggle) {
       previewSideToggle.classList.toggle('hidden', draftSettings.sides !== 'Double-sided');
@@ -1371,8 +1423,7 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        scheduleDraftQuote();
         renderPreviewSheet();
       });
 
@@ -1403,8 +1454,7 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        scheduleDraftQuote();
         renderPreviewSheet();
       });
 
@@ -1475,6 +1525,7 @@
     });
 
     cardModeColor.addEventListener('click', () => {
+      if (activeTariff?.color_enabled !== true) return;
       draftSettings.mode = 'Color';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (doc) {
@@ -1591,8 +1642,9 @@
       const nup = parseInt(doc.settings.pagesPerSheet, 10) || 1;
       const count = doc.selectedPages.length;
       doc.totalSheets = Math.max(1, isDuplex ? Math.ceil(count / (nup * 2)) : Math.ceil(count / nup));
-      doc.pricePaise = calculateDocPrice(doc.totalPages, doc.settings);
-      doc.authoritativePricePaise = doc.pricePaise;
+      doc.pricePaise = 0;
+      doc.authoritativePricePaise = null;
+      refreshDocumentQuote(doc);
 
       switchView('cart');
     });
@@ -1923,7 +1975,36 @@
     btnReviewOrder.innerHTML = `<span>Generating PIN...</span>`;
 
     try {
+      // A new cloud quote is required immediately before order creation.
+      // Do not accept stale prices or quietly substitute a different revision.
+      const confirmed = [];
+      for (const item of readyItems) {
+        const quote = await fetchDocumentQuote(item, item.settings);
+        const prior = item.authoritativePricePaise;
+        if (!Number.isSafeInteger(prior) || prior <= 0 ||
+            quote.total_price_paise !== prior || quote.tariff_revision !== item.tariffRevision) {
+          item.authoritativePricePaise = quote.total_price_paise;
+          item.pricePaise = quote.total_price_paise;
+          item.tariffRevision = quote.tariff_revision;
+          item.totalSheets = quote.total_sheets;
+          throw new Error('Print prices changed. Please review the updated quotation and place your order again.');
+        }
+        confirmed.push(quote);
+      }
+      const revision = confirmed[0].tariff_revision;
+      if (confirmed.some(quote => quote.tariff_revision !== revision)) {
+        for (const item of readyItems) item.authoritativePricePaise = null;
+        readyItems.forEach(item => refreshDocumentQuote(item));
+        throw new Error('Prices changed while preparing your order. Review the new quotation and try again.');
+      }
+      const acceptedTotal = confirmed.reduce((sum, quote) => sum + quote.total_price_paise, 0);
+      if (!Number.isSafeInteger(acceptedTotal) || acceptedTotal <= 0) {
+        throw new Error('The confirmed quotation is invalid.');
+      }
+
       const formData = new FormData();
+      formData.append('accepted_total_price_paise', String(acceptedTotal));
+      formData.append('accepted_tariff_revision', String(revision));
       const metadata = [];
 
       for (let i = 0; i < readyItems.length; i++) {
@@ -1992,6 +2073,11 @@
 
       if (!resp.ok) {
         const errText = await resp.text();
+        if (resp.status === 409) {
+          await loadTariff();
+          await Promise.all(readyItems.map(refreshDocumentQuote));
+          throw new Error('Pricing changed before checkout. Please review the updated amounts and retry.');
+        }
         throw new Error(errText || 'Failed to submit order to kiosk');
       }
 
@@ -2021,7 +2107,7 @@
         checkoutDocsCount.textContent = `${readyItems.length} file${readyItems.length > 1 ? 's' : ''}`;
       }
       if (checkoutTotalAmount) {
-        const totalPaise = data.total_price_paise || readyItems.reduce((acc, it) => acc + it.pricePaise, 0);
+        const totalPaise = Number.isSafeInteger(data.total_price_paise) ? data.total_price_paise : acceptedTotal;
         checkoutTotalAmount.textContent = formatRupees(totalPaise);
       }
 
@@ -2331,7 +2417,7 @@
         submitOrder,
         convertDocumentOnServer,
         renderPreviewSheet,
-        calculateDocPrice,
+        fetchDocumentQuote,
         switchView,
         openSettings
       };
@@ -2343,6 +2429,7 @@
     setupPreviewEventListeners();
     setupCheckoutEventListeners();
     renderCart();
+    loadTariff();
   }
 
   if (document.readyState === 'loading') {

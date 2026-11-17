@@ -39,7 +39,6 @@ func setupTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		addr:               "localhost:0",
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
 		downloadSecret:     []byte("test_secret_key_1234567890"),
 	}
 
