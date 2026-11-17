@@ -1,5 +1,5 @@
 -- XeroxGo Supabase PostgreSQL Schema
--- Canonical idempotent table definitions for orders, print configs, pricing tiers, ads, conversions, and job progress.
+-- Canonical idempotent table definitions for orders, print configs, revisioned sheet tariffs, ads, conversions, and job progress.
 
 CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT PRIMARY KEY,
@@ -47,27 +47,23 @@ CREATE TABLE IF NOT EXISTS print_configs (
     color_mode TEXT NOT NULL DEFAULT 'BW'
 );
 
-CREATE TABLE IF NOT EXISTS pricing (
+-- Canonical pricing is revisioned; an unconfigured deployment has revision 0.
+CREATE TABLE IF NOT EXISTS sheet_tariff_versions (
+    revision BIGINT PRIMARY KEY CHECK (revision > 0),
+    bw_simplex_paise BIGINT NOT NULL CHECK (bw_simplex_paise BETWEEN 1 AND 1000000),
+    bw_duplex_sheet_paise BIGINT NOT NULL CHECK (bw_duplex_sheet_paise BETWEEN 1 AND 1000000),
+    color_simplex_paise BIGINT NOT NULL CHECK (color_simplex_paise BETWEEN 1 AND 1000000),
+    color_duplex_sheet_paise BIGINT NOT NULL CHECK (color_duplex_sheet_paise BETWEEN 1 AND 1000000),
+    color_enabled INTEGER NOT NULL CHECK (color_enabled IN (0, 1)),
+    changed_by TEXT NOT NULL CHECK (length(changed_by) > 0),
+    created_at_ns BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sheet_tariff_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200 CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000 CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200 CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150 CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000 CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750 CHECK (color_duplex_price_paise > 0),
-    color_enabled INTEGER NOT NULL DEFAULT 0,
-    updated_at_ns BIGINT NOT NULL
+    active_revision BIGINT NOT NULL DEFAULT 0 CHECK (active_revision >= 0)
 );
-
-CREATE TABLE IF NOT EXISTS pricing_tiers (
-    id TEXT PRIMARY KEY,
-    min_pages INTEGER NOT NULL CHECK (min_pages > 0),
-    max_pages INTEGER NOT NULL CHECK (max_pages >= min_pages),
-    bw_discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0.0 CHECK (bw_discount_percent >= 0 AND bw_discount_percent <= 100),
-    color_discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0.0 CHECK (color_discount_percent >= 0 AND color_discount_percent <= 100),
-    updated_at_ns BIGINT NOT NULL
-);
+INSERT INTO sheet_tariff_state(id, active_revision)
+VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS payment_webhooks (
     webhook_id TEXT PRIMARY KEY,
