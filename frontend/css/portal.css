@@ -3178,7 +3178,11 @@ body {
 
 
 /* Checkout transfer progress (upload is measured; server work is indeterminate). */
+.cart-bottom-bar { flex-wrap: wrap; row-gap: 12px; }
+.cart-bottom-bar .cart-total-info { order: 1; }
+.cart-bottom-bar .btn-review-order { order: 2; }
 .checkout-progress {
+  order: 3;
   flex: 1 1 100%;
   min-width: 0;
   display: flex;
