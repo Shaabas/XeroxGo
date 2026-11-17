@@ -1,5 +1,8 @@
 # XeroxGo — architecture decisions
 
+> **Status update — 2026-11-17:** Pricing tariff revision 1 was activated previously and pricing PRs #9, #12 and #13 are merged. The sections below marked “Not yet approved” refer to the earlier release stage; they are preserved for decision history. Live rate revisions and backend deployment must be verified anew. The currently proposed checkout optimization is **not approved for implementation until its small architecture plan is reviewed**.
+
+
 Record decisions with rationale, consequences, and approval status. The code and dated ADRs (when created) supersede guesses from old audit reports.
 
 ## Approved / established design constraints
