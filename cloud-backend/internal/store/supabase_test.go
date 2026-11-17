@@ -57,8 +57,8 @@ func TestSupabaseIntegration(t *testing.T) {
 		PricePaise: 500,
 	}
 
-	if err := s.CreateOrder(ctx, order); err != nil {
-		t.Fatalf("CreateOrder failed: %v", err)
+	if err := s.CreateOrderWithTariffRevision(ctx, order, tariff.Revision); err != nil {
+		t.Fatalf("CreateOrderWithTariffRevision failed: %v", err)
 	}
 
 	retrieved, err := s.GetOrder(ctx, testOrderID)
