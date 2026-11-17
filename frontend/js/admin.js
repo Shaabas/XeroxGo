@@ -362,6 +362,7 @@
           document.getElementById(id).value = (data[key] / 100).toFixed(2);
         }
         document.getElementById('pricing-color-enabled').checked = data.color_enabled === true;
+        savedPricingSnapshot = pricingSnapshot();
         if (pricingRevision) pricingRevision.textContent = activeTariffRevision === 0
           ? 'Not activated — save to publish the first tariff'
           : 'Current tariff revision ' + activeTariffRevision;
@@ -370,6 +371,7 @@
         displayPricingMessage('Could not load pricing: ' + err.message);
       } finally {
         if (pricingSave) pricingSave.disabled = activeTariffRevision === null;
+        updatePricingCalculator();
       }
     }
 
@@ -382,6 +384,82 @@
         throw new Error('Each price must be between ₹0.01 and ₹10,000');
       }
       return paise;
+    }
+
+    // Read-only simulator: the same paise arithmetic as cloud pricing.CalculateOrder.
+    // It uses the visible editor inputs, including changes not yet saved.
+    const calcIds = ['calc-pages', 'calc-copies', 'calc-nup', 'calc-sides', 'calc-color'];
+    const calcInputs = calcIds.map(id => document.getElementById(id));
+    const calcTotal = document.getElementById('calc-total');
+    const calcImposed = document.getElementById('calc-imposed');
+    const calcSheets = document.getElementById('calc-sheets');
+    const calcNote = document.getElementById('calc-note');
+    let savedPricingSnapshot = null;
+
+    function pricingSnapshot() {
+      return pricingFields.map(([, id]) => document.getElementById(id).value.trim()).join('|') +
+        '|' + document.getElementById('pricing-color-enabled').checked;
+    }
+
+    function calculateAdminPrice(pages, copies, nup, duplex, color, rates) {
+      if (!Number.isSafeInteger(pages) || pages < 1 || pages > 100000 ||
+          !Number.isSafeInteger(copies) || copies < 1 || copies > 999 ||
+          ![1, 2, 4, 6].includes(nup)) return null;
+      const imposed = Math.ceil(pages / nup);
+      const sheetsPerCopy = duplex ? Math.ceil(imposed / 2) : imposed;
+      const simplex = color ? rates.color_simplex_paise : rates.bw_simplex_paise;
+      const duplexSheet = color ? rates.color_duplex_sheet_paise : rates.bw_duplex_sheet_paise;
+      const perCopy = duplex
+        ? Math.floor(imposed / 2) * duplexSheet + (imposed % 2) * simplex
+        : imposed * simplex;
+      const total = perCopy * copies;
+      if (!Number.isSafeInteger(total) || total < 1) return null;
+      return { imposed, sheets: sheetsPerCopy * copies, total };
+    }
+
+    function updatePricingCalculator() {
+      if (!calcTotal) return;
+      const reset = (message) => {
+        calcImposed.textContent = '—';
+        calcSheets.textContent = '—';
+        calcTotal.textContent = '—';
+        calcNote.textContent = message;
+      };
+      if (activeTariffRevision === null) {
+        reset('Load printing prices first.');
+        return;
+      }
+      const pages = Number(document.getElementById('calc-pages').value);
+      const copies = Number(document.getElementById('calc-copies').value);
+      const nup = Number(document.getElementById('calc-nup').value);
+      const duplex = document.getElementById('calc-sides').value === 'duplex';
+      const color = document.getElementById('calc-color').value === 'color';
+      if (color && !document.getElementById('pricing-color-enabled').checked) {
+        reset('Color printing is currently disabled in the prices on the left.');
+        return;
+      }
+      try {
+        const rates = {};
+        for (const [key, id] of pricingFields) rates[key] = inputPaise(id);
+        const result = calculateAdminPrice(pages, copies, nup, duplex, color, rates);
+        if (!result) throw new Error('Enter valid pages (1–100,000) and copies (1–999).');
+        calcImposed.textContent = String(result.imposed);
+        calcSheets.textContent = String(result.sheets);
+        calcTotal.textContent = '₹' + (result.total / 100).toFixed(2);
+        calcNote.textContent = pricingSnapshot() === savedPricingSnapshot
+          ? 'Based on the currently saved prices. Does not create an order.'
+          : 'Preview using edited prices. Click Save Prices to publish them.';
+      } catch (error) {
+        reset(error.message);
+      }
+    }
+
+    for (const el of [...calcInputs, ...pricingFields.map(([, id]) => document.getElementById(id)),
+      document.getElementById('pricing-color-enabled')]) {
+      if (el) {
+        el.addEventListener('input', updatePricingCalculator);
+        el.addEventListener('change', updatePricingCalculator);
+      }
     }
 
     if (pricingForm) pricingForm.addEventListener('submit', async (event) => {
@@ -403,11 +481,14 @@
         if (!res.ok) throw new Error(data.error || 'Unable to save prices');
         activeTariffRevision = data.revision;
         if (pricingRevision) pricingRevision.textContent = 'Current tariff revision ' + data.revision;
+        savedPricingSnapshot = pricingSnapshot();
+        updatePricingCalculator();
         displayPricingMessage('Prices saved successfully.');
       } catch (err) {
         displayPricingMessage(err.message);
       } finally {
         if (pricingSave) pricingSave.disabled = activeTariffRevision === null;
+        updatePricingCalculator();
       }
     });
     const pricingReload = document.getElementById('pricing-reload');
