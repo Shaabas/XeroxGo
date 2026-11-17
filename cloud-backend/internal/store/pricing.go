@@ -16,8 +16,8 @@ var (
 	ErrSheetTariffRevisionConflict = errors.New("sheet tariff revision changed; reload before saving")
 )
 
-// initSheetTariffSchema adds independent, opt-in rate revisions without
-// modifying the legacy pricing table, existing orders or payment amounts.
+// initSheetTariffSchema initializes the canonical revisioned tariff tables.
+// Existing orders and payment amounts are not modified.
 func initSheetTariffSchema(ctx context.Context, db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS sheet_tariff_versions (
