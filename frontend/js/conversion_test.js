@@ -1,7 +1,7 @@
 // @ts-check
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { convertDocumentOnServer } = require('./portal.js');
+const { convertDocumentOnServer, calculateEstimatedPrice } = require('./portal.js');
 
 // Helper to create a fake File object
 function createDummyFile(name = 'sample.docx', size = 1024) {
@@ -397,3 +397,29 @@ test('Preview Sizing Math — Responsive stage scale and dimension bounds', () =
 });
 
 
+
+test('Instant estimate matches canonical tariff math for duplex, N-Up and copies', () => {
+  const tariff = { revision: 1, bw_simplex_paise: 300, bw_duplex_sheet_paise: 500,
+    color_simplex_paise: 800, color_duplex_sheet_paise: 1000, color_enabled: false };
+  const base = { pageSelection: 'All', pagesPerSheet: '1', copies: 1, mode: 'B&W', sides: 'Double-sided' };
+  assert.equal(calculateEstimatedPrice(5, base, tariff), 1300); // 2 duplex sheets, odd side
+  assert.equal(calculateEstimatedPrice(11, { ...base, pagesPerSheet: '2', copies: 2 }, tariff), 3000);
+  assert.equal(calculateEstimatedPrice(11, { ...base, pagesPerSheet: '6', sides: 'Single-sided' }, tariff), 600);
+  assert.equal(calculateEstimatedPrice(11, { ...base, pagesPerSheet: '4', copies: 3 }, tariff), 2400);
+  assert.equal(calculateEstimatedPrice(11, { ...base, pagesPerSheet: '1', copies: 3, sides: 'Single-sided' }, tariff), 9900);
+});
+
+test('Instant estimate honors selected pages and validates rates and options', () => {
+  const tariff = { revision: 4, bw_simplex_paise: 400, bw_duplex_sheet_paise: 600,
+    color_simplex_paise: 900, color_duplex_sheet_paise: 1200, color_enabled: true };
+  const base = { pageSelection: 'Custom Range', rangeFrom: 2, rangeTo: 6,
+    pagesPerSheet: '2', copies: 2, mode: 'B&W', sides: 'Double-sided' };
+  assert.equal(calculateEstimatedPrice(10, base, tariff), 2000); // 3 sides; 600 + 400 per copy
+  assert.equal(calculateEstimatedPrice(10, { ...base, pageSelection: 'Selection', selectedPages: [1, 3, 3, 5] }, tariff), 1200);
+  assert.equal(calculateEstimatedPrice(10, { ...base, mode: 'Color' }, tariff), 4200);
+  assert.equal(calculateEstimatedPrice(10, { ...base, mode: 'Color' }, { ...tariff, color_enabled: false }), null);
+  assert.equal(calculateEstimatedPrice(10, base, null), null);
+  assert.equal(calculateEstimatedPrice(10, { ...base, copies: 1000 }, tariff), null);
+  assert.equal(calculateEstimatedPrice(10, { ...base, pagesPerSheet: '3' }, tariff), null);
+  assert.equal(calculateEstimatedPrice(10, { ...base, rangeFrom: 8, rangeTo: 2 }, tariff), null);
+});
