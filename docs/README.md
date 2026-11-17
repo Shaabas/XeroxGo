@@ -1,28 +1,30 @@
-# XeroxGo — project documentation
+# XeroxGo — documentation
 
-**Start here:** [agent contract](../AGENTS.md) · [current checkpoint](PROJECT_STATE.md) · [task queue](TASKS.md) · [architecture](ARCHITECTURE.md) · [decisions](DECISIONS.md) · [verification](TESTING.md) · [deployment](DEPLOYMENT.md) · [release readiness](RELEASE_READINESS.md).
+**Start here:** [agent operating rules](../AGENTS.md) · [current state](PROJECT_STATE.md) · [task queue](TASKS.md).
 
-These seven focused documents are the **working navigation layer** for ChatGPT, Antigravity, and human maintainers. Exact repository/CI state must always be verified; the checkpoint is dated.
+## Active reference documents
+| File | Purpose |
+| --- | --- |
+| [PROJECT_STATE.md](PROJECT_STATE.md) | Verified GitHub checkpoint; review date before trusting |
+| [TASKS.md](TASKS.md) | Active tasks, owners, unresolved investigations |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System boundaries and non-negotiable invariants |
+| [DECISIONS.md](DECISIONS.md) | Approved and pending architecture decisions |
+| [TESTING.md](TESTING.md) | Verification gates, current coverage and test gaps |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Deployment, database and rollback precautions |
 
-## Canonical working docs
-- `PROJECT_STATE.md`: current branch, PR, blockers and next action.
-- `TASKS.md`: tasks with owners, scope and dependencies.
-- `ARCHITECTURE.md`: short runtime map and non-negotiable boundaries.
-- `DECISIONS.md`: approved versus pending decisions.
-- `TESTING.md`: evidence required for change acceptance.
-- `DEPLOYMENT.md`: production and migration guardrails.
+## Detailed references retained intentionally
+These documents contain unique behavioral contracts, accepted test cases, or database release procedures that should not be reduced to a short status summary:
 
-## Historical evidence — retained pending deliberate cleanup
-The existing detailed reports are **not current status by default**. They may contain obsolete paths, line references, or outdated conclusions. Before deleting, classify whether each contains important unreproduced behavior/contracts.
+- [architecture/module-contracts.md](architecture/module-contracts.md) — module APIs, state ownership and safety invariants. **Historical implementation references; verify against source code.**
+- [testing/core-acceptance-matrix.md](testing/core-acceptance-matrix.md) — concrete missing hardware/frontend/operational acceptance tests. **Status and paths are historical.**
+- [testing/document-pricing-baseline.md](testing/document-pricing-baseline.md) — PDF layout/billing test cases and the preview/upload API naming discrepancies.
+- [testing/orders-sessions-concurrency.md](testing/orders-sessions-concurrency.md) — PostgreSQL concurrency evidence and unique index/locking invariants.
+- [cleanup/database-release-plan.md](cleanup/database-release-plan.md) — staged PostgreSQL index migration, preflight and rollback procedures. **Do not run its SQL without confirming live DB state.**
 
-- `architecture/overview.md`, `architecture/module-boundaries.md`, `architecture/module-contracts.md`, `architecture/minimum-core.md`: detailed architecture sources.
-- `architecture/orders-sessions-audit.md`: historical orders/sessions audit.
-- `cleanup/branch-integration-plan.md`, `cleanup/conversion-analysis.md`, `cleanup/database-release-plan.md`, `cleanup/module-inventory.md`, `cleanup/orders-sessions-endpoints.md`: historical assessments and plans.
-- `reference/file-inventory.md`: potentially outdated tracked-file inventory.
-- `testing/core-acceptance-matrix.md`, `testing/document-pricing-baseline.md`, `testing/orders-sessions-concurrency.md`: historical test matrices, preserve unique cases in actual tests before retirement.
-- `workflows/minimum-print-path.md`: detailed workflow trace.
+## Cleanup result
+Obsolete branch comparison reports, old code inventories, completed conversion-cleanup narratives, redundant system overviews, stale workflow traces, and pre-release snapshots were removed in the documentation cleanup PR. Their complete content remains available in Git history. Key unresolved work was moved into [TASKS.md](TASKS.md) and [TESTING.md](TESTING.md).
 
-**Cleanup process:** review document for unique invariants and open tasks → migrate essentials into working docs or tracked tests → check references → remove obsolete report in a separate reviewed docs-only PR. Git history retains past reports.
+**Rules:** source and tests override old documents; verify version and environment; never interpret historical audit findings as proof of current bugs. Do not delete the retained detailed specifications unless their unique checks have been migrated into tested code.
 
 ## Starting a new ChatGPT conversation
-> Continue XeroxGo from https://github.com/Shaabas/XeroxGo. Read AGENTS.md and docs/{PROJECT_STATE,TASKS,ARCHITECTURE,DECISIONS}.md. Verify current GitHub branch, commits, CI and PRs. Resume the highest-priority unblocked task under the dual-agent workflow; do not change production or architecture without approval.
+> Continue XeroxGo from https://github.com/Shaabas/XeroxGo. Read AGENTS.md and docs/{PROJECT_STATE,TASKS,ARCHITECTURE,DECISIONS}.md. Verify current GitHub commit, PRs, CI and local worktree. Resume the highest-priority unblocked task. Explain architectural changes before implementing them.
