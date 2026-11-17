@@ -574,7 +574,7 @@
         // ready
         readyCount++;
         const hasAuthPrice = (typeof item.authoritativePricePaise === 'number' && !isNaN(item.authoritativePricePaise));
-        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : calculateDocPrice(item.totalPages, item.settings);
+        const itemPrice = hasAuthPrice ? item.authoritativePricePaise : 0;
         item.pricePaise = itemPrice;
         totalCartPaise += itemPrice;
 
@@ -605,7 +605,7 @@
           metaText += ` · ${item.totalSheets} sheet${item.totalSheets > 1 ? 's' : ''}`;
         }
 
-        const priceDisplayHtml = formatRupees(itemPrice);
+        const priceDisplayHtml = hasAuthPrice ? formatRupees(itemPrice) : (item.quoteError ? 'Quote unavailable' : '…');
 
         card.innerHTML = `
           <div class="doc-card-top">
@@ -679,7 +679,7 @@
         <span>Place Order</span>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
-      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0;
+      const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && !it.quotePending);
       btnReviewOrder.disabled = !canProceed;
     }
   }
@@ -994,8 +994,9 @@
       item.previewPending = false;
       item.authoritativePricePaise = null;
       item.totalSheets = Math.ceil(totalPages / (defaultSides === 'Double-sided' ? 2 : 1));
-      item.pricePaise = calculateDocPrice(totalPages, item.settings);
+      item.pricePaise = 0;
       renderCart();
+      refreshDocumentQuote(item);
     } catch (err) {
       if (item.abortController?.signal?.aborted) {
         return;
@@ -1116,9 +1117,7 @@
     currentPreviewSide = 'front';
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
-    const isColor = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColor ? '₹8.00/sheet' : '₹3.00/sheet';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColor ? '₹10.00/sheet' : '₹5.00/sheet';
+    updateRateLabels();
 
     syncSettingsUI(doc);
     renderPreviewSheet();
@@ -1145,10 +1144,7 @@
       });
     }
 
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) {
-      saveSettingsPrice.textContent = formatRupees(livePrice);
-    }
+    scheduleDraftQuote();
   }
 
   function renderSelectionSeats(doc) {
@@ -1247,10 +1243,7 @@
       rangeErrorText.classList.add('hidden');
     }
 
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) {
-      saveSettingsPrice.textContent = formatRupees(livePrice);
-    }
+    scheduleDraftQuote();
   }
 
   function syncSettingsUI(doc) {
@@ -1302,9 +1295,7 @@
     cardSideDouble.classList.toggle('active', draftSettings.sides === 'Double-sided');
 
     // Dynamic rate labels on Single vs Double side based on Print Mode
-    const isColorChoice = (draftSettings.mode === 'Color');
-    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = isColorChoice ? '₹8.00/sheet' : '₹3.00/sheet';
-    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = isColorChoice ? '₹10.00/sheet' : '₹5.00/sheet';
+    updateRateLabels();
 
     // 5. Orientation
     btnOrientAuto.classList.toggle('active', draftSettings.orientation === 'Auto');
@@ -1319,8 +1310,7 @@
     if (cardNup6) cardNup6.classList.toggle('active', curNup === '6');
 
     // Live bottom price button
-    const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-    if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+    scheduleDraftQuote();
 
     if (previewSideToggle) {
       previewSideToggle.classList.toggle('hidden', draftSettings.sides !== 'Double-sided');
@@ -1433,8 +1423,7 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        scheduleDraftQuote();
         renderPreviewSheet();
       });
 
@@ -1465,8 +1454,7 @@
         draftSettings.rangeTo = to;
         draftSettings.customPageRange = (from === to) ? String(from) : `${from}-${to}`;
 
-        const livePrice = calculateDocPrice(doc.totalPages, draftSettings);
-        if (saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(livePrice);
+        scheduleDraftQuote();
         renderPreviewSheet();
       });
 
@@ -1653,8 +1641,9 @@
       const nup = parseInt(doc.settings.pagesPerSheet, 10) || 1;
       const count = doc.selectedPages.length;
       doc.totalSheets = Math.max(1, isDuplex ? Math.ceil(count / (nup * 2)) : Math.ceil(count / nup));
-      doc.pricePaise = calculateDocPrice(doc.totalPages, doc.settings);
-      doc.authoritativePricePaise = doc.pricePaise;
+      doc.pricePaise = 0;
+      doc.authoritativePricePaise = null;
+      refreshDocumentQuote(doc);
 
       switchView('cart');
     });
@@ -2393,7 +2382,7 @@
         submitOrder,
         convertDocumentOnServer,
         renderPreviewSheet,
-        calculateDocPrice,
+        fetchDocumentQuote,
         switchView,
         openSettings
       };
@@ -2405,6 +2394,7 @@
     setupPreviewEventListeners();
     setupCheckoutEventListeners();
     renderCart();
+    loadTariff();
   }
 
   if (document.readyState === 'loading') {
