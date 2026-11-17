@@ -4,10 +4,10 @@
 
 ## Repository and integration
 - Repository: https://github.com/Shaabas/XeroxGo
-- Stable remote branch: `main`, checked at `c3baa56e4955f7715371fae991811287b040a610` (PR #14 merge).
+- Stable remote branch: `main`, verified at `fa148fee54c91bdfac3496d4c55b466cb6be81f6` (PR #10 workspace merge). Verify again before acting.
 - Merged: [PR #9](https://github.com/Shaabas/XeroxGo/pull/9) central pricing, [PR #11](https://github.com/Shaabas/XeroxGo/pull/11) Vercel workflow correction, [PR #12](https://github.com/Shaabas/XeroxGo/pull/12) instant price estimates, [PR #13](https://github.com/Shaabas/XeroxGo/pull/13) pricing refresh and parity tests, [PR #14](https://github.com/Shaabas/XeroxGo/pull/14) admin price calculator.
 - The latest main verification and Vercel deployment workflow [44108533141](https://github.com/Shaabas/XeroxGo/actions/runs/44108533141) completed successfully. A GitHub Actions deploy success is **not** independent proof of a Render backend rollout or live smoke tests.
-- [PR #10](https://github.com/Shaabas/XeroxGo/pull/10) is the outstanding docs/dual-agent workspace integration, now targeting `main`. Check its final merge state and CI after any edits.
+- [PR #10](https://github.com/Shaabas/XeroxGo/pull/10) dual-agent workspace has merged to `main` at `fa148fee`. Documentation consolidation is tracked separately in [PR #15](https://github.com/Shaabas/XeroxGo/pull/15); do not treat this pending cleanup as merged until GitHub confirms.
 - Branch inventory on 2026-11-17: all other 31 non-main remote branches are ancestors of `main` (0 ahead); they need no new merges. Local Antigravity changes were not accessible or inspected.
 
 ## Active architecture
