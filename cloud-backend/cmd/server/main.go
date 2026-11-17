@@ -35,7 +35,6 @@ type serverConfig struct {
 	addr               string
 	dbPath             string
 	jobsDir            string
-	pricePerSheetPaise int64
 	devMode            bool
 	demoMode           bool
 	downloadSecret     []byte
@@ -1367,30 +1366,6 @@ func main() {
 	}
 	defer storeDB.Close()
 
-	ctx := context.Background()
-	var pricePaise int64
-	priceEnv := os.Getenv("XEROXGO_PRICE_PER_SHEET_PAISE")
-	if priceEnv != "" {
-		p, err := strconv.ParseInt(priceEnv, 10, 64)
-		if err != nil || p <= 0 {
-			log.Fatalf("invalid XEROXGO_PRICE_PER_SHEET_PAISE: %s", priceEnv)
-		}
-		if err := storeDB.SetPricePerSheetPaise(ctx, p); err != nil {
-			log.Fatalf("failed to persist price per sheet: %v", err)
-		}
-		pricePaise = p
-	} else {
-		p, err := storeDB.GetPricePerSheetPaise(ctx)
-		if err == nil && p > 0 {
-			pricePaise = p
-		} else if devMode {
-			pricePaise = 500
-			_ = storeDB.SetPricePerSheetPaise(ctx, pricePaise)
-		} else {
-			log.Fatalf("pricing unconfigured in production mode")
-		}
-	}
-
 	// Initialize default promo ads & bootstrap admin user
 	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer bootstrapCancel()
@@ -1426,7 +1401,6 @@ func main() {
 		addr:               addr,
 		dbPath:             dbPath,
 		jobsDir:            jobsDir,
-		pricePerSheetPaise: pricePaise,
 		devMode:            devMode,
 		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
@@ -1485,7 +1459,7 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v, price=%d paise)", addr, devMode, pricePaise)
+		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v)", addr, devMode)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrCh <- err
 		}
