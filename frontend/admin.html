@@ -70,6 +70,7 @@
       <div class="nav-tabs-bar">
         <button id="tab-nav-overview" class="nav-tab-item active" type="button">Overview</button>
         <button id="tab-nav-orders" class="nav-tab-item" type="button">Orders</button>
+        <button id="tab-nav-pricing" class="nav-tab-item" type="button">Pricing</button>
         <button id="tab-nav-ads" class="nav-tab-item" type="button">Ads</button>
       </div>
     </nav>
@@ -113,6 +114,31 @@
           <div id="analytics-chart-container" class="chart-container-box">
             <!-- Rendered via SVG -->
           </div>
+        </div>
+      </section>
+
+      <!-- Canonical tariff controls -->
+      <section id="view-pricing" class="admin-view hidden">
+        <div class="panel-card">
+          <div class="panel-header"><div>
+            <h2 class="panel-title">Printing Prices</h2>
+            <p id="pricing-revision" style="color:var(--text-muted);font-size:0.85rem;margin-top:0.4rem;">Loading current tariff…</p>
+          </div></div>
+          <form id="pricing-form" style="max-width:560px;">
+            <div class="form-group"><label class="form-label" for="pricing-bw-simplex">B&W single-sided (₹ per side)</label>
+              <input class="form-input" id="pricing-bw-simplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+            <div class="form-group"><label class="form-label" for="pricing-bw-duplex">B&W double-sided (₹ per full sheet)</label>
+              <input class="form-input" id="pricing-bw-duplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+            <div class="form-group"><label class="form-label" for="pricing-color-simplex">Color single-sided (₹ per side)</label>
+              <input class="form-input" id="pricing-color-simplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+            <div class="form-group"><label class="form-label" for="pricing-color-duplex">Color double-sided (₹ per full sheet)</label>
+              <input class="form-input" id="pricing-color-duplex" type="number" min="0.01" max="10000" step="0.01" required /></div>
+            <div class="form-group"><label class="form-label" for="pricing-color-enabled"><input id="pricing-color-enabled" type="checkbox" /> Enable color printing</label></div>
+            <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:1rem;">An odd final duplex side uses the single-sided rate. Saving creates a new tariff revision; existing orders keep their prices.</p>
+            <div id="pricing-message" role="status" style="font-size:0.85rem;margin-bottom:0.75rem;"></div>
+            <button id="pricing-save" type="submit" class="btn-primary">Save Prices</button>
+            <button id="pricing-reload" type="button" class="btn-secondary">Reload</button>
+          </form>
         </div>
       </section>
 
@@ -426,6 +452,6 @@
     </div>
   </template>
 
-  <script src="/js/admin.js?v=5"></script>
+  <script src="/js/admin.js?v=6"></script>
 </body>
 </html>
