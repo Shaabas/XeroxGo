@@ -33,7 +33,7 @@
     }
     window.dispatchEvent(new CustomEvent('pdfjs-ready', { detail: pdfjsLib }));
   </script>
-  <script src="/js/portal.js?v=2.0.0" defer></script>
+  <script src="/js/portal.js?v=2.0.1" defer></script>
   <script>
     (function() {
       var match = window.location.pathname.match(/\/k\/([^/]+)/);
@@ -155,6 +155,12 @@
         <div class="cart-total-info">
           <span class="cart-total-label">Estimated total &middot; <span id="cart-docs-count">0 documents</span></span>
           <span class="cart-total-amount" id="cart-total-amount">&#8377;0.00</span>
+        </div>
+        <div id="checkout-progress" class="checkout-progress hidden" role="status" aria-live="polite">
+          <span id="checkout-progress-label">Uploading documents…</span>
+          <div id="checkout-progress-track" class="checkout-progress-track" role="progressbar" aria-label="Order preparation" aria-valuemin="0" aria-valuemax="100">
+            <div id="checkout-progress-bar" class="checkout-progress-bar checkout-progress-indeterminate"></div>
+          </div>
         </div>
         <button type="button" id="btn-review-order" class="btn-review-order" disabled>
           <span>Review Order</span>
