@@ -1974,7 +1974,36 @@
     btnReviewOrder.innerHTML = `<span>Generating PIN...</span>`;
 
     try {
+      // A new cloud quote is required immediately before order creation.
+      // Do not accept stale prices or quietly substitute a different revision.
+      const confirmed = [];
+      for (const item of readyItems) {
+        const quote = await fetchDocumentQuote(item, item.settings);
+        const prior = item.authoritativePricePaise;
+        if (!Number.isSafeInteger(prior) || prior <= 0 ||
+            quote.total_price_paise !== prior || quote.tariff_revision !== item.tariffRevision) {
+          item.authoritativePricePaise = quote.total_price_paise;
+          item.pricePaise = quote.total_price_paise;
+          item.tariffRevision = quote.tariff_revision;
+          item.totalSheets = quote.total_sheets;
+          throw new Error('Print prices changed. Please review the updated quotation and place your order again.');
+        }
+        confirmed.push(quote);
+      }
+      const revision = confirmed[0].tariff_revision;
+      if (confirmed.some(quote => quote.tariff_revision !== revision)) {
+        for (const item of readyItems) item.authoritativePricePaise = null;
+        readyItems.forEach(item => refreshDocumentQuote(item));
+        throw new Error('Prices changed while preparing your order. Review the new quotation and try again.');
+      }
+      const acceptedTotal = confirmed.reduce((sum, quote) => sum + quote.total_price_paise, 0);
+      if (!Number.isSafeInteger(acceptedTotal) || acceptedTotal <= 0) {
+        throw new Error('The confirmed quotation is invalid.');
+      }
+
       const formData = new FormData();
+      formData.append('accepted_total_price_paise', String(acceptedTotal));
+      formData.append('accepted_tariff_revision', String(revision));
       const metadata = [];
 
       for (let i = 0; i < readyItems.length; i++) {
@@ -2072,7 +2101,7 @@
         checkoutDocsCount.textContent = `${readyItems.length} file${readyItems.length > 1 ? 's' : ''}`;
       }
       if (checkoutTotalAmount) {
-        const totalPaise = data.total_price_paise || readyItems.reduce((acc, it) => acc + it.pricePaise, 0);
+        const totalPaise = Number.isSafeInteger(data.total_price_paise) ? data.total_price_paise : acceptedTotal;
         checkoutTotalAmount.textContent = formatRupees(totalPaise);
       }
 
