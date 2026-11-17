@@ -148,10 +148,10 @@
   const cartDocsCount = document.getElementById('cart-docs-count');
   const cartTotalAmount = document.getElementById('cart-total-amount');
   const btnReviewOrder = document.getElementById('btn-review-order');
-  const checkoutProgress = document.getElementById('checkout-progress');
-  const checkoutProgressLabel = document.getElementById('checkout-progress-label');
-  const checkoutProgressTrack = document.getElementById('checkout-progress-track');
-  const checkoutProgressBar = document.getElementById('checkout-progress-bar');
+  const orderUploadProgress = document.getElementById('order-upload-progress');
+  const orderUploadProgressLabel = document.getElementById('order-upload-progress-label');
+  const orderUploadProgressTrack = document.getElementById('order-upload-progress-track');
+  const orderUploadProgressBar = document.getElementById('order-upload-progress-bar');
   let orderSubmitting = false;
   let orderOutcomeUncertain = false;
 
@@ -2094,23 +2094,23 @@
 
   // --- View 4: Checkout & Order Submission Implementation ---
   function updateCheckoutProgress(stage, percent) {
-    if (!checkoutProgress) return;
-    checkoutProgress.classList.remove('hidden');
+    if (!orderUploadProgress) return;
+    orderUploadProgress.classList.remove('hidden');
     const uploading = stage === 'upload';
-    checkoutProgressLabel.textContent = uploading
+    orderUploadProgressLabel.textContent = uploading
       ? (percent === null ? 'Uploading documents…' : 'Uploading documents… ' + percent + '%')
       : 'Preparing print job and creating PIN…';
-    checkoutProgressTrack.setAttribute('aria-valuetext', uploading
+    orderUploadProgressTrack.setAttribute('aria-valuetext', uploading
       ? (percent === null ? 'Uploading documents' : 'Uploading documents ' + percent + ' percent')
       : 'Processing documents on server');
     if (uploading && percent !== null) {
-      checkoutProgressTrack.setAttribute('aria-valuenow', String(percent));
-      checkoutProgressBar.style.width = percent + '%';
-      checkoutProgressBar.classList.remove('checkout-progress-indeterminate');
+      orderUploadProgressTrack.setAttribute('aria-valuenow', String(percent));
+      orderUploadProgressBar.style.width = percent + '%';
+      orderUploadProgressBar.classList.remove('checkout-progress-indeterminate');
     } else {
-      checkoutProgressTrack.removeAttribute('aria-valuenow');
-      checkoutProgressBar.style.width = '';
-      checkoutProgressBar.classList.add('checkout-progress-indeterminate');
+      orderUploadProgressTrack.removeAttribute('aria-valuenow');
+      orderUploadProgressBar.style.width = '';
+      orderUploadProgressBar.classList.add('checkout-progress-indeterminate');
     }
   }
 
@@ -2263,7 +2263,7 @@
       showCartError(`Could not create order: ${orderErr.message || orderErr}`);
     } finally {
       orderSubmitting = false;
-      if (checkoutProgress) checkoutProgress.classList.add('hidden');
+      if (orderUploadProgress) orderUploadProgress.classList.add('hidden');
       renderCart();
     }
   }
