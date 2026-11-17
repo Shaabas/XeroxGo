@@ -233,6 +233,7 @@ type normalizedDocResult struct {
 	UnitPrice    int64
 	PrintedSides int
 	PricePaise   int64
+	TariffRevision int64
 }
 
 // executeNormalizationAndPricing executes canonical normalization on the prepared input PDF
@@ -244,6 +245,7 @@ func (s *appServer) executeNormalizationAndPricing(
 	opts docPrintOptions,
 	pricingConfig store.PricingConfig,
 	hasPricing bool,
+	sheetTariff ...pricing.Tariff,
 ) (*normalizedDocResult, error) {
 	normRes, err := pdf.NormalizeAndCountWithOptions(ctx, inputPDFPath, outputPath, pdf.NormalizeOptions{
 		Copies:        opts.Copies,
@@ -257,17 +259,36 @@ func (s *appServer) executeNormalizationAndPricing(
 		return nil, err
 	}
 
+	// The normalizer's TotalPages is the number of occupied imposed sides
+	// BEFORE artificial duplex padding. Never bill PaddedPages.
+	if len(sheetTariff) > 1 {
+		return nil, errors.New("multiple sheet tariff snapshots provided")
+	}
+	if len(sheetTariff) == 1 {
+		t := sheetTariff[0]
+		quote, err := pricing.CalculateOrder(t, []pricing.Document{{
+			ImposedSidesPerCopy: int64(normRes.TotalPages),
+			Copies: int64(opts.Copies),
+			Duplex: opts.Duplex != contracts.DuplexSimplex,
+			Color: strings.EqualFold(opts.ColorMode, "COLOR"),
+		}})
+		if err != nil { return nil, fmt.Errorf("calculate sheet quote: %w", err) }
+		if quote.BilledSides > int64(int(^uint(0)>>1)) {
+			return nil, errors.New("billed sides exceed platform range")
+		}
+		return &normalizedDocResult{
+			NormResult: normRes, PrintedSides: int(quote.BilledSides),
+			PricePaise: quote.TotalPaise, TariffRevision: t.Revision,
+		}, nil
+	}
 	unitPrice := s.resolveUnitPrice(pricingConfig, hasPricing, opts.ColorMode, opts.Duplex)
 	printedSides := normRes.TotalPages * opts.Copies
 	docPrice, err := pricing.CalculatePricePaise(printedSides, unitPrice)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate price: %w", err)
 	}
-
 	return &normalizedDocResult{
-		NormResult:   normRes,
-		UnitPrice:    unitPrice,
-		PrintedSides: printedSides,
-		PricePaise:   docPrice,
+		NormResult: normRes, UnitPrice: unitPrice,
+		PrintedSides: printedSides, PricePaise: docPrice,
 	}, nil
 }
