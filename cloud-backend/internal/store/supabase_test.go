@@ -27,13 +27,13 @@ func TestSupabaseIntegration(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1. Pricing test
-	if err := s.SetPricePerSheetPaise(ctx, 500); err != nil {
-		t.Fatalf("SetPricePerSheetPaise failed: %v", err)
+	// 1. Verify the active canonical tariff without modifying live pricing.
+	tariff, err := s.GetActiveSheetTariff(ctx)
+	if err != nil {
+		t.Fatalf("active sheet tariff unavailable: %v", err)
 	}
-	price, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 500 {
-		t.Fatalf("GetPricePerSheetPaise failed: %v, got %d", err, price)
+	if tariff.Revision < 1 {
+		t.Fatal("expected active tariff revision")
 	}
 
 	// 2. Order creation test
