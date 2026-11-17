@@ -656,7 +656,14 @@ func TestMultiJobRecovery_DatabaseErrorHandling(t *testing.T) {
 		_ = client.Run(recovCtx)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for startup recovery to process database error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	client.activeMu.Lock()
 	activeCount := len(client.activeJobs)
@@ -1167,7 +1174,14 @@ func TestMultiJobRecovery_Negative_MultipleActiveCUPSJobs_HoldFailure_BlocksFres
 		_ = client.Run(recovCtx)
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for startup recovery to process database error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if blocked, _ := client.IsRecoveryBarrierActive(); blocked {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// 1. Requirement 10: Fresh submissions blocked by recovery barrier
 	blocked, reason := client.IsRecoveryBarrierActive()
