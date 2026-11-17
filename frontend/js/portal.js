@@ -28,15 +28,11 @@
   }
   const devMode = container.dataset.devMode === 'true' || Boolean(window.__PORTAL_TEST__);
 
-  // Rates in paise (Authoritative default fixed rates in code)
-  // 3 for single side b&w (300p)
-  // 5 for double side b&w (500p per 2 pages)
-  // 8 for single side colour (800p)
-  // 10 for double side colour (1000p per 2 pages)
-  const RATE_BW_SINGLE_PAISE = 300;
-  const RATE_BW_DOUBLE_PAISE = 500;
-  const RATE_COLOR_SINGLE_PAISE = 800;
-  const RATE_COLOR_DOUBLE_PAISE = 1000;
+  // The server owns prices. The public tariff is used only for displaying rate labels.
+  let activeTariff = null;
+  let pricingRequestError = null;
+  let draftQuoteTimer = null;
+  let draftQuoteSerial = 0;
 
   // --- Views DOM ---
   const viewCart = document.getElementById('view-cart');
@@ -287,56 +283,122 @@
     return { valid: true, error: null, pages: selected };
   }
 
-  // Per-document price calculation in integer paise
-  // Rates:
-  // - 3 for single side b&w (₹3 per page)
-  // - 5 for double side b&w (₹5 per 2 pages)
-  // - 8 for single side colour (₹8 per page)
-  // - 10 for double side colour (₹10 per 2 pages)
-  // Odd trailing page on double side: charged at single side rate (₹3 for B&W, ₹8 for Colour)
-  function calculateDocPrice(totalPages, settings) {
-    if (!settings || totalPages <= 0) return 0;
-    let pagesCount = totalPages;
+  function selectedPageRange(totalPages, settings) {
     if (settings.pageSelection === 'Custom Range') {
-      const from = Math.max(1, Math.min(settings.rangeFrom || 1, totalPages));
-      const to = Math.max(from, Math.min(settings.rangeTo || totalPages, totalPages));
-      pagesCount = Math.max(1, to - from + 1);
-    } else if (settings.pageSelection === 'Selection') {
-      const sel = Array.isArray(settings.selectedPages) ? settings.selectedPages : [];
-      pagesCount = sel.length;
-    } else if (settings.customPageRange) {
-      const parsed = parseCustomPages(settings.customPageRange, totalPages);
-      if (parsed.valid && parsed.pages.length > 0) {
-        pagesCount = parsed.pages.length;
+      const from = settings.rangeFrom || 1;
+      const to = settings.rangeTo || totalPages;
+      return from === to ? String(from) : `${from}-${to}`;
+    }
+    if (settings.pageSelection === 'Selection') {
+      return (settings.selectedPages || []).slice().sort((a, b) => a - b).join(',');
+    }
+    return settings.customPageRange || '';
+  }
+
+  function preparedFile(item) {
+    if (item.pdfBytes && (item.isImage || item.isOffice)) {
+      const blob = new Blob([item.pdfBytes], { type: 'application/pdf' });
+      return new File([blob], item.name.replace(/\\.[^.]+$/, '') + '.pdf', { type: 'application/pdf' });
+    }
+    return item.file;
+  }
+
+  function appendPrintOptions(form, item, settings) {
+    form.append('copies', String(settings.copies || 1));
+    form.append('duplex', settings.sides === 'Double-sided' ? 'DUPLEX_LONG_EDGE' : 'SIMPLEX');
+    form.append('color_mode', settings.mode === 'Color' ? 'COLOR' : 'BW');
+    form.append('orientation', (settings.orientation || 'Auto').toUpperCase());
+    form.append('pages_per_sheet', String(parseInt(settings.pagesPerSheet, 10) || 1));
+    const range = selectedPageRange(item.totalPages, settings);
+    if (range) form.append('page_range', range);
+  }
+
+  async function fetchDocumentQuote(item, settings) {
+    const form = new FormData();
+    form.append('file', preparedFile(item));
+    appendPrintOptions(form, item, settings);
+    form.append('format', 'json');
+    const response = await fetch('/api/documents/preview', { method: 'POST', body: form });
+    if (!response.ok) throw new Error((await response.text()).trim() || 'Could not calculate document price');
+    const quote = await response.json();
+    if (!Number.isSafeInteger(quote.total_price_paise) || quote.total_price_paise < 1 ||
+        !Number.isSafeInteger(quote.tariff_revision) || quote.tariff_revision < 1) {
+      throw new Error('Invalid quotation from server');
+    }
+    return quote;
+  }
+
+  async function refreshDocumentQuote(item) {
+    const settingsKey = JSON.stringify(item.settings);
+    item.authoritativePricePaise = null;
+    item.pricePaise = 0;
+    item.quotePending = true;
+    renderCart();
+    try {
+      const quote = await fetchDocumentQuote(item, item.settings);
+      if (!cartItems.includes(item) || JSON.stringify(item.settings) !== settingsKey) return;
+      item.authoritativePricePaise = quote.total_price_paise;
+      item.pricePaise = quote.total_price_paise;
+      item.tariffRevision = quote.tariff_revision;
+      item.totalSheets = quote.total_sheets;
+      item.quoteError = '';
+    } catch (error) {
+      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey) {
+        item.quoteError = error.message;
+        item.authoritativePricePaise = null;
+      }
+    } finally {
+      if (cartItems.includes(item) && JSON.stringify(item.settings) === settingsKey) {
+        item.quotePending = false;
+        renderCart();
       }
     }
+  }
 
-    if (pagesCount <= 0) return 0;
-
-    const nup = parseInt(settings.pagesPerSheet, 10) || 1;
-    const imposedPages = Math.ceil(pagesCount / nup);
-    const isColor = (settings.mode === 'Color');
-    const isDuplex = (settings.sides === 'Double-sided');
-    const copies = Math.max(1, parseInt(settings.copies, 10) || 1);
-
-    let singleCopyPricePaise = 0;
-    if (isDuplex) {
-      const fullSheets = Math.floor(imposedPages / 2);
-      const hasOddPage = (imposedPages % 2 !== 0);
-      if (isColor) {
-        singleCopyPricePaise = (fullSheets * RATE_COLOR_DOUBLE_PAISE) + (hasOddPage ? RATE_COLOR_SINGLE_PAISE : 0);
-      } else {
-        singleCopyPricePaise = (fullSheets * RATE_BW_DOUBLE_PAISE) + (hasOddPage ? RATE_BW_SINGLE_PAISE : 0);
-      }
-    } else {
-      if (isColor) {
-        singleCopyPricePaise = imposedPages * RATE_COLOR_SINGLE_PAISE;
-      } else {
-        singleCopyPricePaise = imposedPages * RATE_BW_SINGLE_PAISE;
-      }
+  async function loadTariff() {
+    try {
+      const response = await fetch('/api/pricing');
+      if (!response.ok) throw new Error('Pricing is not configured');
+      const tariff = await response.json();
+      if (!Number.isSafeInteger(tariff.revision) || tariff.revision < 1) throw new Error('Invalid tariff');
+      activeTariff = tariff;
+      pricingRequestError = null;
+      updateRateLabels();
+    } catch (error) {
+      activeTariff = null;
+      pricingRequestError = error.message;
+      updateRateLabels();
     }
+  }
 
-    return singleCopyPricePaise * copies;
+  function updateRateLabels() {
+    const color = draftSettings?.mode === 'Color';
+    const first = activeTariff ? (color ? activeTariff.color_simplex_paise : activeTariff.bw_simplex_paise) : null;
+    const second = activeTariff ? (color ? activeTariff.color_duplex_sheet_paise : activeTariff.bw_duplex_sheet_paise) : null;
+    if (settingsSinglePriceLabel) settingsSinglePriceLabel.textContent = first === null ? '—' : formatRupees(first) + '/side';
+    if (settingsDoublePriceLabel) settingsDoublePriceLabel.textContent = second === null ? '—' : formatRupees(second) + '/full sheet';
+    if (cardModeColor) {
+      const enabled = activeTariff?.color_enabled === true;
+      cardModeColor.style.opacity = enabled ? '' : '0.5';
+      cardModeColor.setAttribute('aria-disabled', String(!enabled));
+    }
+  }
+
+  function scheduleDraftQuote() {
+    const item = cartItems.find(it => it.id === activeSettingsDocId);
+    if (!item || !draftSettings || !item.file) return;
+    clearTimeout(draftQuoteTimer);
+    const serial = ++draftQuoteSerial;
+    const settings = JSON.parse(JSON.stringify(draftSettings));
+    if (saveSettingsPrice) saveSettingsPrice.textContent = '…';
+    draftQuoteTimer = setTimeout(async () => {
+      try {
+        const quote = await fetchDocumentQuote(item, settings);
+        if (serial === draftQuoteSerial && saveSettingsPrice) saveSettingsPrice.textContent = formatRupees(quote.total_price_paise);
+      } catch (_) {
+        if (serial === draftQuoteSerial && saveSettingsPrice) saveSettingsPrice.textContent = '—';
+      }
+    }, 350);
   }
 
   function getDocSelectedPages(totalPages, settings) {
