@@ -87,15 +87,20 @@
           json: async () => JSON.parse(request.responseText)
         });
       });
-      request.addEventListener('error', () => reject(new Error(
-        'Connection interrupted. The order might have been created; check your kiosk or existing orders before trying again.'
-      )));
-      request.addEventListener('abort', () => reject(new Error(
-        'Upload interrupted. Check whether an order was created before retrying.'
-      )));
-      request.addEventListener('timeout', () => reject(new Error(
-        'Order response timed out. Check whether an order was created before retrying.'
-      )));
+      const ambiguousFailure = message => {
+        const error = new Error(message);
+        error.orderOutcomeUncertain = true;
+        reject(error);
+      };
+      request.addEventListener('error', () => ambiguousFailure(
+        'Connection interrupted. The order might have been created. Check your kiosk before starting a new order.'
+      ));
+      request.addEventListener('abort', () => ambiguousFailure(
+        'Upload interrupted. Check whether an order was created before starting a new order.'
+      ));
+      request.addEventListener('timeout', () => ambiguousFailure(
+        'Order response timed out. Check whether an order was created before starting a new order.'
+      ));
       request.send(formData);
     });
   }
@@ -148,6 +153,7 @@
   const checkoutProgressTrack = document.getElementById('checkout-progress-track');
   const checkoutProgressBar = document.getElementById('checkout-progress-bar');
   let orderSubmitting = false;
+  let orderOutcomeUncertain = false;
 
   // Banner Carousel DOM
   const bannerTrack = document.getElementById('banner-track');
@@ -810,7 +816,7 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
       `;
       const canProceed = !isProcessing && readyCount > 0 && totalCartPaise > 0 && cartItems.filter(it => it.status === 'ready').every(it => Number.isSafeInteger(it.authoritativePricePaise) && it.authoritativePricePaise > 0 && itemHasCurrentQuote(it));
-      btnReviewOrder.disabled = orderSubmitting || !canProceed;
+      btnReviewOrder.disabled = orderSubmitting || orderOutcomeUncertain || !canProceed;
     }
   }
 
@@ -2110,7 +2116,7 @@
 
 
   async function submitOrder() {
-    if (orderSubmitting || (btnReviewOrder && btnReviewOrder.disabled)) return;
+    if (orderSubmitting || orderOutcomeUncertain || (btnReviewOrder && btnReviewOrder.disabled)) return;
     const readyItems = cartItems.filter(it => it.status === 'ready');
     const processingItems = cartItems.filter(it => it.status === 'processing');
     if (processingItems.length > 0) {
@@ -2252,6 +2258,7 @@
       switchView('checkout');
       console.info('Order submitted in', Math.round(performance.now() - orderStartedAt), 'ms');
     } catch (orderErr) {
+      if (orderErr.orderOutcomeUncertain) orderOutcomeUncertain = true;
       console.error('Order submission error:', orderErr);
       showCartError(`Could not create order: ${orderErr.message || orderErr}`);
     } finally {
