@@ -98,7 +98,11 @@ test('ambiguous network failure never silently resubmits an order', async () => 
     const count = MockUploadRequest.calls.length;
     const pending = uploadOrderWithProgress('/api/k/demo/upload', {}, () => {});
     MockUploadRequest.calls.at(-1).fail('error');
-    await assert.rejects(pending, /might have been created/);
+    await assert.rejects(pending, error => {
+      assert.match(error.message, /might have been created/);
+      assert.equal(error.orderOutcomeUncertain, true);
+      return true;
+    });
     assert.equal(MockUploadRequest.calls.length, count + 1);
   } finally { global.XMLHttpRequest = original; }
 });
