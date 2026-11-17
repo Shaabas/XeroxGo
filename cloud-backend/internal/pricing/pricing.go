@@ -121,3 +121,93 @@ func ResolveUnitPriceFromConfig(hasPricing bool, tariff TariffConfig, colorMode 
 	return ResolveUnitPrice(tariff, colorMode, duplex, fallbackUnitPrice)
 }
 
+
+// DuplexPricingPolicy selects how the duplex tariff is interpreted.
+// Existing deployments default to per-side pricing until tariff migration is approved.
+type DuplexPricingPolicy string
+
+const (
+	PricingPerSide  DuplexPricingPolicy = "per-side"
+	PricingPerSheet DuplexPricingPolicy = "per-sheet"
+)
+
+// DocumentQuote is a cloud-authoritative price calculation.
+// The supplied imposed-side count excludes blank duplex padding.
+type DocumentQuote struct {
+	TotalPaise     int64
+	UnitPricePaise int64
+	BilledSides    int
+}
+
+// QuoteDocument is the single pricing calculation used by document preview and upload.
+// With the per-sheet policy, a two-sided sheet uses the duplex rate and a
+// trailing single occupied side uses the simplex rate.
+func QuoteDocument(
+	imposedSides, copies int,
+	colorMode string,
+	duplex contracts.DuplexMode,
+	tariff TariffConfig,
+	hasPricing bool,
+	fallback int64,
+	policy DuplexPricingPolicy,
+) (DocumentQuote, error) {
+	if imposedSides <= 0 || copies <= 0 {
+		return DocumentQuote{}, errors.New("pricing: imposed sides and copies must be positive")
+	}
+	if duplex != contracts.DuplexSimplex &&
+		duplex != contracts.DuplexLongEdge &&
+		duplex != contracts.DuplexShortEdge {
+		return DocumentQuote{}, fmt.Errorf("pricing: unknown duplex mode %q", duplex)
+	}
+	if colorMode != "BW" && colorMode != "COLOR" {
+		return DocumentQuote{}, fmt.Errorf("pricing: unknown color mode %q", colorMode)
+	}
+	if policy != "" && policy != PricingPerSide && policy != PricingPerSheet {
+		return DocumentQuote{}, fmt.Errorf("pricing: unknown policy %q", policy)
+	}
+
+	unit := ResolveUnitPriceFromConfig(hasPricing, tariff, colorMode, duplex, fallback)
+	if unit <= 0 {
+		return DocumentQuote{}, errors.New("pricing: invalid selected tariff")
+	}
+	if imposedSides > int(^uint(0)>>1)/copies {
+		return DocumentQuote{}, errors.New("pricing: billed sides overflow")
+	}
+	billedSides := imposedSides * copies
+	if policy != PricingPerSheet || duplex == contracts.DuplexSimplex {
+		amount, err := CalculatePricePaise(billedSides, unit)
+		if err != nil {
+			return DocumentQuote{}, err
+		}
+		return DocumentQuote{
+			TotalPaise: amount, UnitPricePaise: unit, BilledSides: billedSides,
+		}, nil
+	}
+
+	if !hasPricing {
+		return DocumentQuote{}, errors.New("pricing: sheet policy requires configured four-tier tariffs")
+	}
+	simplex := ResolveUnitPrice(tariff, colorMode, contracts.DuplexSimplex, 0)
+	if simplex <= 0 {
+		return DocumentQuote{}, errors.New("pricing: invalid simplex tariff")
+	}
+	fullSheets := int64(imposedSides / 2)
+	if fullSheets > MaxInt64/unit {
+		return DocumentQuote{}, errors.New("pricing: duplex total overflow")
+	}
+	perCopy := fullSheets * unit
+	if imposedSides%2 != 0 {
+		if perCopy > MaxInt64-simplex {
+			return DocumentQuote{}, errors.New("pricing: trailing-side total overflow")
+		}
+		perCopy += simplex
+	}
+	if int64(copies) > MaxInt64/perCopy {
+		return DocumentQuote{}, errors.New("pricing: copies total overflow")
+	}
+	return DocumentQuote{
+		TotalPaise: perCopy * int64(copies),
+		UnitPricePaise: unit,
+		BilledSides: billedSides,
+	}, nil
+}
