@@ -67,11 +67,13 @@ func TestMultiDocumentOrderCreationAndRetrieval(t *testing.T) {
 			KioskID:     "kiosk-m1",
 			DisplayCode: "1234",
 		},
-		Status:     contracts.JobStatusNormalized,
-		PricePaise: 750,
-		Documents:  docs,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Status:      contracts.JobStatusNormalized,
+		PricePaise:  750,
+		TotalPages:  11,
+		TotalSheets: 6,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	if err := s.CreateOrder(ctx, ord); err != nil {
@@ -168,6 +170,7 @@ func TestMultiDocumentOrderCreationAtomicity(t *testing.T) {
 			TotalSheets:      1,
 			Copies:           1,
 			Duplex:           contracts.DuplexSimplex,
+			PricePaise:       100,
 		},
 		{
 			JobID:            "job-atom-1",
@@ -180,6 +183,7 @@ func TestMultiDocumentOrderCreationAtomicity(t *testing.T) {
 			TotalSheets:      1,
 			Copies:           1,
 			Duplex:           contracts.DuplexSimplex,
+			PricePaise:       100,
 		},
 	}
 
@@ -189,9 +193,11 @@ func TestMultiDocumentOrderCreationAtomicity(t *testing.T) {
 			KioskID:     "kiosk-m1",
 			DisplayCode: "1234",
 		},
-		Status:     contracts.JobStatusNormalized,
-		PricePaise: 200,
-		Documents:  badDocs,
+		Status:      contracts.JobStatusNormalized,
+		PricePaise:  200,
+		TotalPages:  2,
+		TotalSheets: 2,
+		Documents:   badDocs,
 	}
 
 	err := s.CreateOrder(ctx, ord)
@@ -218,11 +224,104 @@ func TestMultiDocumentOrderCreationAtomicity(t *testing.T) {
 	}
 }
 
-func TestMultiDocumentPaymentAndDispatch(t *testing.T) {
+func TestCreateOrder_ParentTotalsEnforced(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	orderID := "ord-disp-multi"
+	orderID := "ord-totals-check"
+	kioskID := "kiosk-tot"
+
+	docs := []OrderDocument{
+		{
+			JobID:            "job-t-0",
+			OrderID:          orderID,
+			DocumentIndex:    0,
+			OriginalFilename: "doc0.pdf",
+			DownloadURL:      "https://example.com/0.pdf",
+			SHA256Checksum:   "sha0",
+			TotalPages:       3,
+			TotalSheets:      2,
+			Copies:           1,
+			Duplex:           contracts.DuplexLongEdge,
+			PricePaise:       300,
+		},
+		{
+			JobID:            "job-t-1",
+			OrderID:          orderID,
+			DocumentIndex:    1,
+			OriginalFilename: "doc1.pdf",
+			DownloadURL:      "https://example.com/1.pdf",
+			SHA256Checksum:   "sha1",
+			TotalPages:       2,
+			TotalSheets:      1,
+			Copies:           1,
+			Duplex:           contracts.DuplexSimplex,
+			PricePaise:       200,
+		},
+	}
+
+	// 1. TotalPages mismatch (5 actual vs 4 claimed) -> must be rejected
+	ordBadPages := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1111"},
+		Status:      contracts.JobStatusNormalized,
+		PricePaise:  500,
+		TotalPages:  4, // MISMATCH
+		TotalSheets: 3,
+		Documents:   docs,
+	}
+	if err := s.CreateOrder(ctx, ordBadPages); err == nil {
+		t.Fatal("expected error on total_pages mismatch, got nil")
+	}
+
+	// 2. TotalSheets mismatch (3 actual vs 4 claimed) -> must be rejected
+	ordBadSheets := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1111"},
+		Status:      contracts.JobStatusNormalized,
+		PricePaise:  500,
+		TotalPages:  5,
+		TotalSheets: 4, // MISMATCH
+		Documents:   docs,
+	}
+	if err := s.CreateOrder(ctx, ordBadSheets); err == nil {
+		t.Fatal("expected error on total_sheets mismatch, got nil")
+	}
+
+	// 3. PricePaise mismatch (500 actual vs 450 claimed) -> must be rejected
+	ordBadPrice := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1111"},
+		Status:      contracts.JobStatusNormalized,
+		PricePaise:  450, // MISMATCH
+		TotalPages:  5,
+		TotalSheets: 3,
+		Documents:   docs,
+	}
+	if err := s.CreateOrder(ctx, ordBadPrice); err == nil {
+		t.Fatal("expected error on price_paise mismatch, got nil")
+	}
+
+	// 4. Exact match succeeds
+	ordValid := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1111"},
+		Status:      contracts.JobStatusNormalized,
+		PricePaise:  500,
+		TotalPages:  5,
+		TotalSheets: 3,
+		Documents:   docs,
+	}
+	if err := s.CreateOrder(ctx, ordValid); err != nil {
+		t.Fatalf("expected valid order with matching totals to succeed, got %v", err)
+	}
+}
+
+func TestMultiDocumentPayment_DispatchPreventedUntilSpoolerReady(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	orderID := "ord-disp-prevent"
 	kioskID := "kiosk-m2"
 	now := time.Now().UTC()
 
@@ -239,6 +338,7 @@ func TestMultiDocumentPaymentAndDispatch(t *testing.T) {
 			Copies:           1,
 			Duplex:           contracts.DuplexSimplex,
 			ColorMode:        "BW",
+			PricePaise:       100,
 		},
 		{
 			JobID:            "job-disp-1",
@@ -252,6 +352,7 @@ func TestMultiDocumentPaymentAndDispatch(t *testing.T) {
 			Copies:           2,
 			Duplex:           contracts.DuplexLongEdge,
 			ColorMode:        "COLOR",
+			PricePaise:       300,
 		},
 	}
 
@@ -261,11 +362,13 @@ func TestMultiDocumentPaymentAndDispatch(t *testing.T) {
 			KioskID:     kioskID,
 			DisplayCode: "5678",
 		},
-		Status:     contracts.JobStatusPendingPayment,
-		PricePaise: 400,
-		Documents:  docs,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  400,
+		TotalPages:  6,
+		TotalSheets: 3,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	if err := s.CreateOrder(ctx, ord); err != nil {
@@ -306,45 +409,128 @@ func TestMultiDocumentPaymentAndDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CapturePaymentAndCheckDispatch failed: %v", err)
 	}
-	if !result.DispatchEligible {
-		t.Fatalf("expected DispatchEligible=true, got false")
+
+	// SAFEGUARD VERIFICATION: Multi-job orders must NOT be dispatched to the kiosk!
+	if result.DispatchEligible {
+		t.Fatalf("VIOLATION: multi-job order was marked DispatchEligible=true before kiosk spooler upgrade!")
 	}
-	if len(result.Commands) != 2 {
-		t.Fatalf("expected 2 dispatched commands, got %d", len(result.Commands))
+	if result.OrderStatus != contracts.JobStatusPaidWaiting {
+		t.Errorf("expected order status PAID_WAITING, got %s", result.OrderStatus)
+	}
+	if len(result.Commands) != 0 {
+		t.Errorf("expected 0 dispatched commands for multi-job order, got %d", len(result.Commands))
 	}
 
-	// Verify both commands have document-specific properties
-	if result.Commands[0].JobID != "job-disp-0" || result.Commands[0].DocumentIndex != 0 || result.Commands[0].TotalDocuments != 2 {
-		t.Errorf("unexpected command[0]: %+v", result.Commands[0])
-	}
-	if result.Commands[1].JobID != "job-disp-1" || result.Commands[1].DocumentIndex != 1 || result.Commands[1].ColorMode != "COLOR" {
-		t.Errorf("unexpected command[1]: %+v", result.Commands[1])
-	}
-
-	// Check dispatch_intents has 2 records keyed by job_id
+	// Check dispatch_intents has 0 records (no intent created for multi-job order)
 	var intentCount int
 	err = s.db.QueryRow("SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ?", orderID).Scan(&intentCount)
 	if err != nil {
 		t.Fatalf("query intent count failed: %v", err)
 	}
-	if intentCount != 2 {
-		t.Fatalf("expected 2 dispatch_intents rows, got %d", intentCount)
+	if intentCount != 0 {
+		t.Fatalf("expected 0 dispatch_intents rows, got %d", intentCount)
 	}
 
-	// Mark first intent sent & acknowledged
-	if err := s.MarkDispatchIntentSent(ctx, "job-disp-0"); err != nil {
-		t.Fatalf("MarkDispatchIntentSent failed: %v", err)
-	}
-	if err := s.MarkDispatchIntentAcknowledged(ctx, "job-disp-0"); err != nil {
-		t.Fatalf("MarkDispatchIntentAcknowledged failed: %v", err)
+	// Attempting ReleasePaidOrder on multi-job order must fail explicitly
+	_, err = s.ReleasePaidOrder(ctx, kioskID, orderID, sess.SessionID, now)
+	if err == nil {
+		t.Fatal("expected ReleasePaidOrder to fail on multi-job order, got nil")
 	}
 
-	st0, ack0, err := s.GetDispatchIntentStatus(ctx, "job-disp-0")
+	// GetPendingDispatchOrders must NOT return commands for multi-job orders
+	pendingCmds, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil {
+		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
+	}
+	for _, c := range pendingCmds {
+		if c.OrderID == orderID {
+			t.Fatalf("VIOLATION: GetPendingDispatchOrders returned command for multi-job order %s", orderID)
+		}
+	}
+}
+
+func TestSingleDocumentPaymentAndDispatch_Succeeds(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	orderID := "ord-single-disp"
+	kioskID := "kiosk-single"
+	now := time.Now().UTC()
+
+	ord := Order{
+		OrderID: orderID,
+		Command: contracts.PrintJobCommand{
+			JobID:          "job-single-1",
+			KioskID:        kioskID,
+			DisplayCode:    "4321",
+			DownloadURL:    "https://example.com/single.pdf",
+			SHA256Checksum: "shasingle",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  200,
+		TotalPages:  2,
+		TotalSheets: 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	sess, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 10, 15*time.Minute, now)
+	if err != nil {
+		t.Fatalf("create session failed: %v", err)
+	}
+
+	att := PaymentAttempt{
+		AttemptID:   "att-single-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		SessionID:   sess.SessionID,
+		AmountPaise: 200,
+		Status:      "CREATED",
+		ExpiresAt:   now.Add(15 * time.Minute),
+	}
+	if err := s.CreatePaymentAttempt(ctx, att); err != nil {
+		t.Fatalf("CreatePaymentAttempt failed: %v", err)
+	}
+
+	pay := PaymentRecord{
+		PaymentID:   "pay-single-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		SessionID:   sess.SessionID,
+		AmountPaise: 200,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}
+
+	result, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+	if err != nil {
+		t.Fatalf("CapturePaymentAndCheckDispatch failed: %v", err)
+	}
+	if !result.DispatchEligible {
+		t.Fatalf("expected single job to be DispatchEligible=true")
+	}
+	if result.OrderStatus != contracts.JobStatusDispatched {
+		t.Errorf("expected DISPATCHED status, got %s", result.OrderStatus)
+	}
+	if len(result.Commands) != 1 {
+		t.Fatalf("expected 1 dispatched command, got %d", len(result.Commands))
+	}
+
+	// Verify intent is recorded
+	st, _, err := s.GetDispatchIntentStatus(ctx, "job-single-1")
 	if err != nil {
 		t.Fatalf("GetDispatchIntentStatus failed: %v", err)
 	}
-	if st0 != "ACKNOWLEDGED" || ack0 <= 0 {
-		t.Errorf("expected ACKNOWLEDGED status with ack > 0, got %s / %d", st0, ack0)
+	if st != "PENDING" {
+		t.Errorf("expected PENDING status, got %s", st)
 	}
 }
 
@@ -369,6 +555,7 @@ func TestMultiDocumentOrderCompletionInvariant(t *testing.T) {
 			Copies:           1,
 			Duplex:           contracts.DuplexSimplex,
 			ColorMode:        "BW",
+			PricePaise:       100,
 		},
 		{
 			JobID:            "job-comp-1",
@@ -382,6 +569,7 @@ func TestMultiDocumentOrderCompletionInvariant(t *testing.T) {
 			Copies:           1,
 			Duplex:           contracts.DuplexSimplex,
 			ColorMode:        "BW",
+			PricePaise:       100,
 		},
 	}
 
@@ -391,11 +579,13 @@ func TestMultiDocumentOrderCompletionInvariant(t *testing.T) {
 			KioskID:     kioskID,
 			DisplayCode: "9999",
 		},
-		Status:     contracts.JobStatusDispatched,
-		PricePaise: 200,
-		Documents:  docs,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  200,
+		TotalPages:  4,
+		TotalSheets: 2,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	if err := s.CreateOrder(ctx, ord); err != nil {
@@ -506,85 +696,44 @@ VALUES (?, 'https://example.com/dummy.pdf', 'sha', 1, 1, 1, 'SIMPLEX', 1, 'BW');
 	}
 }
 
-func TestMultiDocumentGetPendingDispatchOrders(t *testing.T) {
+func TestGetOrder_ChildDocumentReadFailure(t *testing.T) {
 	s, _ := newTestStore(t)
 	ctx := context.Background()
 
-	orderID := "ord-pending-multi"
-	kioskID := "kiosk-pm1"
+	orderID := "ord-corrupt-read"
+	kioskID := "kiosk-cr"
 	now := time.Now().UTC()
 
-	docs := []OrderDocument{
-		{
-			JobID:            "job-pm-0",
-			OrderID:          orderID,
-			DocumentIndex:    0,
-			OriginalFilename: "report.pdf",
-			DownloadURL:      "https://example.com/report.pdf",
-			SHA256Checksum:   "sha0",
-			TotalPages:       10,
-			TotalSheets:      5,
-			Copies:           3,
-			Duplex:           contracts.DuplexLongEdge,
-			ColorMode:        "BW",
-		},
-		{
-			JobID:            "job-pm-1",
-			OrderID:          orderID,
-			DocumentIndex:    1,
-			OriginalFilename: "cover.pdf",
-			DownloadURL:      "https://example.com/cover.pdf",
-			SHA256Checksum:   "sha1",
-			TotalPages:       1,
-			TotalSheets:      1,
-			Copies:           3,
-			Duplex:           contracts.DuplexSimplex,
-			ColorMode:        "COLOR",
-		},
-	}
-
-	ord := Order{
-		OrderID: orderID,
-		Command: contracts.PrintJobCommand{
-			KioskID:     kioskID,
-			DisplayCode: "1122",
-		},
-		Status:     contracts.JobStatusDispatched,
-		PricePaise: 800,
-		Documents:  docs,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := s.CreateOrder(ctx, ord); err != nil {
-		t.Fatalf("CreateOrder failed: %v", err)
-	}
-
-	// Insert 2 pending dispatch intents
-	nowNS := now.UnixNano()
-	for _, d := range docs {
-		_, err := s.db.Exec(`
-INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
-VALUES (?, ?, ?, '', 'PENDING', ?, ?);
-`, d.JobID, orderID, kioskID, nowNS, nowNS)
-		if err != nil {
-			t.Fatalf("insert dispatch_intent %s failed: %v", d.JobID, err)
-		}
-	}
-
-	cmds, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	// Insert order and print_config
+	_, err := s.db.Exec(`
+INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, created_at_ns, updated_at_ns)
+VALUES (?, 'job-cr-0', ?, '3333', 'PENDING_PAYMENT', 100, ?, ?);
+`, orderID, kioskID, now.UnixNano(), now.UnixNano())
 	if err != nil {
-		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
+		t.Fatalf("insert raw order failed: %v", err)
 	}
-	if len(cmds) != 2 {
-		t.Fatalf("expected 2 commands, got %d", len(cmds))
+	_, err = s.db.Exec(`
+INSERT INTO print_configs (order_id, download_url, sha256_checksum, total_pages, total_sheets, copies, duplex, start_from_page, color_mode)
+VALUES (?, 'https://example.com/cr.pdf', 'shacr', 1, 1, 1, 'SIMPLEX', 1, 'BW');
+`, orderID)
+	if err != nil {
+		t.Fatalf("insert raw print_configs failed: %v", err)
 	}
 
-	// Verify command 0
-	if cmds[0].JobID != "job-pm-0" || cmds[0].DocumentIndex != 0 || cmds[0].TotalDocuments != 2 || cmds[0].Copies != 3 || cmds[0].Duplex != contracts.DuplexLongEdge || cmds[0].ColorMode != "BW" || cmds[0].OriginalFilename != "report.pdf" {
-		t.Errorf("cmds[0] properties incorrect: %+v", cmds[0])
+	// Insert order_document with invalid total_sheets = NULL or invalid type that causes scan failure
+	// In SQLite we can insert a non-integer string into an INTEGER column to cause Scan to fail with an error!
+	_, err = s.db.Exec(`
+INSERT INTO order_documents (job_id, order_id, document_index, original_filename, download_url, sha256_checksum,
+    total_pages, total_sheets, copies, duplex, color_mode, price_paise, status, created_at_ns, updated_at_ns)
+VALUES ('job-cr-0', ?, 0, 'file.pdf', 'https://example.com', 'sha', 'NOT_AN_INT_CORRUPT', 1, 1, 'SIMPLEX', 'BW', 100, 'NORMALIZED', ?, ?);
+`, orderID, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert corrupt order_document failed: %v", err)
 	}
-	// Verify command 1
-	if cmds[1].JobID != "job-pm-1" || cmds[1].DocumentIndex != 1 || cmds[1].TotalDocuments != 2 || cmds[1].Copies != 3 || cmds[1].Duplex != contracts.DuplexSimplex || cmds[1].ColorMode != "COLOR" || cmds[1].OriginalFilename != "cover.pdf" {
-		t.Errorf("cmds[1] properties incorrect: %+v", cmds[1])
+
+	// GetOrder must fail explicitly and NEVER return an order with silently missing documents!
+	ord, err := s.GetOrder(ctx, orderID)
+	if err == nil {
+		t.Fatalf("expected GetOrder to fail explicitly on corrupted child document scan, got order: %+v", ord)
 	}
 }

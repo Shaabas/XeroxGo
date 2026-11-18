@@ -12,9 +12,9 @@ echo "Working directory: ${REPO_ROOT}"
 echo ""
 
 # -----------------------------------------------------------------------------
-# Gate 1 — Frozen Contracts
+# Gate 1 — Contract Baseline & Verification
 # -----------------------------------------------------------------------------
-echo "=== Gate 1: Frozen Contracts ==="
+echo "=== Gate 1: Contract Baseline & Verification ==="
 gate1_passed=true
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -27,13 +27,33 @@ if [[ ! -f "pkg/contracts/models.go" ]]; then
     gate1_passed=false
 fi
 
+if [[ ! -f "pkg/contracts/contract_baseline.sha256" ]]; then
+    echo "ERROR: pkg/contracts/contract_baseline.sha256 does not exist."
+    gate1_passed=false
+fi
+
 if [[ "$gate1_passed" == "true" ]]; then
-    if go vet ./pkg/contracts/... >/dev/null 2>&1 && go test -race ./pkg/contracts/... >/dev/null 2>&1; then
-        CURRENT_SHA=$(sha256sum pkg/contracts/models.go | awk '{print $1}')
-        echo "Gate 1 PASSED: pkg/contracts/models.go valid and verified (${CURRENT_SHA})."
-    else
-        echo "ERROR: pkg/contracts validation failed."
+    CURRENT_SHA=$(sha256sum pkg/contracts/models.go | awk '{print $1}')
+    BASELINE_SHA=$(cat pkg/contracts/contract_baseline.sha256 | tr -d '[:space:]')
+
+    if [[ "$CURRENT_SHA" != "$BASELINE_SHA" ]]; then
+        echo "ERROR: pkg/contracts/models.go checksum (${CURRENT_SHA}) does not match recorded baseline (${BASELINE_SHA})."
+        echo "If this contract change is intentional, update pkg/contracts/contract_baseline.sha256 and ensure roundtrip tests pass."
         gate1_passed=false
+    fi
+
+    if ! go vet ./pkg/contracts/... >/dev/null 2>&1; then
+        echo "ERROR: go vet ./pkg/contracts/... failed."
+        gate1_passed=false
+    fi
+
+    if ! go test -race ./pkg/contracts/... >/dev/null 2>&1; then
+        echo "ERROR: go test -race ./pkg/contracts/... failed."
+        gate1_passed=false
+    fi
+
+    if [[ "$gate1_passed" == "true" ]]; then
+        echo "Gate 1 PASSED: pkg/contracts/models.go verified against baseline (${CURRENT_SHA})."
     fi
 fi
 

@@ -297,3 +297,178 @@ func TestIsOrderCompleted(t *testing.T) {
 		t.Errorf("expected order to be completed when all child jobs are COMPLETED")
 	}
 }
+
+func TestIsOrderCompleted_MissingJobIndices(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	orderID := "ord-missing-indices"
+	// Order expects 3 documents, but only index 0 and index 2 exist (index 1 is missing)
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job-miss-0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 3,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/0.pdf",
+		SHA256Checksum: "sha0",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd2 := contracts.PrintJobCommand{
+		JobID:          "job-miss-2",
+		OrderID:        orderID,
+		DocumentIndex:  2,
+		TotalDocuments: 3,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/2.pdf",
+		SHA256Checksum: "sha2",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	_ = s.SaveJob(ctx, cmd0, contracts.JobStatusCompleted)
+	_ = s.SaveJob(ctx, cmd2, contracts.JobStatusCompleted)
+
+	completed, err := s.IsOrderCompleted(ctx, orderID)
+	if err != nil {
+		t.Fatalf("IsOrderCompleted returned unexpected error: %v", err)
+	}
+	if completed {
+		t.Fatalf("INVARIANT VIOLATION: order with missing index 1 evaluated to completed!")
+	}
+}
+
+func TestIsOrderCompleted_DuplicateJobIndices(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	orderID := "ord-dup-indices"
+	// Two distinct jobs saved with duplicate document_index 0
+	cmd0a := contracts.PrintJobCommand{
+		JobID:          "job-dup-0a",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/0a.pdf",
+		SHA256Checksum: "sha0a",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd0b := contracts.PrintJobCommand{
+		JobID:          "job-dup-0b",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/0b.pdf",
+		SHA256Checksum: "sha0b",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	_ = s.SaveJob(ctx, cmd0a, contracts.JobStatusCompleted)
+	_ = s.SaveJob(ctx, cmd0b, contracts.JobStatusCompleted)
+
+	_, err := s.IsOrderCompleted(ctx, orderID)
+	if err == nil {
+		t.Fatalf("expected error for duplicate document_index, got nil")
+	}
+}
+
+func TestIsOrderCompleted_InconsistentTotalDocuments(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	orderID := "ord-inconsistent-total"
+	// Job 0 claims total=2, Job 1 claims total=3
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job-incon-0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/0.pdf",
+		SHA256Checksum: "sha0",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job-incon-1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 3,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/1.pdf",
+		SHA256Checksum: "sha1",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	_ = s.SaveJob(ctx, cmd0, contracts.JobStatusCompleted)
+	_ = s.SaveJob(ctx, cmd1, contracts.JobStatusCompleted)
+
+	_, err := s.IsOrderCompleted(ctx, orderID)
+	if err == nil {
+		t.Fatalf("expected error for inconsistent total_documents across jobs, got nil")
+	}
+}
+
+func TestIsOrderCompleted_OutOfRangeIndex(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	orderID := "ord-out-of-range"
+	// TotalDocuments is 2, but DocumentIndex is 2 (valid indices are 0 and 1)
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job-out-range",
+		OrderID:        orderID,
+		DocumentIndex:  2,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-01",
+		DisplayCode:    "A1B2",
+		DownloadURL:    "https://example.invalid/2.pdf",
+		SHA256Checksum: "sha2",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	_ = s.SaveJob(ctx, cmd, contracts.JobStatusCompleted)
+
+	_, err := s.IsOrderCompleted(ctx, orderID)
+	if err == nil {
+		t.Fatalf("expected error for out-of-range document_index, got nil")
+	}
+}

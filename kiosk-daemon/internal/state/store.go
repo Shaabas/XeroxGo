@@ -143,24 +143,134 @@ CREATE TABLE IF NOT EXISTS printer_state (
 		return nil, fmt.Errorf("failed to initialize database schema: %w", err)
 	}
 
-	// Schema migrations for existing databases
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN cups_job_id TEXT NOT NULL DEFAULT '';")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN submitted_to_printer INTEGER NOT NULL DEFAULT 0;")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN order_id TEXT NOT NULL DEFAULT '';")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN document_index INTEGER NOT NULL DEFAULT 0;")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN total_documents INTEGER NOT NULL DEFAULT 1;")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN original_filename TEXT NOT NULL DEFAULT '';")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
-	_, _ = db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_jobs_order_doc ON jobs (order_id, document_index);")
-	_, _ = db.ExecContext(ctx, "ALTER TABLE printer_state ADD COLUMN is_calibrated INTEGER NOT NULL DEFAULT 0;")
-
-	initQuery := `
-INSERT OR IGNORE INTO printer_state (id, estimated_sheets, is_calibrated)
-VALUES (1, 250, 0);
-`
-	if _, err := db.ExecContext(ctx, initQuery); err != nil {
+	// Inspect existing columns before migrating
+	jobCols := make(map[string]bool)
+	rowsJobs, err := db.QueryContext(ctx, "PRAGMA table_info(jobs);")
+	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("failed to initialize default printer state: %w", err)
+		return nil, fmt.Errorf("inspect jobs table schema: %w", err)
+	}
+	for rowsJobs.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt *string
+		if err := rowsJobs.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rowsJobs.Close()
+			cleanup()
+			return nil, fmt.Errorf("scan jobs column info: %w", err)
+		}
+		jobCols[name] = true
+	}
+	if err := rowsJobs.Err(); err != nil {
+		_ = rowsJobs.Close()
+		cleanup()
+		return nil, fmt.Errorf("iterate jobs column info: %w", err)
+	}
+	_ = rowsJobs.Close()
+
+	printerCols := make(map[string]bool)
+	rowsPrinter, err := db.QueryContext(ctx, "PRAGMA table_info(printer_state);")
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("inspect printer_state table schema: %w", err)
+	}
+	for rowsPrinter.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt *string
+		if err := rowsPrinter.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rowsPrinter.Close()
+			cleanup()
+			return nil, fmt.Errorf("scan printer_state column info: %w", err)
+		}
+		printerCols[name] = true
+	}
+	if err := rowsPrinter.Err(); err != nil {
+		_ = rowsPrinter.Close()
+		cleanup()
+		return nil, fmt.Errorf("iterate printer_state column info: %w", err)
+	}
+	_ = rowsPrinter.Close()
+
+	// Execute migrations atomically in a transaction
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if !jobCols["cups_job_id"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN cups_job_id TEXT NOT NULL DEFAULT '';"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add cups_job_id: %w", err)
+		}
+	}
+	if !jobCols["submitted_to_printer"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN submitted_to_printer INTEGER NOT NULL DEFAULT 0;"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add submitted_to_printer: %w", err)
+		}
+	}
+	if !jobCols["order_id"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN order_id TEXT NOT NULL DEFAULT '';"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add order_id: %w", err)
+		}
+	}
+	if !jobCols["document_index"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN document_index INTEGER NOT NULL DEFAULT 0;"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add document_index: %w", err)
+		}
+	}
+	if !jobCols["total_documents"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN total_documents INTEGER NOT NULL DEFAULT 1;"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add total_documents: %w", err)
+		}
+	}
+	if !jobCols["original_filename"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN original_filename TEXT NOT NULL DEFAULT '';"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add original_filename: %w", err)
+		}
+	}
+	if !jobCols["color_mode"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate jobs add color_mode: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_jobs_order_doc ON jobs (order_id, document_index);"); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("create index idx_jobs_order_doc: %w", err)
+	}
+
+	if !printerCols["is_calibrated"] {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE printer_state ADD COLUMN is_calibrated INTEGER NOT NULL DEFAULT 0;"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("migrate printer_state add is_calibrated: %w", err)
+		}
+	}
+
+	var stateCount int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(1) FROM printer_state WHERE id = 1;").Scan(&stateCount); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("check printer_state record: %w", err)
+	}
+	if stateCount == 0 {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO printer_state (id, estimated_sheets, is_calibrated) VALUES (1, 250, 0);"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("initialize default printer state: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("commit migration tx: %w", err)
 	}
 
 	return &Store{db: db}, nil
@@ -741,8 +851,8 @@ ORDER BY document_index ASC;`
 }
 
 // IsOrderCompleted checks whether all jobs belonging to the order are completed.
-// Invariant: exactly N persisted jobs (N > 0) must all be marked COMPLETED.
-// Zero jobs must never count as completed.
+// Invariant: requires exactly the authoritative TotalDocuments count, all COMPLETED.
+// Rejects missing, duplicate, out-of-range, or inconsistent child indices.
 func (s *Store) IsOrderCompleted(
 	ctx context.Context,
 	orderID string,
@@ -761,22 +871,77 @@ func (s *Store) IsOrderCompleted(
 		return false, errors.New("order_id cannot be empty")
 	}
 
-	var totalJobs, completedJobs int
 	query := `
-SELECT COUNT(1), COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0)
+SELECT document_index, total_documents, status
 FROM jobs
 WHERE order_id = ?;`
 
-	err := s.db.QueryRowContext(ctx, query, orderID).Scan(&totalJobs, &completedJobs)
+	rows, err := s.db.QueryContext(ctx, query, orderID)
 	if err != nil {
-		return false, fmt.Errorf("failed to check order completion for %s: %w", orderID, err)
+		return false, fmt.Errorf("check order completion for %s: %w", orderID, err)
+	}
+	defer rows.Close()
+
+	type jobInfo struct {
+		index     int
+		totalDocs int
+		status    string
+	}
+	var jobList []jobInfo
+	for rows.Next() {
+		var j jobInfo
+		if err := rows.Scan(&j.index, &j.totalDocs, &j.status); err != nil {
+			return false, fmt.Errorf("check order completion for %s: scan: %w", orderID, err)
+		}
+		jobList = append(jobList, j)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("check order completion for %s: rows: %w", orderID, err)
 	}
 
-	if totalJobs == 0 {
+	if len(jobList) == 0 {
 		return false, nil
 	}
 
-	return totalJobs == completedJobs, nil
+	authTotal := jobList[0].totalDocs
+	if authTotal < 1 {
+		return false, fmt.Errorf("order %s has invalid authoritative total_documents: %d", orderID, authTotal)
+	}
+
+	seenIndices := make(map[int]bool)
+	allCompleted := true
+
+	for _, j := range jobList {
+		if j.totalDocs != authTotal {
+			return false, fmt.Errorf("order %s has inconsistent total_documents: expected %d, got %d", orderID, authTotal, j.totalDocs)
+		}
+		if j.index < 0 || j.index >= authTotal {
+			return false, fmt.Errorf("order %s has out-of-range document_index: %d (total %d)", orderID, j.index, authTotal)
+		}
+		if seenIndices[j.index] {
+			return false, fmt.Errorf("order %s has duplicate document_index: %d", orderID, j.index)
+		}
+		seenIndices[j.index] = true
+
+		if j.status != string(contracts.JobStatusCompleted) {
+			allCompleted = false
+		}
+	}
+
+	if len(jobList) < authTotal {
+		return false, nil
+	}
+	if len(jobList) > authTotal {
+		return false, fmt.Errorf("order %s has more jobs (%d) than total_documents (%d)", orderID, len(jobList), authTotal)
+	}
+
+	for i := 0; i < authTotal; i++ {
+		if !seenIndices[i] {
+			return false, fmt.Errorf("order %s has missing document_index %d", orderID, i)
+		}
+	}
+
+	return allCompleted, nil
 }
 
 func (s *Store) GetEstimatedSheets(

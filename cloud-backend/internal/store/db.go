@@ -469,8 +469,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"ALTER TABLE dispatch_intents ADD COLUMN IF NOT EXISTS acknowledged_at_ns BIGINT NOT NULL DEFAULT 0;",
 			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);",
 			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);",
-			"ALTER TABLE dispatch_intents DROP CONSTRAINT IF EXISTS dispatch_intents_pkey;",
-			"ALTER TABLE dispatch_intents ADD PRIMARY KEY (job_id);",
+			"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_name = 'dispatch_intents' AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = 'job_id') THEN ALTER TABLE dispatch_intents DROP CONSTRAINT IF EXISTS dispatch_intents_pkey; ALTER TABLE dispatch_intents ADD PRIMARY KEY (job_id); END IF; END $$;",
 			"ALTER TABLE job_progress DROP CONSTRAINT IF EXISTS job_progress_job_id_fkey;",
 			"ALTER TABLE recovery_records DROP CONSTRAINT IF EXISTS recovery_records_job_id_fkey;",
 			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', demo_token TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
@@ -985,24 +984,46 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 	colsDispatch := make(map[string]bool)
 	jobIdIsPK := false
 	rowsDisp, err := db.Query("PRAGMA table_info(dispatch_intents);")
-	if err == nil {
-		for rowsDisp.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rowsDisp.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsDispatch[name] = true
-				if name == "job_id" && pk == 1 {
-					jobIdIsPK = true
-				}
-			}
-		}
-		_ = rowsDisp.Close()
+	if err != nil {
+		return fmt.Errorf("open store: sqlite inspect dispatch_intents: %w", err)
 	}
+	for rowsDisp.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt *string
+		if err := rowsDisp.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rowsDisp.Close()
+			return fmt.Errorf("open store: sqlite scan dispatch_intents column info: %w", err)
+		}
+		colsDispatch[name] = true
+		if name == "job_id" && pk == 1 {
+			jobIdIsPK = true
+		}
+	}
+	if err := rowsDisp.Err(); err != nil {
+		_ = rowsDisp.Close()
+		return fmt.Errorf("open store: sqlite iterate dispatch_intents column info: %w", err)
+	}
+	_ = rowsDisp.Close()
+
 	if len(colsDispatch) > 0 && !jobIdIsPK {
-		_, _ = db.Exec(`
-CREATE TABLE IF NOT EXISTS dispatch_intents_new (
+		var dupJobs int
+		if err := db.QueryRow("SELECT COUNT(1) FROM (SELECT job_id FROM dispatch_intents GROUP BY job_id HAVING COUNT(1) > 1);").Scan(&dupJobs); err != nil {
+			return fmt.Errorf("open store: sqlite preflight dispatch_intents duplicate check: %w", err)
+		}
+		if dupJobs > 0 {
+			return fmt.Errorf("open store: sqlite migration failed: found %d duplicate job_id records in dispatch_intents; manual resolution required", dupJobs)
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("open store: sqlite begin dispatch_intents migration tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		migrationSQL := `
+CREATE TABLE dispatch_intents_new (
     job_id TEXT PRIMARY KEY,
     order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
     kiosk_id TEXT NOT NULL,
@@ -1015,37 +1036,69 @@ CREATE TABLE IF NOT EXISTS dispatch_intents_new (
     retry_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT ''
 );
-INSERT OR IGNORE INTO dispatch_intents_new (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error)
+INSERT INTO dispatch_intents_new (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error)
 SELECT job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error
 FROM dispatch_intents;
 DROP TABLE dispatch_intents;
 ALTER TABLE dispatch_intents_new RENAME TO dispatch_intents;
 CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
 CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
-`)
+`
+		if _, err := tx.Exec(migrationSQL); err != nil {
+			return fmt.Errorf("open store: sqlite execute dispatch_intents migration: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("open store: sqlite commit dispatch_intents migration: %w", err)
+		}
+		colsDispatch["acknowledged_at_ns"] = true
 	}
-	if !colsDispatch["acknowledged_at_ns"] {
-		_, _ = db.Exec("ALTER TABLE dispatch_intents ADD COLUMN acknowledged_at_ns INTEGER NOT NULL DEFAULT 0;")
+
+	if len(colsDispatch) > 0 && !colsDispatch["acknowledged_at_ns"] {
+		if _, err := db.Exec("ALTER TABLE dispatch_intents ADD COLUMN acknowledged_at_ns INTEGER NOT NULL DEFAULT 0;"); err != nil {
+			return fmt.Errorf("open store: sqlite add acknowledged_at_ns column: %w", err)
+		}
 	}
-	_, _ = db.Exec("UPDATE dispatch_intents SET status = 'PENDING' WHERE status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL);")
+	if _, err := db.Exec("UPDATE dispatch_intents SET status = 'PENDING' WHERE status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL);"); err != nil {
+		return fmt.Errorf("open store: sqlite reset unacknowledged dispatch intents: %w", err)
+	}
 
 	colsPayAttempts := make(map[string]bool)
 	rowsPay, err := db.Query("PRAGMA table_info(payment_attempts);")
-	if err == nil {
-		for rowsPay.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rowsPay.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsPayAttempts[name] = true
-			}
-		}
-		_ = rowsPay.Close()
+	if err != nil {
+		return fmt.Errorf("open store: sqlite inspect payment_attempts: %w", err)
 	}
-	if !colsPayAttempts["demo_token"] {
-		_, _ = db.Exec("ALTER TABLE payment_attempts ADD COLUMN demo_token TEXT NOT NULL DEFAULT '';")
-		_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);")
+	for rowsPay.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt *string
+		if err := rowsPay.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rowsPay.Close()
+			return fmt.Errorf("open store: sqlite scan payment_attempts column info: %w", err)
+		}
+		colsPayAttempts[name] = true
+	}
+	if err := rowsPay.Err(); err != nil {
+		_ = rowsPay.Close()
+		return fmt.Errorf("open store: sqlite iterate payment_attempts column info: %w", err)
+	}
+	_ = rowsPay.Close()
+
+	if len(colsPayAttempts) > 0 && !colsPayAttempts["demo_token"] {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("open store: sqlite begin payment_attempts migration: %w", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec("ALTER TABLE payment_attempts ADD COLUMN demo_token TEXT NOT NULL DEFAULT '';"); err != nil {
+			return fmt.Errorf("open store: sqlite add demo_token column: %w", err)
+		}
+		if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);"); err != nil {
+			return fmt.Errorf("open store: sqlite create idx_payment_attempts_demo_token: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("open store: sqlite commit payment_attempts migration: %w", err)
+		}
 	}
 
 	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';"); err != nil {
@@ -1120,6 +1173,15 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		if !isValidDuplex(order.Command.Duplex) {
 			return fmt.Errorf("create order: invalid duplex mode %q", order.Command.Duplex)
 		}
+		if order.TotalPages > 0 && order.TotalPages != order.Command.TotalPages {
+			return fmt.Errorf("create order: total_pages mismatch: order has %d, command has %d", order.TotalPages, order.Command.TotalPages)
+		}
+		if order.TotalSheets > 0 && order.TotalSheets != order.Command.TotalSheets {
+			return fmt.Errorf("create order: total_sheets mismatch: order has %d, command has %d", order.TotalSheets, order.Command.TotalSheets)
+		}
+		order.TotalPages = order.Command.TotalPages
+		order.TotalSheets = order.Command.TotalSheets
+
 		filename := order.Command.OriginalFilename
 		if filename == "" {
 			filename = "Document.pdf"
@@ -1149,6 +1211,7 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		// Validate multi-document list
 		calcPages := 0
 		calcSheets := 0
+		var calcPrice int64
 		for i, doc := range order.Documents {
 			if strings.TrimSpace(doc.JobID) == "" {
 				return fmt.Errorf("create order: document [%d] job_id cannot be empty", i)
@@ -1173,25 +1236,25 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 			}
 			calcPages += doc.TotalPages
 			calcSheets += doc.TotalSheets
+			calcPrice += doc.PricePaise
 		}
-		if order.TotalPages <= 0 {
-			order.TotalPages = calcPages
+
+		if order.TotalPages != calcPages {
+			return fmt.Errorf("create order: total_pages mismatch: order has %d, sum of child documents is %d", order.TotalPages, calcPages)
 		}
-		if order.TotalSheets <= 0 {
-			order.TotalSheets = calcSheets
+		if order.TotalSheets != calcSheets {
+			return fmt.Errorf("create order: total_sheets mismatch: order has %d, sum of child documents is %d", order.TotalSheets, calcSheets)
 		}
+		if order.PricePaise != calcPrice {
+			return fmt.Errorf("create order: price_paise mismatch: order has %d, sum of child documents is %d", order.PricePaise, calcPrice)
+		}
+
 		if strings.TrimSpace(order.Command.JobID) == "" {
 			order.Command.JobID = order.Documents[0].JobID
 		}
-		if order.Command.TotalPages <= 0 {
-			order.Command.TotalPages = order.Documents[0].TotalPages
-		}
-		if order.Command.TotalSheets <= 0 {
-			order.Command.TotalSheets = order.Documents[0].TotalSheets
-		}
-		if order.Command.Copies <= 0 {
-			order.Command.Copies = order.Documents[0].Copies
-		}
+		order.Command.TotalPages = order.Documents[0].TotalPages
+		order.Command.TotalSheets = order.Documents[0].TotalSheets
+		order.Command.Copies = order.Documents[0].Copies
 		if order.Command.StartFromPage < 1 {
 			order.Command.StartFromPage = 1
 		}
@@ -1492,67 +1555,24 @@ WHERE o.order_id = ?;
 	}
 
 	// Fetch child documents from order_documents
-	docsQuery := `
-SELECT
-    job_id, order_id, document_index, original_filename, download_url, sha256_checksum,
-    total_pages, total_sheets, copies, duplex, color_mode, page_range, orientation,
-    pages_per_sheet, price_paise, status, created_at_ns, updated_at_ns
-FROM order_documents
-WHERE order_id = ?
-ORDER BY document_index ASC;
-`
-	docRows, err := s.db.QueryContext(ctx, s.rebind(docsQuery), orderID)
-	if err == nil {
-		var docs []OrderDocument
-		for docRows.Next() {
-			var (
-				dJobID, dOrdID, dFilename, dURL, dCheck, dDuplex, dColor, dRange, dOrient, dStatus string
-				dIdx, dPages, dSheets, dCopies, dPPS                                                int
-				dPrice, dCreatedNS, dUpdatedNS                                                      int64
-			)
-			if sErr := docRows.Scan(
-				&dJobID, &dOrdID, &dIdx, &dFilename, &dURL, &dCheck,
-				&dPages, &dSheets, &dCopies, &dDuplex, &dColor, &dRange, &dOrient,
-				&dPPS, &dPrice, &dStatus, &dCreatedNS, &dUpdatedNS,
-			); sErr == nil {
-				docs = append(docs, OrderDocument{
-					JobID:            dJobID,
-					OrderID:          dOrdID,
-					DocumentIndex:    dIdx,
-					OriginalFilename: dFilename,
-					DownloadURL:      dURL,
-					SHA256Checksum:   dCheck,
-					TotalPages:       dPages,
-					TotalSheets:      dSheets,
-					Copies:           dCopies,
-					Duplex:           contracts.DuplexMode(dDuplex),
-					ColorMode:        dColor,
-					PageRange:        dRange,
-					Orientation:      dOrient,
-					PagesPerSheet:    dPPS,
-					PricePaise:       dPrice,
-					Status:           contracts.JobStatus(dStatus),
-					CreatedAt:        time.Unix(0, dCreatedNS).UTC(),
-					UpdatedAt:        time.Unix(0, dUpdatedNS).UTC(),
-				})
-			}
-		}
-		_ = docRows.Close()
-		result.Documents = docs
-		if len(docs) > 0 {
-			result.Command.JobID = docs[0].JobID
-			result.Command.OrderID = resOrderID
-			result.Command.DocumentIndex = 0
-			result.Command.TotalDocuments = len(docs)
-			result.Command.OriginalFilename = docs[0].OriginalFilename
-			result.Command.DownloadURL = docs[0].DownloadURL
-			result.Command.SHA256Checksum = docs[0].SHA256Checksum
-			result.Command.TotalPages = docs[0].TotalPages
-			result.Command.TotalSheets = docs[0].TotalSheets
-			result.Command.Copies = docs[0].Copies
-			result.Command.Duplex = docs[0].Duplex
-			result.Command.ColorMode = docs[0].ColorMode
-		}
+	docs, err := s.GetOrderDocuments(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("get order: child documents for %s: %w", orderID, err)
+	}
+	result.Documents = docs
+	if len(docs) > 0 {
+		result.Command.JobID = docs[0].JobID
+		result.Command.OrderID = resOrderID
+		result.Command.DocumentIndex = 0
+		result.Command.TotalDocuments = len(docs)
+		result.Command.OriginalFilename = docs[0].OriginalFilename
+		result.Command.DownloadURL = docs[0].DownloadURL
+		result.Command.SHA256Checksum = docs[0].SHA256Checksum
+		result.Command.TotalPages = docs[0].TotalPages
+		result.Command.TotalSheets = docs[0].TotalSheets
+		result.Command.Copies = docs[0].Copies
+		result.Command.Duplex = docs[0].Duplex
+		result.Command.ColorMode = docs[0].ColorMode
 	}
 
 	return result, nil
@@ -3409,86 +3429,103 @@ WHERE order_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING' AND expires_a
 		if p.SessionID == "" || p.SessionID != sessID {
 			dispatchEligible = false
 		} else {
-			updateSession := s.rebind(`
+			var docJobIDs []string
+			rowsDocs, err := tx.QueryContext(ctx, s.rebind(`SELECT job_id FROM order_documents WHERE order_id = ? ORDER BY document_index ASC;`), p.OrderID)
+			if err != nil {
+				return nil, fmt.Errorf("capture payment: query order_documents: %w", err)
+			}
+			for rowsDocs.Next() {
+				var jID string
+				if sErr := rowsDocs.Scan(&jID); sErr != nil {
+					_ = rowsDocs.Close()
+					return nil, fmt.Errorf("capture payment: scan order_documents: %w", sErr)
+				}
+				docJobIDs = append(docJobIDs, jID)
+			}
+			if err := rowsDocs.Err(); err != nil {
+				_ = rowsDocs.Close()
+				return nil, fmt.Errorf("capture payment: iterate order_documents: %w", err)
+			}
+			_ = rowsDocs.Close()
+
+			if len(docJobIDs) == 0 {
+				docJobIDs = []string{orderJobID}
+			}
+
+			// Multi-job safeguard (Finding 5):
+			// Prevent physical dispatch to kiosk for multi-job orders (len > 1)
+			// until multi-job admission, persistence, sequencing, and recovery are implemented on the kiosk.
+			// For multi-job orders, payment is captured safely and the order remains in PAID_WAITING.
+			if len(docJobIDs) > 1 {
+				dispatchEligible = false
+				currentStatus = contracts.JobStatusPaidWaiting
+			} else {
+				updateSession := s.rebind(`
 UPDATE kiosk_sessions
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE session_id = ? AND status = 'PAYMENT_PENDING';
 `)
-			resSess, err := tx.ExecContext(ctx, updateSession, nowNS, sessID)
-			if err != nil {
-				return nil, fmt.Errorf("capture payment: complete session: %w", err)
-			}
-			rowsSess, err := resSess.RowsAffected()
-			if err != nil {
-				return nil, fmt.Errorf("capture payment: complete session rows affected: %w", err)
-			}
-			if rowsSess > 0 {
-				updateDispatched := s.rebind(`
+				resSess, err := tx.ExecContext(ctx, updateSession, nowNS, sessID)
+				if err != nil {
+					return nil, fmt.Errorf("capture payment: complete session: %w", err)
+				}
+				rowsSess, err := resSess.RowsAffected()
+				if err != nil {
+					return nil, fmt.Errorf("capture payment: complete session rows affected: %w", err)
+				}
+				if rowsSess > 0 {
+					updateDispatched := s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE order_id = ? AND status = ?;
 `)
-				resOrd, err := tx.ExecContext(ctx, updateDispatched, string(contracts.JobStatusDispatched), nowNS, p.OrderID, string(contracts.JobStatusPaidWaiting))
-				if err != nil {
-					return nil, fmt.Errorf("capture payment: update order dispatched: %w", err)
-				}
-				rowsOrd, err := resOrd.RowsAffected()
-				if err != nil {
-					return nil, fmt.Errorf("capture payment: update order dispatched rows affected: %w", err)
-				}
-				if rowsOrd > 0 {
-					// Check existing dispatch intent status before modifying
-					var existingActiveIntents int
-					queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
-					errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingActiveIntents)
-					if errIntent != nil {
-						return nil, fmt.Errorf("capture payment: check dispatch intent: %w", errIntent)
-					}
-					if existingActiveIntents > 0 {
-						return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already active or completed", p.OrderID)
-					}
-
-					deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
-					resDel, err := tx.ExecContext(ctx, deleteIntent, p.OrderID)
+					resOrd, err := tx.ExecContext(ctx, updateDispatched, string(contracts.JobStatusDispatched), nowNS, p.OrderID, string(contracts.JobStatusPaidWaiting))
 					if err != nil {
-						return nil, fmt.Errorf("capture payment: delete dispatch intent: %w", err)
+						return nil, fmt.Errorf("capture payment: update order dispatched: %w", err)
 					}
-					if _, err := resDel.RowsAffected(); err != nil {
-						return nil, fmt.Errorf("capture payment: delete dispatch intent rows affected: %w", err)
+					rowsOrd, err := resOrd.RowsAffected()
+					if err != nil {
+						return nil, fmt.Errorf("capture payment: update order dispatched rows affected: %w", err)
 					}
-
-					var docJobIDs []string
-					rowsDocs, err := tx.QueryContext(ctx, s.rebind(`SELECT job_id FROM order_documents WHERE order_id = ? ORDER BY document_index ASC;`), p.OrderID)
-					if err == nil {
-						for rowsDocs.Next() {
-							var jID string
-							if sErr := rowsDocs.Scan(&jID); sErr == nil && jID != "" {
-								docJobIDs = append(docJobIDs, jID)
-							}
+					if rowsOrd > 0 {
+						// Check existing dispatch intent status before modifying
+						var existingActiveIntents int
+						queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
+						errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingActiveIntents)
+						if errIntent != nil {
+							return nil, fmt.Errorf("capture payment: check dispatch intent: %w", errIntent)
 						}
-						_ = rowsDocs.Close()
-					}
-					if len(docJobIDs) == 0 {
-						docJobIDs = []string{orderJobID}
-					}
+						if existingActiveIntents > 0 {
+							return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already active or completed", p.OrderID)
+						}
 
-					insertIntent := s.rebind(`
+						deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
+						resDel, err := tx.ExecContext(ctx, deleteIntent, p.OrderID)
+						if err != nil {
+							return nil, fmt.Errorf("capture payment: delete dispatch intent: %w", err)
+						}
+						if _, err := resDel.RowsAffected(); err != nil {
+							return nil, fmt.Errorf("capture payment: delete dispatch intent rows affected: %w", err)
+						}
+
+						insertIntent := s.rebind(`
 INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-					for _, jID := range docJobIDs {
-						resIns, err := tx.ExecContext(ctx, insertIntent, jID, p.OrderID, orderKioskID, sessID, nowNS, nowNS)
-						if err != nil {
-							return nil, fmt.Errorf("capture payment: insert dispatch intent for job %s: %w", jID, err)
+						for _, jID := range docJobIDs {
+							resIns, err := tx.ExecContext(ctx, insertIntent, jID, p.OrderID, orderKioskID, sessID, nowNS, nowNS)
+							if err != nil {
+								return nil, fmt.Errorf("capture payment: insert dispatch intent for job %s: %w", jID, err)
+							}
+							if _, err := resIns.RowsAffected(); err != nil {
+								return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected for job %s: %w", jID, err)
+							}
 						}
-						if _, err := resIns.RowsAffected(); err != nil {
-							return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected for job %s: %w", jID, err)
-						}
-					}
 
-					dispatchEligible = true
-					activeSessionID = sessID
-					currentStatus = contracts.JobStatusDispatched
+						dispatchEligible = true
+						activeSessionID = sessID
+						currentStatus = contracts.JobStatusDispatched
+					}
 				}
 			}
 		}
@@ -3532,7 +3569,7 @@ WHERE order_id = ? AND status = 'CREATED';
 	order, _ := s.GetOrder(ctx, p.OrderID)
 	var cmd *contracts.PrintJobCommand
 	var cmds []contracts.PrintJobCommand
-	if order != nil {
+	if order != nil && dispatchEligible {
 		cmd = &order.Command
 		if len(order.Documents) > 0 {
 			cmds = make([]contracts.PrintJobCommand, len(order.Documents))
@@ -3542,6 +3579,8 @@ WHERE order_id = ? AND status = 'CREATED';
 		} else {
 			cmds = []contracts.PrintJobCommand{order.Command}
 		}
+	} else if order != nil {
+		cmd = &order.Command
 	}
 
 	return &PaymentCaptureResult{
@@ -3673,14 +3712,28 @@ WHERE order_id = ? AND status = ?;
 
 	var docJobIDs []string
 	rowsDocs, err := tx.QueryContext(ctx, s.rebind(`SELECT job_id FROM order_documents WHERE order_id = ? ORDER BY document_index ASC;`), orderID)
-	if err == nil {
-		for rowsDocs.Next() {
-			var jID string
-			if sErr := rowsDocs.Scan(&jID); sErr == nil && jID != "" {
-				docJobIDs = append(docJobIDs, jID)
-			}
+	if err != nil {
+		return nil, fmt.Errorf("release paid order: query order_documents: %w", err)
+	}
+	for rowsDocs.Next() {
+		var jID string
+		if sErr := rowsDocs.Scan(&jID); sErr != nil {
+			_ = rowsDocs.Close()
+			return nil, fmt.Errorf("release paid order: scan order_documents: %w", sErr)
 		}
+		if jID != "" {
+			docJobIDs = append(docJobIDs, jID)
+		}
+	}
+	if err := rowsDocs.Err(); err != nil {
 		_ = rowsDocs.Close()
+		return nil, fmt.Errorf("release paid order: iterate order_documents: %w", err)
+	}
+	_ = rowsDocs.Close()
+
+	// Multi-job safeguard (Finding 5):
+	if len(docJobIDs) > 1 {
+		return nil, fmt.Errorf("release paid order: multi-job dispatch to kiosk is disabled until multi-job spooler is implemented (order %s has %d documents)", orderID, len(docJobIDs))
 	}
 	if len(docJobIDs) == 0 {
 		docJobIDs = []string{orderJobID}
@@ -3943,13 +3996,14 @@ ORDER BY created_at_ns ASC;
 
 		ord, err := s.GetOrder(ctx, cand.orderID)
 		if err == nil && ord != nil {
+			if len(ord.Documents) > 1 {
+				// Multi-job safeguard (Finding 5):
+				// Multi-job dispatch to kiosk is disabled until multi-job spooler is implemented.
+				continue
+			}
 			doc, errDoc := s.GetOrderDocument(ctx, cand.jobID)
 			if errDoc == nil && doc != nil {
-				totalDocs := len(ord.Documents)
-				if totalDocs == 0 {
-					totalDocs = 1
-				}
-				cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, totalDocs))
+				cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, 1))
 			} else {
 				cmds = append(cmds, ord.Command)
 			}
