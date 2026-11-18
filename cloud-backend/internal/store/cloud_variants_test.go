@@ -16,6 +16,7 @@ func TestCloudVariantReservationAndImmutablePublish(t *testing.T) {
   settings_hash TEXT NOT NULL, normalizer_version TEXT NOT NULL,
   storage_key TEXT UNIQUE, checksum_sha256 TEXT, billable_sides INTEGER,
   total_sheets INTEGER, canonical_price_paise BIGINT, tariff_revision BIGINT,
+  copies INTEGER, duplex TEXT, color_mode TEXT,
   state TEXT NOT NULL, error_code TEXT, expires_at TIMESTAMP NOT NULL,
   UNIQUE(upload_id,settings_hash,normalizer_version)
  )`)
@@ -34,6 +35,7 @@ func TestCloudVariantReservationAndImmutablePublish(t *testing.T) {
  got.StorageKey="variants/variant-a/output.pdf"
  got.Checksum="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
  got.BilledSides=2;got.TotalSheets=1;got.PricePaise=500;got.TariffRevision=1
+ got.Copies=1;got.Duplex="DUPLEX_LONG_EDGE";got.ColorMode="BW"
  ok,err:=db.PublishCloudVariant(ctx,got)
  if err!=nil||!ok {t.Fatalf("first publish %v %v",ok,err)}
  ok,err=db.PublishCloudVariant(ctx,got)
