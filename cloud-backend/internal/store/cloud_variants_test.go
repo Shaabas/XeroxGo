@@ -110,4 +110,17 @@ func TestCloudVariantReclaimsAbandonedLeaseWithoutOverwritingReady(t *testing.T)
  if err!=nil||acquired||got.ID!="v2"||got.State!="READY" {
   t.Fatalf("published artifact was replaced %+v %v %v",got,acquired,err)
  }
+ // A known failed attempt can be retried without waiting for lease expiry.
+ failed:=ident
+ failed.ID="v4"
+ failed.SettingsHash="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+ got,acquired,err=db.AcquireCloudVariant(ctx,failed)
+ if err!=nil||!acquired{t.Fatalf("failed-case reservation %v %v",acquired,err)}
+ if err:=db.FailCloudVariant(ctx,got.ID);err!=nil{t.Fatal(err)}
+ retry:=failed
+ retry.ID="v5"
+ got,acquired,err=db.AcquireCloudVariant(ctx,retry)
+ if err!=nil||!acquired||got.ID!="v5"{
+  t.Fatalf("FAILED attempt not recoverable %+v %v %v",got,acquired,err)
+ }
 }
