@@ -61,3 +61,8 @@ These are lower-priority investigations than the approved planning work for XG-C
 - Blockers for release: Gate 1–6 latest verification, live Storage integration, durable preparation worker retry/cleanup, upload rate limits and quotas, multi-file fidelity audit XG-004, secure lifecycle/retention and Pi recovery testing.
 
 - XG-CLOUD-DOCS-V2 recovery slice: 10-minute DB preparation lease, 8-minute worker execution bound, atomic stale PREPARING/FAILED recovery using new variant IDs, stale-publisher protection and SQLite tests. Still synchronous request-driven preparation, NOT durable background queue. Multi-file printer fidelity audited in `docs/architecture/multi-document-fidelity-gate.md`; no print behavior change approved. No live Storage migration or deployment.
+
+### V2 upload/storage guardrails (draft; 2026-11-18)
+- **Done on branch:** Durable per-kiosk 20-upload/100-MiB-per-hour reservation quota, HTTP 429 exhaustion, transaction lock, targeted store tests. Kiosk identifiers are untrusted, so globally enforced edge/session abuse controls still block deployment.
+- **Done on branch:** Opt-in 5-minute cleanup of expired, database-known unreferenced originals/variants, safe Storage DELETE path validation, retry after failed deletion, never clean in-flight/ordered files. Cleanup flag OFF by default; live Supabase untouched.
+- **Still to do:** Trusted session quotas/edge rate limiting, durable independent preparation queue, cleanup of orphan Storage objects not represented in DB, terminal-order retention policy, all-format uploads, full printer-safe multi-file handling, cart integration, Supabase/Render/Pi staging tests and latest CI gate approval.
