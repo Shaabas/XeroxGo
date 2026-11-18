@@ -44,7 +44,7 @@ func cloudCheckoutTestStore(t *testing.T) (*Store, CloudOrderInput) {
  _,err=db.DB().Exec(`INSERT INTO document_variants
   (variant_id,upload_id,state,expires_at,canonical_price_paise,
    tariff_revision,checksum_sha256,billable_sides,total_sheets,storage_key,duplex,color_mode,copies)
-  VALUES('variant-a','upload-a','READY',?,?,?,?,?,?,?,?,?,?,?)`,
+  VALUES('variant-a','upload-a','READY',?,?,?,?,?,?,?,?,?,?)`,
   expires,500,tariff.Revision,hash,2,1,"variants/variant-a/output.pdf","DUPLEX_LONG_EDGE","BW",1)
  if err!=nil {t.Fatal(err)}
  order:=Order{OrderID:"ord-cloud-1",Status:contracts.JobStatusPendingPayment,
