@@ -86,7 +86,7 @@ func TestCloudPlanTxRejectsExpiredForeignAndUnreadyInputs(t *testing.T) {
    return r
   },ErrSheetTariffRevisionConflict},
   {"wrong pairing",func(t *testing.T,db *Store,r []CloudPreparedReference) []CloudPreparedReference{
-   r[0].UploadID="upload-a"
+   r[0].UploadID="upload-unknown"
    return r
   },ErrVariantUnavailable},
  }
