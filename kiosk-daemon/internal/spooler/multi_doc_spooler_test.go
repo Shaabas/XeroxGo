@@ -1905,6 +1905,22 @@ func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
 	}
 }
 
+type failureInjectedStore struct {
+	StateStore
+	injectedGetJobsErr   error
+	injectedGetJobsEmpty bool
+}
+
+func (s *failureInjectedStore) GetJobsByOrderID(ctx context.Context, orderID string) ([]state.StoredJob, error) {
+	if s.injectedGetJobsErr != nil {
+		return nil, s.injectedGetJobsErr
+	}
+	if s.injectedGetJobsEmpty {
+		return []state.StoredJob{}, nil
+	}
+	return s.StateStore.GetJobsByOrderID(ctx, orderID)
+}
+
 // TestMultiDoc_StartupRecovery_InjectedSQLiteFailure verifies that when GetJobsByOrderID fails or returns empty,
 // startup recovery fails closed: incomplete jobs are never substituted or queued, no automatic physical
 // submissions occur, and jobs are transitioned to PAUSED_ERROR reporting the database inconsistency.
@@ -1974,14 +1990,15 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 		_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
 		_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
 
-		// Inject query failure into GetJobsByOrderID
-		errInj := errors.New("injected SQLite disk read error")
-		store.SetInjectedGetJobsByOrderIDErr(errInj)
+		fStore := &failureInjectedStore{
+			StateStore:         store,
+			injectedGetJobsErr: errors.New("injected SQLite disk read error"),
+		}
 
 		client, err := NewClient(ClientConfig{
 			CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
 			KioskID:       "kiosk-inj-1",
-			StateStore:    store,
+			StateStore:    fStore,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://example.com/qr",
 			ScreenSink:    func(*image.RGBA) error { return nil },
@@ -2066,13 +2083,15 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 		}
 		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
 
-		// Inject empty result into GetJobsByOrderID
-		store.SetInjectedGetJobsByOrderIDEmpty(true)
+		fStore := &failureInjectedStore{
+			StateStore:           store,
+			injectedGetJobsEmpty: true,
+		}
 
 		client, err := NewClient(ClientConfig{
 			CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
 			KioskID:       "kiosk-inj-2",
-			StateStore:    store,
+			StateStore:    fStore,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://example.com/qr",
 			ScreenSink:    func(*image.RGBA) error { return nil },
@@ -2117,4 +2136,409 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 			t.Fatalf("expected job in PAUSED_ERROR with database inconsistency, got status=%v reason=%q", j.Status, j.ErrorReason)
 		}
 	})
+}
+
+// TestMultiDoc_OrdersLargerThanQueueCapacity verifies that orders containing more documents
+// than the in-memory queue buffer capacity progress cleanly without dropped jobs, deadlocks,
+// or reordering, with every document receiving job_ack upon SQLite persistence.
+func TestMultiDoc_OrdersLargerThanQueueCapacity(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "order_larger_cap.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var printedIndices []int
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedIndices = append(printedIndices, cmd.DocumentIndex)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+	mockRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("printer-state=idle\nprinter-is-accepting-jobs=true\n"), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-large-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		CUPSRunner:    mockRunner,
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Constrain jobQueue capacity to 2 items
+	client.jobQueue = make(chan contracts.PrintJobCommand, 2)
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	orderID := "ord_large_cap_5"
+	totalDocs := 5
+	// Deliver all 5 documents. Each must be admitted and persisted regardless of in-memory queue capacity.
+	for i := 0; i < totalDocs; i++ {
+		cmd := contracts.PrintJobCommand{
+			JobID:          fmt.Sprintf("job_large_%d", i),
+			OrderID:        orderID,
+			DocumentIndex:  i,
+			TotalDocuments: totalDocs,
+			KioskID:        "kiosk-large-1",
+			DisplayCode:    "8888",
+			DownloadURL:    fileServer.URL + fmt.Sprintf("/doc%d.pdf", i),
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		client.handleIncomingJob(cmd)
+	}
+
+	// Wait for all 5 documents to be printed in FIFO order and order to complete
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		completed, err := store.IsOrderCompleted(ctx, orderID)
+		if err == nil && completed {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	completed, err := store.IsOrderCompleted(ctx, orderID)
+	if err != nil || !completed {
+		t.Fatalf("expected order to be completed, got %v, err: %v", completed, err)
+	}
+
+	printMu.Lock()
+	defer printMu.Unlock()
+	if len(printedIndices) != totalDocs {
+		t.Fatalf("expected %d documents printed, got %d (%v)", totalDocs, len(printedIndices), printedIndices)
+	}
+	for i := 0; i < totalDocs; i++ {
+		if printedIndices[i] != i {
+			t.Fatalf("expected document index %d at position %d, got %v", i, i, printedIndices)
+		}
+	}
+}
+
+// TestMultiDoc_QueueFullArrivalOfFinalDocument verifies that when earlier documents or other
+// jobs have completely saturated the in-memory queue, the arrival of the final document
+// is acknowledged with job_ack, committed to SQLite, and admitted for execution without errors.
+func TestMultiDoc_QueueFullArrivalOfFinalDocument(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "queue_full_final.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var printedIndices []int
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedIndices = append(printedIndices, cmd.DocumentIndex)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+	mockRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("printer-state=idle\nprinter-is-accepting-jobs=true\n"), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-final-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		CUPSRunner:    mockRunner,
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Capacity 2
+	client.jobQueue = make(chan contracts.PrintJobCommand, 2)
+
+	orderID := "ord_final_doc_full"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_final_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 3,
+		KioskID:        "kiosk-final-1",
+		DisplayCode:    "9991",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_final_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 3,
+		KioskID:        "kiosk-final-1",
+		DisplayCode:    "9991",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd2 := contracts.PrintJobCommand{
+		JobID:          "job_final_2",
+		OrderID:        orderID,
+		DocumentIndex:  2,
+		TotalDocuments: 3,
+		KioskID:        "kiosk-final-1",
+		DisplayCode:    "9991",
+		DownloadURL:    fileServer.URL + "/doc2.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// 1. Deliver doc 0 and doc 1
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Fill jobQueue so capacity is 2 and channel is completely full at arrival of final document
+	client.jobQueue <- contracts.PrintJobCommand{JobID: "fill_1"}
+	client.jobQueue <- contracts.PrintJobCommand{JobID: "fill_2"}
+
+	// 2. Deliver final document: doc 2 (while queue is full)
+	client.handleIncomingJob(cmd2)
+
+	// Doc 2 must be safely committed to SQLite
+	stored2, err := store.GetJob(ctx, "job_final_2")
+	if err != nil || stored2 == nil {
+		t.Fatalf("expected doc 2 to be saved in SQLite, got %v, err: %v", stored2, err)
+	}
+
+	// Drain the dummy fill items from jobQueue
+	<-client.jobQueue
+	<-client.jobQueue
+
+	// Run client worker to process order
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Wait for all 3 documents to print and order to complete
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		completed, err := store.IsOrderCompleted(ctx, orderID)
+		if err == nil && completed {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	completed, err := store.IsOrderCompleted(ctx, orderID)
+	if err != nil || !completed {
+		t.Fatalf("expected order completed, got %v, err: %v", completed, err)
+	}
+
+	printMu.Lock()
+	defer printMu.Unlock()
+	if len(printedIndices) != 3 {
+		t.Fatalf("expected 3 documents printed, got %d (%v)", len(printedIndices), printedIndices)
+	}
+	for i := 0; i < 3; i++ {
+		if printedIndices[i] != i {
+			t.Fatalf("expected document %d at index %d, got %v", i, i, printedIndices)
+		}
+	}
+}
+
+// TestMultiDoc_LargerThanQueueCapacity_RestartReconnect verifies that when an order larger than
+// queue capacity is interrupted and reconnected, already-completed documents are not reprinted
+// and remaining documents complete in strict order without duplicates or drops.
+func TestMultiDoc_LargerThanQueueCapacity_RestartReconnect(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "reconnect_large.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var printedJobs []string
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedJobs = append(printedJobs, cmd.JobID)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+	mockRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("printer-state=idle\nprinter-is-accepting-jobs=true\n"), nil
+	}
+
+	orderID := "ord_reconnect_large_4"
+	totalDocs := 4
+	makeCmd := func(idx int) contracts.PrintJobCommand {
+		return contracts.PrintJobCommand{
+			JobID:          fmt.Sprintf("job_rec_lg_%d", idx),
+			OrderID:        orderID,
+			DocumentIndex:  idx,
+			TotalDocuments: totalDocs,
+			KioskID:        "kiosk-rec-lg-1",
+			DisplayCode:    "4444",
+			DownloadURL:    fileServer.URL + fmt.Sprintf("/doc%d.pdf", idx),
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+	}
+
+	// Doc 0 was already COMPLETED before restart/reconnect
+	cmd0 := makeCmd(0)
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusCompleted)
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd0.JobID,
+		KioskID:       cmd0.KioskID,
+		Status:        contracts.JobStatusCompleted,
+		PagesPrinted:  1,
+		SheetsPrinted: 1,
+		Timestamp:     time.Now().UTC(),
+	})
+
+	// Start client with constrained queue capacity = 2
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-rec-lg-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		CUPSRunner:    mockRunner,
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	client.jobQueue = make(chan contracts.PrintJobCommand, 2)
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Cloud reconnects and delivers all 4 documents again
+	for i := 0; i < totalDocs; i++ {
+		client.handleIncomingJob(makeCmd(i))
+	}
+
+	// Wait for uncompleted documents (1, 2, 3) to print and order to be marked completed in store
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		completed, err := store.IsOrderCompleted(ctx, orderID)
+		if err == nil && completed {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	completed, err := store.IsOrderCompleted(ctx, orderID)
+	if err != nil || !completed {
+		t.Fatalf("expected order completed, got %v, err: %v", completed, err)
+	}
+
+	printMu.Lock()
+	defer printMu.Unlock()
+	// Must have printed ONLY docs 1, 2, 3 (doc 0 was completed and must NOT be reprinted)
+	if len(printedJobs) != 3 {
+		t.Fatalf("expected 3 documents printed, got %d (%v)", len(printedJobs), printedJobs)
+	}
+	expectedJobs := []string{"job_rec_lg_1", "job_rec_lg_2", "job_rec_lg_3"}
+	for i, exp := range expectedJobs {
+		if printedJobs[i] != exp {
+			t.Fatalf("expected job %s at position %d, got %v", exp, i, printedJobs)
+		}
+	}
 }

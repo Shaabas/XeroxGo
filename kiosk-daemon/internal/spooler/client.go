@@ -43,12 +43,29 @@ type wireMessage struct {
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 }
 
+// StateStore defines the persistence interface required by the spooler client.
+// In production, *state.Store implements this interface against local SQLite.
+type StateStore interface {
+	SaveJob(ctx context.Context, cmd contracts.PrintJobCommand, status contracts.JobStatus) error
+	UpdateProgress(ctx context.Context, event contracts.JobProgressEvent) error
+	RecordSheetProgress(ctx context.Context, event contracts.JobProgressEvent) error
+	MarkJobSubmitting(ctx context.Context, jobID string) error
+	RecordJobSubmission(ctx context.Context, jobID string, cupsJobID string) error
+	GetIncompleteJobs(ctx context.Context) ([]state.StoredJob, error)
+	GetJob(ctx context.Context, jobID string) (*state.StoredJob, error)
+	GetJobsByOrderID(ctx context.Context, orderID string) ([]state.StoredJob, error)
+	IsOrderCompleted(ctx context.Context, orderID string) (bool, error)
+	GetEstimatedSheets(ctx context.Context) (int, error)
+	GetPaperSupply(ctx context.Context) (int, bool, error)
+	ResetPaperTray(ctx context.Context, sheets int) error
+}
+
 // ClientConfig holds the runtime dependencies and parameters for the kiosk spooler client.
 type ClientConfig struct {
 	CloudURL                 string
 	KioskID                  string
 	KioskSecret              string
-	StateStore               *state.Store
+	StateStore               StateStore
 	PrinterAddr              string
 	SNMPTarget               string
 	SNMPCommunity            string
@@ -477,9 +494,17 @@ func (c *Client) DiscoverStartupPrinterState(ctx context.Context) printer.IPPPri
 // Run executes the spooler client loops until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
+	c.queueMu.Lock()
 	c.runCtx = runCtx
 	c.runCancel = runCancel
-	defer c.runCancel()
+	c.queueMu.Unlock()
+	defer func() {
+		c.queueMu.Lock()
+		if c.runCancel != nil {
+			c.runCancel()
+		}
+		c.queueMu.Unlock()
+	}()
 
 	defer func() {
 		c.idleMu.Lock()
@@ -1481,24 +1506,6 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		return
 	}
 
-	// Queue full check: after durable persistence in SQLite, if jobQueue is full, do not admit or send job_ack
-	c.queueMu.Lock()
-	isQueueFull := cap(c.jobQueue) > 0 && (len(c.jobQueue)+len(c.pendingQueue) >= cap(c.jobQueue))
-	c.queueMu.Unlock()
-	if isQueueFull {
-		c.connMu.Lock()
-		conn := c.conn
-		c.connMu.Unlock()
-		if conn != nil {
-			_ = c.sendWire(context.Background(), conn, wireMessage{
-				Type:  "error",
-				Error: "kiosk job queue is full",
-			})
-		}
-		log.Printf("[SPOOLER] Failed to admit job %s to queue: queue is full; preserved in state store for recovery", cmd.JobID)
-		return
-	}
-
 	// 4. Send explicit job_ack back to cloud immediately upon durable persistence
 	c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
@@ -1757,14 +1764,11 @@ func (c *Client) runProducer() {
 			return
 		}
 		nextJob := c.pendingQueue[0]
-		c.queueMu.Unlock()
-
-		var ctx context.Context
-		if c.runCtx != nil {
-			ctx = c.runCtx
-		} else {
+		ctx := c.runCtx
+		if ctx == nil {
 			ctx = context.Background()
 		}
+		c.queueMu.Unlock()
 
 		select {
 		case <-ctx.Done():

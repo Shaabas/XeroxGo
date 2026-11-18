@@ -2938,8 +2938,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 	})
 
-	// Scenario G: Queue admission failure
-	t.Run("ScenarioG_QueueAdmissionFailure", func(t *testing.T) {
+	// Scenario G: Queue saturation durable acceptance
+	t.Run("ScenarioG_QueueSaturationDurableAcceptance", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_g.db")
 		store, err := state.Open(dbPath)
@@ -2972,7 +2972,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			}
 			defer c.CloseNow()
 
-			// Send the job command that will fail queue admission
+			// Send the job command when in-memory queue is already saturated
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
 
 			for {
@@ -2983,8 +2983,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 				msgMu.Lock()
 				receivedMessages = append(receivedMessages, msg)
 				msgMu.Unlock()
-				// The client sends wireMessage{Type: "error", Error: "kiosk job queue is full"} on queue admission failure!
-				if msg.Type == "error" && msg.Error == "kiosk job queue is full" {
+				// Once committed to SQLite, client sends job_ack regardless of queue saturation
+				if msg.Type == "job_ack" && msg.Progress != nil && msg.Progress.JobID == cmd.JobID {
 					close(doneSync)
 					return
 				}
@@ -3027,37 +3027,26 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		select {
 		case <-doneSync:
 		case <-time.After(5 * time.Second):
-			t.Fatal("timeout waiting for queue full error message")
+			t.Fatal("timeout waiting for job_ack under queue saturation")
 		}
 
-		// Assert that neither job_ack nor false SPOOLING progress was transmitted
-		msgMu.Lock()
-		for _, m := range receivedMessages {
-			if m.Type == "job_ack" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
-				t.Errorf("job_ack must NOT be transmitted on queue full: %+v", m)
-			}
-			if m.Type == "progress" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
-				t.Errorf("progress must NOT be transmitted on queue full: %+v", m)
-			}
-		}
-		msgMu.Unlock()
-
-		// Assert: reservation released
-		client.activeMu.Lock()
-		reserved := client.activeJobs[cmd.JobID]
-		client.activeMu.Unlock()
-		if reserved {
-			t.Errorf("expected in-memory reservation for %s to be released on queue full", cmd.JobID)
-		}
-
-		// Assert: durable record preserved in store for recovery
+		// Assert: durable record preserved in store in SPOOLING status
 		ctx := context.Background()
 		saved, err := store.GetJob(ctx, cmd.JobID)
 		if err != nil || saved == nil {
-			t.Fatalf("expected saved record in store for recovery, got: %v, err: %v", saved, err)
+			t.Fatalf("expected saved record in store, got: %v, err: %v", saved, err)
 		}
 		if saved.Status != contracts.JobStatusSpooling {
 			t.Errorf("expected saved status SPOOLING, got %s", saved.Status)
+		}
+
+		// Assert: admitted and buffered by ordered producer under queue saturation
+		client.queueMu.Lock()
+		pendingCount := len(client.pendingQueue)
+		isProducerRunning := client.producerRunning
+		client.queueMu.Unlock()
+		if pendingCount == 0 && !isProducerRunning {
+			t.Errorf("expected job to be pending or handled by ordered producer")
 		}
 
 		// Assert: GetIncompleteJob finds this job for startup recovery
