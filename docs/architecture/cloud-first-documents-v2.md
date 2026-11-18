@@ -55,3 +55,21 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 - A tariff revision currently creates a separate versioned variant to preserve pricing correctness. Cross-tariff PDF byte reuse is a future optimization.
 - Orphan prepared objects after a successful Storage upload followed by a DB write failure require lifecycle cleanup before rollout.
 - Reuse of already prepared PDFs at **checkout** and at the **Pi** is NOT implemented yet.
+
+## Reference-only checkout slice (2026-11-18)
+**Implemented, opt-in only; not wired into the production cart.**
+- `POST /api/documents/checkout`: accepts ONE verified upload capability, immutable READY variant ID, stable idempotency key, exact customer accepted price and tariff revision. NO file bytes.
+- Render checks capability ownership, fresh variant state, current revision, stored printer settings/price, then atomically inserts the PIN reservation, order, print config, order_document reference and idempotency ledger. The store re-locks active tariff revision within the same transaction.
+- Repeating the same key and exact details returns the original persisted order/PIN. A different request ID for an already ordered variant fails closed (one order per uploaded variant); change of variant/price with same key is rejected.
+- `GET /api/orders/{order_id}/pdf` keeps the existing signed Pi URL, but **only for V2 orders** uses private Storage after full SHA-256 verification. Other orders keep their original Render-disk behavior.
+- An isolated `frontend/js/cloud_checkout.js` helper builds the reference request with the same request ID on retry. The customer cart remains on the old multipart route.
+- **Single prepared PDF only.** Multiple documents need exact mixed-setting packing and retained checksum semantics under task XG-004. No silent first-document-only ordering.
+- Copies/color/duplex are persisted with the normalized variant. The order may not override baked print options or original verified pages.
+- A successful, already-prepared order should not run Ghostscript, upload file bytes or perform conversion while creating its PIN. Disk/Storage transfer for printer happens later on the authenticated download route.
+
+### Unfinished release blockers
+- Storage migrations must be applied only after access/RLS/grant review and rollout approval.
+- Storage CORS, ingress/proxy secret, rate limits/quotas, cleanup and durable preparation worker/leases remain unfinished.
+- Full multi-file checkout, original Office/image upload parity and customer UI cutover remain unfinished.
+- Storage-backed Pi artifact download currently reuses the signed Render path and verifies the checksum; needs integration test on a real private bucket and recovery tests.
+- No switch to cloud checkout until new API/Storage/order idempotency tests and end-to-end printer lifecycle tests pass.
