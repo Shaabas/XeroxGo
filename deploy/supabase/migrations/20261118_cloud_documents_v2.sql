@@ -109,3 +109,33 @@ create index if not exists cloud_prep_claim_idx
   on public.cloud_preparation_jobs (state, lease_expires_at, created_at);
 alter table public.cloud_preparation_jobs enable row level security;
 revoke all on public.cloud_preparation_jobs from PUBLIC, anon, authenticated;
+
+
+-- Proposed V2 multi-document printer task ledger (NOT used by the live Pi).
+-- Each task is one immutable canonical variant with its own physical settings.
+-- Never treat a task as completed from an uncertain CUPS submission alone.
+create table if not exists public.cloud_print_tasks (
+  task_id text primary key,
+  order_id text not null references public.orders(order_id) on delete cascade,
+  sequence_no integer not null check (sequence_no >= 1),
+  variant_id text not null references public.document_variants(variant_id),
+  checksum_sha256 text not null,
+  copies integer not null check (copies = 1),
+  duplex text not null check (duplex in ('SIMPLEX','DUPLEX_LONG_EDGE','DUPLEX_SHORT_EDGE')),
+  color_mode text not null check (color_mode in ('BW','COLOR')),
+  total_pages integer not null check (total_pages > 0),
+  total_sheets integer not null check (total_sheets > 0),
+  state text not null default 'AWAITING_PAYMENT'
+    check (state in (
+      'AWAITING_PAYMENT','READY','DISPATCHING','SUBMITTED',
+      'COMPLETED','RECONCILE','CANCELED')),
+  cups_job_id text,
+  dispatch_attempt integer not null default 0 check (dispatch_attempt >= 0),
+  updated_at timestamptz not null default now(),
+  unique (order_id,sequence_no),
+  unique (order_id,variant_id)
+);
+create index if not exists cloud_print_tasks_order_idx
+  on public.cloud_print_tasks (order_id,sequence_no);
+alter table public.cloud_print_tasks enable row level security;
+revoke all on public.cloud_print_tasks from PUBLIC, anon, authenticated;
