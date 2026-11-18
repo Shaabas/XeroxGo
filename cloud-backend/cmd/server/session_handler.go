@@ -664,10 +664,21 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 
 	// Dispatch job to kiosk physical printer
 	if s.hub != nil {
-		if err := s.hub.SendJob(r.Context(), order.Command); err != nil {
-			log.Printf("[RELEASE] Warning: failed to send job %s to kiosk %s: %v", order.Command.JobID, kioskID, err)
+		if len(order.Documents) > 0 {
+			for _, doc := range order.Documents {
+				jobCmd := doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
+				if err := s.hub.SendJob(r.Context(), jobCmd); err != nil {
+					log.Printf("[RELEASE] Warning: failed to send child job %s to kiosk %s: %v", doc.JobID, kioskID, err)
+					break
+				}
+				_ = s.db.MarkDispatchIntentSent(r.Context(), doc.JobID)
+			}
 		} else {
-			_ = s.db.MarkDispatchIntentSent(r.Context(), order.OrderID)
+			if err := s.hub.SendJob(r.Context(), order.Command); err != nil {
+				log.Printf("[RELEASE] Warning: failed to send job %s to kiosk %s: %v", order.Command.JobID, kioskID, err)
+			} else {
+				_ = s.db.MarkDispatchIntentSent(r.Context(), order.Command.JobID)
+			}
 		}
 	}
 

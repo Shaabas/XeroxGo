@@ -197,9 +197,17 @@ func linkOrCopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(dst)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(dst)
+		return closeErr
+	}
+	return nil
 }
 
 func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +300,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if metadataRaw != "" {
 		if err := json.Unmarshal([]byte(metadataRaw), &metaItems); err != nil {
 			http.Error(w, fmt.Sprintf("invalid metadata JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+		if len(metaItems) != len(fileHeaders) {
+			http.Error(w, fmt.Sprintf("metadata count (%d) must match uploaded files count (%d)", len(metaItems), len(fileHeaders)), http.StatusBadRequest)
 			return
 		}
 	}
@@ -435,10 +447,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if !isMultiFile && len(docs) == 1 {
 		hOrd := sha256.Sum256([]byte(orderID))
 		orderPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
+		createdJobFiles = append(createdJobFiles, orderPDFPath)
 		hJob := sha256.Sum256([]byte(docs[0].JobID))
 		jobPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
-		if err := linkOrCopyFile(jobPDFPath, orderPDFPath); err == nil {
-			createdJobFiles = append(createdJobFiles, orderPDFPath)
+		if err := linkOrCopyFile(jobPDFPath, orderPDFPath); err != nil {
+			http.Error(w, fmt.Sprintf("failed to create order-level artifact: %v", err), http.StatusInternalServerError)
+			return
 		}
 	}
 
@@ -953,19 +967,35 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if captureRes.DispatchEligible && captureRes.Command != nil {
+	if captureRes.DispatchEligible {
 		if s.hub != nil {
-			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"order_id": orderID,
-					"status":   string(contracts.JobStatusPaidWaiting),
-					"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
-				})
-				return
+			if len(captureRes.Commands) > 0 {
+				for _, cmd := range captureRes.Commands {
+					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_ = json.NewEncoder(w).Encode(map[string]interface{}{
+							"order_id": orderID,
+							"status":   string(contracts.JobStatusPaidWaiting),
+							"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
+						})
+						return
+					}
+					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
+				}
+			} else if captureRes.Command != nil {
+				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"order_id": orderID,
+						"status":   string(contracts.JobStatusPaidWaiting),
+						"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
+					})
+					return
+				}
+				_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
 			}
-			_ = s.db.MarkDispatchIntentSent(r.Context(), orderID)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1178,13 +1208,23 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 
 	// PHYSICAL PRINT AUTHORIZATION GATE
 	// Only dispatch print if valid active kiosk session exists for customer presence
-	if captureRes.DispatchEligible && captureRes.Command != nil {
+	if captureRes.DispatchEligible {
 		log.Printf("[PAYMENT] Order %s authorized for print (active session %s)", orderID, captureRes.ActiveSessionID)
 		if s.hub != nil {
-			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-				log.Printf("[PAYMENT] Failed to dispatch job %s to kiosk %s: %v", captureRes.Command.JobID, captureRes.KioskID, err)
-			} else {
-				_ = s.db.MarkDispatchIntentSent(r.Context(), orderID)
+			if len(captureRes.Commands) > 0 {
+				for _, cmd := range captureRes.Commands {
+					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
+						log.Printf("[PAYMENT] Failed to dispatch job %s to kiosk %s: %v", cmd.JobID, cmd.KioskID, err)
+						break
+					}
+					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
+				}
+			} else if captureRes.Command != nil {
+				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
+					log.Printf("[PAYMENT] Failed to dispatch job %s to kiosk %s: %v", captureRes.Command.JobID, captureRes.KioskID, err)
+				} else {
+					_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
+				}
 			}
 		}
 		w.WriteHeader(http.StatusOK)

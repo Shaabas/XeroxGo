@@ -3452,80 +3452,72 @@ WHERE order_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING' AND expires_a
 				docJobIDs = []string{orderJobID}
 			}
 
-			// Multi-job safeguard (Finding 5):
-			// Prevent physical dispatch to kiosk for multi-job orders (len > 1)
-			// until multi-job admission, persistence, sequencing, and recovery are implemented on the kiosk.
-			// For multi-job orders, payment is captured safely and the order remains in PAID_WAITING.
-			if len(docJobIDs) > 1 {
-				dispatchEligible = false
-				currentStatus = contracts.JobStatusPaidWaiting
-			} else {
-				updateSession := s.rebind(`
+			updateSession := s.rebind(`
 UPDATE kiosk_sessions
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE session_id = ? AND status = 'PAYMENT_PENDING';
 `)
-				resSess, err := tx.ExecContext(ctx, updateSession, nowNS, sessID)
-				if err != nil {
-					return nil, fmt.Errorf("capture payment: complete session: %w", err)
-				}
-				rowsSess, err := resSess.RowsAffected()
-				if err != nil {
-					return nil, fmt.Errorf("capture payment: complete session rows affected: %w", err)
-				}
-				if rowsSess > 0 {
-					updateDispatched := s.rebind(`
+			resSess, err := tx.ExecContext(ctx, updateSession, nowNS, sessID)
+			if err != nil {
+				return nil, fmt.Errorf("capture payment: complete session: %w", err)
+			}
+			rowsSess, err := resSess.RowsAffected()
+			if err != nil {
+				return nil, fmt.Errorf("capture payment: complete session rows affected: %w", err)
+			}
+			if rowsSess > 0 {
+				updateDispatched := s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE order_id = ? AND status = ?;
 `)
-					resOrd, err := tx.ExecContext(ctx, updateDispatched, string(contracts.JobStatusDispatched), nowNS, p.OrderID, string(contracts.JobStatusPaidWaiting))
-					if err != nil {
-						return nil, fmt.Errorf("capture payment: update order dispatched: %w", err)
+				resOrd, err := tx.ExecContext(ctx, updateDispatched, string(contracts.JobStatusDispatched), nowNS, p.OrderID, string(contracts.JobStatusPaidWaiting))
+				if err != nil {
+					return nil, fmt.Errorf("capture payment: update order dispatched: %w", err)
+				}
+				rowsOrd, err := resOrd.RowsAffected()
+				if err != nil {
+					return nil, fmt.Errorf("capture payment: update order dispatched rows affected: %w", err)
+				}
+				if rowsOrd > 0 {
+					// Check existing dispatch intent status before modifying
+					var existingActiveIntents int
+					queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
+					errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingActiveIntents)
+					if errIntent != nil {
+						return nil, fmt.Errorf("capture payment: check dispatch intent: %w", errIntent)
 					}
-					rowsOrd, err := resOrd.RowsAffected()
-					if err != nil {
-						return nil, fmt.Errorf("capture payment: update order dispatched rows affected: %w", err)
+					if existingActiveIntents > 0 {
+						return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already active or completed", p.OrderID)
 					}
-					if rowsOrd > 0 {
-						// Check existing dispatch intent status before modifying
-						var existingActiveIntents int
-						queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
-						errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingActiveIntents)
-						if errIntent != nil {
-							return nil, fmt.Errorf("capture payment: check dispatch intent: %w", errIntent)
-						}
-						if existingActiveIntents > 0 {
-							return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already active or completed", p.OrderID)
-						}
 
-						deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
-						resDel, err := tx.ExecContext(ctx, deleteIntent, p.OrderID)
-						if err != nil {
-							return nil, fmt.Errorf("capture payment: delete dispatch intent: %w", err)
-						}
-						if _, err := resDel.RowsAffected(); err != nil {
-							return nil, fmt.Errorf("capture payment: delete dispatch intent rows affected: %w", err)
-						}
+					deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
+					resDel, err := tx.ExecContext(ctx, deleteIntent, p.OrderID)
+					if err != nil {
+						return nil, fmt.Errorf("capture payment: delete dispatch intent: %w", err)
+					}
+					if _, err := resDel.RowsAffected(); err != nil {
+						return nil, fmt.Errorf("capture payment: delete dispatch intent rows affected: %w", err)
+					}
 
-						insertIntent := s.rebind(`
+					insertIntent := s.rebind(`
 INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-						for _, jID := range docJobIDs {
-							resIns, err := tx.ExecContext(ctx, insertIntent, jID, p.OrderID, orderKioskID, sessID, nowNS, nowNS)
-							if err != nil {
-								return nil, fmt.Errorf("capture payment: insert dispatch intent for job %s: %w", jID, err)
-							}
-							if _, err := resIns.RowsAffected(); err != nil {
-								return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected for job %s: %w", jID, err)
-							}
+					for idx, jID := range docJobIDs {
+						intentCreatedNS := nowNS + int64(idx)
+						resIns, err := tx.ExecContext(ctx, insertIntent, jID, p.OrderID, orderKioskID, sessID, intentCreatedNS, intentCreatedNS)
+						if err != nil {
+							return nil, fmt.Errorf("capture payment: insert dispatch intent for job %s: %w", jID, err)
 						}
-
-						dispatchEligible = true
-						activeSessionID = sessID
-						currentStatus = contracts.JobStatusDispatched
+						if _, err := resIns.RowsAffected(); err != nil {
+							return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected for job %s: %w", jID, err)
+						}
 					}
+
+					dispatchEligible = true
+					activeSessionID = sessID
+					currentStatus = contracts.JobStatusDispatched
 				}
 			}
 		}
@@ -3731,10 +3723,6 @@ WHERE order_id = ? AND status = ?;
 	}
 	_ = rowsDocs.Close()
 
-	// Multi-job safeguard (Finding 5):
-	if len(docJobIDs) > 1 {
-		return nil, fmt.Errorf("release paid order: multi-job dispatch to kiosk is disabled until multi-job spooler is implemented (order %s has %d documents)", orderID, len(docJobIDs))
-	}
 	if len(docJobIDs) == 0 {
 		docJobIDs = []string{orderJobID}
 	}
@@ -3743,8 +3731,9 @@ WHERE order_id = ? AND status = ?;
 INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-	for _, jID := range docJobIDs {
-		resIns, err := tx.ExecContext(ctx, insertIntent, jID, orderID, kioskID, sessID, nowNS, nowNS)
+	for idx, jID := range docJobIDs {
+		intentCreatedNS := nowNS + int64(idx)
+		resIns, err := tx.ExecContext(ctx, insertIntent, jID, orderID, kioskID, sessID, intentCreatedNS, intentCreatedNS)
 		if err != nil {
 			return nil, fmt.Errorf("release paid order: record dispatch intent: %w", err)
 		}
@@ -3910,6 +3899,60 @@ func (s *Store) GetDispatchIntentStatus(ctx context.Context, orderOrJobID string
 	return status, acknowledgedAtNS, err
 }
 
+// DispatchIntent represents a persisted job dispatch intent.
+type DispatchIntent struct {
+	JobID            string
+	OrderID          string
+	KioskID          string
+	SessionID        string
+	Status           string
+	CreatedAtNS      int64
+	UpdatedAtNS      int64
+	DispatchedAtNS   int64
+	AcknowledgedAtNS int64
+	RetryCount       int
+	LastError        string
+}
+
+// GetDispatchIntentsByOrder retrieves all dispatch intents for an order ordered by created_at_ns ASC.
+func (s *Store) GetDispatchIntentsByOrder(ctx context.Context, orderID string) ([]DispatchIntent, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store not initialized")
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return nil, errors.New("orderID cannot be empty")
+	}
+	query := s.rebind(`
+SELECT job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error
+FROM dispatch_intents
+WHERE order_id = ?
+ORDER BY created_at_ns ASC;
+`)
+	rows, err := s.db.QueryContext(ctx, query, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("get dispatch intents by order: %w", err)
+	}
+	defer rows.Close()
+
+	var intents []DispatchIntent
+	for rows.Next() {
+		var di DispatchIntent
+		if err := rows.Scan(
+			&di.JobID, &di.OrderID, &di.KioskID, &di.SessionID, &di.Status,
+			&di.CreatedAtNS, &di.UpdatedAtNS, &di.DispatchedAtNS, &di.AcknowledgedAtNS,
+			&di.RetryCount, &di.LastError,
+		); err != nil {
+			return nil, fmt.Errorf("scan dispatch intent: %w", err)
+		}
+		intents = append(intents, di)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dispatch intents: %w", err)
+	}
+	return intents, nil
+}
+
 // ResetUnacknowledgedDispatchIntents safely reverts unacknowledged SENT dispatch intents
 // back to PENDING status so that network or daemon crashes do not permanently strand orders.
 func (s *Store) ResetUnacknowledgedDispatchIntents(ctx context.Context, kioskID string) error {
@@ -3996,14 +4039,28 @@ ORDER BY created_at_ns ASC;
 
 		ord, err := s.GetOrder(ctx, cand.orderID)
 		if err == nil && ord != nil {
-			if len(ord.Documents) > 1 {
-				// Multi-job safeguard (Finding 5):
-				// Multi-job dispatch to kiosk is disabled until multi-job spooler is implemented.
+			// Never dispatch unpaid, canceled, expired, or unauthorized orders
+			if ord.Status != contracts.JobStatusDispatched {
+				if ord.Status == contracts.JobStatusFailedRefundable || string(ord.Status) == "CANCELED" {
+					_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
+				}
+				continue
+			}
+			var payCount int
+			_ = s.db.QueryRowContext(ctx, s.rebind(`SELECT COUNT(1) FROM payments WHERE order_id = ?;`), cand.orderID).Scan(&payCount)
+			if payCount == 0 {
 				continue
 			}
 			doc, errDoc := s.GetOrderDocument(ctx, cand.jobID)
 			if errDoc == nil && doc != nil {
-				cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, 1))
+				totalDocs := len(ord.Documents)
+				if totalDocs == 0 {
+					totalDocs = ord.Command.TotalDocuments
+				}
+				if totalDocs == 0 {
+					totalDocs = 1
+				}
+				cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, totalDocs))
 			} else {
 				cmds = append(cmds, ord.Command)
 			}

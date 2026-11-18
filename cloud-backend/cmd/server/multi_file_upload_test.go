@@ -675,3 +675,95 @@ func TestMultiFileUpload_CopiesPreservedExactlyOnce(t *testing.T) {
 		t.Errorf("PDF on disk has %d pages, want 2 (hardware replication exactly once)", pages)
 	}
 }
+
+func TestMultiFileUpload_MetadataCountMismatch_Rejected(t *testing.T) {
+	_, mux := setupUploadTestServer(t)
+
+	tmpDir := t.TempDir()
+	doc1Path := createTestPDFWithPages(t, tmpDir, 1)
+	doc2Path := createTestPDFWithPages(t, tmpDir, 1)
+
+	doc1Bytes, _ := os.ReadFile(doc1Path)
+	doc2Bytes, _ := os.ReadFile(doc2Path)
+
+	// Case 1: 2 files, 1 metadata item
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	p1, _ := writer.CreateFormFile("files", "doc1.pdf")
+	_, _ = p1.Write(doc1Bytes)
+	p2, _ := writer.CreateFormFile("files", "doc2.pdf")
+	_, _ = p2.Write(doc2Bytes)
+	_ = writer.WriteField("metadata", `[{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW"}]`)
+	_ = writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-meta-test/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for metadata count mismatch (1 vs 2), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "metadata count (1) must match uploaded files count (2)") {
+		t.Errorf("unexpected error message: %s", w.Body.String())
+	}
+
+	// Case 2: 2 files, 3 metadata items
+	body2 := &bytes.Buffer{}
+	writer2 := multipart.NewWriter(body2)
+	p1_2, _ := writer2.CreateFormFile("files", "doc1.pdf")
+	_, _ = p1_2.Write(doc1Bytes)
+	p2_2, _ := writer2.CreateFormFile("files", "doc2.pdf")
+	_, _ = p2_2.Write(doc2Bytes)
+	_ = writer2.WriteField("metadata", `[
+		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW"},
+		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW"},
+		{"copies": 1, "duplex": "SIMPLEX", "color_mode": "BW"}
+	]`)
+	_ = writer2.Close()
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-meta-test/upload", body2)
+	req2.Header.Set("Content-Type", writer2.FormDataContentType())
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for metadata count mismatch (3 vs 2), got %d: %s", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "metadata count (3) must match uploaded files count (2)") {
+		t.Errorf("unexpected error message: %s", w2.Body.String())
+	}
+}
+
+func TestSingleFileUpload_CleanupOnFailure(t *testing.T) {
+	app, mux := setupUploadTestServer(t)
+
+	// Upload invalid corrupt PDF disguised as a single file
+	corruptBytes := []byte("Not a real PDF file header corrupted garbage")
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	p, _ := writer.CreateFormFile("file", "corrupt.pdf")
+	_, _ = p.Write(corruptBytes)
+	_ = writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-single-fail/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code == http.StatusOK {
+		t.Fatalf("expected upload failure for corrupt file, got 200 OK")
+	}
+
+	// Verify no PDF files left in jobsDir
+	entries, err := os.ReadDir(app.cfg.jobsDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".pdf") {
+			t.Errorf("found orphaned PDF file in jobsDir after failed single upload: %s", entry.Name())
+		}
+	}
+}

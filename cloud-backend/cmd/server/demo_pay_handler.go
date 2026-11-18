@@ -553,13 +553,23 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Physical Print Authorization Gate
-	if captureRes.DispatchEligible && captureRes.Command != nil {
+	if captureRes.DispatchEligible {
 		log.Printf("[DEMO-PAY] Order %s authorized for printing (session %s)", att.OrderID, captureRes.ActiveSessionID)
 		if s.hub != nil {
-			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-				log.Printf("[DEMO-PAY] Failed to send print job to hub for kiosk %s: %v", captureRes.KioskID, err)
-			} else {
-				_ = s.db.MarkDispatchIntentSent(r.Context(), att.OrderID)
+			if len(captureRes.Commands) > 0 {
+				for _, cmd := range captureRes.Commands {
+					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
+						log.Printf("[DEMO-PAY] Failed to send print job to hub for kiosk %s: %v", cmd.KioskID, err)
+						break
+					}
+					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
+				}
+			} else if captureRes.Command != nil {
+				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
+					log.Printf("[DEMO-PAY] Failed to send print job to hub for kiosk %s: %v", captureRes.KioskID, err)
+				} else {
+					_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
+				}
 			}
 		}
 
