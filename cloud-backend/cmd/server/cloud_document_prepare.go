@@ -190,3 +190,44 @@ func (s *appServer) handleCloudVariantPrepare(w http.ResponseWriter,r *http.Requ
  })
 }
 
+
+type cloudVariantStatusRequest struct {
+ UploadID string `json:"upload_id"`
+ UploadToken string `json:"upload_token"`
+ VariantID string `json:"variant_id"`
+}
+
+// POST /api/documents/variants/status
+// Uses a POST body so the upload capability is never placed in URL query logs.
+func (s *appServer) handleCloudVariantStatus(w http.ResponseWriter,r *http.Request) {
+ if !cloudUploadsEnabled(){http.NotFound(w,r);return}
+ if r.Method!=http.MethodPost{http.Error(w,"method not allowed",405);return}
+ if s.db==nil {http.Error(w,"database unavailable",503);return}
+ r.Body=http.MaxBytesReader(w,r.Body,4096)
+ var input cloudVariantStatusRequest
+ decoder:=json.NewDecoder(r.Body);decoder.DisallowUnknownFields()
+ if decoder.Decode(&input)!=nil || len(input.UploadID)!=32 ||
+  len(input.UploadToken)!=64 || len(input.VariantID)!=32 {
+  http.Error(w,"invalid variant status request",400);return
+ }
+ sum:=sha256.Sum256([]byte(input.UploadToken))
+ upload,err:=s.db.AuthorizeCloudDocumentUpload(r.Context(),input.UploadID,hex.EncodeToString(sum[:]))
+ if err!=nil {http.Error(w,"upload not found",404);return}
+ variant,err:=s.db.GetCloudVariantByID(r.Context(),upload.ID,input.VariantID)
+ if err!=nil {http.Error(w,"variant not found",404);return}
+ if !time.Now().Before(variant.ExpiresAt) {http.Error(w,"variant expired",410);return}
+ w.Header().Set("Cache-Control","no-store")
+ w.Header().Set("Content-Type","application/json")
+ switch variant.State {
+ case "READY":
+  _=json.NewEncoder(w).Encode(map[string]any{"variant_id":variant.ID,"status":"READY",
+   "price_paise":variant.PricePaise,"tariff_revision":variant.TariffRevision,
+   "total_sheets":variant.TotalSheets,"billed_sides":variant.BilledSides})
+ case "PREPARING":
+  _=json.NewEncoder(w).Encode(map[string]string{"variant_id":variant.ID,"status":"PREPARING"})
+ case "FAILED":
+  _=json.NewEncoder(w).Encode(map[string]string{"variant_id":variant.ID,"status":"FAILED"})
+ default:
+  http.Error(w,"variant unavailable",409)
+ }
+}
