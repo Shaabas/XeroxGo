@@ -12,7 +12,8 @@ import (
 // upload and an exact set of rendering options.
 type CloudDocumentVariant struct {
  ID, UploadID, SettingsHash, NormalizerVersion, StorageKey, Checksum, State string
- BilledSides, TotalSheets int
+ Duplex, ColorMode string
+ Copies, BilledSides, TotalSheets int
  PricePaise, TariffRevision int64
  ExpiresAt time.Time
 }
@@ -45,12 +46,13 @@ func (s *Store) GetCloudVariant(ctx context.Context, uploadID, settingsHash, ver
  q := s.rebind(`SELECT variant_id, upload_id, settings_hash, normalizer_version, state,
    COALESCE(storage_key,''), COALESCE(checksum_sha256,''),
    COALESCE(billable_sides,0), COALESCE(total_sheets,0),
-   COALESCE(canonical_price_paise,0), COALESCE(tariff_revision,0), expires_at
+   COALESCE(canonical_price_paise,0), COALESCE(tariff_revision,0), expires_at,
+   COALESCE(copies,0), COALESCE(duplex,''), COALESCE(color_mode,'')
    FROM document_variants WHERE upload_id=? AND settings_hash=? AND normalizer_version=?`)
  err := s.db.QueryRowContext(ctx, q, uploadID, settingsHash, version).Scan(
   &v.ID, &v.UploadID, &v.SettingsHash, &v.NormalizerVersion, &v.State,
   &v.StorageKey, &v.Checksum, &v.BilledSides, &v.TotalSheets, &v.PricePaise,
-  &v.TariffRevision, &v.ExpiresAt)
+  &v.TariffRevision, &v.ExpiresAt, &v.Copies, &v.Duplex, &v.ColorMode)
  if errors.Is(err, sql.ErrNoRows) { return CloudDocumentVariant{}, ErrVariantUnavailable }
  return v, err
 }
@@ -61,12 +63,12 @@ func (s *Store) GetCloudVariant(ctx context.Context, uploadID, settingsHash, ver
 func (s *Store) PublishCloudVariant(ctx context.Context, v CloudDocumentVariant) (bool, error) {
  if s == nil || s.db == nil { return false, errors.New("database unavailable") }
  if len(v.Checksum) != 64 || v.StorageKey == "" || v.BilledSides < 1 || v.TotalSheets < 1 ||
-  v.PricePaise < 1 || v.TariffRevision < 1 { return false, errors.New("invalid canonical variant") }
+  v.PricePaise < 1 || v.TariffRevision < 1 || v.Copies < 1 || v.Duplex == "" || v.ColorMode == "" { return false, errors.New("invalid canonical variant") }
  q := s.rebind(`UPDATE document_variants SET state='READY', storage_key=?,
-  checksum_sha256=?, billable_sides=?, total_sheets=?, canonical_price_paise=?, tariff_revision=?
+  checksum_sha256=?, billable_sides=?, total_sheets=?, canonical_price_paise=?, tariff_revision=?, copies=?, duplex=?, color_mode=?
   WHERE variant_id=? AND state='PREPARING' AND expires_at > CURRENT_TIMESTAMP`)
  res, err := s.db.ExecContext(ctx, q, v.StorageKey, v.Checksum, v.BilledSides,
-  v.TotalSheets, v.PricePaise, v.TariffRevision, v.ID)
+  v.TotalSheets, v.PricePaise, v.TariffRevision, v.Copies, v.Duplex, v.ColorMode, v.ID)
  if err != nil { return false, err }
  n, err := res.RowsAffected()
  return n == 1, err
@@ -86,12 +88,13 @@ func (s *Store) GetCloudVariantByID(ctx context.Context, uploadID, variantID str
  q := s.rebind(`SELECT variant_id, upload_id, settings_hash, normalizer_version, state,
    COALESCE(storage_key,''), COALESCE(checksum_sha256,''),
    COALESCE(billable_sides,0), COALESCE(total_sheets,0),
-   COALESCE(canonical_price_paise,0), COALESCE(tariff_revision,0), expires_at
+   COALESCE(canonical_price_paise,0), COALESCE(tariff_revision,0), expires_at,
+   COALESCE(copies,0), COALESCE(duplex,''), COALESCE(color_mode,'')
    FROM document_variants WHERE upload_id=? AND variant_id=?`)
  err := s.db.QueryRowContext(ctx, q, uploadID, variantID).Scan(
   &v.ID, &v.UploadID, &v.SettingsHash, &v.NormalizerVersion, &v.State,
   &v.StorageKey, &v.Checksum, &v.BilledSides, &v.TotalSheets, &v.PricePaise,
-  &v.TariffRevision, &v.ExpiresAt)
+  &v.TariffRevision, &v.ExpiresAt, &v.Copies, &v.Duplex, &v.ColorMode)
  if errors.Is(err, sql.ErrNoRows) { return CloudDocumentVariant{}, ErrVariantUnavailable }
  return v, err
 }
