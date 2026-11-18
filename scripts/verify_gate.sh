@@ -150,7 +150,7 @@ echo ""
 # Gate 6 — Frontend Conversion Test Suite
 # -----------------------------------------------------------------------------
 echo "=== Gate 6: Frontend Conversion and Checkout Tests ==="
-if node --test frontend/js/conversion_test.js frontend/js/checkout_test.js; then
+if node --test frontend/js/conversion_test.js frontend/js/checkout_test.js frontend/js/cloud_upload_test.js; then
     echo "Gate 6 PASSED: Frontend conversion tests passed."
 else
     echo "Gate 6 FAILED: Frontend tests failed."
