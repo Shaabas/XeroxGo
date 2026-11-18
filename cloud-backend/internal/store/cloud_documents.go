@@ -96,3 +96,19 @@ func (s *Store) CompleteCloudDocumentUpload(ctx context.Context, id string, byte
     rows, err := res.RowsAffected()
     return rows == 1, err
 }
+
+
+// Worker-only lookup. Never expose this method through a public HTTP route:
+// the queue has already been authorized when the job was first committed.
+func (s *Store) GetVerifiedCloudUploadForWorker(ctx context.Context,id string) (CloudDocumentUpload,error) {
+ var u CloudDocumentUpload
+ if s==nil||s.db==nil||id=="" {return u,ErrCloudUploadUnauthorized}
+ q:=s.rebind(`SELECT upload_id,kiosk_id,object_key,content_type,declared_bytes,
+  verified_sha256,state,expires_at FROM document_uploads
+  WHERE upload_id=? AND state='UPLOADED' AND expires_at>CURRENT_TIMESTAMP
+   AND verified_sha256 IS NOT NULL`)
+ err:=s.db.QueryRowContext(ctx,q,id).Scan(&u.ID,&u.KioskID,&u.ObjectKey,
+  &u.ContentType,&u.DeclaredBytes,&u.VerifiedSHA256,&u.State,&u.ExpiresAt)
+ if err!=nil{return CloudDocumentUpload{},ErrCloudUploadUnauthorized}
+ return u,nil
+}
