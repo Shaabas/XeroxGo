@@ -20,6 +20,7 @@ func TestCloudCleanupStrictObjectPaths(t *testing.T){
   {Kind:"original",ID:strings.Repeat("a",32),Key:"uploads/../../secret"},
   {Kind:"original",ID:"not-hex",Key:"uploads/not-hex/original.pdf"},
   {Kind:"prepared",ID:"x",Key:"../../secret"},
+  {Kind:"prepared",ID:strings.Repeat("a",32),Key:"variants/"+strings.Repeat("b",32)+"/output.pdf"},
   {Kind:"other",ID:"x",Key:"uploads/x/original.pdf"},
  }
  for _,item:=range bad{
