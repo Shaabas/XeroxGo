@@ -179,6 +179,9 @@ func (s *appServer) handleCloudVariantPrepare(w http.ResponseWriter,r *http.Requ
  variant.TotalSheets=normalized.NormResult.TotalSheets
  variant.PricePaise=normalized.PricePaise
  variant.TariffRevision=normalized.TariffRevision
+ variant.Copies=opts.Copies
+ variant.Duplex=string(opts.Duplex)
+ variant.ColorMode=opts.ColorMode
  published,err=s.db.PublishCloudVariant(r.Context(),variant)
  if err!=nil || !published {http.Error(w,"prepared file could not be registered",503);return}
  w.Header().Set("Cache-Control","no-store")
