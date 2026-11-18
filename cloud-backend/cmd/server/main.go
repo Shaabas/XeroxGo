@@ -1473,6 +1473,7 @@ func main() {
 	defer stop()
 
 	go app.startConversionWorker(sigCtx)
+	go app.startCloudPreparationWorker(sigCtx)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
@@ -1504,6 +1505,7 @@ func (app *appServer) routes() *http.ServeMux {
 	mux.HandleFunc("/api/documents/uploads/complete", app.handleCloudUploadComplete)
 	mux.HandleFunc("/api/documents/variants/prepare", app.handleCloudVariantPrepare)
 	mux.HandleFunc("/api/documents/variants/status", app.handleCloudVariantStatus)
+	mux.HandleFunc("/api/documents/preparations/status", app.handleCloudPreparationStatus)
 	mux.HandleFunc("/api/documents/checkout", app.handleCloudReferenceCheckout)
 	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
 	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
