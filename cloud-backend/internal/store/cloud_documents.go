@@ -11,7 +11,7 @@ import (
 // CloudDocumentUpload is the server-owned upload capability record.
 // No upload token, object key or private file is exposed via the Data API.
 type CloudDocumentUpload struct {
-    ID, TokenHash, KioskID, OriginalName, ObjectKey, ContentType string
+    ID, TokenHash, KioskID, OriginalName, ObjectKey, ContentType, VerifiedSHA256 string
     DeclaredBytes int64
     State string
     ExpiresAt time.Time
@@ -43,11 +43,11 @@ func (s *Store) AuthorizeCloudDocumentUpload(ctx context.Context, id, tokenHash 
         return u, ErrCloudUploadUnauthorized
     }
     q := s.rebind(`SELECT upload_id, upload_token_hash, kiosk_id, original_name,
-        object_key, content_type, declared_bytes, state, expires_at
+        object_key, content_type, declared_bytes, state, expires_at, COALESCE(verified_sha256,'')
         FROM document_uploads WHERE upload_id = ?`)
     err := s.db.QueryRowContext(ctx, q, id).Scan(&u.ID, &u.TokenHash,
         &u.KioskID, &u.OriginalName, &u.ObjectKey, &u.ContentType,
-        &u.DeclaredBytes, &u.State, &u.ExpiresAt)
+        &u.DeclaredBytes, &u.State, &u.ExpiresAt, &u.VerifiedSHA256)
     if err != nil || subtle.ConstantTimeCompare([]byte(u.TokenHash), []byte(tokenHash)) != 1 ||
         !time.Now().Before(u.ExpiresAt) {
         return CloudDocumentUpload{}, ErrCloudUploadUnauthorized
