@@ -23,7 +23,9 @@ func cloudCleanupEnabled() bool {
 func safeCloudCleanupLocation(item store.CloudCleanupObject) (bucket string,err error) {
  switch item.Kind {
  case "prepared":
-  if !safePreparedObjectKey(item.Key){return "",errors.New("invalid private variant key")}
+  if len(item.ID)!=32 || item.Key!="variants/"+item.ID+"/output.pdf" || !safePreparedObjectKey(item.Key) {
+   return "",errors.New("invalid private variant key")
+  }
   return cloudPreparedBucket,nil
  case "original":
   if len(item.ID)!=32 {return "",errors.New("invalid original identity")}
