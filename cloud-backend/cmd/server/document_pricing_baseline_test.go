@@ -366,48 +366,70 @@ func TestDocumentPricing_MultiFileCollationOrderAndPadding(t *testing.T) {
 		t.Errorf("total_price_paise = %d, want 1050", totalPricePaise)
 	}
 
-	// Verify merged PDF page count:
-	// DocAlpha: 2 pages
-	// DocBeta: 3 content + 1 blank padding = 4 pages
-	// DocGamma: 1 page
-	// Total merged pages = 2 + 4 + 1 = 7 pages
+	// In multi-document printing architecture, no concatenated merged PDF is created.
+	// Instead, each document is normalized independently into its own canonical PDF.
 	orderID := resp["order_id"].(string)
 	jobHash := sha256ChecksumString(orderID)
 	mergedPDFPath := filepath.Join(app.cfg.jobsDir, jobHash+".pdf")
-
-	mergedPages := getPDFPageCount(t, mergedPDFPath)
-	if mergedPages != 7 {
-		t.Errorf("merged PDF page count = %d, want 7", mergedPages)
+	if _, err := os.Stat(mergedPDFPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no merged PDF at %s, but file exists", mergedPDFPath)
 	}
 
-	// Verify strict collation order and blank padding:
-	p1Text := getPageText(t, mergedPDFPath, 1)
-	if !strings.Contains(p1Text, "DocAlpha Page 1") {
-		t.Errorf("Page 1 should be DocAlpha Page 1, got: %q", p1Text)
+	// Verify child documents from store:
+	docs, err := app.db.GetOrderDocuments(context.Background(), orderID)
+	if err != nil {
+		t.Fatalf("GetOrderDocuments failed: %v", err)
 	}
-	p2Text := getPageText(t, mergedPDFPath, 2)
-	if !strings.Contains(p2Text, "DocAlpha Page 2") {
-		t.Errorf("Page 2 should be DocAlpha Page 2, got: %q", p2Text)
+	if len(docs) != 3 {
+		t.Fatalf("expected 3 child documents, got %d", len(docs))
 	}
-	p3Text := getPageText(t, mergedPDFPath, 3)
-	if !strings.Contains(p3Text, "DocBeta Page 1") {
-		t.Errorf("Page 3 should be DocBeta Page 1, got: %q", p3Text)
+
+	// DocAlpha: 2 content pages, simplex -> 2 pages on disk, 400 paise
+	dAlpha := docs[0]
+	if dAlpha.OriginalFilename != "DocAlpha_2p.pdf" || dAlpha.TotalPages != 2 || dAlpha.TotalSheets != 2 || dAlpha.PricePaise != 400 {
+		t.Errorf("dAlpha mismatch: %+v", dAlpha)
 	}
-	p4Text := getPageText(t, mergedPDFPath, 4)
-	if !strings.Contains(p4Text, "DocBeta Page 2") {
-		t.Errorf("Page 4 should be DocBeta Page 2, got: %q", p4Text)
+	dAlphaPath := filepath.Join(app.cfg.jobsDir, sha256ChecksumString(dAlpha.JobID)+".pdf")
+	if getPDFPageCount(t, dAlphaPath) != 2 {
+		t.Errorf("dAlpha PDF pages = %d, want 2", getPDFPageCount(t, dAlphaPath))
 	}
-	p5Text := getPageText(t, mergedPDFPath, 5)
-	if !strings.Contains(p5Text, "DocBeta Page 3") {
-		t.Errorf("Page 5 should be DocBeta Page 3, got: %q", p5Text)
+	if p1 := getPageText(t, dAlphaPath, 1); !strings.Contains(p1, "DocAlpha Page 1") {
+		t.Errorf("dAlpha Page 1 = %q", p1)
 	}
-	p6Text := getPageText(t, mergedPDFPath, 6)
-	if strings.TrimSpace(p6Text) != "" {
-		t.Errorf("Page 6 should be blank duplex padding for DocBeta, got: %q", p6Text)
+	if p2 := getPageText(t, dAlphaPath, 2); !strings.Contains(p2, "DocAlpha Page 2") {
+		t.Errorf("dAlpha Page 2 = %q", p2)
 	}
-	p7Text := getPageText(t, mergedPDFPath, 7)
-	if !strings.Contains(p7Text, "DocGamma Page 1") {
-		t.Errorf("Page 7 should be DocGamma Page 1, got: %q", p7Text)
+
+	// DocBeta: 3 content pages, duplex -> 4 pages on disk (with duplex blank back padding), 450 paise
+	dBeta := docs[1]
+	if dBeta.OriginalFilename != "DocBeta_3p.pdf" || dBeta.TotalPages != 3 || dBeta.TotalSheets != 2 || dBeta.PricePaise != 450 {
+		t.Errorf("dBeta mismatch: %+v", dBeta)
+	}
+	dBetaPath := filepath.Join(app.cfg.jobsDir, sha256ChecksumString(dBeta.JobID)+".pdf")
+	if getPDFPageCount(t, dBetaPath) != 4 {
+		t.Errorf("dBeta PDF pages = %d, want 4 (with duplex padding)", getPDFPageCount(t, dBetaPath))
+	}
+	if p1 := getPageText(t, dBetaPath, 1); !strings.Contains(p1, "DocBeta Page 1") {
+		t.Errorf("dBeta Page 1 = %q", p1)
+	}
+	if p3 := getPageText(t, dBetaPath, 3); !strings.Contains(p3, "DocBeta Page 3") {
+		t.Errorf("dBeta Page 3 = %q", p3)
+	}
+	if p4 := getPageText(t, dBetaPath, 4); strings.TrimSpace(p4) != "" {
+		t.Errorf("dBeta Page 4 should be blank padding, got %q", p4)
+	}
+
+	// DocGamma: 1 content page, simplex -> 1 page on disk, 200 paise
+	dGamma := docs[2]
+	if dGamma.OriginalFilename != "DocGamma_1p.pdf" || dGamma.TotalPages != 1 || dGamma.TotalSheets != 1 || dGamma.PricePaise != 200 {
+		t.Errorf("dGamma mismatch: %+v", dGamma)
+	}
+	dGammaPath := filepath.Join(app.cfg.jobsDir, sha256ChecksumString(dGamma.JobID)+".pdf")
+	if getPDFPageCount(t, dGammaPath) != 1 {
+		t.Errorf("dGamma PDF pages = %d, want 1", getPDFPageCount(t, dGammaPath))
+	}
+	if p1 := getPageText(t, dGammaPath, 1); !strings.Contains(p1, "DocGamma Page 1") {
+		t.Errorf("dGamma Page 1 = %q", p1)
 	}
 }
 

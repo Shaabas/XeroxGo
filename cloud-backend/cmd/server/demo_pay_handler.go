@@ -66,6 +66,19 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 
 	now := time.Now().UTC()
 	order, _ := s.db.GetOrder(r.Context(), att.OrderID)
+	if order != nil && len(order.Documents) > 1 {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "multi-document orders are not yet supported for payment",
+				"code":  "MULTI_DOC_PAYMENT_BLOCKED",
+			})
+			return
+		}
+		s.renderDemoErrorPage(w, http.StatusConflict, "Payment Not Supported", "Multi-document orders are not yet supported for payment at this kiosk.")
+		return
+	}
 	sess, _ := s.db.GetKioskSession(r.Context(), att.SessionID, now)
 
 	isExpired := now.After(att.ExpiresAt) || att.Status == "EXPIRED"
@@ -468,6 +481,19 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 	}
 
 	order, _ := s.db.GetOrder(r.Context(), att.OrderID)
+	if order != nil && len(order.Documents) > 1 {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "multi-document orders are not yet supported for payment",
+				"code":  "MULTI_DOC_PAYMENT_BLOCKED",
+			})
+			return
+		}
+		s.renderDemoErrorPage(w, http.StatusConflict, "Payment Not Supported", "Multi-document orders are not yet supported for payment at this kiosk.")
+		return
+	}
 
 	// Idempotency: if already marked paid, return success immediately
 	if att.Status == "PAID" {

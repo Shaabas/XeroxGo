@@ -1369,7 +1369,8 @@ func (c *Client) jobWorker(ctx context.Context) {
 	}
 }
 
-// extractOrderIDFromDownloadURL parses rawURL and extracts {order_id} if the path matches /api/orders/{order_id}/pdf.
+// extractOrderIDFromDownloadURL parses rawURL and extracts {order_id} if the path matches /api/orders/{order_id}/pdf
+// or /api/orders/{order_id}/jobs/{job_id}/pdf.
 // It returns empty string if the URL is malformed, not an orders endpoint, or has empty path segments.
 func extractOrderIDFromDownloadURL(rawURL string) string {
 	if strings.TrimSpace(rawURL) == "" {
@@ -1388,12 +1389,22 @@ func extractOrderIDFromDownloadURL(rawURL string) string {
 			return orderID
 		}
 	}
+	// Expected: ["api", "orders", "{order_id}", "jobs", "{job_id}", "pdf"]
+	if len(parts) == 6 && parts[0] == "api" && parts[1] == "orders" && parts[3] == "jobs" && parts[5] == "pdf" {
+		orderID := strings.TrimSpace(parts[2])
+		if orderID != "" {
+			return orderID
+		}
+	}
 	return ""
 }
 
 func isJobForActiveOrder(cmd contracts.PrintJobCommand, activeOrderID string) bool {
 	if activeOrderID == "" {
 		return false
+	}
+	if cmd.OrderID != "" && cmd.OrderID == activeOrderID {
+		return true
 	}
 	if cmd.JobID == activeOrderID || cmd.JobID == "job_"+activeOrderID {
 		return true

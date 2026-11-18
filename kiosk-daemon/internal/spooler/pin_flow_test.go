@@ -664,6 +664,8 @@ func TestSpooler_ExactURLPathCorrelation(t *testing.T) {
 		expected string
 	}{
 		{"valid standard order URL", "http://localhost:8080/api/orders/ord_123/pdf", "ord_123"},
+		{"valid per-job order URL", "http://localhost:8080/api/orders/ord_123/jobs/job_456/pdf", "ord_123"},
+		{"valid https per-job order URL", "https://cloud.xeroxgo.demo/api/orders/ord_abc-xyz_99/jobs/job_def-789/pdf", "ord_abc-xyz_99"},
 		{"valid https order URL", "https://cloud.xeroxgo.demo/api/orders/ord_abc-xyz_99/pdf", "ord_abc-xyz_99"},
 		{"prefix collision rejected", "http://localhost:8080/api/orders/ord_123_evil/pdf", "ord_123_evil"},
 		{"query collision rejected", "http://localhost:8080/api/orders/ord_123?ext=pdf", ""},

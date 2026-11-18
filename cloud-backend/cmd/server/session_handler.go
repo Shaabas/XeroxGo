@@ -404,6 +404,24 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Load order to verify document count and printable readiness
+	ord, oErr := s.db.GetOrder(r.Context(), orderID)
+	if oErr != nil || ord == nil {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	// Safety: Block payment initiation for multi-document orders until full printing pipeline is ready
+	if len(ord.Documents) > 1 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "multi-document orders are not yet supported for payment",
+			"code":  "MULTI_DOC_PAYMENT_BLOCKED",
+		})
+		return
+	}
+
 	// Revalidate printer condition and fresh stock before initiating payment
 	stock, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
@@ -419,21 +437,18 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 	// Verify paper supply against other commitments
 	committedSheets, cErr := s.db.GetCommittedPaperSheets(r.Context(), kioskID, orderID, now)
 	if cErr == nil {
-		ord, oErr := s.db.GetOrder(r.Context(), orderID)
-		if oErr == nil && ord != nil {
-			reqSheets := ord.Command.TotalSheets
-			if reqSheets <= 0 {
-				reqSheets = 1
-			}
-			if (stock - committedSheets) < reqSheets {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				_ = json.NewEncoder(w).Encode(map[string]string{
-					"error": "insufficient paper in kiosk tray to fulfill order",
-					"code":  "INSUFFICIENT_PAPER",
-				})
-				return
-			}
+		reqSheets := ord.Command.TotalSheets
+		if reqSheets <= 0 {
+			reqSheets = 1
+		}
+		if (stock - committedSheets) < reqSheets {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "insufficient paper in kiosk tray to fulfill order",
+				"code":  "INSUFFICIENT_PAPER",
+			})
+			return
 		}
 	}
 

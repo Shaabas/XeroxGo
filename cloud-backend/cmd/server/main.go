@@ -17,7 +17,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -165,6 +164,44 @@ func verifySignedDownloadURL(orderID string, expires int64, sig string, secret [
 	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expected)))
 }
 
+func generateSignedJobDownloadURL(baseURL, orderID, jobID string, secret []byte, ttl time.Duration) string {
+	expires := time.Now().Add(ttl).Unix()
+	msg := fmt.Sprintf("%s\n%s\n%d", orderID, jobID, expires)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(msg))
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return fmt.Sprintf("%s/api/orders/%s/jobs/%s/pdf?expires=%d&sig=%s", baseURL, orderID, jobID, expires, sig)
+}
+
+func verifySignedJobDownloadURL(orderID, jobID string, expires int64, sig string, secret []byte) bool {
+	if time.Now().Unix() > expires {
+		return false
+	}
+	msg := fmt.Sprintf("%s\n%s\n%d", orderID, jobID, expires)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(msg))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expected)))
+}
+
+func linkOrCopyFile(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
 func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -251,247 +288,23 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metadataRaw := strings.TrimSpace(r.FormValue("metadata"))
-	if len(fileHeaders) > 1 || metadataRaw != "" {
-		var metaItems []docItemMeta
-		if metadataRaw != "" {
-			_ = json.Unmarshal([]byte(metadataRaw), &metaItems)
-		}
-
-		pricing, err := s.db.GetPricing(r.Context())
-		if err != nil {
-			pricing = store.DefaultPricingConfig()
-		}
-
-		orderHex, err := randomHex(12)
-		if err != nil {
-			http.Error(w, "failed to generate order id", http.StatusInternalServerError)
+	var metaItems []docItemMeta
+	if metadataRaw != "" {
+		if err := json.Unmarshal([]byte(metadataRaw), &metaItems); err != nil {
+			http.Error(w, fmt.Sprintf("invalid metadata JSON: %v", err), http.StatusBadRequest)
 			return
 		}
-		orderID := "ord_" + orderHex
-
-		jobHex, err := randomHex(12)
-		if err != nil {
-			http.Error(w, "failed to generate job id", http.StatusInternalServerError)
-			return
-		}
-		jobID := "job_" + jobHex
-
-		h := sha256.Sum256([]byte(orderID))
-		outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
-
-		var intermediateNormPDFs []string
-		defer func() {
-			for _, p := range intermediateNormPDFs {
-				_ = os.Remove(p)
-			}
-		}()
-
-		var totalOrderPricePaise int64
-		var totalPrintedPages int
-		var totalSheets int
-		anyDuplex := false
-		anyColor := false
-
-		for idx, fh := range fileHeaders {
-			originalFilename := fh.Filename
-			f, err := fh.Open()
-			if err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, fmt.Sprintf("failed to open uploaded file %q: %v", originalFilename, err), http.StatusBadRequest)
-				return
-			}
-
-			var docOpts docPrintOptions
-			if idx < len(metaItems) {
-				docOpts, err = parseMetadataPrintOptions(metaItems[idx], pricing.ColorEnabled, idx+1)
-			} else {
-				docOpts, err = parseFormPrintOptions(r, pricing.ColorEnabled, idx+1)
-			}
-			if err != nil {
-				_ = f.Close()
-				_ = os.Remove(outputPath)
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-
-			prep, err := prepareInputPDF(r.Context(), f, originalFilename, s.cfg.jobsDir, "upload_in_*", idx+1)
-			_ = f.Close()
-			if err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			defer prep.cleanup()
-
-			if docOpts.Duplex != contracts.DuplexSimplex {
-				anyDuplex = true
-			}
-			if docOpts.ColorMode == "COLOR" {
-				anyColor = true
-			}
-
-			tmpNorm, err := os.CreateTemp(s.cfg.jobsDir, "upload_norm_*.pdf")
-			if err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, "failed to create intermediate file", http.StatusInternalServerError)
-				return
-			}
-			tmpNormPath := tmpNorm.Name()
-			_ = tmpNorm.Close()
-			intermediateNormPDFs = append(intermediateNormPDFs, tmpNormPath)
-
-			res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpNormPath, docOpts, pricing, true)
-			if err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
-				return
-			}
-
-			totalOrderPricePaise += res.PricePaise
-			totalPrintedPages += res.PrintedSides
-			totalSheets += res.NormResult.TotalSheets
-		}
-
-		if len(intermediateNormPDFs) == 1 {
-			data, err := os.ReadFile(intermediateNormPDFs[0])
-			if err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, "failed to read normalized document", http.StatusInternalServerError)
-				return
-			}
-			if err := os.WriteFile(outputPath, data, 0600); err != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, "failed to save output document", http.StatusInternalServerError)
-				return
-			}
-		} else {
-			qpdfArgs := []string{"--empty", "--pages"}
-			for _, p := range intermediateNormPDFs {
-				qpdfArgs = append(qpdfArgs, p, "1-z")
-			}
-			qpdfArgs = append(qpdfArgs, "--", outputPath)
-
-			cmdMerge := exec.CommandContext(r.Context(), "qpdf", qpdfArgs...)
-			outMerge, errMerge := cmdMerge.CombinedOutput()
-			if errMerge != nil {
-				_ = os.Remove(outputPath)
-				http.Error(w, fmt.Sprintf("failed to merge documents: %s: %v", strings.TrimSpace(string(outMerge)), errMerge), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		finalBytes, err := os.ReadFile(outputPath)
-		if err != nil {
-			_ = os.Remove(outputPath)
-			http.Error(w, "failed to read merged document", http.StatusInternalServerError)
-			return
-		}
-		checksumBytes := sha256.Sum256(finalBytes)
-		sha256Checksum := hex.EncodeToString(checksumBytes[:])
-
-		baseURL := os.Getenv("XEROXGO_PUBLIC_URL")
-		if baseURL == "" {
-			scheme := "http"
-			if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-				scheme = "https"
-			}
-			baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
-		}
-		baseURL = strings.TrimRight(baseURL, "/")
-		downloadURL := generateSignedDownloadURL(baseURL, orderID, s.cfg.downloadSecret, 24*time.Hour)
-
-		overallDuplex := contracts.DuplexSimplex
-		if anyDuplex {
-			overallDuplex = contracts.DuplexLongEdge
-		}
-		overallColor := "BW"
-		if anyColor {
-			overallColor = "COLOR"
-		}
-
-		cmd := contracts.PrintJobCommand{
-			JobID:          jobID,
-			KioskID:        kioskID,
-			DisplayCode:    "",
-			DownloadURL:    downloadURL,
-			SHA256Checksum: sha256Checksum,
-			TotalPages:     totalPrintedPages,
-			TotalSheets:    totalSheets,
-			Copies:         1,
-			Duplex:         overallDuplex,
-			StartFromPage:  1,
-		}
-
-		claimToken, err := randomHex(32)
-		if err != nil {
-			http.Error(w, "failed to generate recovery credential", http.StatusInternalServerError)
-			return
-		}
-
-		pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
-		order := store.Order{
-			OrderID:      orderID,
-			Command:      cmd,
-			Status:       contracts.JobStatusPendingPayment,
-			PricePaise:   totalOrderPricePaise,
-			ColorMode:    overallColor,
-			PINExpiresAt: pinExpiresAt,
-			ClaimToken:   claimToken,
-		}
-
-		if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
-			_ = os.Remove(outputPath)
-			http.Error(w, "failed to persist order", http.StatusInternalServerError)
-			return
-		}
-		displayCode := order.Command.DisplayCode
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"order_id":              orderID,
-			"job_id":                jobID,
-			"display_code":          displayCode,
-			"claim_token":           claimToken,
-			"recovery_token":        claimToken,
-			"pin_expires_at":        pinExpiresAt.Format(time.RFC3339),
-			"color_mode":            overallColor,
-			"total_pages":           totalPrintedPages,
-			"total_sheets":          totalSheets,
-			"copies":                1,
-			"duplex":                string(overallDuplex),
-			"documents_count":       len(fileHeaders),
-			"total_price_paise":     totalOrderPricePaise,
-			"status":                string(contracts.JobStatusPendingPayment),
-		})
-		return
 	}
-
-	fileHeader := fileHeaders[0]
-	file, err := fileHeader.Open()
-	if err != nil {
-		http.Error(w, "failed to open file", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	originalFilename := fileHeader.Filename
 
 	pricing, err := s.db.GetPricing(r.Context())
 	hasPricing := err == nil
-	colorEnabled := hasPricing && pricing.ColorEnabled
-
-	opts, err := parseFormPrintOptions(r, colorEnabled, 0)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		pricing = store.DefaultPricingConfig()
 	}
-
-	prep, err := prepareInputPDF(r.Context(), file, originalFilename, s.cfg.jobsDir, "upload_in_*", 0)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	if len(fileHeaders) > 1 || len(metaItems) > 0 {
+		hasPricing = true
 	}
-	defer prep.cleanup()
+	colorEnabled := pricing.ColorEnabled
 
 	orderHex, err := randomHex(12)
 	if err != nil {
@@ -499,23 +312,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orderID := "ord_" + orderHex
-
-	jobHex, err := randomHex(12)
-	if err != nil {
-		http.Error(w, "failed to generate job id", http.StatusInternalServerError)
-		return
-	}
-	jobID := "job_" + jobHex
-
-	h := sha256.Sum256([]byte(orderID))
-	outputPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
-
-	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, outputPath, opts, pricing, hasPricing)
-	if err != nil {
-		_ = os.Remove(outputPath)
-		http.Error(w, fmt.Sprintf("normalization failed: %v", err), http.StatusBadRequest)
-		return
-	}
 
 	baseURL := os.Getenv("XEROXGO_PUBLIC_URL")
 	if baseURL == "" {
@@ -526,19 +322,133 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
-	downloadURL := generateSignedDownloadURL(baseURL, orderID, s.cfg.downloadSecret, 24*time.Hour)
 
-	cmd := contracts.PrintJobCommand{
-		JobID:          jobID,
-		KioskID:        kioskID,
-		DisplayCode:    "",
-		DownloadURL:    downloadURL,
-		SHA256Checksum: res.NormResult.SHA256Checksum,
-		TotalPages:     res.NormResult.TotalPages,
-		TotalSheets:    res.NormResult.TotalSheets,
-		Copies:         opts.Copies,
-		Duplex:         opts.Duplex,
-		StartFromPage:  1,
+	var createdJobFiles []string
+	var success bool
+	defer func() {
+		if !success {
+			for _, p := range createdJobFiles {
+				_ = os.Remove(p)
+			}
+		}
+	}()
+
+	var docs []store.OrderDocument
+	var totalOrderPricePaise int64
+	var totalOrderPages int
+	var totalOrderSheets int
+	var firstUnitPrice int64
+	anyDuplex := false
+	anyColor := false
+
+	isMultiFile := len(fileHeaders) > 1
+
+	for idx, fh := range fileHeaders {
+		originalFilename := fh.Filename
+		f, err := fh.Open()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to open uploaded file %q: %v", originalFilename, err), http.StatusBadRequest)
+			return
+		}
+
+		docNum := idx + 1
+		if !isMultiFile && len(metaItems) == 0 {
+			docNum = 0
+		}
+
+		var docOpts docPrintOptions
+		if idx < len(metaItems) {
+			docOpts, err = parseMetadataPrintOptions(metaItems[idx], colorEnabled, docNum)
+		} else {
+			docOpts, err = parseFormPrintOptions(r, colorEnabled, docNum)
+		}
+		if err != nil {
+			_ = f.Close()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		prep, err := prepareInputPDF(r.Context(), f, originalFilename, s.cfg.jobsDir, "upload_in_*", docNum)
+		_ = f.Close()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer prep.cleanup()
+
+		jobHex, err := randomHex(12)
+		if err != nil {
+			http.Error(w, "failed to generate job id", http.StatusInternalServerError)
+			return
+		}
+		jobID := "job_" + jobHex
+
+		hJob := sha256.Sum256([]byte(jobID))
+		jobPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
+		createdJobFiles = append(createdJobFiles, jobPDFPath)
+
+		res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, jobPDFPath, docOpts, pricing, hasPricing)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
+			return
+		}
+
+		if idx == 0 {
+			firstUnitPrice = res.UnitPrice
+		}
+
+		jobDownloadURL := generateSignedJobDownloadURL(baseURL, orderID, jobID, s.cfg.downloadSecret, 24*time.Hour)
+
+		doc := store.OrderDocument{
+			JobID:            jobID,
+			OrderID:          orderID,
+			DocumentIndex:    idx,
+			OriginalFilename: originalFilename,
+			DownloadURL:      jobDownloadURL,
+			SHA256Checksum:   res.NormResult.SHA256Checksum,
+			TotalPages:       res.NormResult.TotalPages,
+			TotalSheets:      res.NormResult.TotalSheets,
+			Copies:           docOpts.Copies,
+			Duplex:           docOpts.Duplex,
+			ColorMode:        docOpts.ColorMode,
+			PageRange:        docOpts.PageRange,
+			Orientation:      docOpts.Orientation,
+			PagesPerSheet:    docOpts.PagesPerSheet,
+			PricePaise:       res.PricePaise,
+			Status:           contracts.JobStatusPendingPayment,
+		}
+		docs = append(docs, doc)
+
+		totalOrderPricePaise += res.PricePaise
+		totalOrderPages += res.NormResult.TotalPages
+		totalOrderSheets += res.NormResult.TotalSheets
+
+		if docOpts.Duplex != contracts.DuplexSimplex {
+			anyDuplex = true
+		}
+		if docOpts.ColorMode == "COLOR" {
+			anyColor = true
+		}
+	}
+
+	// For single-document orders, also create the order-level PDF link/file for backward compatibility with existing tests
+	if !isMultiFile && len(docs) == 1 {
+		hOrd := sha256.Sum256([]byte(orderID))
+		orderPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
+		hJob := sha256.Sum256([]byte(docs[0].JobID))
+		jobPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
+		if err := linkOrCopyFile(jobPDFPath, orderPDFPath); err == nil {
+			createdJobFiles = append(createdJobFiles, orderPDFPath)
+		}
+	}
+
+	overallDuplex := contracts.DuplexSimplex
+	if anyDuplex {
+		overallDuplex = contracts.DuplexLongEdge
+	}
+	overallColor := "BW"
+	if anyColor {
+		overallColor = "COLOR"
 	}
 
 	claimToken, err := randomHex(32)
@@ -548,86 +458,88 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
+
+	cmd := contracts.PrintJobCommand{
+		JobID:            docs[0].JobID,
+		OrderID:          orderID,
+		DocumentIndex:    0,
+		TotalDocuments:   len(docs),
+		OriginalFilename: docs[0].OriginalFilename,
+		ColorMode:        docs[0].ColorMode,
+		KioskID:          kioskID,
+		DisplayCode:      "",
+		DownloadURL:      docs[0].DownloadURL,
+		SHA256Checksum:   docs[0].SHA256Checksum,
+		TotalPages:       totalOrderPages,
+		TotalSheets:      totalOrderSheets,
+		Copies:           docs[0].Copies,
+		Duplex:           docs[0].Duplex,
+		StartFromPage:    1,
+	}
+
 	order := store.Order{
 		OrderID:      orderID,
 		Command:      cmd,
 		Status:       contracts.JobStatusPendingPayment,
-		PricePaise:   res.PricePaise,
-		ColorMode:    opts.ColorMode,
+		PricePaise:   totalOrderPricePaise,
+		ColorMode:    overallColor,
+		TotalPages:   totalOrderPages,
+		TotalSheets:  totalOrderSheets,
+		Documents:    docs,
 		PINExpiresAt: pinExpiresAt,
 		ClaimToken:   claimToken,
 	}
 
 	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
-		_ = os.Remove(outputPath)
 		http.Error(w, "failed to persist order", http.StatusInternalServerError)
 		return
 	}
+	success = true
 	displayCode := order.Command.DisplayCode
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"order_id":              orderID,
-		"job_id":                jobID,
-		"display_code":          displayCode,
-		"claim_token":           claimToken,
-		"recovery_token":        claimToken,
-		"pin_expires_at":        pinExpiresAt.Format(time.RFC3339),
-		"color_mode":            opts.ColorMode,
-		"total_pages":           res.NormResult.TotalPages,
-		"total_sheets":          res.NormResult.TotalSheets,
-		"copies":                opts.Copies,
-		"duplex":                string(opts.Duplex),
-		"price_per_sheet_paise": res.UnitPrice,
-		"price_per_side_paise":  res.UnitPrice,
-		"unit_price_paise":      res.UnitPrice,
-		"total_price_paise":     res.PricePaise,
-		"status":                string(contracts.JobStatusPendingPayment),
-	})
+	resp := map[string]interface{}{
+		"order_id":          orderID,
+		"job_id":            docs[0].JobID,
+		"display_code":      displayCode,
+		"claim_token":       claimToken,
+		"recovery_token":    claimToken,
+		"pin_expires_at":    pinExpiresAt.Format(time.RFC3339),
+		"color_mode":        overallColor,
+		"total_pages":       totalOrderPages,
+		"total_sheets":      totalOrderSheets,
+		"copies":            docs[0].Copies,
+		"duplex":            string(overallDuplex),
+		"documents_count":   len(docs),
+		"total_price_paise": totalOrderPricePaise,
+		"status":            string(contracts.JobStatusPendingPayment),
+	}
+	if !isMultiFile {
+		resp["price_per_sheet_paise"] = firstUnitPrice
+		resp["price_per_side_paise"] = firstUnitPrice
+		resp["unit_price_paise"] = firstUnitPrice
+	}
+	docSummaries := make([]map[string]interface{}, len(docs))
+	for i, d := range docs {
+		docSummaries[i] = map[string]interface{}{
+			"job_id":            d.JobID,
+			"document_index":    d.DocumentIndex,
+			"original_filename": d.OriginalFilename,
+			"download_url":      d.DownloadURL,
+			"sha256_checksum":   d.SHA256Checksum,
+			"total_pages":       d.TotalPages,
+			"total_sheets":      d.TotalSheets,
+			"copies":            d.Copies,
+			"duplex":            string(d.Duplex),
+			"color_mode":        d.ColorMode,
+			"price_paise":       d.PricePaise,
+		}
+	}
+	resp["documents"] = docSummaries
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	prefix := "/api/orders/"
-	suffix := "/pdf"
-	if !strings.HasPrefix(r.URL.Path, prefix) || !strings.HasSuffix(r.URL.Path, suffix) {
-		http.NotFound(w, r)
-		return
-	}
-	orderID := strings.TrimPrefix(r.URL.Path, prefix)
-	orderID = strings.TrimSuffix(orderID, suffix)
-	orderID = strings.TrimSpace(orderID)
-	if orderID == "" {
-		http.Error(w, "order id required", http.StatusBadRequest)
-		return
-	}
-
-	expiresStr := r.URL.Query().Get("expires")
-	sig := r.URL.Query().Get("sig")
-	if expiresStr == "" || sig == "" {
-		http.Error(w, "missing authentication signature", http.StatusUnauthorized)
-		return
-	}
-
-	expires, err := strconv.ParseInt(expiresStr, 10, 64)
-	if err != nil || !verifySignedDownloadURL(orderID, expires, sig, s.cfg.downloadSecret) {
-		http.Error(w, "invalid or expired download URL", http.StatusUnauthorized)
-		return
-	}
-
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusNotFound)
-		return
-	}
-
-	h := sha256.Sum256([]byte(orderID))
-	pdfPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
-
+func (s *appServer) streamPDF(w http.ResponseWriter, pdfPath, expectedChecksum string) {
 	f, err := os.Open(pdfPath)
 	if err != nil {
 		http.Error(w, "document artifact not found", http.StatusNotFound)
@@ -641,7 +553,7 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	calcSHA := hex.EncodeToString(hasher.Sum(nil))
-	if calcSHA != strings.ToLower(order.Command.SHA256Checksum) {
+	if expectedChecksum != "" && strings.ToLower(calcSHA) != strings.ToLower(expectedChecksum) {
 		http.Error(w, "artifact integrity check failed", http.StatusInternalServerError)
 		return
 	}
@@ -656,6 +568,113 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.Copy(w, f)
+}
+
+func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	prefix := "/api/orders/"
+	suffix := "/pdf"
+	if !strings.HasPrefix(r.URL.Path, prefix) || !strings.HasSuffix(r.URL.Path, suffix) {
+		http.NotFound(w, r)
+		return
+	}
+
+	trimmed := strings.TrimPrefix(r.URL.Path, prefix)
+	trimmed = strings.TrimSuffix(trimmed, suffix)
+	trimmed = strings.Trim(trimmed, "/")
+
+	expiresStr := r.URL.Query().Get("expires")
+	sig := r.URL.Query().Get("sig")
+	if expiresStr == "" || sig == "" {
+		http.Error(w, "missing authentication signature", http.StatusUnauthorized)
+		return
+	}
+	expires, err := strconv.ParseInt(expiresStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid expiration", http.StatusUnauthorized)
+		return
+	}
+
+	// Check if this is a per-job download route: /api/orders/{orderID}/jobs/{jobID}/pdf
+	if strings.Contains(trimmed, "/jobs/") {
+		parts := strings.Split(trimmed, "/jobs/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			http.Error(w, "invalid job download path", http.StatusBadRequest)
+			return
+		}
+		orderID := strings.TrimSpace(parts[0])
+		jobID := strings.TrimSpace(parts[1])
+
+		if !verifySignedJobDownloadURL(orderID, jobID, expires, sig, s.cfg.downloadSecret) {
+			http.Error(w, "invalid or expired download URL", http.StatusUnauthorized)
+			return
+		}
+
+		doc, err := s.db.GetOrderDocument(r.Context(), jobID)
+		if err != nil || doc == nil {
+			http.Error(w, "document not found", http.StatusNotFound)
+			return
+		}
+
+		// Security: prevent exposing other orders' documents
+		if doc.OrderID != orderID {
+			http.Error(w, "document does not belong to specified order", http.StatusForbidden)
+			return
+		}
+
+		h := sha256.Sum256([]byte(jobID))
+		pdfPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
+		s.streamPDF(w, pdfPath, doc.SHA256Checksum)
+		return
+	}
+
+	// Order-level download route: /api/orders/{orderID}/pdf
+	orderID := strings.TrimSpace(trimmed)
+	if orderID == "" {
+		http.Error(w, "order id required", http.StatusBadRequest)
+		return
+	}
+
+	if !verifySignedDownloadURL(orderID, expires, sig, s.cfg.downloadSecret) {
+		http.Error(w, "invalid or expired download URL", http.StatusUnauthorized)
+		return
+	}
+
+	order, err := s.db.GetOrder(r.Context(), orderID)
+	if err != nil || order == nil {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	if len(order.Documents) > 1 {
+		http.Error(w, "multi-document order requires per-job download URL", http.StatusBadRequest)
+		return
+	}
+
+	var expectedChecksum string
+	var pdfPath string
+
+	if len(order.Documents) == 1 {
+		expectedChecksum = order.Documents[0].SHA256Checksum
+		jobID := order.Documents[0].JobID
+		hJob := sha256.Sum256([]byte(jobID))
+		candJobPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
+		if _, err := os.Stat(candJobPath); err == nil {
+			pdfPath = candJobPath
+		}
+	}
+
+	if pdfPath == "" {
+		expectedChecksum = order.Command.SHA256Checksum
+		hOrd := sha256.Sum256([]byte(orderID))
+		pdfPath = filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
+	}
+
+	s.streamPDF(w, pdfPath, expectedChecksum)
 }
 
 // handleDocumentPreview handles POST /api/documents/preview.
@@ -813,6 +832,17 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 	order, err := s.db.GetOrder(r.Context(), orderID)
 	if err != nil || order == nil {
 		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	if len(order.Documents) > 1 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"order_id": orderID,
+			"error":    "multi-document orders are not yet supported for payment",
+			"code":     "MULTI_DOC_PAYMENT_BLOCKED",
+		})
 		return
 	}
 
