@@ -35,6 +35,9 @@ create table if not exists public.document_variants (
   checksum_sha256 text,
   billable_sides integer,
   total_sheets integer,
+  copies integer,
+  duplex text,
+  color_mode text,
   canonical_price_paise bigint,
   tariff_revision bigint,
   state text not null default 'PREPARING'
@@ -74,7 +77,8 @@ create table if not exists public.cloud_order_requests (
   kiosk_id text not null,
   accepted_price_paise bigint not null check (accepted_price_paise > 0),
   tariff_revision bigint not null check (tariff_revision > 0),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  unique (upload_id, variant_id)
 );
 alter table public.cloud_order_requests enable row level security;
 revoke all on public.cloud_order_requests from PUBLIC, anon, authenticated;
