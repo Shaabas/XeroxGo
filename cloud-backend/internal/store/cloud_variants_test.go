@@ -42,6 +42,11 @@ func TestCloudVariantReservationAndImmutablePublish(t *testing.T) {
  if err!=nil||final.State!="READY"||final.PricePaise!=500||final.Checksum!=got.Checksum {
   t.Fatalf("unexpected persisted variant %+v %v",final,err)
  }
+ scoped,err:=db.GetCloudVariantByID(ctx,got.UploadID,got.ID)
+ if err!=nil||scoped.ID!=got.ID||scoped.State!="READY" {t.Fatalf("scoped read %+v %v",scoped,err)}
+ if _,err:=db.GetCloudVariantByID(ctx,"another-upload",got.ID);err==nil {
+  t.Fatal("cross-upload variant access accepted")
+ }
  if err:=db.FailCloudVariant(ctx,got.ID);err!=nil {t.Fatal(err)}
  final,err=db.GetCloudVariant(ctx,got.UploadID,got.SettingsHash,got.NormalizerVersion)
  if err!=nil||final.State!="READY" {t.Fatalf("READY mutated after fail %+v %v",final,err)}
