@@ -659,6 +659,24 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// V2 order artifacts live in private Storage, not Render's ephemeral disk.
+	// Legacy jobs continue to use the existing disk-backed path unchanged.
+	if cloudUploadsEnabled() {
+		key, checksum, cloud, lookupErr := s.db.CloudOrderPreparedObject(r.Context(), orderID)
+		if lookupErr != nil {
+			http.Error(w, "document reference unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if cloud {
+			if checksum != order.Command.SHA256Checksum {
+				http.Error(w, "stored document checksum mismatch", http.StatusInternalServerError)
+				return
+			}
+			s.serveCloudOrderArtifact(w, r, key, checksum)
+			return
+		}
+	}
+
 	h := sha256.Sum256([]byte(orderID))
 	pdfPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
@@ -1486,6 +1504,7 @@ func (app *appServer) routes() *http.ServeMux {
 	mux.HandleFunc("/api/documents/uploads/complete", app.handleCloudUploadComplete)
 	mux.HandleFunc("/api/documents/variants/prepare", app.handleCloudVariantPrepare)
 	mux.HandleFunc("/api/documents/variants/status", app.handleCloudVariantStatus)
+	mux.HandleFunc("/api/documents/checkout", app.handleCloudReferenceCheckout)
 	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
 	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
 	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
