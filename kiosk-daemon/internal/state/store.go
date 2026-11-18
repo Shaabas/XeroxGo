@@ -108,6 +108,11 @@ func Open(dbPath string) (*Store, error) {
 	schema := `
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL DEFAULT '',
+    document_index INTEGER NOT NULL DEFAULT 0,
+    total_documents INTEGER NOT NULL DEFAULT 1,
+    original_filename TEXT NOT NULL DEFAULT '',
+    color_mode TEXT NOT NULL DEFAULT 'BW',
     kiosk_id TEXT NOT NULL,
     display_code TEXT NOT NULL,
     download_url TEXT NOT NULL,
@@ -141,6 +146,12 @@ CREATE TABLE IF NOT EXISTS printer_state (
 	// Schema migrations for existing databases
 	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN cups_job_id TEXT NOT NULL DEFAULT '';")
 	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN submitted_to_printer INTEGER NOT NULL DEFAULT 0;")
+	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN order_id TEXT NOT NULL DEFAULT '';")
+	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN document_index INTEGER NOT NULL DEFAULT 0;")
+	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN total_documents INTEGER NOT NULL DEFAULT 1;")
+	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN original_filename TEXT NOT NULL DEFAULT '';")
+	_, _ = db.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
+	_, _ = db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_jobs_order_doc ON jobs (order_id, document_index);")
 	_, _ = db.ExecContext(ctx, "ALTER TABLE printer_state ADD COLUMN is_calibrated INTEGER NOT NULL DEFAULT 0;")
 
 	initQuery := `
@@ -182,6 +193,9 @@ func (s *Store) SaveJob(
 	if cmd.KioskID == "" {
 		return errors.New("kiosk_id cannot be empty")
 	}
+	if cmd.DocumentIndex < 0 {
+		return fmt.Errorf("document_index must be >= 0, got %d", cmd.DocumentIndex)
+	}
 	if cmd.TotalPages < 1 {
 		return fmt.Errorf("total_pages must be >= 1, got %d", cmd.TotalPages)
 	}
@@ -204,18 +218,34 @@ func (s *Store) SaveJob(
 		return fmt.Errorf("invalid job status: %q", status)
 	}
 
+	totalDocs := cmd.TotalDocuments
+	if totalDocs < 1 {
+		totalDocs = 1
+	}
+
+	colorMode := strings.ToUpper(strings.TrimSpace(cmd.ColorMode))
+	if colorMode == "" {
+		colorMode = "BW"
+	}
+
 	nowNS := time.Now().UTC().UnixNano()
 
 	query := `
 INSERT INTO jobs (
-    job_id, kiosk_id, display_code, download_url, sha256_checksum,
+    job_id, order_id, document_index, total_documents, original_filename, color_mode,
+    kiosk_id, display_code, download_url, sha256_checksum,
     total_pages, total_sheets, copies, duplex, start_from_page,
     status, pages_printed, sheets_printed, error_reason,
     cups_job_id, submitted_to_printer, updated_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '', '', 0, ?);`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '', '', 0, ?);`
 
 	_, err := s.db.ExecContext(ctx, query,
 		cmd.JobID,
+		cmd.OrderID,
+		cmd.DocumentIndex,
+		totalDocs,
+		cmd.OriginalFilename,
+		colorMode,
 		cmd.KioskID,
 		cmd.DisplayCode,
 		cmd.DownloadURL,
@@ -508,39 +538,20 @@ WHERE job_id = ?;`
 	return nil
 }
 
-func (s *Store) GetIncompleteJob(
-	ctx context.Context,
-) (*StoredJob, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("store is not open")
-	}
-	if ctx == nil {
-		return nil, errors.New("context cannot be nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	query := `
-SELECT job_id, kiosk_id, display_code, download_url, sha256_checksum,
-       total_pages, total_sheets, copies, duplex, start_from_page,
-       status, pages_printed, sheets_printed, error_reason,
-       cups_job_id, submitted_to_printer, updated_at_ns
-FROM jobs
-WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
-ORDER BY updated_at_ns DESC, job_id ASC
-LIMIT 1;`
-
-	row := s.db.QueryRowContext(ctx, query)
-
+func scanStoredJob(scan func(dest ...any) error) (*StoredJob, error) {
 	var job StoredJob
 	var duplexStr string
 	var statusStr string
 	var updatedAtNS int64
 	var submittedInt int
 
-	err := row.Scan(
+	err := scan(
 		&job.Command.JobID,
+		&job.Command.OrderID,
+		&job.Command.DocumentIndex,
+		&job.Command.TotalDocuments,
+		&job.Command.OriginalFilename,
+		&job.Command.ColorMode,
 		&job.Command.KioskID,
 		&job.Command.DisplayCode,
 		&job.Command.DownloadURL,
@@ -559,10 +570,7 @@ LIMIT 1;`
 		&updatedAtNS,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to query incomplete job: %w", err)
+		return nil, err
 	}
 
 	job.Command.Duplex = contracts.DuplexMode(duplexStr)
@@ -571,6 +579,82 @@ LIMIT 1;`
 	job.UpdatedAt = time.Unix(0, updatedAtNS).UTC()
 
 	return &job, nil
+}
+
+func (s *Store) GetIncompleteJob(
+	ctx context.Context,
+) (*StoredJob, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+SELECT job_id, order_id, document_index, total_documents, original_filename, color_mode,
+       kiosk_id, display_code, download_url, sha256_checksum,
+       total_pages, total_sheets, copies, duplex, start_from_page,
+       status, pages_printed, sheets_printed, error_reason,
+       cups_job_id, submitted_to_printer, updated_at_ns
+FROM jobs
+WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+ORDER BY updated_at_ns DESC, job_id ASC
+LIMIT 1;`
+
+	row := s.db.QueryRowContext(ctx, query)
+	job, err := scanStoredJob(row.Scan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query incomplete job: %w", err)
+	}
+	return job, nil
+}
+
+// GetIncompleteJobs returns all incomplete jobs ordered by order_id, document_index, and updated_at_ns.
+func (s *Store) GetIncompleteJobs(
+	ctx context.Context,
+) ([]StoredJob, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	query := `
+SELECT job_id, order_id, document_index, total_documents, original_filename, color_mode,
+       kiosk_id, display_code, download_url, sha256_checksum,
+       total_pages, total_sheets, copies, duplex, start_from_page,
+       status, pages_printed, sheets_printed, error_reason,
+       cups_job_id, submitted_to_printer, updated_at_ns
+FROM jobs
+WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+ORDER BY order_id ASC, document_index ASC, updated_at_ns ASC;`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query incomplete jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []StoredJob
+	for rows.Next() {
+		job, err := scanStoredJob(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan incomplete job: %w", err)
+		}
+		jobs = append(jobs, *job)
+	}
+	return jobs, rows.Err()
 }
 
 func (s *Store) GetJob(
@@ -591,7 +675,8 @@ func (s *Store) GetJob(
 	}
 
 	query := `
-SELECT job_id, kiosk_id, display_code, download_url, sha256_checksum,
+SELECT job_id, order_id, document_index, total_documents, original_filename, color_mode,
+       kiosk_id, display_code, download_url, sha256_checksum,
        total_pages, total_sheets, copies, duplex, start_from_page,
        status, pages_printed, sheets_printed, error_reason,
        cups_job_id, submitted_to_printer, updated_at_ns
@@ -599,45 +684,99 @@ FROM jobs
 WHERE job_id = ?;`
 
 	row := s.db.QueryRowContext(ctx, query, jobID)
-
-	var job StoredJob
-	var duplexStr string
-	var statusStr string
-	var updatedAtNS int64
-	var submittedInt int
-
-	err := row.Scan(
-		&job.Command.JobID,
-		&job.Command.KioskID,
-		&job.Command.DisplayCode,
-		&job.Command.DownloadURL,
-		&job.Command.SHA256Checksum,
-		&job.Command.TotalPages,
-		&job.Command.TotalSheets,
-		&job.Command.Copies,
-		&duplexStr,
-		&job.Command.StartFromPage,
-		&statusStr,
-		&job.PagesPrinted,
-		&job.SheetsPrinted,
-		&job.ErrorReason,
-		&job.CUPSJobID,
-		&submittedInt,
-		&updatedAtNS,
-	)
+	job, err := scanStoredJob(row.Scan)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to query job %s: %w", jobID, err)
 	}
+	return job, nil
+}
 
-	job.Command.Duplex = contracts.DuplexMode(duplexStr)
-	job.Status = contracts.JobStatus(statusStr)
-	job.SubmittedToPrinter = submittedInt != 0
-	job.UpdatedAt = time.Unix(0, updatedAtNS).UTC()
+// GetJobsByOrderID returns all jobs belonging to an order, ordered by document_index.
+func (s *Store) GetJobsByOrderID(
+	ctx context.Context,
+	orderID string,
+) ([]StoredJob, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return nil, errors.New("order_id cannot be empty")
+	}
 
-	return &job, nil
+	query := `
+SELECT job_id, order_id, document_index, total_documents, original_filename, color_mode,
+       kiosk_id, display_code, download_url, sha256_checksum,
+       total_pages, total_sheets, copies, duplex, start_from_page,
+       status, pages_printed, sheets_printed, error_reason,
+       cups_job_id, submitted_to_printer, updated_at_ns
+FROM jobs
+WHERE order_id = ?
+ORDER BY document_index ASC;`
+
+	rows, err := s.db.QueryContext(ctx, query, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query jobs for order %s: %w", orderID, err)
+	}
+	defer rows.Close()
+
+	var jobs []StoredJob
+	for rows.Next() {
+		job, err := scanStoredJob(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan job for order %s: %w", orderID, err)
+		}
+		jobs = append(jobs, *job)
+	}
+	return jobs, rows.Err()
+}
+
+// IsOrderCompleted checks whether all jobs belonging to the order are completed.
+// Invariant: exactly N persisted jobs (N > 0) must all be marked COMPLETED.
+// Zero jobs must never count as completed.
+func (s *Store) IsOrderCompleted(
+	ctx context.Context,
+	orderID string,
+) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("store is not open")
+	}
+	if ctx == nil {
+		return false, errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return false, errors.New("order_id cannot be empty")
+	}
+
+	var totalJobs, completedJobs int
+	query := `
+SELECT COUNT(1), COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0)
+FROM jobs
+WHERE order_id = ?;`
+
+	err := s.db.QueryRowContext(ctx, query, orderID).Scan(&totalJobs, &completedJobs)
+	if err != nil {
+		return false, fmt.Errorf("failed to check order completion for %s: %w", orderID, err)
+	}
+
+	if totalJobs == 0 {
+		return false, nil
+	}
+
+	return totalJobs == completedJobs, nil
 }
 
 func (s *Store) GetEstimatedSheets(

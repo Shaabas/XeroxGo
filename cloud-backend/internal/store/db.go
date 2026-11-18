@@ -68,12 +68,57 @@ func (s *Store) rebind(query string) string {
 	return b.String()
 }
 
+type OrderDocument struct {
+	JobID            string               `json:"job_id"`
+	OrderID          string               `json:"order_id"`
+	DocumentIndex    int                  `json:"document_index"`
+	OriginalFilename string               `json:"original_filename"`
+	DownloadURL      string               `json:"download_url"`
+	SHA256Checksum   string               `json:"sha256_checksum"`
+	TotalPages       int                  `json:"total_pages"`
+	TotalSheets      int                  `json:"total_sheets"`
+	Copies           int                  `json:"copies"`
+	Duplex           contracts.DuplexMode `json:"duplex"`
+	ColorMode        string               `json:"color_mode"` // "BW" or "COLOR"
+	PageRange        string               `json:"page_range"`
+	Orientation      string               `json:"orientation"`
+	PagesPerSheet    int                  `json:"pages_per_sheet"`
+	PricePaise       int64                `json:"price_paise"`
+	Status           contracts.JobStatus  `json:"status"`
+	CreatedAt        time.Time            `json:"created_at"`
+	UpdatedAt        time.Time            `json:"updated_at"`
+}
+
+// Command converts an OrderDocument to a contracts.PrintJobCommand.
+func (d OrderDocument) Command(kioskID, displayCode string, totalDocs int) contracts.PrintJobCommand {
+	return contracts.PrintJobCommand{
+		JobID:            d.JobID,
+		OrderID:          d.OrderID,
+		DocumentIndex:    d.DocumentIndex,
+		TotalDocuments:   totalDocs,
+		OriginalFilename: d.OriginalFilename,
+		ColorMode:        d.ColorMode,
+		KioskID:          kioskID,
+		DisplayCode:      displayCode,
+		DownloadURL:      d.DownloadURL,
+		SHA256Checksum:   d.SHA256Checksum,
+		TotalPages:       d.TotalPages,
+		TotalSheets:      d.TotalSheets,
+		Copies:           d.Copies,
+		Duplex:           d.Duplex,
+		StartFromPage:    1,
+	}
+}
+
 type Order struct {
 	OrderID      string
 	Command      contracts.PrintJobCommand
 	Status       contracts.JobStatus
 	PricePaise   int64
 	ColorMode    string // "BW" or "COLOR"
+	TotalPages   int
+	TotalSheets  int
+	Documents    []OrderDocument
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	PINExpiresAt time.Time
@@ -147,17 +192,43 @@ func Open(dbPath string) (*Store, error) {
 		schema := `
 CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL,
     kiosk_id TEXT NOT NULL,
     display_code TEXT NOT NULL,
     status TEXT NOT NULL,
     price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    total_sheets INTEGER NOT NULL DEFAULT 0,
     created_at_ns BIGINT NOT NULL,
     updated_at_ns BIGINT NOT NULL,
     pin_expires_at_ns BIGINT NOT NULL DEFAULT 0,
     claim_token TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);
+CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);
+
+CREATE TABLE IF NOT EXISTS order_documents (
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    document_index INTEGER NOT NULL CHECK (document_index >= 0),
+    original_filename TEXT NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
+    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
+    copies INTEGER NOT NULL CHECK (copies > 0),
+    duplex TEXT NOT NULL,
+    color_mode TEXT NOT NULL DEFAULT 'BW',
+    page_range TEXT NOT NULL DEFAULT '',
+    orientation TEXT NOT NULL DEFAULT 'AUTO',
+    pages_per_sheet INTEGER NOT NULL DEFAULT 1,
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(order_id, document_index)
+);
+CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);
 
 CREATE TABLE IF NOT EXISTS print_configs (
     order_id TEXT PRIMARY KEY
@@ -198,8 +269,7 @@ CREATE TABLE IF NOT EXISTS payment_webhooks (
 );
 
 CREATE TABLE IF NOT EXISTS job_progress (
-    job_id TEXT PRIMARY KEY
-        REFERENCES orders(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY,
     kiosk_id TEXT NOT NULL,
     status TEXT NOT NULL,
     pages_printed INTEGER NOT NULL CHECK (pages_printed >= 0),
@@ -210,7 +280,7 @@ CREATE TABLE IF NOT EXISTS job_progress (
 
 CREATE TABLE IF NOT EXISTS recovery_records (
     recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
     kiosk_id TEXT NOT NULL,
     sequence_id INTEGER NOT NULL,
     confirmed_sheets_printed INTEGER NOT NULL,
@@ -318,8 +388,8 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);
 
 CREATE TABLE IF NOT EXISTS dispatch_intents (
-    order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
-    job_id TEXT NOT NULL,
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
     kiosk_id TEXT NOT NULL,
     session_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
@@ -331,6 +401,7 @@ CREATE TABLE IF NOT EXISTS dispatch_intents (
     last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
 
 CREATE TABLE IF NOT EXISTS payment_attempts (
     attempt_id TEXT PRIMARY KEY,
@@ -372,11 +443,16 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
 			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS pin_expires_at_ns BIGINT NOT NULL DEFAULT 0;",
+			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_pages INTEGER NOT NULL DEFAULT 0;",
+			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_sheets INTEGER NOT NULL DEFAULT 0;",
 			"CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);",
+			"CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);",
+			"CREATE TABLE IF NOT EXISTS order_documents (job_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, document_index INTEGER NOT NULL CHECK (document_index >= 0), original_filename TEXT NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, total_pages INTEGER NOT NULL CHECK (total_pages > 0), total_sheets INTEGER NOT NULL CHECK (total_sheets > 0), copies INTEGER NOT NULL CHECK (copies > 0), duplex TEXT NOT NULL, color_mode TEXT NOT NULL DEFAULT 'BW', page_range TEXT NOT NULL DEFAULT '', orientation TEXT NOT NULL DEFAULT 'AUTO', pages_per_sheet INTEGER NOT NULL DEFAULT 1, price_paise BIGINT NOT NULL CHECK (price_paise >= 0), status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(order_id, document_index));",
+			"CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);",
 			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS recovery_records (recovery_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, confirmed_sheets_printed INTEGER NOT NULL, remaining_pages INTEGER NOT NULL, remaining_sheets INTEGER NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(job_id, sequence_id));",
+			"CREATE TABLE IF NOT EXISTS recovery_records (recovery_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, kiosk_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, confirmed_sheets_printed INTEGER NOT NULL, remaining_pages INTEGER NOT NULL, remaining_sheets INTEGER NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(job_id, sequence_id));",
 			"CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);",
 			"CREATE TABLE IF NOT EXISTS pin_reservations (kiosk_id TEXT NOT NULL, pin TEXT NOT NULL, order_id TEXT NOT NULL, expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, PRIMARY KEY (kiosk_id, pin));",
 			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_order ON pin_reservations (order_id);",
@@ -389,9 +465,14 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, created_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';",
-			"CREATE TABLE IF NOT EXISTS dispatch_intents (order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE, job_id TEXT NOT NULL, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, dispatched_at_ns BIGINT NOT NULL DEFAULT 0, acknowledged_at_ns BIGINT NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');",
+			"CREATE TABLE IF NOT EXISTS dispatch_intents (job_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, dispatched_at_ns BIGINT NOT NULL DEFAULT 0, acknowledged_at_ns BIGINT NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');",
 			"ALTER TABLE dispatch_intents ADD COLUMN IF NOT EXISTS acknowledged_at_ns BIGINT NOT NULL DEFAULT 0;",
 			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);",
+			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);",
+			"ALTER TABLE dispatch_intents DROP CONSTRAINT IF EXISTS dispatch_intents_pkey;",
+			"ALTER TABLE dispatch_intents ADD PRIMARY KEY (job_id);",
+			"ALTER TABLE job_progress DROP CONSTRAINT IF EXISTS job_progress_job_id_fkey;",
+			"ALTER TABLE recovery_records DROP CONSTRAINT IF EXISTS recovery_records_job_id_fkey;",
 			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', demo_token TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
 			"ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS demo_token TEXT NOT NULL DEFAULT '';",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order_id);",
@@ -485,17 +566,43 @@ SELECT COUNT(1) FROM (
 	schema := `
 CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL,
     kiosk_id TEXT NOT NULL,
     display_code TEXT NOT NULL,
     status TEXT NOT NULL,
     price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    total_sheets INTEGER NOT NULL DEFAULT 0,
     created_at_ns BIGINT NOT NULL,
     updated_at_ns BIGINT NOT NULL,
     pin_expires_at_ns BIGINT NOT NULL DEFAULT 0,
     claim_token TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);
+CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);
+
+CREATE TABLE IF NOT EXISTS order_documents (
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    document_index INTEGER NOT NULL CHECK (document_index >= 0),
+    original_filename TEXT NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
+    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
+    copies INTEGER NOT NULL CHECK (copies > 0),
+    duplex TEXT NOT NULL,
+    color_mode TEXT NOT NULL DEFAULT 'BW',
+    page_range TEXT NOT NULL DEFAULT '',
+    orientation TEXT NOT NULL DEFAULT 'AUTO',
+    pages_per_sheet INTEGER NOT NULL DEFAULT 1,
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(order_id, document_index)
+);
+CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);
 
 CREATE TABLE IF NOT EXISTS print_configs (
     order_id TEXT PRIMARY KEY
@@ -536,8 +643,7 @@ CREATE TABLE IF NOT EXISTS payment_webhooks (
 );
 
 CREATE TABLE IF NOT EXISTS job_progress (
-    job_id TEXT PRIMARY KEY
-        REFERENCES orders(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY,
     kiosk_id TEXT NOT NULL,
     status TEXT NOT NULL,
     pages_printed INTEGER NOT NULL CHECK (pages_printed >= 0),
@@ -548,7 +654,7 @@ CREATE TABLE IF NOT EXISTS job_progress (
 
 CREATE TABLE IF NOT EXISTS recovery_records (
     recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
     kiosk_id TEXT NOT NULL,
     sequence_id INTEGER NOT NULL,
     confirmed_sheets_printed INTEGER NOT NULL,
@@ -697,7 +803,39 @@ func migrateSQLiteSchema(db *sql.DB) error {
 	if !colsOrders["claim_token"] {
 		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';")
 	}
+	if !colsOrders["total_pages"] {
+		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN total_pages INTEGER NOT NULL DEFAULT 0;")
+	}
+	if !colsOrders["total_sheets"] {
+		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN total_sheets INTEGER NOT NULL DEFAULT 0;")
+	}
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);")
+
+	_, _ = db.Exec(`
+CREATE TABLE IF NOT EXISTS order_documents (
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    document_index INTEGER NOT NULL CHECK (document_index >= 0),
+    original_filename TEXT NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
+    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
+    copies INTEGER NOT NULL CHECK (copies > 0),
+    duplex TEXT NOT NULL,
+    color_mode TEXT NOT NULL DEFAULT 'BW',
+    page_range TEXT NOT NULL DEFAULT '',
+    orientation TEXT NOT NULL DEFAULT 'AUTO',
+    pages_per_sheet INTEGER NOT NULL DEFAULT 1,
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(order_id, document_index)
+);
+CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);
+`)
 
 	// Preflight check: detect existing duplicate active sessions before migrating SQLite.
 	// Must fail closed on any database query error or if duplicate active sessions exist.
@@ -741,7 +879,7 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 
 CREATE TABLE IF NOT EXISTS recovery_records (
     recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL REFERENCES orders(job_id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
     kiosk_id TEXT NOT NULL,
     sequence_id INTEGER NOT NULL,
     confirmed_sheets_printed INTEGER NOT NULL,
@@ -803,8 +941,8 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);
 
 CREATE TABLE IF NOT EXISTS dispatch_intents (
-    order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
-    job_id TEXT NOT NULL,
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
     kiosk_id TEXT NOT NULL,
     session_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
@@ -816,6 +954,7 @@ CREATE TABLE IF NOT EXISTS dispatch_intents (
     last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
 
 CREATE TABLE IF NOT EXISTS payment_attempts (
     attempt_id TEXT PRIMARY KEY,
@@ -844,6 +983,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 `)
 
 	colsDispatch := make(map[string]bool)
+	jobIdIsPK := false
 	rowsDisp, err := db.Query("PRAGMA table_info(dispatch_intents);")
 	if err == nil {
 		for rowsDisp.Next() {
@@ -853,9 +993,36 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			var dflt *string
 			if err := rowsDisp.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
 				colsDispatch[name] = true
+				if name == "job_id" && pk == 1 {
+					jobIdIsPK = true
+				}
 			}
 		}
 		_ = rowsDisp.Close()
+	}
+	if len(colsDispatch) > 0 && !jobIdIsPK {
+		_, _ = db.Exec(`
+CREATE TABLE IF NOT EXISTS dispatch_intents_new (
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    kiosk_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    dispatched_at_ns BIGINT NOT NULL DEFAULT 0,
+    acknowledged_at_ns BIGINT NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO dispatch_intents_new (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error)
+SELECT job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error
+FROM dispatch_intents;
+DROP TABLE dispatch_intents;
+ALTER TABLE dispatch_intents_new RENAME TO dispatch_intents;
+CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
+`)
 	}
 	if !colsDispatch["acknowledged_at_ns"] {
 		_, _ = db.Exec("ALTER TABLE dispatch_intents ADD COLUMN acknowledged_at_ns INTEGER NOT NULL DEFAULT 0;")
@@ -896,7 +1063,7 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// CreateOrder persists an order and its associated print configuration atomically.
+// CreateOrder persists an order and its associated print configuration and child documents atomically.
 func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("create order: store is closed or nil")
@@ -912,38 +1079,138 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 	if strings.TrimSpace(order.OrderID) == "" {
 		return fmt.Errorf("create order: order_id cannot be empty")
 	}
-	if strings.TrimSpace(order.Command.JobID) == "" {
-		return fmt.Errorf("create order: command.job_id cannot be empty")
-	}
 	if strings.TrimSpace(order.Command.KioskID) == "" {
 		return fmt.Errorf("create order: command.kiosk_id cannot be empty")
 	}
 	if strings.TrimSpace(order.Command.DisplayCode) == "" {
 		return fmt.Errorf("create order: command.display_code cannot be empty")
 	}
-	if order.Command.TotalPages < 1 {
-		return fmt.Errorf("create order: total_pages must be >= 1, got %d", order.Command.TotalPages)
-	}
-	if order.Command.TotalSheets < 1 {
-		return fmt.Errorf("create order: total_sheets must be >= 1, got %d", order.Command.TotalSheets)
-	}
-	if order.Command.Copies < 1 {
-		return fmt.Errorf("create order: copies must be >= 1, got %d", order.Command.Copies)
-	}
-	if order.Command.StartFromPage < 1 {
-		return fmt.Errorf("create order: start_from_page must be >= 1, got %d", order.Command.StartFromPage)
-	}
-	if order.Command.StartFromPage > order.Command.TotalPages {
-		return fmt.Errorf("create order: start_from_page (%d) exceeds total_pages (%d)", order.Command.StartFromPage, order.Command.TotalPages)
-	}
-	if !isValidDuplex(order.Command.Duplex) {
-		return fmt.Errorf("create order: invalid duplex mode %q", order.Command.Duplex)
-	}
 	if !isValidJobStatus(order.Status) {
 		return fmt.Errorf("create order: invalid job status %q", order.Status)
 	}
 	if order.PricePaise < 0 {
 		return fmt.Errorf("create order: price_paise must be >= 0, got %d", order.PricePaise)
+	}
+
+	colorMode := strings.ToUpper(strings.TrimSpace(order.ColorMode))
+	if colorMode == "" {
+		colorMode = "BW"
+	}
+
+	// If no explicit documents provided, synthesize single document from order.Command
+	if len(order.Documents) == 0 {
+		if strings.TrimSpace(order.Command.JobID) == "" {
+			return fmt.Errorf("create order: command.job_id cannot be empty")
+		}
+		if order.Command.TotalPages < 1 {
+			return fmt.Errorf("create order: total_pages must be >= 1, got %d", order.Command.TotalPages)
+		}
+		if order.Command.TotalSheets < 1 {
+			return fmt.Errorf("create order: total_sheets must be >= 1, got %d", order.Command.TotalSheets)
+		}
+		if order.Command.Copies < 1 {
+			return fmt.Errorf("create order: copies must be >= 1, got %d", order.Command.Copies)
+		}
+		if order.Command.StartFromPage < 1 {
+			return fmt.Errorf("create order: start_from_page must be >= 1, got %d", order.Command.StartFromPage)
+		}
+		if order.Command.StartFromPage > order.Command.TotalPages {
+			return fmt.Errorf("create order: start_from_page (%d) exceeds total_pages (%d)", order.Command.StartFromPage, order.Command.TotalPages)
+		}
+		if !isValidDuplex(order.Command.Duplex) {
+			return fmt.Errorf("create order: invalid duplex mode %q", order.Command.Duplex)
+		}
+		filename := order.Command.OriginalFilename
+		if filename == "" {
+			filename = "Document.pdf"
+		}
+		cmdColor := order.Command.ColorMode
+		if cmdColor == "" {
+			cmdColor = colorMode
+		}
+		order.Documents = []OrderDocument{
+			{
+				JobID:            order.Command.JobID,
+				OrderID:          order.OrderID,
+				DocumentIndex:    0,
+				OriginalFilename: filename,
+				DownloadURL:      order.Command.DownloadURL,
+				SHA256Checksum:   order.Command.SHA256Checksum,
+				TotalPages:       order.Command.TotalPages,
+				TotalSheets:      order.Command.TotalSheets,
+				Copies:           order.Command.Copies,
+				Duplex:           order.Command.Duplex,
+				ColorMode:        cmdColor,
+				PricePaise:       order.PricePaise,
+				Status:           order.Status,
+			},
+		}
+	} else {
+		// Validate multi-document list
+		calcPages := 0
+		calcSheets := 0
+		for i, doc := range order.Documents {
+			if strings.TrimSpace(doc.JobID) == "" {
+				return fmt.Errorf("create order: document [%d] job_id cannot be empty", i)
+			}
+			if doc.DocumentIndex != i {
+				return fmt.Errorf("create order: document [%d] index mismatch: got %d, want %d", i, doc.DocumentIndex, i)
+			}
+			if doc.TotalPages < 1 {
+				return fmt.Errorf("create order: document [%d] total_pages must be >= 1, got %d", i, doc.TotalPages)
+			}
+			if doc.TotalSheets < 1 {
+				return fmt.Errorf("create order: document [%d] total_sheets must be >= 1, got %d", i, doc.TotalSheets)
+			}
+			if doc.Copies < 1 {
+				return fmt.Errorf("create order: document [%d] copies must be >= 1, got %d", i, doc.Copies)
+			}
+			if !isValidDuplex(doc.Duplex) {
+				return fmt.Errorf("create order: document [%d] invalid duplex mode %q", i, doc.Duplex)
+			}
+			if doc.PricePaise < 0 {
+				return fmt.Errorf("create order: document [%d] price_paise must be >= 0, got %d", i, doc.PricePaise)
+			}
+			calcPages += doc.TotalPages
+			calcSheets += doc.TotalSheets
+		}
+		if order.TotalPages <= 0 {
+			order.TotalPages = calcPages
+		}
+		if order.TotalSheets <= 0 {
+			order.TotalSheets = calcSheets
+		}
+		if strings.TrimSpace(order.Command.JobID) == "" {
+			order.Command.JobID = order.Documents[0].JobID
+		}
+		if order.Command.TotalPages <= 0 {
+			order.Command.TotalPages = order.Documents[0].TotalPages
+		}
+		if order.Command.TotalSheets <= 0 {
+			order.Command.TotalSheets = order.Documents[0].TotalSheets
+		}
+		if order.Command.Copies <= 0 {
+			order.Command.Copies = order.Documents[0].Copies
+		}
+		if order.Command.StartFromPage < 1 {
+			order.Command.StartFromPage = 1
+		}
+		if order.Command.Duplex == "" {
+			order.Command.Duplex = order.Documents[0].Duplex
+		}
+		if order.Command.DownloadURL == "" {
+			order.Command.DownloadURL = order.Documents[0].DownloadURL
+		}
+		if order.Command.SHA256Checksum == "" {
+			order.Command.SHA256Checksum = order.Documents[0].SHA256Checksum
+		}
+	}
+
+	if order.TotalPages <= 0 {
+		order.TotalPages = order.Command.TotalPages
+	}
+	if order.TotalSheets <= 0 {
+		order.TotalSheets = order.Command.TotalSheets
 	}
 
 	// Timestamp handling
@@ -1003,8 +1270,8 @@ VALUES (?, ?, ?, ?, ?);
 	}
 
 	_, err = tx.ExecContext(ctx, s.rebind(`
-INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, created_at_ns, updated_at_ns, pin_expires_at_ns, claim_token)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, total_pages, total_sheets, created_at_ns, updated_at_ns, pin_expires_at_ns, claim_token)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `),
 		order.OrderID,
 		order.Command.JobID,
@@ -1012,6 +1279,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 		order.Command.DisplayCode,
 		string(order.Status),
 		order.PricePaise,
+		order.TotalPages,
+		order.TotalSheets,
 		createdNS,
 		updatedNS,
 		pinExpiresNS,
@@ -1019,11 +1288,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	)
 	if err != nil {
 		return fmt.Errorf("create order: insert into orders: %w", err)
-	}
-
-	colorMode := strings.ToUpper(strings.TrimSpace(order.ColorMode))
-	if colorMode == "" {
-		colorMode = "BW"
 	}
 
 	_, err = tx.ExecContext(ctx, s.rebind(`
@@ -1044,6 +1308,65 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 		return fmt.Errorf("create order: insert into print_configs: %w", err)
 	}
 
+	// Insert all child document jobs into order_documents
+	for _, doc := range order.Documents {
+		docCreatedAt := doc.CreatedAt
+		if docCreatedAt.IsZero() {
+			docCreatedAt = createdAt
+		}
+		docUpdatedAt := doc.UpdatedAt
+		if docUpdatedAt.IsZero() {
+			docUpdatedAt = updatedAt
+		}
+		docColor := doc.ColorMode
+		if docColor == "" {
+			docColor = colorMode
+		}
+		docStatus := doc.Status
+		if docStatus == "" {
+			docStatus = order.Status
+		}
+		orient := doc.Orientation
+		if orient == "" {
+			orient = "AUTO"
+		}
+		pps := doc.PagesPerSheet
+		if pps <= 0 {
+			pps = 1
+		}
+
+		_, err = tx.ExecContext(ctx, s.rebind(`
+INSERT INTO order_documents (
+    job_id, order_id, document_index, original_filename, download_url,
+    sha256_checksum, total_pages, total_sheets, copies, duplex,
+    color_mode, page_range, orientation, pages_per_sheet, price_paise,
+    status, created_at_ns, updated_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+`),
+			doc.JobID,
+			order.OrderID,
+			doc.DocumentIndex,
+			doc.OriginalFilename,
+			doc.DownloadURL,
+			doc.SHA256Checksum,
+			doc.TotalPages,
+			doc.TotalSheets,
+			doc.Copies,
+			string(doc.Duplex),
+			docColor,
+			doc.PageRange,
+			orient,
+			pps,
+			doc.PricePaise,
+			string(docStatus),
+			docCreatedAt.UnixNano(),
+			docUpdatedAt.UnixNano(),
+		)
+		if err != nil {
+			return fmt.Errorf("create order: insert into order_documents [%d]: %w", doc.DocumentIndex, err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("create order: commit tx: %w", err)
 	}
@@ -1051,7 +1374,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 	return nil
 }
 
-// GetOrder retrieves an order and its associated print configuration.
+// GetOrder retrieves an order and its associated print configuration and child documents.
 func (s *Store) GetOrder(ctx context.Context, orderID string) (*Order, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("get order: store is closed or nil")
@@ -1068,7 +1391,9 @@ func (s *Store) GetOrder(ctx context.Context, orderID string) (*Order, error) {
 
 	query := `
 SELECT
-    o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise, o.created_at_ns, o.updated_at_ns,
+    o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise,
+    COALESCE(o.total_pages, 0), COALESCE(o.total_sheets, 0),
+    o.created_at_ns, o.updated_at_ns,
     p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page,
     COALESCE(p.color_mode, 'BW'), o.pin_expires_at_ns, COALESCE(o.claim_token, '')
 FROM orders o
@@ -1079,24 +1404,26 @@ WHERE o.order_id = ?;
 	row := s.db.QueryRowContext(ctx, s.rebind(query), orderID)
 
 	var (
-		resOrderID    string
-		jobID         string
-		kioskID       string
-		displayCode   string
-		statusStr     string
-		pricePaise    int64
-		createdNS     int64
-		updatedNS     int64
-		downloadURL   string
-		sha256Check   string
-		totalPages    int
-		totalSheets   int
-		copies        int
-		duplexStr     string
-		startFromPage int
-		colorMode     string
-		pinExpiresNS  int64
-		claimToken    string
+		resOrderID     string
+		jobID          string
+		kioskID        string
+		displayCode    string
+		statusStr      string
+		pricePaise     int64
+		ordTotalPages  int
+		ordTotalSheets int
+		createdNS      int64
+		updatedNS      int64
+		downloadURL    string
+		sha256Check    string
+		totalPages     int
+		totalSheets    int
+		copies         int
+		duplexStr      string
+		startFromPage  int
+		colorMode      string
+		pinExpiresNS   int64
+		claimToken     string
 	)
 
 	err := row.Scan(
@@ -1106,6 +1433,8 @@ WHERE o.order_id = ?;
 		&displayCode,
 		&statusStr,
 		&pricePaise,
+		&ordTotalPages,
+		&ordTotalSheets,
 		&createdNS,
 		&updatedNS,
 		&downloadURL,
@@ -1126,10 +1455,20 @@ WHERE o.order_id = ?;
 		return nil, fmt.Errorf("get order: scan: %w", err)
 	}
 
+	if ordTotalPages <= 0 {
+		ordTotalPages = totalPages
+	}
+	if ordTotalSheets <= 0 {
+		ordTotalSheets = totalSheets
+	}
+
 	result := &Order{
 		OrderID: resOrderID,
 		Command: contracts.PrintJobCommand{
 			JobID:          jobID,
+			OrderID:        resOrderID,
+			DocumentIndex:  0,
+			TotalDocuments: 1,
 			KioskID:        kioskID,
 			DisplayCode:    displayCode,
 			DownloadURL:    downloadURL,
@@ -1139,20 +1478,88 @@ WHERE o.order_id = ?;
 			Copies:         copies,
 			Duplex:         contracts.DuplexMode(duplexStr),
 			StartFromPage:  startFromPage,
+			ColorMode:      colorMode,
 		},
 		Status:       contracts.JobStatus(statusStr),
 		PricePaise:   pricePaise,
 		ColorMode:    colorMode,
+		TotalPages:   ordTotalPages,
+		TotalSheets:  ordTotalSheets,
 		CreatedAt:    time.Unix(0, createdNS).UTC(),
 		UpdatedAt:    time.Unix(0, updatedNS).UTC(),
 		PINExpiresAt: time.Unix(0, pinExpiresNS).UTC(),
 		ClaimToken:   claimToken,
 	}
 
+	// Fetch child documents from order_documents
+	docsQuery := `
+SELECT
+    job_id, order_id, document_index, original_filename, download_url, sha256_checksum,
+    total_pages, total_sheets, copies, duplex, color_mode, page_range, orientation,
+    pages_per_sheet, price_paise, status, created_at_ns, updated_at_ns
+FROM order_documents
+WHERE order_id = ?
+ORDER BY document_index ASC;
+`
+	docRows, err := s.db.QueryContext(ctx, s.rebind(docsQuery), orderID)
+	if err == nil {
+		var docs []OrderDocument
+		for docRows.Next() {
+			var (
+				dJobID, dOrdID, dFilename, dURL, dCheck, dDuplex, dColor, dRange, dOrient, dStatus string
+				dIdx, dPages, dSheets, dCopies, dPPS                                                int
+				dPrice, dCreatedNS, dUpdatedNS                                                      int64
+			)
+			if sErr := docRows.Scan(
+				&dJobID, &dOrdID, &dIdx, &dFilename, &dURL, &dCheck,
+				&dPages, &dSheets, &dCopies, &dDuplex, &dColor, &dRange, &dOrient,
+				&dPPS, &dPrice, &dStatus, &dCreatedNS, &dUpdatedNS,
+			); sErr == nil {
+				docs = append(docs, OrderDocument{
+					JobID:            dJobID,
+					OrderID:          dOrdID,
+					DocumentIndex:    dIdx,
+					OriginalFilename: dFilename,
+					DownloadURL:      dURL,
+					SHA256Checksum:   dCheck,
+					TotalPages:       dPages,
+					TotalSheets:      dSheets,
+					Copies:           dCopies,
+					Duplex:           contracts.DuplexMode(dDuplex),
+					ColorMode:        dColor,
+					PageRange:        dRange,
+					Orientation:      dOrient,
+					PagesPerSheet:    dPPS,
+					PricePaise:       dPrice,
+					Status:           contracts.JobStatus(dStatus),
+					CreatedAt:        time.Unix(0, dCreatedNS).UTC(),
+					UpdatedAt:        time.Unix(0, dUpdatedNS).UTC(),
+				})
+			}
+		}
+		_ = docRows.Close()
+		result.Documents = docs
+		if len(docs) > 0 {
+			result.Command.JobID = docs[0].JobID
+			result.Command.OrderID = resOrderID
+			result.Command.DocumentIndex = 0
+			result.Command.TotalDocuments = len(docs)
+			result.Command.OriginalFilename = docs[0].OriginalFilename
+			result.Command.DownloadURL = docs[0].DownloadURL
+			result.Command.SHA256Checksum = docs[0].SHA256Checksum
+			result.Command.TotalPages = docs[0].TotalPages
+			result.Command.TotalSheets = docs[0].TotalSheets
+			result.Command.Copies = docs[0].Copies
+			result.Command.Duplex = docs[0].Duplex
+			result.Command.ColorMode = docs[0].ColorMode
+		}
+	}
+
 	return result, nil
 }
 
 // GetOrderByJobID retrieves an order and its print configuration by jobID.
+// It checks order_documents first, then falls back to orders.
 func (s *Store) GetOrderByJobID(ctx context.Context, jobID string) (*Order, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("get order by job id: store is closed or nil")
@@ -1167,90 +1574,159 @@ func (s *Store) GetOrderByJobID(ctx context.Context, jobID string) (*Order, erro
 		return nil, fmt.Errorf("get order by job id: jobID cannot be empty")
 	}
 
-	query := `
-SELECT
-    o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise, o.created_at_ns, o.updated_at_ns,
-    p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page,
-    COALESCE(p.color_mode, 'BW'), o.pin_expires_at_ns, COALESCE(o.claim_token, '')
-FROM orders o
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE o.job_id = ?;
-`
+	targetJobID := jobID
+	if idx := strings.LastIndex(jobID, "-rec"); idx != -1 {
+		pJobID := jobID[:idx]
+		if pJobID != "" {
+			targetJobID = pJobID
+		}
+	}
 
-	row := s.db.QueryRowContext(ctx, s.rebind(query), jobID)
+	var orderID string
+	queryDoc := `SELECT order_id FROM order_documents WHERE job_id = ?;`
+	err := s.db.QueryRowContext(ctx, s.rebind(queryDoc), targetJobID).Scan(&orderID)
+	if err == nil && orderID != "" {
+		return s.GetOrder(ctx, orderID)
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("get order by job id: query order_documents: %w", err)
+	}
 
-	var (
-		resOrderID    string
-		resJobID      string
-		kioskID       string
-		displayCode   string
-		statusStr     string
-		pricePaise    int64
-		createdNS     int64
-		updatedNS     int64
-		downloadURL   string
-		sha256Check   string
-		totalPages    int
-		totalSheets   int
-		copies        int
-		duplexStr     string
-		startFromPage int
-		colorMode     string
-		pinExpiresNS  int64
-		claimToken    string
-	)
-
-	err := row.Scan(
-		&resOrderID,
-		&resJobID,
-		&kioskID,
-		&displayCode,
-		&statusStr,
-		&pricePaise,
-		&createdNS,
-		&updatedNS,
-		&downloadURL,
-		&sha256Check,
-		&totalPages,
-		&totalSheets,
-		&copies,
-		&duplexStr,
-		&startFromPage,
-		&colorMode,
-		&pinExpiresNS,
-		&claimToken,
-	)
+	queryOrder := `SELECT order_id FROM orders WHERE job_id = ?;`
+	err = s.db.QueryRowContext(ctx, s.rebind(queryOrder), targetJobID).Scan(&orderID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get order by job id: scan: %w", err)
+		return nil, fmt.Errorf("get order by job id: query orders: %w", err)
 	}
 
-	result := &Order{
-		OrderID: resOrderID,
-		Command: contracts.PrintJobCommand{
-			JobID:          resJobID,
-			KioskID:        kioskID,
-			DisplayCode:    displayCode,
-			DownloadURL:    downloadURL,
-			SHA256Checksum: sha256Check,
-			TotalPages:     totalPages,
-			TotalSheets:    totalSheets,
-			Copies:         copies,
-			Duplex:         contracts.DuplexMode(duplexStr),
-			StartFromPage:  startFromPage,
-		},
-		Status:       contracts.JobStatus(statusStr),
-		PricePaise:   pricePaise,
-		ColorMode:    colorMode,
-		CreatedAt:    time.Unix(0, createdNS).UTC(),
-		UpdatedAt:    time.Unix(0, updatedNS).UTC(),
-		PINExpiresAt: time.Unix(0, pinExpiresNS).UTC(),
-		ClaimToken:   claimToken,
+	return s.GetOrder(ctx, orderID)
+}
+
+// GetOrderDocuments retrieves all child documents for an order, ordered by document_index.
+func (s *Store) GetOrderDocuments(ctx context.Context, orderID string) ([]OrderDocument, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("get order documents: store is closed or nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("get order documents: context is nil")
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return nil, fmt.Errorf("get order documents: orderID cannot be empty")
 	}
 
-	return result, nil
+	query := `
+SELECT
+    job_id, order_id, document_index, original_filename, download_url, sha256_checksum,
+    total_pages, total_sheets, copies, duplex, color_mode, page_range, orientation,
+    pages_per_sheet, price_paise, status, created_at_ns, updated_at_ns
+FROM order_documents
+WHERE order_id = ?
+ORDER BY document_index ASC;
+`
+	rows, err := s.db.QueryContext(ctx, s.rebind(query), orderID)
+	if err != nil {
+		return nil, fmt.Errorf("get order documents: %w", err)
+	}
+	defer rows.Close()
+
+	var docs []OrderDocument
+	for rows.Next() {
+		var (
+			dJobID, dOrdID, dFilename, dURL, dCheck, dDuplex, dColor, dRange, dOrient, dStatus string
+			dIdx, dPages, dSheets, dCopies, dPPS                                                int
+			dPrice, dCreatedNS, dUpdatedNS                                                      int64
+		)
+		if err := rows.Scan(
+			&dJobID, &dOrdID, &dIdx, &dFilename, &dURL, &dCheck,
+			&dPages, &dSheets, &dCopies, &dDuplex, &dColor, &dRange, &dOrient,
+			&dPPS, &dPrice, &dStatus, &dCreatedNS, &dUpdatedNS,
+		); err != nil {
+			return nil, fmt.Errorf("get order documents: scan: %w", err)
+		}
+		docs = append(docs, OrderDocument{
+			JobID:            dJobID,
+			OrderID:          dOrdID,
+			DocumentIndex:    dIdx,
+			OriginalFilename: dFilename,
+			DownloadURL:      dURL,
+			SHA256Checksum:   dCheck,
+			TotalPages:       dPages,
+			TotalSheets:      dSheets,
+			Copies:           dCopies,
+			Duplex:           contracts.DuplexMode(dDuplex),
+			ColorMode:        dColor,
+			PageRange:        dRange,
+			Orientation:      dOrient,
+			PagesPerSheet:    dPPS,
+			PricePaise:       dPrice,
+			Status:           contracts.JobStatus(dStatus),
+			CreatedAt:        time.Unix(0, dCreatedNS).UTC(),
+			UpdatedAt:        time.Unix(0, dUpdatedNS).UTC(),
+		})
+	}
+	return docs, rows.Err()
+}
+
+// GetOrderDocument retrieves a single child document by its jobID.
+func (s *Store) GetOrderDocument(ctx context.Context, jobID string) (*OrderDocument, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("get order document: store is closed or nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("get order document: context is nil")
+	}
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("get order document: jobID cannot be empty")
+	}
+
+	query := `
+SELECT
+    job_id, order_id, document_index, original_filename, download_url, sha256_checksum,
+    total_pages, total_sheets, copies, duplex, color_mode, page_range, orientation,
+    pages_per_sheet, price_paise, status, created_at_ns, updated_at_ns
+FROM order_documents
+WHERE job_id = ?;
+`
+	var (
+		dJobID, dOrdID, dFilename, dURL, dCheck, dDuplex, dColor, dRange, dOrient, dStatus string
+		dIdx, dPages, dSheets, dCopies, dPPS                                                int
+		dPrice, dCreatedNS, dUpdatedNS                                                      int64
+	)
+	err := s.db.QueryRowContext(ctx, s.rebind(query), jobID).Scan(
+		&dJobID, &dOrdID, &dIdx, &dFilename, &dURL, &dCheck,
+		&dPages, &dSheets, &dCopies, &dDuplex, &dColor, &dRange, &dOrient,
+		&dPPS, &dPrice, &dStatus, &dCreatedNS, &dUpdatedNS,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get order document: %w", err)
+	}
+
+	return &OrderDocument{
+		JobID:            dJobID,
+		OrderID:          dOrdID,
+		DocumentIndex:    dIdx,
+		OriginalFilename: dFilename,
+		DownloadURL:      dURL,
+		SHA256Checksum:   dCheck,
+		TotalPages:       dPages,
+		TotalSheets:      dSheets,
+		Copies:           dCopies,
+		Duplex:           contracts.DuplexMode(dDuplex),
+		ColorMode:        dColor,
+		PageRange:        dRange,
+		Orientation:      dOrient,
+		PagesPerSheet:    dPPS,
+		PricePaise:       dPrice,
+		Status:           contracts.JobStatus(dStatus),
+		CreatedAt:        time.Unix(0, dCreatedNS).UTC(),
+		UpdatedAt:        time.Unix(0, dUpdatedNS).UTC(),
+	}, nil
 }
 
 // GetOrderByPIN retrieves the latest order for a given kioskID and numeric PIN.
@@ -1271,60 +1747,14 @@ func (s *Store) GetOrderByPIN(ctx context.Context, kioskID, pin string) (*Order,
 	}
 
 	query := `
-SELECT
-    o.order_id, o.job_id, o.kiosk_id, o.display_code, o.status, o.price_paise, o.created_at_ns, o.updated_at_ns,
-    p.download_url, p.sha256_checksum, p.total_pages, p.total_sheets, p.copies, p.duplex, p.start_from_page,
-    COALESCE(p.color_mode, 'BW'), o.pin_expires_at_ns, COALESCE(o.claim_token, '')
-FROM orders o
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE o.kiosk_id = ? AND o.display_code = ?
-ORDER BY o.created_at_ns DESC
+SELECT order_id
+FROM orders
+WHERE kiosk_id = ? AND display_code = ?
+ORDER BY created_at_ns DESC
 LIMIT 1;
 `
-
-	row := s.db.QueryRowContext(ctx, s.rebind(query), kioskID, pin)
-
-	var (
-		resOrderID    string
-		jobID         string
-		resKioskID    string
-		displayCode   string
-		statusStr     string
-		pricePaise    int64
-		createdNS     int64
-		updatedNS     int64
-		downloadURL   string
-		sha256Check   string
-		totalPages    int
-		totalSheets   int
-		copies        int
-		duplexStr     string
-		startFromPage int
-		colorMode     string
-		pinExpiresNS  int64
-		claimToken    string
-	)
-
-	err := row.Scan(
-		&resOrderID,
-		&jobID,
-		&resKioskID,
-		&displayCode,
-		&statusStr,
-		&pricePaise,
-		&createdNS,
-		&updatedNS,
-		&downloadURL,
-		&sha256Check,
-		&totalPages,
-		&totalSheets,
-		&copies,
-		&duplexStr,
-		&startFromPage,
-		&colorMode,
-		&pinExpiresNS,
-		&claimToken,
-	)
+	var orderID string
+	err := s.db.QueryRowContext(ctx, s.rebind(query), kioskID, pin).Scan(&orderID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1332,30 +1762,7 @@ LIMIT 1;
 		return nil, fmt.Errorf("get order by pin: scan: %w", err)
 	}
 
-	result := &Order{
-		OrderID: resOrderID,
-		Command: contracts.PrintJobCommand{
-			JobID:          jobID,
-			KioskID:        resKioskID,
-			DisplayCode:    displayCode,
-			DownloadURL:    downloadURL,
-			SHA256Checksum: sha256Check,
-			TotalPages:     totalPages,
-			TotalSheets:    totalSheets,
-			Copies:         copies,
-			Duplex:         contracts.DuplexMode(duplexStr),
-			StartFromPage:  startFromPage,
-		},
-		Status:       contracts.JobStatus(statusStr),
-		PricePaise:   pricePaise,
-		ColorMode:    colorMode,
-		CreatedAt:    time.Unix(0, createdNS).UTC(),
-		UpdatedAt:    time.Unix(0, updatedNS).UTC(),
-		PINExpiresAt: time.Unix(0, pinExpiresNS).UTC(),
-		ClaimToken:   claimToken,
-	}
-
-	return result, nil
+	return s.GetOrder(ctx, orderID)
 }
 
 // IsPINInUse checks whether the given PIN is currently reserved and unexpired on the specified kiosk.
@@ -1851,11 +2258,13 @@ func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgre
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Check order exists and retrieve kiosk_id, total_pages, total_sheets
+	// 1. Check if job is a child document in order_documents, or directly on orders, or recovery
 	var (
+		orderID            string
 		orderKioskID       string
 		totalPages         int
 		totalSheets        int
+		isDocJob           bool
 		isRecovery         bool
 		parentJobID        string
 		recoveryID         string
@@ -1863,38 +2272,54 @@ func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgre
 		recRemainingSheets int
 		recConfirmedSheets int
 	)
-	queryOrder := `
-SELECT o.kiosk_id, p.total_pages, p.total_sheets
+
+	// Check order_documents first
+	queryDoc := `
+SELECT d.order_id, o.kiosk_id, d.total_pages, d.total_sheets
+FROM order_documents d
+JOIN orders o ON d.order_id = o.order_id
+WHERE d.job_id = ?;
+`
+	err = tx.QueryRowContext(ctx, s.rebind(queryDoc), event.JobID).Scan(&orderID, &orderKioskID, &totalPages, &totalSheets)
+	if err == nil {
+		isDocJob = true
+	} else if errors.Is(err, sql.ErrNoRows) {
+		// Fallback to legacy orders / recovery
+		queryOrder := `
+SELECT o.order_id, o.kiosk_id, p.total_pages, p.total_sheets
 FROM orders o
 JOIN print_configs p ON o.order_id = p.order_id
 WHERE o.job_id = ?;
 `
-	err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderKioskID, &totalPages, &totalSheets)
-	if err == sql.ErrNoRows {
-		if idx := strings.LastIndex(event.JobID, "-rec"); idx != -1 {
-			pJobID := event.JobID[:idx]
-			seqStr := event.JobID[idx+4:]
-			if seqID, parseErr := strconv.Atoi(seqStr); parseErr == nil && pJobID != "" {
-				queryRec := `
-SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed, r.remaining_pages, r.remaining_sheets, p.total_pages, p.total_sheets
+		err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderID, &orderKioskID, &totalPages, &totalSheets)
+		if err == sql.ErrNoRows {
+			if idx := strings.LastIndex(event.JobID, "-rec"); idx != -1 {
+				pJobID := event.JobID[:idx]
+				seqStr := event.JobID[idx+4:]
+				if seqID, parseErr := strconv.Atoi(seqStr); parseErr == nil && pJobID != "" {
+					queryRec := `
+SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed, r.remaining_pages, r.remaining_sheets, p.total_pages, p.total_sheets, o.order_id
 FROM recovery_records r
 JOIN orders o ON r.job_id = o.job_id
 JOIN print_configs p ON o.order_id = p.order_id
 WHERE r.job_id = ? AND r.sequence_id = ?;
 `
-				recErr := tx.QueryRowContext(ctx, s.rebind(queryRec), pJobID, seqID).Scan(
-					&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets, &recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets,
-				)
-				if recErr == nil {
-					isRecovery = true
+					recErr := tx.QueryRowContext(ctx, s.rebind(queryRec), pJobID, seqID).Scan(
+						&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets, &recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets, &orderID,
+					)
+					if recErr == nil {
+						isRecovery = true
+					}
 				}
 			}
+			if !isRecovery {
+				return fmt.Errorf("update job progress: job %q not found in orders or order_documents", event.JobID)
+			}
+		} else if err != nil {
+			return fmt.Errorf("update job progress: query order: %w", err)
 		}
-		if !isRecovery {
-			return fmt.Errorf("update job progress: job %q not found in orders", event.JobID)
-		}
-	} else if err != nil {
-		return fmt.Errorf("update job progress: query order: %w", err)
+	} else {
+		return fmt.Errorf("update job progress: query order_documents: %w", err)
 	}
 
 	// 2. Verify kiosk ID matches
@@ -1912,10 +2337,10 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		}
 	} else {
 		if event.PagesPrinted > totalPages {
-			return fmt.Errorf("update job progress: pages_printed (%d) exceeds order total_pages (%d)", event.PagesPrinted, totalPages)
+			return fmt.Errorf("update job progress: pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
 		}
 		if event.SheetsPrinted > totalSheets {
-			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds order total_sheets (%d)", event.SheetsPrinted, totalSheets)
+			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
 		}
 	}
 
@@ -1982,34 +2407,101 @@ WHERE recovery_id = ?;
 `), recStatus, eventNS, recoveryID)
 	}
 
-	// 6. Update associated order's status and updated_at_ns
-	_, err = tx.ExecContext(ctx, s.rebind(`
+	// 6. Update document / order status
+	if isDocJob {
+		_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE order_documents
+SET status = ?, updated_at_ns = ?
+WHERE job_id = ?;
+`), string(event.Status), eventNS, event.JobID)
+		if err != nil {
+			return fmt.Errorf("update job progress: update order_documents status: %w", err)
+		}
+
+		// Check multi-document completion invariant:
+		// Order completion requires exactly N persisted jobs (N > 0), all marked COMPLETED. Zero jobs must never count as completed.
+		var (
+			totalDocs     int
+			completedDocs int
+			failedDocs    int
+			printingDocs  int
+			spoolingDocs  int
+		)
+		queryCounts := `
+SELECT
+    COUNT(1),
+    COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'FAILED_REFUNDABLE' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'PRINTING' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'SPOOLING' THEN 1 ELSE 0 END), 0)
+FROM order_documents
+WHERE order_id = ?;
+`
+		err = tx.QueryRowContext(ctx, s.rebind(queryCounts), orderID).Scan(
+			&totalDocs, &completedDocs, &failedDocs, &printingDocs, &spoolingDocs,
+		)
+		if err != nil {
+			return fmt.Errorf("update job progress: query order document counts: %w", err)
+		}
+
+		if totalDocs > 0 && completedDocs == totalDocs {
+			_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders
+SET status = 'COMPLETED', updated_at_ns = ?
+WHERE order_id = ?;
+`), eventNS, orderID)
+			if err != nil {
+				return fmt.Errorf("update job progress: update order completed: %w", err)
+			}
+			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
+		} else if failedDocs > 0 {
+			_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders
+SET status = 'FAILED_REFUNDABLE', updated_at_ns = ?
+WHERE order_id = ?;
+`), eventNS, orderID)
+		} else if printingDocs > 0 {
+			_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders
+SET status = 'PRINTING', updated_at_ns = ?
+WHERE order_id = ? AND status NOT IN ('COMPLETED');
+`), eventNS, orderID)
+		} else if spoolingDocs > 0 {
+			_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders
+SET status = 'SPOOLING', updated_at_ns = ?
+WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED');
+`), eventNS, orderID)
+		}
+	} else {
+		// Legacy single-job orders table update
+		_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
 WHERE job_id = ?;
 `), string(event.Status), eventNS, targetJobID)
-	if err != nil {
-		return fmt.Errorf("update job progress: update order status: %w", err)
+		if err != nil {
+			return fmt.Errorf("update job progress: update order status: %w", err)
+		}
+
+		if event.Status == contracts.JobStatusCompleted || event.Status == contracts.JobStatusFailedRefundable {
+			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
+		}
 	}
 
-	// Release PIN reservation upon terminal status
-	if event.Status == contracts.JobStatusCompleted || event.Status == contracts.JobStatusFailedRefundable {
-		_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = (SELECT order_id FROM orders WHERE job_id = ?);"), targetJobID)
-	}
-
-	// Synchronize dispatch intent status with authoritative progress
+	// 7. Synchronize dispatch intent status with authoritative progress
 	if event.Status == contracts.JobStatusCompleted {
 		_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE job_id = ?;
-`), eventNS, targetJobID)
+`), eventNS, event.JobID)
 	} else if event.Status == contracts.JobStatusSpooling || event.Status == contracts.JobStatusPrinting {
 		_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'ACKNOWLEDGED', acknowledged_at_ns = ?, updated_at_ns = ?
 WHERE job_id = ? AND status IN ('PENDING', 'SENT');
-`), eventNS, eventNS, targetJobID)
+`), eventNS, eventNS, event.JobID)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -2713,6 +3205,7 @@ type PaymentCaptureResult struct {
 	PricePaise       int64
 	KioskID          string
 	Command          *contracts.PrintJobCommand
+	Commands         []contracts.PrintJobCommand
 }
 
 // CapturePaymentAndCheckDispatch atomically records payment, transitions order status to PAID_WAITING,
@@ -2752,6 +3245,15 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 		if oErr != nil || order == nil {
 			return &PaymentCaptureResult{AlreadyProcessed: true}, nil
 		}
+		var cmds []contracts.PrintJobCommand
+		if len(order.Documents) > 0 {
+			cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+			for i, doc := range order.Documents {
+				cmds[i] = doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
+			}
+		} else {
+			cmds = []contracts.PrintJobCommand{order.Command}
+		}
 		return &PaymentCaptureResult{
 			OrderStatus:      order.Status,
 			AlreadyProcessed: true,
@@ -2759,6 +3261,7 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 			PricePaise:       order.PricePaise,
 			KioskID:          order.Command.KioskID,
 			Command:          &order.Command,
+			Commands:         cmds,
 		}, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("capture payment: check existing payment: %w", err)
@@ -2827,8 +3330,17 @@ WHERE order_id = ? AND status = 'CREATED';
 		}
 		order, _ := s.GetOrder(ctx, p.OrderID)
 		var cmd *contracts.PrintJobCommand
+		var cmds []contracts.PrintJobCommand
 		if order != nil {
 			cmd = &order.Command
+			if len(order.Documents) > 0 {
+				cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+				for i, doc := range order.Documents {
+					cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
+				}
+			} else {
+				cmds = []contracts.PrintJobCommand{order.Command}
+			}
 		}
 		return &PaymentCaptureResult{
 			OrderStatus:      currentStatus,
@@ -2837,6 +3349,7 @@ WHERE order_id = ? AND status = 'CREATED';
 			PricePaise:       pricePaise,
 			KioskID:          orderKioskID,
 			Command:          cmd,
+			Commands:         cmds,
 		}, nil
 	}
 
@@ -2925,15 +3438,14 @@ WHERE order_id = ? AND status = ?;
 				}
 				if rowsOrd > 0 {
 					// Check existing dispatch intent status before modifying
-					var existingIntentStatus string
-					queryIntent := s.rebind(`SELECT status FROM dispatch_intents WHERE order_id = ?;`)
-					errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingIntentStatus)
-					if errIntent == nil {
-						if existingIntentStatus == "ACKNOWLEDGED" || existingIntentStatus == "COMPLETED" {
-							return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already %s", p.OrderID, existingIntentStatus)
-						}
-					} else if !errors.Is(errIntent, sql.ErrNoRows) {
+					var existingActiveIntents int
+					queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
+					errIntent := tx.QueryRowContext(ctx, queryIntent, p.OrderID).Scan(&existingActiveIntents)
+					if errIntent != nil {
 						return nil, fmt.Errorf("capture payment: check dispatch intent: %w", errIntent)
+					}
+					if existingActiveIntents > 0 {
+						return nil, fmt.Errorf("order %s cannot create dispatch intent: existing intent is already active or completed", p.OrderID)
 					}
 
 					deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
@@ -2945,16 +3457,33 @@ WHERE order_id = ? AND status = ?;
 						return nil, fmt.Errorf("capture payment: delete dispatch intent rows affected: %w", err)
 					}
 
+					var docJobIDs []string
+					rowsDocs, err := tx.QueryContext(ctx, s.rebind(`SELECT job_id FROM order_documents WHERE order_id = ? ORDER BY document_index ASC;`), p.OrderID)
+					if err == nil {
+						for rowsDocs.Next() {
+							var jID string
+							if sErr := rowsDocs.Scan(&jID); sErr == nil && jID != "" {
+								docJobIDs = append(docJobIDs, jID)
+							}
+						}
+						_ = rowsDocs.Close()
+					}
+					if len(docJobIDs) == 0 {
+						docJobIDs = []string{orderJobID}
+					}
+
 					insertIntent := s.rebind(`
-INSERT INTO dispatch_intents (order_id, job_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
+INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-					resIns, err := tx.ExecContext(ctx, insertIntent, p.OrderID, orderJobID, orderKioskID, sessID, nowNS, nowNS)
-					if err != nil {
-						return nil, fmt.Errorf("capture payment: insert dispatch intent: %w", err)
-					}
-					if _, err := resIns.RowsAffected(); err != nil {
-						return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected: %w", err)
+					for _, jID := range docJobIDs {
+						resIns, err := tx.ExecContext(ctx, insertIntent, jID, p.OrderID, orderKioskID, sessID, nowNS, nowNS)
+						if err != nil {
+							return nil, fmt.Errorf("capture payment: insert dispatch intent for job %s: %w", jID, err)
+						}
+						if _, err := resIns.RowsAffected(); err != nil {
+							return nil, fmt.Errorf("capture payment: insert dispatch intent rows affected for job %s: %w", jID, err)
+						}
 					}
 
 					dispatchEligible = true
@@ -3002,8 +3531,17 @@ WHERE order_id = ? AND status = 'CREATED';
 
 	order, _ := s.GetOrder(ctx, p.OrderID)
 	var cmd *contracts.PrintJobCommand
+	var cmds []contracts.PrintJobCommand
 	if order != nil {
 		cmd = &order.Command
+		if len(order.Documents) > 0 {
+			cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+			for i, doc := range order.Documents {
+				cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
+			}
+		} else {
+			cmds = []contracts.PrintJobCommand{order.Command}
+		}
 	}
 
 	return &PaymentCaptureResult{
@@ -3014,6 +3552,7 @@ WHERE order_id = ? AND status = 'CREATED';
 		PricePaise:       pricePaise,
 		KioskID:          orderKioskID,
 		Command:          cmd,
+		Commands:         cmds,
 	}, nil
 }
 
@@ -3076,15 +3615,14 @@ WHERE session_id = ? AND order_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PEN
 	}
 
 	// 3. Ensure we do not delete or overwrite an acknowledged or completed dispatch intent
-	var existingIntentStatus string
-	queryIntent := s.rebind(`SELECT status FROM dispatch_intents WHERE order_id = ?;`)
-	errIntent := tx.QueryRowContext(ctx, queryIntent, orderID).Scan(&existingIntentStatus)
-	if errIntent == nil {
-		if existingIntentStatus == "ACKNOWLEDGED" || existingIntentStatus == "COMPLETED" {
-			return nil, fmt.Errorf("order %s cannot be released: dispatch intent is already %s", orderID, existingIntentStatus)
-		}
-	} else if !errors.Is(errIntent, sql.ErrNoRows) {
+	var existingActiveIntents int
+	queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
+	errIntent := tx.QueryRowContext(ctx, queryIntent, orderID).Scan(&existingActiveIntents)
+	if errIntent != nil {
 		return nil, fmt.Errorf("release paid order: check existing dispatch intent: %w", errIntent)
+	}
+	if existingActiveIntents > 0 {
+		return nil, fmt.Errorf("order %s cannot be released: dispatch intent is already active or completed", orderID)
 	}
 
 	// 4. Mark session COMPLETED
@@ -3123,7 +3661,7 @@ WHERE order_id = ? AND status = ?;
 		return nil, fmt.Errorf("order state conflict: could not transition to DISPATCHED")
 	}
 
-	// 6. Record durable dispatch intent in PENDING status
+	// 6. Record durable dispatch intent in PENDING status for all child document jobs
 	deleteIntent := s.rebind(`DELETE FROM dispatch_intents WHERE order_id = ? AND status NOT IN ('ACKNOWLEDGED', 'COMPLETED');`)
 	resDel, err := tx.ExecContext(ctx, deleteIntent, orderID)
 	if err != nil {
@@ -3133,16 +3671,33 @@ WHERE order_id = ? AND status = ?;
 		return nil, fmt.Errorf("release paid order: delete dispatch intent rows affected: %w", err)
 	}
 
+	var docJobIDs []string
+	rowsDocs, err := tx.QueryContext(ctx, s.rebind(`SELECT job_id FROM order_documents WHERE order_id = ? ORDER BY document_index ASC;`), orderID)
+	if err == nil {
+		for rowsDocs.Next() {
+			var jID string
+			if sErr := rowsDocs.Scan(&jID); sErr == nil && jID != "" {
+				docJobIDs = append(docJobIDs, jID)
+			}
+		}
+		_ = rowsDocs.Close()
+	}
+	if len(docJobIDs) == 0 {
+		docJobIDs = []string{orderJobID}
+	}
+
 	insertIntent := s.rebind(`
-INSERT INTO dispatch_intents (order_id, job_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
+INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns)
 VALUES (?, ?, ?, ?, 'PENDING', ?, ?);
 `)
-	resIns, err := tx.ExecContext(ctx, insertIntent, orderID, orderJobID, kioskID, sessID, nowNS, nowNS)
-	if err != nil {
-		return nil, fmt.Errorf("release paid order: record dispatch intent: %w", err)
-	}
-	if _, err := resIns.RowsAffected(); err != nil {
-		return nil, fmt.Errorf("release paid order: record dispatch intent rows affected: %w", err)
+	for _, jID := range docJobIDs {
+		resIns, err := tx.ExecContext(ctx, insertIntent, jID, orderID, kioskID, sessID, nowNS, nowNS)
+		if err != nil {
+			return nil, fmt.Errorf("release paid order: record dispatch intent: %w", err)
+		}
+		if _, err := resIns.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("release paid order: record dispatch intent rows affected: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -3292,13 +3847,13 @@ WHERE (order_id = ? OR job_id = ?) AND status != 'COMPLETED';
 	return err
 }
 
-// GetDispatchIntentStatus returns the status and acknowledged_at_ns for an order's dispatch intent.
-func (s *Store) GetDispatchIntentStatus(ctx context.Context, orderID string) (status string, acknowledgedAtNS int64, err error) {
+// GetDispatchIntentStatus returns the status and acknowledged_at_ns for an order's or job's dispatch intent.
+func (s *Store) GetDispatchIntentStatus(ctx context.Context, orderOrJobID string) (status string, acknowledgedAtNS int64, err error) {
 	if s == nil || s.db == nil {
 		return "", 0, errors.New("store not initialized")
 	}
-	query := s.rebind(`SELECT status, acknowledged_at_ns FROM dispatch_intents WHERE order_id = ?;`)
-	err = s.db.QueryRowContext(ctx, query, orderID).Scan(&status, &acknowledgedAtNS)
+	query := s.rebind(`SELECT status, acknowledged_at_ns FROM dispatch_intents WHERE job_id = ? OR order_id = ?;`)
+	err = s.db.QueryRowContext(ctx, query, orderOrJobID, orderOrJobID).Scan(&status, &acknowledgedAtNS)
 	return status, acknowledgedAtNS, err
 }
 
@@ -3376,7 +3931,7 @@ ORDER BY created_at_ns ASC;
 			err := s.db.QueryRowContext(ctx, qSess, cand.sessionID).Scan(&sessStatus, &sessExpNS)
 			if err != nil || sessStatus == "CANCELED" || sessStatus == "EXPIRED" || (sessStatus == "PAYMENT_PENDING" && sessExpNS <= nowNS) {
 				// Cancel intent and revert order to PAID_WAITING to avoid unattended ghost printing
-				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE order_id = ?;`), nowNS, cand.orderID)
+				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ? OR order_id = ?;`), nowNS, cand.jobID, cand.orderID)
 				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE orders SET status = ?, updated_at_ns = ? WHERE order_id = ? AND status = ?;`),
 					string(contracts.JobStatusPaidWaiting), nowNS, cand.orderID, string(contracts.JobStatusDispatched))
 				continue
@@ -3384,11 +3939,20 @@ ORDER BY created_at_ns ASC;
 		}
 
 		// Valid authorized job: record retry increment
-		_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET retry_count = retry_count + 1, updated_at_ns = ? WHERE order_id = ?;`), nowNS, cand.orderID)
+		_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET retry_count = retry_count + 1, updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
 
 		ord, err := s.GetOrder(ctx, cand.orderID)
 		if err == nil && ord != nil {
-			cmds = append(cmds, ord.Command)
+			doc, errDoc := s.GetOrderDocument(ctx, cand.jobID)
+			if errDoc == nil && doc != nil {
+				totalDocs := len(ord.Documents)
+				if totalDocs == 0 {
+					totalDocs = 1
+				}
+				cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, totalDocs))
+			} else {
+				cmds = append(cmds, ord.Command)
+			}
 		}
 	}
 	return cmds, nil

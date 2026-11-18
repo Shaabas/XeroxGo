@@ -3,17 +3,43 @@
 
 CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL,
     kiosk_id TEXT NOT NULL,
     display_code TEXT NOT NULL,
     status TEXT NOT NULL,
     price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    total_sheets INTEGER NOT NULL DEFAULT 0,
     created_at_ns BIGINT NOT NULL,
     updated_at_ns BIGINT NOT NULL,
     pin_expires_at_ns BIGINT NOT NULL DEFAULT 0,
     claim_token TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);
+CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);
+
+CREATE TABLE IF NOT EXISTS order_documents (
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    document_index INTEGER NOT NULL CHECK (document_index >= 0),
+    original_filename TEXT NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256_checksum TEXT NOT NULL,
+    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
+    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
+    copies INTEGER NOT NULL CHECK (copies > 0),
+    duplex TEXT NOT NULL,
+    color_mode TEXT NOT NULL DEFAULT 'BW',
+    page_range TEXT NOT NULL DEFAULT '',
+    orientation TEXT NOT NULL DEFAULT 'AUTO',
+    pages_per_sheet INTEGER NOT NULL DEFAULT 1,
+    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
+    status TEXT NOT NULL,
+    created_at_ns BIGINT NOT NULL,
+    updated_at_ns BIGINT NOT NULL,
+    UNIQUE(order_id, document_index)
+);
+CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);
 
 CREATE TABLE IF NOT EXISTS pin_reservations (
     kiosk_id TEXT NOT NULL,
@@ -75,7 +101,7 @@ CREATE TABLE IF NOT EXISTS payment_webhooks (
 );
 
 CREATE TABLE IF NOT EXISTS job_progress (
-    job_id TEXT PRIMARY KEY REFERENCES orders(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY,
     kiosk_id TEXT NOT NULL,
     status TEXT NOT NULL,
     pages_printed INTEGER NOT NULL CHECK (pages_printed >= 0),
@@ -159,8 +185,8 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);
 
 CREATE TABLE IF NOT EXISTS dispatch_intents (
-    order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
-    job_id TEXT NOT NULL,
+    job_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
     kiosk_id TEXT NOT NULL,
     session_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
@@ -172,6 +198,7 @@ CREATE TABLE IF NOT EXISTS dispatch_intents (
     last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
+CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
 
 CREATE TABLE IF NOT EXISTS payment_attempts (
     attempt_id TEXT PRIMARY KEY,

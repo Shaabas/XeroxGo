@@ -40,20 +40,26 @@ type PrinterHealth struct {
 }
 
 type PrintJobCommand struct {
-	JobID          string     `json:"job_id"`
-	KioskID        string     `json:"kiosk_id"`
-	DisplayCode    string     `json:"display_code"`    // 4-char code shown on HDMI screen (e.g. "A74X")
-	DownloadURL    string     `json:"download_url"`    // Signed URL to download normalized PDF
-	SHA256Checksum string     `json:"sha256_checksum"` // Verified by Pi before printing
-	TotalPages     int        `json:"total_pages"`     // Logical PDF pages after normalization
-	TotalSheets    int        `json:"total_sheets"`    // Physical A4 sheets required
-	Copies         int        `json:"copies"`
-	Duplex         DuplexMode `json:"duplex"`
-	StartFromPage  int        `json:"start_from_page"` // 1 normally; >1 when resuming after crash/paper out
+	JobID            string     `json:"job_id"`
+	OrderID          string     `json:"order_id,omitempty"`           // Parent order ID for multi-document correlation
+	DocumentIndex    int        `json:"document_index"`               // 0-indexed position within parent order
+	TotalDocuments   int        `json:"total_documents"`              // Total document jobs belonging to parent order
+	OriginalFilename string     `json:"original_filename,omitempty"`  // Document display name
+	ColorMode        string     `json:"color_mode,omitempty"`         // "BW" or "COLOR"
+	KioskID          string     `json:"kiosk_id"`
+	DisplayCode      string     `json:"display_code"`                 // 4-char code shown on HDMI screen (e.g. "A74X")
+	DownloadURL      string     `json:"download_url"`                 // Signed URL to download normalized PDF
+	SHA256Checksum   string     `json:"sha256_checksum"`              // Verified by Pi before printing
+	TotalPages       int        `json:"total_pages"`                  // Logical PDF pages per copy after normalization
+	TotalSheets      int        `json:"total_sheets"`                 // Physical A4 sheets required (sheetsPerCopy * copies)
+	Copies           int        `json:"copies"`
+	Duplex           DuplexMode `json:"duplex"`
+	StartFromPage    int        `json:"start_from_page"`              // 1 normally; >1 when resuming after crash/paper out
 }
 
 type JobProgressEvent struct {
 	JobID         string    `json:"job_id"`
+	OrderID       string    `json:"order_id,omitempty"`
 	KioskID       string    `json:"kiosk_id"`
 	Status        JobStatus `json:"status"`
 	PagesPrinted  int       `json:"pages_printed"`

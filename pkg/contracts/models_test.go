@@ -37,6 +37,11 @@ func TestJSONRoundTrip(t *testing.T) {
 			name: "print_job_command",
 			input: contracts.PrintJobCommand{
 				JobID:          "job-001",
+				OrderID:        "ord-001",
+				DocumentIndex:  1,
+				TotalDocuments: 3,
+				OriginalFilename: "Chapter1.pdf",
+				ColorMode:      "COLOR",
 				KioskID:        "kiosk-001",
 				DisplayCode:    "A74X",
 				DownloadURL:    "https://example.invalid/document.pdf",
@@ -53,6 +58,7 @@ func TestJSONRoundTrip(t *testing.T) {
 			name: "job_progress_event",
 			input: contracts.JobProgressEvent{
 				JobID:         "job-001",
+				OrderID:       "ord-001",
 				KioskID:       "kiosk-001",
 				Status:        contracts.JobStatusPrinting,
 				PagesPrinted:  2,
