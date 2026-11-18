@@ -115,6 +115,10 @@ func (s *appServer) runCloudPreparationJob(ctx context.Context,job *store.CloudP
 }
 
 func (s *appServer) processCloudPreparationQueue(ctx context.Context) {
+ if _,err:=s.db.FailExhaustedCloudPreparations(ctx,time.Now().UTC());err!=nil {
+  log.Printf("[CLOUD-PREP] exhausted-worker reconciliation failed: %v",err)
+  return
+ }
  for i:=0;i<3 && ctx.Err()==nil;i++ {
   job,err:=s.db.ClaimNextCloudPreparation(ctx,time.Now().UTC())
   if err!=nil{log.Printf("[CLOUD-PREP] claim failure: %v",err);return}
