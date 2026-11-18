@@ -76,5 +76,5 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 
 ### Feature flags (both OFF by default)
 - `XEROXGO_CLOUD_UPLOADS_ENABLED=1` exposes signed uploads, verification, preparation and variant status for controlled development only. This is NOT safe to enable publicly before quotas/rate limits and storage cleanup exist.
-- `XEROXGO_CLOUD_CHECKOUT_ENABLED=1` additionally requires the upload flag and enables reference-only order creation plus Storage-backed signed Pi downloads. It must stay off until all checkout and printer safety gates are complete.
-- A rollout must enable the second flag only after the first workflow has been validated with private Storage and correct migrations. Production `main` remains on the original flow.
+- `XEROXGO_CLOUD_DELIVERY_ENABLED=1` makes already-created cloud orders readable through the existing signed Render-to-Pi endpoint. This must remain enabled until **every** V2 order has reached an irreversible terminal state and its recovery window has ended, even if checkout is rolled back.\n- `XEROXGO_CLOUD_CHECKOUT_ENABLED=1` requires both upload and delivery flags and allows new reference-only orders. Disabling checkout blocks new orders but does **not** disable cloud delivery for existing ones.
+- A rollout must enable cloud delivery before checkout only after the upload workflow has been validated with private Storage and correct migrations. Production `main` remains on the original flow.
