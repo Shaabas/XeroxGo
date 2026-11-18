@@ -40,11 +40,12 @@ func (s *Store) ReserveCloudDocumentUpload(ctx context.Context, u CloudDocumentU
     if s.dialect == "postgres" {
         if _, err = tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", "cloud-upload:"+u.KioskID); err != nil { return err }
     }
+    now := time.Now().UTC()
     quotaQ := s.rebind(`SELECT COUNT(*), COALESCE(SUM(declared_bytes), 0)
         FROM document_uploads WHERE kiosk_id=? AND created_at>=?`)
     var count int64
     var bytesUsed int64
-    err = tx.QueryRowContext(ctx, quotaQ, u.KioskID, time.Now().UTC().Add(-time.Hour)).Scan(&count, &bytesUsed)
+    err = tx.QueryRowContext(ctx, quotaQ, u.KioskID, now.Add(-time.Hour)).Scan(&count, &bytesUsed)
     if err != nil { return err }
     if count >= cloudMaxUploadsPerKioskHour ||
         bytesUsed > cloudMaxDeclaredBytesPerKioskHour-u.DeclaredBytes {
@@ -52,10 +53,10 @@ func (s *Store) ReserveCloudDocumentUpload(ctx context.Context, u CloudDocumentU
     }
     q := s.rebind(`INSERT INTO document_uploads
         (upload_id, upload_token_hash, kiosk_id, original_name, object_key,
-         content_type, declared_bytes, state, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_UPLOAD', ?)`)
+         content_type, declared_bytes, state, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_UPLOAD', ?, ?)`)
     if _, err = tx.ExecContext(ctx, q, u.ID, u.TokenHash, u.KioskID,
-        u.OriginalName, u.ObjectKey, u.ContentType, u.DeclaredBytes, u.ExpiresAt); err != nil { return err }
+        u.OriginalName, u.ObjectKey, u.ContentType, u.DeclaredBytes, u.ExpiresAt, now); err != nil { return err }
     return tx.Commit()
 }
 
