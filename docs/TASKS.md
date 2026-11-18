@@ -52,3 +52,10 @@ These are lower-priority investigations than the approved planning work for XG-C
 - Pending implementation: secure prepared variants, reference-only checkout, order idempotency, Storage-backed printer downloads, end-to-end tests and rollout.
 
 - Prepared-variant foundation now implemented: verified original re-download, canonical normalization, immutable private Storage output, DB CAS READY, exact-setting reuse and tests. **Not yet async/durable**; request crashes can leave PREPARING and no retry lease exists. Do not enable.
+
+### XG-CLOUD-DOCS-V2 reference-only checkout slice (draft PR #17)
+- Added feature-gated single-variant `POST /api/documents/checkout`: upload capability, variant ID, stable idempotency key, accepted total and revision only; no PDF bytes.
+- Added transactionally bound READY-variant+tariff check, order/PIN/print config/immutable variant reference and idempotency ledger. Retries must reuse the original order; new idempotency keys cannot reorder the same upload variant.
+- Added signed Render PDF download backing from private Storage with checksum verification before bytes reach the Pi. Legacy jobs remain disk-backed.
+- Added isolated browser checkout request helper and Go/Node regression tests. **Cart integration and multi-file packing not yet implemented; not production ready.**
+- Blockers for release: Gate 1–6 latest verification, live Storage integration, durable preparation worker retry/cleanup, upload rate limits and quotas, multi-file fidelity audit XG-004, secure lifecycle/retention and Pi recovery testing.
