@@ -1,3 +1,5 @@
+> **Checkpoint addendum — 2026-11-18**: Verified remote `main` at `0b40181669129b506a8804c2bb595d88cdc2c18e`; PR #16 is merged. Inventory: 34 non-main remote branches, all 0 commits ahead of `main`; no open PRs before XG-CLOUD-DOCS-V2 work. Local Antigravity worktree not inspected. New branch `feat/cloud-first-documents-v2` implements ONLY the disabled-by-default private upload foundation, not customer checkout cutover. Storage migration **not applied**. Preserve existing portal/Render/Pi paths. See `docs/architecture/cloud-first-documents-v2.md` and `docs/TASKS.md`.
+
 # XeroxGo — current project checkpoint
 
 **Verified:** 2026-11-17 using the connected GitHub repository. This is a GitHub snapshot, not proof of the Render backend's deployed image or the local Antigravity worktree.
