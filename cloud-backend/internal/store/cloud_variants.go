@@ -20,24 +20,47 @@ type CloudDocumentVariant struct {
 
 var ErrVariantUnavailable = errors.New("prepared variant unavailable")
 
-// AcquireCloudVariant returns an existing variant or exclusively reserves a
-// new PREPARING row. The unique index is the cross-Render-instance lock.
-// The caller must never process a row unless acquired is true.
+// AcquireCloudVariant atomically reserves or recovers a preparation lease.
+// READY output is never modified. After a crash, an expired PREPARING lease
+// (or FAILED attempt) can be replaced with a new variant identity; the old
+// worker cannot publish after replacement because its variant ID no longer
+// matches. Existing Storage objects under the old ID require orphan cleanup.
 func (s *Store) AcquireCloudVariant(ctx context.Context, v CloudDocumentVariant) (got CloudDocumentVariant, acquired bool, err error) {
- if s == nil || s.db == nil { return got, false, errors.New("database unavailable") }
- if v.ID == "" || v.UploadID == "" || len(v.SettingsHash) != 64 || v.NormalizerVersion == "" {
-  return got, false, errors.New("invalid variant identity")
+ if s==nil||s.db==nil {return got,false,errors.New("database unavailable")}
+ if v.ID==""||v.UploadID==""||len(v.SettingsHash)!=64||v.NormalizerVersion=="" {
+  return got,false,errors.New("invalid variant identity")
  }
- q := s.rebind(`INSERT INTO document_variants
-   (variant_id, upload_id, settings_hash, normalizer_version, state, expires_at)
-   VALUES (?, ?, ?, ?, 'PREPARING', ?) ON CONFLICT (upload_id, settings_hash, normalizer_version) DO NOTHING`)
- res, err := s.db.ExecContext(ctx, q, v.ID, v.UploadID, v.SettingsHash, v.NormalizerVersion, v.ExpiresAt)
- if err != nil { return got, false, fmt.Errorf("reserve variant: %w", err) }
- rows, err := res.RowsAffected()
- if err != nil { return got, false, err }
- if rows == 1 { v.State = "PREPARING"; return v, true, nil }
- got, err = s.GetCloudVariant(ctx, v.UploadID, v.SettingsHash, v.NormalizerVersion)
- return got, false, err
+ now:=time.Now().UTC()
+ leaseUntil:=now.Add(10*time.Minute)
+ q:=s.rebind(`INSERT INTO document_variants
+  (variant_id,upload_id,settings_hash,normalizer_version,state,expires_at,lease_expires_at)
+  VALUES (?,?,?,?,'PREPARING',?,?)
+  ON CONFLICT (upload_id,settings_hash,normalizer_version) DO NOTHING`)
+ res,err:=s.db.ExecContext(ctx,q,v.ID,v.UploadID,v.SettingsHash,v.NormalizerVersion,v.ExpiresAt,leaseUntil)
+ if err!=nil {return got,false,fmt.Errorf("reserve variant: %w",err)}
+ count,err:=res.RowsAffected()
+ if err!=nil{return got,false,err}
+ if count==1 {v.State="PREPARING";return v,true,nil}
+
+ // An abandoned reservation is reclaimable, but a live lease or READY
+ // variant is never stolen. The conditional UPDATE is concurrency-safe.
+ reclaim:=s.rebind(`UPDATE document_variants
+   SET variant_id=?,state='PREPARING',error_code=NULL,lease_expires_at=?,expires_at=?,
+       storage_key=NULL,checksum_sha256=NULL,billable_sides=NULL,total_sheets=NULL,
+       canonical_price_paise=NULL,tariff_revision=NULL,copies=NULL,duplex=NULL,color_mode=NULL
+   WHERE upload_id=? AND settings_hash=? AND normalizer_version=?
+     AND (state='FAILED' OR
+       (state='PREPARING' AND (lease_expires_at IS NULL OR lease_expires_at<=?)))
+     AND NOT EXISTS (SELECT 1 FROM order_documents od
+       WHERE od.variant_id=document_variants.variant_id)`)
+ res,err=s.db.ExecContext(ctx,reclaim,v.ID,leaseUntil,v.ExpiresAt,
+  v.UploadID,v.SettingsHash,v.NormalizerVersion,now)
+ if err!=nil{return got,false,fmt.Errorf("recover variant: %w",err)}
+ count,err=res.RowsAffected()
+ if err!=nil{return got,false,err}
+ if count==1{v.State="PREPARING";return v,true,nil}
+ got,err=s.GetCloudVariant(ctx,v.UploadID,v.SettingsHash,v.NormalizerVersion)
+ return got,false,err
 }
 
 func (s *Store) GetCloudVariant(ctx context.Context, uploadID, settingsHash, version string) (CloudDocumentVariant, error) {
