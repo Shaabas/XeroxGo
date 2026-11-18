@@ -73,3 +73,8 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 - Full multi-file checkout, original Office/image upload parity and customer UI cutover remain unfinished.
 - Storage-backed Pi artifact download currently reuses the signed Render path and verifies the checksum; needs integration test on a real private bucket and recovery tests.
 - No switch to cloud checkout until new API/Storage/order idempotency tests and end-to-end printer lifecycle tests pass.
+
+### Feature flags (both OFF by default)
+- `XEROXGO_CLOUD_UPLOADS_ENABLED=1` exposes signed uploads, verification, preparation and variant status for controlled development only. This is NOT safe to enable publicly before quotas/rate limits and storage cleanup exist.
+- `XEROXGO_CLOUD_CHECKOUT_ENABLED=1` additionally requires the upload flag and enables reference-only order creation plus Storage-backed signed Pi downloads. It must stay off until all checkout and printer safety gates are complete.
+- A rollout must enable the second flag only after the first workflow has been validated with private Storage and correct migrations. Production `main` remains on the original flow.
