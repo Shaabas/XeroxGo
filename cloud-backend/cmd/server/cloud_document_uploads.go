@@ -120,8 +120,17 @@ func (s *appServer) handleCloudUploadInit(w http.ResponseWriter, r *http.Request
         DeclaredBytes: input.SizeBytes, State: "PENDING_UPLOAD",
         ExpiresAt: time.Now().Add(2*time.Hour),
     }
-    if s.db == nil || s.db.ReserveCloudDocumentUpload(r.Context(), item) != nil {
-        http.Error(w, "cannot reserve document upload", http.StatusServiceUnavailable)
+    if s.db == nil {
+        http.Error(w, "document store unavailable", http.StatusServiceUnavailable)
+        return
+    }
+    if err := s.db.ReserveCloudDocumentUpload(r.Context(), item); err != nil {
+        if errors.Is(err, store.ErrCloudUploadQuota) {
+            w.Header().Set("Retry-After", "3600")
+            http.Error(w, "upload limit reached; try again later", http.StatusTooManyRequests)
+        } else {
+            http.Error(w, "cannot reserve document upload", http.StatusServiceUnavailable)
+        }
         return
     }
     endpoint := base + "/storage/v1/object/upload/sign/" + cloudOriginalBucket + "/" + objectKey
