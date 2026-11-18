@@ -86,3 +86,7 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 - **Not a durable background queue yet**: the client still starts synchronous preparation; after a crash it must request preparation again, and recovery can take up to the lease duration. A clean cancellation marks FAILED. A true queue/worker and progress events remain release improvements.
 - A partially uploaded object from an abandoned worker can become an orphan. Lifecycle cleanup is still required; do not enable publicly.
 - Multi-file output is intentionally blocked pending `docs/architecture/multi-document-fidelity-gate.md`. The current legacy merge has one global duplex/color mode that can lose per-document printing intent.
+
+### Status semantics after interrupted preparation
+- `POST /api/documents/variants/status` reports `PREPARING` while the DB lease is live, `RETRYABLE` after it expires, `FAILED` on a known failed attempt, and `READY` only after verified immutable publication. A client seeing RETRYABLE/FAILED must issue `prepare` again with the original upload capability and settings; the new successful reservation may return a **new variant ID**. Never submit a stale old variant at checkout.
+- Note that a private, capability-protected status call is polling, not a durable worker. Automatic background processing after browser disconnect remains a separate engineering gate.
