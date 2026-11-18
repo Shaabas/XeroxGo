@@ -45,3 +45,13 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 - Supabase Storage is empty as of 2026-11-18; migration is a *file*, not an applied change.
 - Legacy Supabase public tables have unreviewed RLS/grants, separate task XG-006.
 - Actual Render deploy, storage API credentials, CORS and browser-to-storage performance not established.
+
+## Latest implementation slice: canonical prepared PDF variants (2026-11-18)
+- `POST /api/documents/variants/prepare` accepts the server-issued upload capability plus exact print settings; it does **not** accept arbitrary Storage paths, display prices or file bytes.
+- The PDF must already have been verified by Render. Render rechecks its digest while downloading from the private originals bucket, calls the existing `executeNormalizationAndPricing` path, uploads the result to the private prepared bucket, then marks an immutable variant READY through a conditional database update.
+- Exact-settings variants are keyed per upload + canonical normalizer/tariff revision. Concurrent duplicate requests see PREPARING or reuse READY; no duplicate render inside a healthy active reservation.
+- This is a **synchronous, opt-in foundation**, not the final background worker. It is not yet wired to the browser cart. Work must be moved to a durable background worker before enabling the experience in production; a request crash can currently leave PREPARING stuck, and failed variants cannot yet be safely retried.
+- Current canonical normalization includes copies in the output. Consequently changing copies can still create a new variant; separating copies-only repricing from PDF output reuse requires explicit output-fidelity tests first.
+- A tariff revision currently creates a separate versioned variant to preserve pricing correctness. Cross-tariff PDF byte reuse is a future optimization.
+- Orphan prepared objects after a successful Storage upload followed by a DB write failure require lifecycle cleanup before rollout.
+- Reuse of already prepared PDFs at **checkout** and at the **Pi** is NOT implemented yet.
