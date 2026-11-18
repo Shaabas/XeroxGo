@@ -33,7 +33,8 @@
 
   async function cloudUploadPDF(file, kioskID, onProgress = () => {},
                                 request = fetch, xhrFactory = () => new XMLHttpRequest()) {
-    if (!file || !file.name || file.type !== 'application/pdf' ||
+    if (!file || !file.name || !/\.pdf$/i.test(file.name) ||
+        (file.type && file.type !== 'application/pdf') ||
         file.size < 1 || file.size > 25 * 1024 * 1024) {
       throw new Error('Select a PDF of 25 MiB or less');
     }
@@ -56,7 +57,14 @@
     // Retain grant in memory so a failed finalize can be recovered without
     // uploading bytes again. Never persist it in URLs, logs, or localStorage.
     const receipt = { upload_id: grant.upload_id, upload_token: grant.upload_token };
-    await uploadSignedFile(grant.upload_url, file, onProgress, xhrFactory);
+    try {
+      await uploadSignedFile(grant.upload_url, file, onProgress, xhrFactory);
+    } catch (error) {
+      // The transfer may have finished before the connection failed.
+      // Preserve receipt for a safe verification attempt; never auto-reupload.
+      error.uploadReceipt = receipt;
+      throw error;
+    }
     const completed = await request('/api/documents/uploads/complete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
