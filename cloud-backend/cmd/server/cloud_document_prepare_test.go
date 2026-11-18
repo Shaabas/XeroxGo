@@ -105,3 +105,12 @@ func TestCloudPreparationUsesVerifiedSourceAndPrivateDestination(t *testing.T) {
  }
  if err:=os.WriteFile(filepath.Join(dir,"not_pdf.pdf"),[]byte("bad"),0600);err!=nil {t.Fatal(err)}
 }
+
+func TestCloudVariantStatusOffByDefault(t *testing.T) {
+ t.Setenv("XEROXGO_CLOUD_UPLOADS_ENABLED","")
+ s:=&appServer{}
+ w:=httptest.NewRecorder()
+ req:=httptest.NewRequest(http.MethodPost,"/api/documents/variants/status",strings.NewReader("{}"))
+ s.handleCloudVariantStatus(w,req)
+ if w.Code!=http.StatusNotFound {t.Fatalf("unexpected status %d",w.Code)}
+}
