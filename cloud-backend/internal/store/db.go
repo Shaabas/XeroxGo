@@ -3300,8 +3300,11 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 		}
 
 		order, oErr := s.GetOrder(ctx, p.OrderID)
-		if oErr != nil || order == nil {
-			return &PaymentCaptureResult{AlreadyProcessed: true}, nil
+		if oErr != nil {
+			return nil, fmt.Errorf("capture payment: duplicate payment fetch order %s: %w", p.OrderID, oErr)
+		}
+		if order == nil {
+			return nil, fmt.Errorf("capture payment: duplicate payment order %s not found: %w", p.OrderID, ErrOrderNotFound)
 		}
 		var cmds []contracts.PrintJobCommand
 		if len(order.Documents) > 0 {
@@ -3373,27 +3376,29 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 			qCheck := s.rebind(`SELECT order_id, amount_paise, status, provider FROM payments WHERE payment_id = ?;`)
 			if sErr := s.db.QueryRowContext(ctx, qCheck, p.PaymentID).Scan(&cOrderID, &cAmount, &cStatus, &cProvider); sErr == nil {
 				if cOrderID == p.OrderID && cAmount == pricePaise && cProvider == p.Provider && IsVerifiedCapturedStatus(cStatus) {
-					order, _ := s.GetOrder(ctx, p.OrderID)
-					var cmd *contracts.PrintJobCommand
+					order, oErr := s.GetOrder(ctx, p.OrderID)
+					if oErr != nil {
+						return nil, fmt.Errorf("capture payment: conflict recovery fetch order %s: %w", p.OrderID, oErr)
+					}
+					if order == nil {
+						return nil, fmt.Errorf("capture payment: conflict recovery order %s not found: %w", p.OrderID, ErrOrderNotFound)
+					}
 					var cmds []contracts.PrintJobCommand
-					if order != nil {
-						cmd = &order.Command
-						if len(order.Documents) > 0 {
-							cmds = make([]contracts.PrintJobCommand, len(order.Documents))
-							for i, doc := range order.Documents {
-								cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
-							}
-						} else {
-							cmds = []contracts.PrintJobCommand{order.Command}
+					if len(order.Documents) > 0 {
+						cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+						for i, doc := range order.Documents {
+							cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
 						}
+					} else {
+						cmds = []contracts.PrintJobCommand{order.Command}
 					}
 					return &PaymentCaptureResult{
-						OrderStatus:      currentStatus,
+						OrderStatus:      order.Status,
 						DispatchEligible: false,
 						AlreadyProcessed: true,
 						PricePaise:       pricePaise,
 						KioskID:          orderKioskID,
-						Command:          cmd,
+						Command:          &order.Command,
 						Commands:         cmds,
 					}, nil
 				}
@@ -3431,19 +3436,21 @@ WHERE order_id = ? AND status = 'CREATED';
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("capture payment: commit tx: %w", err)
 		}
-		order, _ := s.GetOrder(ctx, p.OrderID)
-		var cmd *contracts.PrintJobCommand
+		order, oErr := s.GetOrder(ctx, p.OrderID)
+		if oErr != nil {
+			return nil, fmt.Errorf("capture payment: fetch committed order %s: %w", p.OrderID, oErr)
+		}
+		if order == nil {
+			return nil, fmt.Errorf("capture payment: committed order %s not found: %w", p.OrderID, ErrOrderNotFound)
+		}
 		var cmds []contracts.PrintJobCommand
-		if order != nil {
-			cmd = &order.Command
-			if len(order.Documents) > 0 {
-				cmds = make([]contracts.PrintJobCommand, len(order.Documents))
-				for i, doc := range order.Documents {
-					cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
-				}
-			} else {
-				cmds = []contracts.PrintJobCommand{order.Command}
+		if len(order.Documents) > 0 {
+			cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+			for i, doc := range order.Documents {
+				cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
 			}
+		} else {
+			cmds = []contracts.PrintJobCommand{order.Command}
 		}
 		return &PaymentCaptureResult{
 			OrderStatus:      currentStatus,
@@ -3451,7 +3458,7 @@ WHERE order_id = ? AND status = 'CREATED';
 			AlreadyProcessed: true,
 			PricePaise:       pricePaise,
 			KioskID:          orderKioskID,
-			Command:          cmd,
+			Command:          &order.Command,
 			Commands:         cmds,
 		}, nil
 	}
@@ -3627,17 +3634,21 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 		qCheck := s.rebind(`SELECT order_id, amount_paise, status, provider FROM payments WHERE payment_id = ?;`)
 		if sErr := s.db.QueryRowContext(ctx, qCheck, p.PaymentID).Scan(&cOrderID, &cAmount, &cStatus, &cProvider); sErr == nil {
 			if cOrderID == p.OrderID && cAmount == pricePaise && cProvider == p.Provider && IsVerifiedCapturedStatus(cStatus) {
-				order, _ := s.GetOrder(ctx, p.OrderID)
+				order, oErr := s.GetOrder(ctx, p.OrderID)
+				if oErr != nil {
+					return nil, fmt.Errorf("capture payment: conflict recovery fetch order %s: %w", p.OrderID, oErr)
+				}
+				if order == nil {
+					return nil, fmt.Errorf("capture payment: conflict recovery order %s not found: %w", p.OrderID, ErrOrderNotFound)
+				}
 				var cmds []contracts.PrintJobCommand
-				if order != nil {
-					if len(order.Documents) > 0 {
-						cmds = make([]contracts.PrintJobCommand, len(order.Documents))
-						for i, doc := range order.Documents {
-							cmds[i] = doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
-						}
-					} else {
-						cmds = []contracts.PrintJobCommand{order.Command}
+				if len(order.Documents) > 0 {
+					cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+					for i, doc := range order.Documents {
+						cmds[i] = doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
 					}
+				} else {
+					cmds = []contracts.PrintJobCommand{order.Command}
 				}
 				return &PaymentCaptureResult{
 					OrderStatus:      order.Status,
@@ -3684,10 +3695,16 @@ WHERE order_id = ? AND status = 'CREATED';
 		return nil, fmt.Errorf("capture payment: commit tx: %w", err)
 	}
 
-	order, _ := s.GetOrder(ctx, p.OrderID)
+	order, oErr := s.GetOrder(ctx, p.OrderID)
+	if oErr != nil {
+		return nil, fmt.Errorf("capture payment: fetch committed order %s: %w", p.OrderID, oErr)
+	}
+	if order == nil {
+		return nil, fmt.Errorf("capture payment: committed order %s not found: %w", p.OrderID, ErrOrderNotFound)
+	}
 	var cmd *contracts.PrintJobCommand
 	var cmds []contracts.PrintJobCommand
-	if order != nil && dispatchEligible {
+	if dispatchEligible {
 		cmd = &order.Command
 		if len(order.Documents) > 0 {
 			cmds = make([]contracts.PrintJobCommand, len(order.Documents))
@@ -3697,7 +3714,7 @@ WHERE order_id = ? AND status = 'CREATED';
 		} else {
 			cmds = []contracts.PrintJobCommand{order.Command}
 		}
-	} else if order != nil {
+	} else {
 		cmd = &order.Command
 	}
 

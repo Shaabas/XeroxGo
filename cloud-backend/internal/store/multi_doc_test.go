@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2036,5 +2038,230 @@ func TestGetPendingDispatchOrders_CapturedPayment_SuccessfullyDispatched(t *test
 	}
 	if !found {
 		t.Fatalf("expected order %s job job-cap-0 to be dispatched, got cmds: %+v", orderID, cmds)
+	}
+}
+
+func TestCapturePayment_DuplicateRecovery_MissingOrder_FailsSafely(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-dup-missing"
+	orderID := "ord-dup-missing-1"
+
+	// Create valid order
+	docs := []OrderDocument{
+		{JobID: "job-dm-0", OrderID: orderID, DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 150},
+	}
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1111"},
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  150,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	pay := PaymentRecord{
+		PaymentID:   "pay-dup-miss-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 150,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+
+	// First capture succeeds
+	res1, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+	if err != nil {
+		t.Fatalf("first capture failed: %v", err)
+	}
+	if res1 == nil {
+		t.Fatal("expected non-nil result from first capture")
+	}
+
+	// Delete print_configs to simulate corrupted/missing order where GetOrder returns nil
+	if _, err := s.db.Exec(`DELETE FROM print_configs WHERE order_id = ?;`, orderID); err != nil {
+		t.Fatalf("delete print_configs failed: %v", err)
+	}
+
+	// Second capture (duplicate/replay) MUST fail safely and never return AlreadyProcessed: true or panic
+	res2, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+	if err == nil {
+		t.Fatalf("expected error when duplicate recovery cannot load order, got nil with result: %+v", res2)
+	}
+	if !errors.Is(err, ErrOrderNotFound) {
+		t.Fatalf("expected ErrOrderNotFound, got: %v", err)
+	}
+	if res2 != nil {
+		t.Fatalf("expected nil result on failed recovery, got %+v", res2)
+	}
+}
+
+func TestCapturePayment_DuplicateRecovery_GetOrderError_FailsSafely(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-dup-err"
+	orderID := "ord-dup-err-1"
+
+	docs := []OrderDocument{
+		{JobID: "job-de-0", OrderID: orderID, DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 150},
+	}
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "2222"},
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  150,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	pay := PaymentRecord{
+		PaymentID:   "pay-dup-err-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 150,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now); err != nil {
+		t.Fatalf("first capture failed: %v", err)
+	}
+
+	// Call duplicate payment with already-canceled context
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	res2, err := s.CapturePaymentAndCheckDispatch(canceledCtx, pay, now)
+	if err == nil {
+		t.Fatalf("expected error with canceled context, got nil with result: %+v", res2)
+	}
+	if res2 != nil {
+		t.Fatalf("expected nil result on error, got %+v", res2)
+	}
+}
+
+func TestCapturePayment_ConflictRecovery_MissingOrder_FailsSafely(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-conflict-miss"
+	orderID := "ord-conflict-miss-1"
+
+	// Create order in `orders` but NO row in `print_configs`
+	nowNS := now.UnixNano()
+	_, err := s.db.Exec(`
+INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, total_pages, total_sheets, created_at_ns, updated_at_ns)
+VALUES (?, ?, ?, ?, 'PENDING_PAYMENT', 300, 2, 1, ?, ?);
+`, orderID, "job-cm-0", kioskID, "3333", nowNS, nowNS)
+	if err != nil {
+		t.Fatalf("insert order failed: %v", err)
+	}
+
+	pay := PaymentRecord{
+		PaymentID:   "pay-conflict-miss-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 300,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+
+	// Run concurrent attempts to trigger race where one inserts payment and second enters conflict recovery
+	concurrency := 6
+	errs := make([]error, concurrency)
+	results := make([]*PaymentCaptureResult, concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			res, cErr := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+			results[idx] = res
+			errs[idx] = cErr
+		}(i)
+	}
+	wg.Wait()
+
+	// Every attempt must fail safely because the order cannot be loaded
+	for i, cErr := range errs {
+		if cErr == nil {
+			t.Fatalf("attempt %d: expected error due to missing order, got nil with result: %+v", i, results[i])
+		}
+		if !errors.Is(cErr, ErrOrderNotFound) {
+			t.Fatalf("attempt %d: expected ErrOrderNotFound, got: %v", i, cErr)
+		}
+		if results[i] != nil {
+			t.Fatalf("attempt %d: expected nil result on failure, got: %+v", i, results[i])
+		}
+	}
+}
+
+func TestCapturePayment_AlreadyDispatched_ConflictRecovery_MissingOrder_FailsSafely(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-disp-conflict-miss"
+	orderID := "ord-disp-conflict-miss-1"
+
+	// Create order in `orders` with status DISPATCHED, but NO row in `print_configs`
+	nowNS := now.UnixNano()
+	_, err := s.db.Exec(`
+INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, total_pages, total_sheets, created_at_ns, updated_at_ns)
+VALUES (?, ?, ?, ?, 'DISPATCHED', 200, 2, 1, ?, ?);
+`, orderID, "job-dcm-0", kioskID, "4444", nowNS, nowNS)
+	if err != nil {
+		t.Fatalf("insert order failed: %v", err)
+	}
+
+	pay := PaymentRecord{
+		PaymentID:   "pay-disp-conflict-miss-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 200,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+
+	concurrency := 6
+	errs := make([]error, concurrency)
+	results := make([]*PaymentCaptureResult, concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			res, cErr := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+			results[idx] = res
+			errs[idx] = cErr
+		}(i)
+	}
+	wg.Wait()
+
+	for i, cErr := range errs {
+		if cErr == nil {
+			t.Fatalf("attempt %d: expected error due to missing order, got nil with result: %+v", i, results[i])
+		}
+		if !errors.Is(cErr, ErrOrderNotFound) {
+			t.Fatalf("attempt %d: expected ErrOrderNotFound, got: %v", i, cErr)
+		}
+		if results[i] != nil {
+			t.Fatalf("attempt %d: expected nil result on failure, got: %+v", i, results[i])
+		}
 	}
 }
