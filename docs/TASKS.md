@@ -59,3 +59,5 @@ These are lower-priority investigations than the approved planning work for XG-C
 - Added signed Render PDF download backing from private Storage with checksum verification before bytes reach the Pi. Legacy jobs remain disk-backed.
 - Added isolated browser checkout request helper and Go/Node regression tests. **Cart integration and multi-file packing not yet implemented; not production ready.**
 - Blockers for release: Gate 1–6 latest verification, live Storage integration, durable preparation worker retry/cleanup, upload rate limits and quotas, multi-file fidelity audit XG-004, secure lifecycle/retention and Pi recovery testing.
+
+- XG-CLOUD-DOCS-V2 recovery slice: 10-minute DB preparation lease, 8-minute worker execution bound, atomic stale PREPARING/FAILED recovery using new variant IDs, stale-publisher protection and SQLite tests. Still synchronous request-driven preparation, NOT durable background queue. Multi-file printer fidelity audited in `docs/architecture/multi-document-fidelity-gate.md`; no print behavior change approved. No live Storage migration or deployment.
