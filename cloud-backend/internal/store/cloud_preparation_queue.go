@@ -76,7 +76,9 @@ func (s *Store) GetCloudPreparationByID(ctx context.Context,upload,id string) (C
 // and SQLite serialize competing updates; a lost race returns no job.
 func (s *Store) ClaimNextCloudPreparation(ctx context.Context,now time.Time) (*CloudPreparationJob,error) {
  if s==nil||s.db==nil{return nil,errors.New("database unavailable")}
- deadline:=now.Add(10*time.Minute)
+ // The job lease must outlast the variant lease (10 minutes) to prevent
+ // a restarted worker from observing a still-live stale normalization.
+ deadline:=now.Add(11*time.Minute)
  q:=s.rebind(`UPDATE cloud_preparation_jobs
   SET state='PROCESSING',attempts=attempts+1,lease_expires_at=?,updated_at=?
   WHERE job_id=(
