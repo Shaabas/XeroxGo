@@ -38,7 +38,7 @@ func (s *Store) CreateCloudOrderAtomic(ctx context.Context, in CloudOrderInput) 
   o.OrderID=="" || o.Command.JobID=="" || o.Command.KioskID=="" ||
   o.Command.DisplayCode=="" || o.Command.SHA256Checksum=="" ||
   o.Command.TotalPages<1 || o.Command.TotalSheets<1 || o.Command.Copies<1 ||
-  o.Command.StartFromPage!=1 || o.Command.DownloadURL=="" ||
+  o.Command.StartFromPage!=1 || o.Command.Copies!=1 || o.Command.DownloadURL=="" ||
   o.PricePaise!=in.AcceptedPricePaise {
   return "",false,errors.New("invalid cloud order")
  }
@@ -71,22 +71,24 @@ func (s *Store) CreateCloudOrderAtomic(ctx context.Context, in CloudOrderInput) 
  // Hold the prepared variant stable while building the order. The uploaded
  // source and prepared file must be fresh and explicitly ready.
  variantQ:=s.rebind(`SELECT v.canonical_price_paise,v.tariff_revision,
-  v.checksum_sha256,v.billable_sides,v.total_sheets,v.storage_key
+  v.checksum_sha256,v.billable_sides,v.total_sheets,v.storage_key,
+  v.duplex,v.color_mode,v.copies
   FROM document_variants v JOIN document_uploads u ON u.upload_id=v.upload_id
   WHERE v.variant_id=? AND v.upload_id=? AND v.state='READY'
    AND v.expires_at>CURRENT_TIMESTAMP AND u.state='UPLOADED'
    AND u.expires_at>CURRENT_TIMESTAMP`)
  if s.dialect=="postgres" {variantQ+=" FOR UPDATE OF v"}
  var price,revision int64
- var hash,key string
- var sides,sheets int
+ var hash,key,duplex,color string
+ var sides,sheets,copies int
  err=tx.QueryRowContext(ctx,variantQ,in.VariantID,in.UploadID).Scan(
-  &price,&revision,&hash,&sides,&sheets,&key)
+  &price,&revision,&hash,&sides,&sheets,&key,&duplex,&color,&copies)
  if errors.Is(err,sql.ErrNoRows) {return "",false,ErrVariantUnavailable}
  if err!=nil {return "",false,err}
  if price!=in.AcceptedPricePaise||revision!=in.TariffRevision||
   hash!=o.Command.SHA256Checksum||sides!=o.Command.TotalPages||
-  sheets!=o.Command.TotalSheets||key=="" {
+  sheets!=o.Command.TotalSheets||key=="" || copies<1 ||
+  duplex!=string(o.Command.Duplex) || color!=strings.ToUpper(o.ColorMode) {
   return "",false,ErrCloudQuoteConflict
  }
 
