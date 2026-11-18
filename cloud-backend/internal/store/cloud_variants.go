@@ -66,18 +66,20 @@ func (s *Store) AcquireCloudVariant(ctx context.Context, v CloudDocumentVariant)
 
 func (s *Store) GetCloudVariant(ctx context.Context, uploadID, settingsHash, version string) (CloudDocumentVariant, error) {
  var v CloudDocumentVariant
+ var lease sql.NullTime
  if s == nil || s.db == nil { return v, errors.New("database unavailable") }
  q := s.rebind(`SELECT variant_id, upload_id, settings_hash, normalizer_version, state,
    COALESCE(storage_key,''), COALESCE(checksum_sha256,''),
    COALESCE(billable_sides,0), COALESCE(total_sheets,0),
    COALESCE(canonical_price_paise,0), COALESCE(tariff_revision,0), expires_at,
    COALESCE(copies,0), COALESCE(duplex,''), COALESCE(color_mode,''),
-   COALESCE(lease_expires_at,expires_at)
+   lease_expires_at
    FROM document_variants WHERE upload_id=? AND settings_hash=? AND normalizer_version=?`)
  err := s.db.QueryRowContext(ctx, q, uploadID, settingsHash, version).Scan(
   &v.ID, &v.UploadID, &v.SettingsHash, &v.NormalizerVersion, &v.State,
   &v.StorageKey, &v.Checksum, &v.BilledSides, &v.TotalSheets, &v.PricePaise,
-  &v.TariffRevision, &v.ExpiresAt, &v.Copies, &v.Duplex, &v.ColorMode, &v.LeaseExpiresAt)
+  &v.TariffRevision, &v.ExpiresAt, &v.Copies, &v.Duplex, &v.ColorMode, &lease)
+ if lease.Valid {v.LeaseExpiresAt=lease.Time}
  if errors.Is(err, sql.ErrNoRows) { return CloudDocumentVariant{}, ErrVariantUnavailable }
  return v, err
 }
@@ -108,6 +110,7 @@ func (s *Store) FailCloudVariant(ctx context.Context, id string) error {
 
 func (s *Store) GetCloudVariantByID(ctx context.Context, uploadID, variantID string) (CloudDocumentVariant, error) {
  var v CloudDocumentVariant
+ var lease sql.NullTime
  if s == nil || s.db == nil { return v, errors.New("database unavailable") }
  if uploadID == "" || variantID == "" { return v, ErrVariantUnavailable }
  q := s.rebind(`SELECT variant_id, upload_id, settings_hash, normalizer_version, state,
@@ -115,12 +118,13 @@ func (s *Store) GetCloudVariantByID(ctx context.Context, uploadID, variantID str
    COALESCE(billable_sides,0), COALESCE(total_sheets,0),
    COALESCE(canonical_price_paise,0), COALESCE(tariff_revision,0), expires_at,
    COALESCE(copies,0), COALESCE(duplex,''), COALESCE(color_mode,''),
-   COALESCE(lease_expires_at,expires_at)
+   lease_expires_at
    FROM document_variants WHERE upload_id=? AND variant_id=?`)
  err := s.db.QueryRowContext(ctx, q, uploadID, variantID).Scan(
   &v.ID, &v.UploadID, &v.SettingsHash, &v.NormalizerVersion, &v.State,
   &v.StorageKey, &v.Checksum, &v.BilledSides, &v.TotalSheets, &v.PricePaise,
-  &v.TariffRevision, &v.ExpiresAt, &v.Copies, &v.Duplex, &v.ColorMode, &v.LeaseExpiresAt)
+  &v.TariffRevision, &v.ExpiresAt, &v.Copies, &v.Duplex, &v.ColorMode, &lease)
+ if lease.Valid {v.LeaseExpiresAt=lease.Time}
  if errors.Is(err, sql.ErrNoRows) { return CloudDocumentVariant{}, ErrVariantUnavailable }
  return v, err
 }
