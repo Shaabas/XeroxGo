@@ -63,3 +63,18 @@ alter table public.document_variants enable row level security;
 alter table public.order_documents enable row level security;
 revoke all on public.document_uploads, public.document_variants, public.order_documents
   from PUBLIC, anon, authenticated;
+
+-- Reference-only checkout idempotency. Unique across all cloud checkout attempts.
+-- The upload capability authorizes recovery of the corresponding order.
+create table if not exists public.cloud_order_requests (
+  request_id text primary key,
+  upload_id text not null references public.document_uploads(upload_id),
+  variant_id text not null references public.document_variants(variant_id),
+  order_id text not null unique references public.orders(order_id) on delete cascade,
+  kiosk_id text not null,
+  accepted_price_paise bigint not null check (accepted_price_paise > 0),
+  tariff_revision bigint not null check (tariff_revision > 0),
+  created_at timestamptz not null default now()
+);
+alter table public.cloud_order_requests enable row level security;
+revoke all on public.cloud_order_requests from PUBLIC, anon, authenticated;
