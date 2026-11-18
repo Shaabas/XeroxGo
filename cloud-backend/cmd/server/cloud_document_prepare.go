@@ -231,6 +231,12 @@ func (s *appServer) handleCloudVariantStatus(w http.ResponseWriter,r *http.Reque
    "price_paise":variant.PricePaise,"tariff_revision":variant.TariffRevision,
    "total_sheets":variant.TotalSheets,"billed_sides":variant.BilledSides})
  case "PREPARING":
+  if !time.Now().Before(variant.LeaseExpiresAt) {
+   _=json.NewEncoder(w).Encode(map[string]string{
+    "variant_id":variant.ID,"status":"RETRYABLE",
+    "message":"Preparation interrupted. Request preparation again with the same settings."})
+   return
+  }
   _=json.NewEncoder(w).Encode(map[string]string{"variant_id":variant.ID,"status":"PREPARING"})
  case "FAILED":
   _=json.NewEncoder(w).Encode(map[string]string{"variant_id":variant.ID,"status":"FAILED"})
