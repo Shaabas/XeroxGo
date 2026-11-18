@@ -510,6 +510,10 @@ func PrintPDFWithCUPSHooksCustom(
 		lpArgs = append(lpArgs, "-o", "sides=two-sided-short-edge")
 	}
 
+	if strings.EqualFold(strings.TrimSpace(cmd.ColorMode), "COLOR") {
+		lpArgs = append(lpArgs, "-o", "print-color-mode=color")
+	}
+
 	lpArgs = append(lpArgs, pdfPath)
 
 	log.Printf("[CUPS] Submitting print job %s to queue %q: lp %s", cmd.JobID, queue, strings.Join(lpArgs, " "))

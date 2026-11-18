@@ -1,0 +1,815 @@
+package spooler
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"image"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"xeroxgo/kiosk-daemon/internal/state"
+	"xeroxgo/kiosk-daemon/internal/ui_ipc"
+	"xeroxgo/pkg/contracts"
+)
+
+type mockSoundPlayer struct {
+	mu        sync.Mutex
+	completed int
+}
+
+func (m *mockSoundPlayer) PlayCompletion() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.completed++
+}
+
+func (m *mockSoundPlayer) CompletionCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.completed
+}
+
+func (m *mockSoundPlayer) PlayKeyPress() {}
+
+func (m *mockSoundPlayer) WAVBytes() []byte { return nil }
+
+// TestMultiDoc_OutOfOrderArrivalAndSequencing verifies that when documents for an order arrive
+// out-of-order over the wire (doc 2, doc 0, doc 1), none are queued until all 3 are durably persisted,
+// and once all documents arrive, they are queued strictly in DocumentIndex order (0, 1, 2).
+func TestMultiDoc_OutOfOrderArrivalAndSequencing(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "out_of_order.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var printedJobs []string
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedJobs = append(printedJobs, cmd.JobID)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-multi-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_out_of_order_123"
+	makeCmd := func(idx int, jobID string) contracts.PrintJobCommand {
+		return contracts.PrintJobCommand{
+			JobID:          jobID,
+			OrderID:        orderID,
+			DocumentIndex:  idx,
+			TotalDocuments: 3,
+			KioskID:        "kiosk-multi-1",
+			DisplayCode:    "8888",
+			DownloadURL:    fileServer.URL + "/" + jobID + ".pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+	}
+
+	cmd2 := makeCmd(2, "job_doc_2")
+	cmd0 := makeCmd(0, "job_doc_0")
+	cmd1 := makeCmd(1, "job_doc_1")
+
+	// 1. Deliver Document 2 first
+	client.handleIncomingJob(cmd2)
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected 0 jobs in queue after doc 2 arrival, got %d", len(client.jobQueue))
+	}
+
+	// 2. Deliver Document 0 second
+	client.handleIncomingJob(cmd0)
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected 0 jobs in queue after doc 0 arrival, got %d", len(client.jobQueue))
+	}
+
+	// 3. Deliver Document 1 third (completes the order)
+	client.handleIncomingJob(cmd1)
+
+	// All 3 should now be queued
+	if len(client.jobQueue) != 3 {
+		t.Fatalf("expected 3 jobs in queue after all docs arrived, got %d", len(client.jobQueue))
+	}
+
+	// Verify the queue order is strictly 0, 1, 2
+	first := <-client.jobQueue
+	second := <-client.jobQueue
+	third := <-client.jobQueue
+
+	if first.DocumentIndex != 0 || first.JobID != "job_doc_0" {
+		t.Fatalf("expected first queued job to be doc 0, got idx=%d job=%s", first.DocumentIndex, first.JobID)
+	}
+	if second.DocumentIndex != 1 || second.JobID != "job_doc_1" {
+		t.Fatalf("expected second queued job to be doc 1, got idx=%d job=%s", second.DocumentIndex, second.JobID)
+	}
+	if third.DocumentIndex != 2 || third.JobID != "job_doc_2" {
+		t.Fatalf("expected third queued job to be doc 2, got idx=%d job=%s", third.DocumentIndex, third.JobID)
+	}
+}
+
+// TestMultiDoc_SiblingConsistencyValidation verifies that incoming jobs with conflicting
+// metadata within the same order are rejected.
+func TestMultiDoc_SiblingConsistencyValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "consistency.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      "ws://127.0.0.1:9090/ws",
+		KioskID:       "kiosk-multi-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		CUPSQueue:     "MockQueue",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	validChecksum := strings.Repeat("a", 64)
+	baseCmd := contracts.PrintJobCommand{
+		JobID:          "job_sib_0",
+		OrderID:        "ord_sibling_test",
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-multi-test",
+		DisplayCode:    "5555",
+		DownloadURL:    "http://127.0.0.1:9090/doc0.pdf",
+		SHA256Checksum: validChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Persist doc 0
+	client.handleIncomingJob(baseCmd)
+	stored, err := store.GetJob(context.Background(), "job_sib_0")
+	if err != nil || stored == nil {
+		t.Fatalf("expected doc 0 to be stored, got err: %v", err)
+	}
+
+	// 1. Conflicting TotalDocuments (expected 2, got 3)
+	badTotalDocs := baseCmd
+	badTotalDocs.JobID = "job_sib_bad_total"
+	badTotalDocs.DocumentIndex = 1
+	badTotalDocs.TotalDocuments = 3
+	client.handleIncomingJob(badTotalDocs)
+	if j, _ := store.GetJob(context.Background(), "job_sib_bad_total"); j != nil {
+		t.Fatalf("expected job with conflicting TotalDocuments to be rejected")
+	}
+
+	// 2. Conflicting DisplayCode
+	badDisplayCode := baseCmd
+	badDisplayCode.JobID = "job_sib_bad_disp"
+	badDisplayCode.DocumentIndex = 1
+	badDisplayCode.DisplayCode = "9999"
+	client.handleIncomingJob(badDisplayCode)
+	if j, _ := store.GetJob(context.Background(), "job_sib_bad_disp"); j != nil {
+		t.Fatalf("expected job with conflicting DisplayCode to be rejected")
+	}
+
+	// 3. Conflicting JobID for already assigned DocumentIndex 0
+	badIndexCollision := baseCmd
+	badIndexCollision.JobID = "job_sib_collision"
+	badIndexCollision.DocumentIndex = 0
+	client.handleIncomingJob(badIndexCollision)
+	if j, _ := store.GetJob(context.Background(), "job_sib_collision"); j != nil {
+		t.Fatalf("expected job with duplicate DocumentIndex but different JobID to be rejected")
+	}
+}
+
+// TestMultiDoc_DeduplicationWithoutReprint verifies that duplicate deliveries of already admitted,
+// submitted, or completed jobs are acknowledged without re-queuing or double printing.
+func TestMultiDoc_DeduplicationWithoutReprint(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "dedup.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      "ws://127.0.0.1:9090/ws",
+		KioskID:       "kiosk-multi-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		CUPSQueue:     "MockQueue",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	validChecksum := strings.Repeat("b", 64)
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job_dedup_01",
+		OrderID:        "ord_dedup_test",
+		DocumentIndex:  0,
+		TotalDocuments: 1,
+		KioskID:        "kiosk-multi-test",
+		DisplayCode:    "1234",
+		DownloadURL:    "http://127.0.0.1:9090/doc.pdf",
+		SHA256Checksum: validChecksum,
+		TotalPages:     2,
+		TotalSheets:    2,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Initial delivery
+	client.handleIncomingJob(cmd)
+	if len(client.jobQueue) != 1 {
+		t.Fatalf("expected 1 job queued, got %d", len(client.jobQueue))
+	}
+	<-client.jobQueue // drain
+
+	// Redundant delivery while stored
+	client.handleIncomingJob(cmd)
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected 0 jobs queued on redundant delivery, got %d", len(client.jobQueue))
+	}
+
+	// Conflicting duplicate delivery (different copies) -> rejected
+	conflictingCmd := cmd
+	conflictingCmd.Copies = 5
+	client.handleIncomingJob(conflictingCmd)
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected 0 jobs queued on conflicting duplicate delivery, got %d", len(client.jobQueue))
+	}
+}
+
+// TestMultiDoc_SingleCopyReplicationViaCUPS verifies that copies are passed to CUPS exactly once
+// via cmd.Copies and not duplicated prior to CUPS submission.
+func TestMultiDoc_SingleCopyReplicationViaCUPS(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "copies.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var receivedCmd contracts.PrintJobCommand
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		receivedCmd = cmd
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-copies-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job_copies_01",
+		OrderID:        "ord_copies_test",
+		DocumentIndex:  0,
+		TotalDocuments: 1,
+		KioskID:        "kiosk-copies-test",
+		DisplayCode:    "7777",
+		DownloadURL:    fileServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     2,
+		TotalSheets:    6, // 2 pages * 3 copies = 6 sheets
+		Copies:         3,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	client.processJob(ctx, cmd)
+
+	if receivedCmd.Copies != 3 {
+		t.Fatalf("expected CUPS mock to receive Copies=3, got %d", receivedCmd.Copies)
+	}
+}
+
+// TestMultiDoc_HardwareFaultPausesOrder verifies that when document 0 experiences a hardware fault,
+// the order is paused and document 1 is NOT submitted to CUPS.
+func TestMultiDoc_HardwareFaultPausesOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "fault_pause.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var cupsSubmitted []string
+	var cupsMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		cupsMu.Lock()
+		cupsSubmitted = append(cupsSubmitted, cmd.JobID)
+		cupsMu.Unlock()
+		if cmd.DocumentIndex == 0 {
+			return errors.New("paper feed jam detected in printer")
+		}
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-fault-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_fault_123"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_fault_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-fault-test",
+		DisplayCode:    "3333",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_fault_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-fault-test",
+		DisplayCode:    "3333",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Deliver both documents so order is admitted
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Process doc 0 -> should encounter jam and enter PAUSED_ERROR
+	doc0 := <-client.jobQueue
+	client.processJob(ctx, doc0)
+
+	stored0, err := store.GetJob(ctx, "job_fault_0")
+	if err != nil || stored0.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected doc 0 to be PAUSED_ERROR, got status=%s err=%v", stored0.Status, err)
+	}
+
+	// Now try to process doc 1 -> must NOT submit to CUPS due to sibling fault
+	doc1 := <-client.jobQueue
+	client.processJob(ctx, doc1)
+
+	cupsMu.Lock()
+	defer cupsMu.Unlock()
+	if len(cupsSubmitted) != 1 || cupsSubmitted[0] != "job_fault_0" {
+		t.Fatalf("expected only doc 0 to have been submitted to CUPS, got %v", cupsSubmitted)
+	}
+
+	stored1, err := store.GetJob(ctx, "job_fault_1")
+	if err != nil || stored1.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected doc 1 to be PAUSED_ERROR without submitting, got status=%s", stored1.Status)
+	}
+}
+
+// TestMultiDoc_OrderLevelPaperCheck verifies that before document 0 begins printing,
+// the client verifies that the paper tray has enough sheets for the ENTIRE order.
+func TestMultiDoc_OrderLevelPaperCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "paper_check.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	// Set paper tray supply to 3 sheets
+	_ = store.ResetPaperTray(ctx, 3)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var cupsCalled atomic.Bool
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		cupsCalled.Store(true)
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-paper-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_paper_shortage"
+	// Order needs: doc 0 (2 sheets) + doc 1 (2 sheets) = 4 sheets. Tray only has 3 sheets.
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_paper_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-paper-test",
+		DisplayCode:    "4444",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     2,
+		TotalSheets:    2,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_paper_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-paper-test",
+		DisplayCode:    "4444",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     2,
+		TotalSheets:    2,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	doc0 := <-client.jobQueue
+	client.processJob(ctx, doc0)
+
+	if cupsCalled.Load() {
+		t.Fatalf("CUPS must NOT be called when order paper supply is insufficient")
+	}
+
+	stored0, err := store.GetJob(ctx, "job_paper_0")
+	if err != nil || stored0.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected doc 0 to be PAUSED_ERROR due to insufficient paper, got %v", stored0)
+	}
+	if !strings.Contains(stored0.ErrorReason, "paper tray supply insufficient") {
+		t.Fatalf("expected reason to contain 'paper tray supply insufficient', got: %s", stored0.ErrorReason)
+	}
+}
+
+// TestMultiDoc_StartupRecoveryUnsubmitted verifies that on daemon restart, an unprinted multi-document
+// order is recovered from SQLite and executed in document index order 0, 1.
+func TestMultiDoc_StartupRecoveryUnsubmitted(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "recovery_unprinted.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var recoveredOrder []string
+	var recMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		recMu.Lock()
+		recoveredOrder = append(recoveredOrder, cmd.JobID)
+		recMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	orderID := "ord_recov_001"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_recov_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-recov-test",
+		DisplayCode:    "1111",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_recov_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-recov-test",
+		DisplayCode:    "1111",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Persist both as unsubmitted SPOOLING jobs
+	if err := store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("failed to save cmd0: %v", err)
+	}
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("failed to save cmd1: %v", err)
+	}
+
+	// Start a fresh client
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-recov-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+		HTTPClient:    fileServer.Client(),
+		ScreenSink:    func(*image.RGBA) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Wait for both jobs to execute in order
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		recMu.Lock()
+		count := len(recoveredOrder)
+		recMu.Unlock()
+		if count >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	runCancel()
+
+	recMu.Lock()
+	defer recMu.Unlock()
+	if len(recoveredOrder) != 2 {
+		t.Fatalf("expected 2 jobs recovered and printed, got %v", recoveredOrder)
+	}
+	if recoveredOrder[0] != "job_recov_0" || recoveredOrder[1] != "job_recov_1" {
+		t.Fatalf("expected execution order [job_recov_0, job_recov_1], got %v", recoveredOrder)
+	}
+}
+
+// TestMultiDoc_OrderCompletionSemantics verifies that intermediate documents display intermediate
+// completion and do NOT trigger completion chime or idle reset, while the final document triggers
+// completion chime, ModeCompleted screen, and idle reset.
+func TestMultiDoc_OrderCompletionSemantics(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "order_completion.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	sound := &mockSoundPlayer{}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:                 strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:                  "kiosk-comp-test",
+		StateStore:               store,
+		DownloadDir:              tmpDir,
+		IdleQRContent:            "https://example.com/qr",
+		ScreenSink:               func(*image.RGBA) error { return nil },
+		HTTPClient:               fileServer.Client(),
+		CUPSQueue:                "MockQueue",
+		MockCUPSPrint:            mockCUPS,
+		SoundPlayer:              sound,
+		CompletedDisplayDuration: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_comp_semantics"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_comp_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-comp-test",
+		DisplayCode:    "2222",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_comp_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-comp-test",
+		DisplayCode:    "2222",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Process doc 0
+	doc0 := <-client.jobQueue
+	client.processJob(ctx, doc0)
+
+	// After doc 0 finishes, sound should NOT have played, and mode should not be ModeCompleted
+	if sound.CompletionCount() != 0 {
+		t.Fatalf("sound played after intermediate doc 0 completion: %d", sound.CompletionCount())
+	}
+	client.currentModeMu.Lock()
+	mode0 := client.currentMode
+	client.currentModeMu.Unlock()
+	if mode0 == ui_ipc.ModeCompleted {
+		t.Fatalf("expected mode != ModeCompleted after doc 0, got %s", mode0)
+	}
+
+	// Process doc 1
+	doc1 := <-client.jobQueue
+	client.processJob(ctx, doc1)
+
+	// After doc 1 finishes, all 2 docs are completed -> sound must play exactly once
+	if sound.CompletionCount() != 1 {
+		t.Fatalf("expected sound played exactly once for order completion, got %d", sound.CompletionCount())
+	}
+	client.currentModeMu.Lock()
+	mode1 := client.currentMode
+	client.currentModeMu.Unlock()
+	if mode1 != ui_ipc.ModeCompleted {
+		t.Fatalf("expected mode == ModeCompleted after doc 1, got %s", mode1)
+	}
+}
