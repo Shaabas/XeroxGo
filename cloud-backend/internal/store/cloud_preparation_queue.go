@@ -129,3 +129,16 @@ func (s *Store) RetryCloudPreparation(ctx context.Context,id string,attempt int)
  _,err:=s.db.ExecContext(ctx,q,state,time.Now().UTC(),id,attempt)
  return err
 }
+
+
+// Mark a worker whose final allowed attempt crashed as FAILED rather than
+// leaving an eternal PROCESSING/RECOVERING status with no eligible claimant.
+func (s *Store) FailExhaustedCloudPreparations(ctx context.Context,now time.Time) (int64,error){
+ if s==nil||s.db==nil{return 0,errors.New("database unavailable")}
+ q:=s.rebind(`UPDATE cloud_preparation_jobs
+   SET state='FAILED',lease_expires_at=NULL,updated_at=?
+   WHERE state='PROCESSING' AND attempts>=3 AND lease_expires_at<=?`)
+ res,err:=s.db.ExecContext(ctx,q,now,now)
+ if err!=nil{return 0,err}
+ return res.RowsAffected()
+}
