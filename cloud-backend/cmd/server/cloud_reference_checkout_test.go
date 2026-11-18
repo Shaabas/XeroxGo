@@ -48,3 +48,15 @@ func TestCloudArtifactRejectsUntrustedPath(t *testing.T) {
  s.serveCloudOrderArtifact(w,req,"../../secrets",strings.Repeat("a",64))
  if w.Code!=http.StatusInternalServerError {t.Fatalf("unsafe path status %d",w.Code)}
 }
+
+func TestCloudCheckoutRequiresDeliveryButDownloadSurvivesCheckoutDisable(t *testing.T) {
+ t.Setenv("XEROXGO_CLOUD_UPLOADS_ENABLED","1")
+ t.Setenv("XEROXGO_CLOUD_CHECKOUT_ENABLED","1")
+ t.Setenv("XEROXGO_CLOUD_DELIVERY_ENABLED","")
+ if cloudCheckoutEnabled(){t.Fatal("checkout enabled without printer delivery")}
+ t.Setenv("XEROXGO_CLOUD_DELIVERY_ENABLED","1")
+ if !cloudCheckoutEnabled(){t.Fatal("full rollout flags did not enable checkout")}
+ t.Setenv("XEROXGO_CLOUD_CHECKOUT_ENABLED","")
+ if cloudCheckoutEnabled(){t.Fatal("checkout still enabled after rollback")}
+ if !cloudDeliveryEnabled(){t.Fatal("in-flight cloud order delivery disabled by checkout rollback")}
+}
