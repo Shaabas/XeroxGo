@@ -133,6 +133,10 @@ func (s *appServer) handleCloudVariantPrepare(w http.ResponseWriter,r *http.Requ
  if err!=nil {http.Error(w,"pricing unavailable",503);return}
  opts,err:=strictVariantOptions(input.Settings,tariff.ColorEnabled)
  if err!=nil {http.Error(w,err.Error(),400);return}
+ if cloudAsyncPreparationEnabled() {
+  s.enqueueCloudVariantPreparation(w,r,item,opts,tariff.Revision)
+  return
+ }
  base,secret,err:=cloudStorageConfig()
  if err!=nil {http.Error(w,"cloud storage unavailable",503);return}
  key:=cloudVariantSettingsHash(opts)
