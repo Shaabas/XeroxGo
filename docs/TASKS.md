@@ -73,3 +73,9 @@ These are lower-priority investigations than the approved planning work for XG-C
 - Both upload and `XEROXGO_CLOUD_ASYNC_PREP_ENABLED` must be enabled to activate background mode; flags default OFF. Legacy checkout and Pi are unchanged.
 - **To verify:** CI Gate 1–6 for latest commit, PostgreSQL concurrent claims and forced process restart, real Supabase Storage, error recovery, browser reconnect and upload retention semantics. Queue migration not applied.
 - **Still release blockers:** global quota/abuse controls, multi-file print fidelity, full browser cart integration, orphan Storage reconciliation, completed order retention and real Pi/printer regression.
+
+### XG-004 multi-file fidelity foundation — 2026-11-18
+- Implemented **read-only** `BuildCloudPrintPlan`, `LoadReadyCloudPrintPlan`, and opt-in `POST /api/documents/batch/quote`: reads READY same-kiosk, unexpired, verified prepared variants, keeps each document's actual duplex/color/physical sheet count, validates 1–20 document batch, checksum/path, tariff revision, duplicates and total overflow.
+- Added private `cloud_print_tasks` migration schema as a ledger for future per-document durable Pi work and a fail-closed transition model. Uncertain CUPS dispatch must go to RECONCILE, and a next task must not proceed before prior task is physically confirmed. Tests cover invalid transitions, mixed color/duplex, invalid references and price calculations.
+- **No multi-file checkout or Pi dispatch is enabled**; `checkout_supported=false` for multi-file quote. Future task: **single atomic checkout** for all variants+PIN+idempotency+task creation, versioned per-task Pi commands, CUPS per-task persistence and physical recovery, emulator and physical printer validation.
+- No legacy upload, customer UI, payment or printer changes. All feature flags remain OFF and migration unapplied.
