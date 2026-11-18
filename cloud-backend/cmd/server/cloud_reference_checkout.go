@@ -48,9 +48,9 @@ func respondCloudOrder(w http.ResponseWriter, order *store.Order, revision int64
  })
 }
 
-func cloudCheckoutEnabled() bool { return cloudUploadsEnabled() && strings.TrimSpace(strings.ToLower(strings.TrimSpace(getCloudCheckoutEnv())))=="1" }
-
-func getCloudCheckoutEnv() string { return os.Getenv("XEROXGO_CLOUD_CHECKOUT_ENABLED") }
+func cloudCheckoutEnabled() bool {
+ return cloudUploadsEnabled() && os.Getenv("XEROXGO_CLOUD_CHECKOUT_ENABLED")=="1"
+}
 
 func (s *appServer) handleCloudReferenceCheckout(w http.ResponseWriter,r *http.Request) {
  if !cloudCheckoutEnabled(){http.NotFound(w,r);return}
