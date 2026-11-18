@@ -91,6 +91,9 @@ func TestCloudVariantReclaimsAbandonedLeaseWithoutOverwritingReady(t *testing.T)
  next:=ident;next.ID="v2"
  got,acquired,err:=db.AcquireCloudVariant(ctx,next)
  if err!=nil||acquired||got.ID!="v1" {t.Fatalf("live lease stolen %+v %v %v",got,acquired,err)}
+ if !got.LeaseExpiresAt.After(time.Now()) || got.LeaseExpiresAt.After(time.Now().Add(11*time.Minute)) {
+  t.Fatalf("invalid live lease deadline %s",got.LeaseExpiresAt)
+ }
  if _,err:=db.DB().Exec("UPDATE document_variants SET lease_expires_at=? WHERE variant_id='v1'",
   time.Now().Add(-time.Minute));err!=nil{t.Fatal(err)}
  got,acquired,err=db.AcquireCloudVariant(ctx,next)
