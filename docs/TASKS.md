@@ -11,9 +11,10 @@ Statuses: TODO / IN_PROGRESS / BLOCKED / REVIEW / DONE. A merged PR needs eviden
 | XG-005 | BLOCKED | Antigravity | Implement an approved XG-004 design | Requires XG-004 decision |
 | XG-006 | TODO | ChatGPT | Assess existing Supabase table RLS/grants without breaking backend | Analysis-only first |
 | XG-007 | TODO | Joint | Verify Antigravity discovery of `.agents/skills` in actual local checkout | User/local check required |
-| XG-CHECKOUT-FAST-1 | TODO | Antigravity (after scope approval) | Remove redundant checkout final re-quote passes; retain authoritative final normalization and tariff/price verification. Add honest upload progress and processing state, protect multi-file, stale pricing and retry failure cases | Baseline network/PDF timing, scoped design, tests and human review before merging |
+| XG-CHECKOUT-FAST-1 | DONE (GitHub scope) | ChatGPT | PR #16 merged at 0b40181; removed synchronous checkout re-quotes and added real upload progress + Gate 6 tests | Benchmark live checkout separately; quote preparation remains expensive |
+| XG-CLOUD-DOCS-V2 | IN_PROGRESS (foundation only) | ChatGPT | `feat/cloud-first-documents-v2`: private Storage migration file, feature-gated signed upload/verification APIs, browser transport + tests; old checkout untouched | Validate Gate 1–6, inspect storage credentials/config/security, then implement durable preparation and reference-only checkout as separate reviewed slice |
 
-## Next task: XG-CHECKOUT-FAST-1
+## Historical task: XG-CHECKOUT-FAST-1
 - **Architecture:** front-end reuses server-confirmed quote and tariff revision for the final order request; server still recalculates price against normalized output and rejects stale/mismatched submissions.
 - **UX:** provide actual upload transfer progress and an indeterminate state for PDF processing and order creation. Never simulate a meaningful percentage without backend signals.
 - **Do not:** add a new storage service, bypass backend validation, generate PIN before a durable order exists, or silently retry an upload that may have created an order.
@@ -42,3 +43,10 @@ The removed historical reports are **not current defect confirmations**. Their a
 | XG-014 | TODO | Add or verify frontend end-to-end acceptance for document selection, N-Up/duplex price display, file collation, admin rate changes, and PIN workflow. Existing `conversion_test.js` and arithmetic parity tests do **not** by themselves prove browser UX or physical output. |
 
 These are lower-priority investigations than the approved planning work for XG-CHECKOUT-FAST-1. Hardware tests and database migration reviews require separate scope and approval.
+
+
+## XG-CLOUD-DOCS-V2 implementation guardrails
+- Current work is **foundation only**; no production migration, Storage bucket, credentials, browser cutover, or payment/printer changes authorized.
+- Architecture details, acceptance criteria and rollback are in `docs/architecture/cloud-first-documents-v2.md`.
+- Do NOT turn `XEROXGO_CLOUD_UPLOADS_ENABLED` on until server-side upload rate limits/quotas, Supabase CORS, preflight tests and object cleanup have been implemented.
+- Pending implementation: secure prepared variants, reference-only checkout, order idempotency, Storage-backed printer downloads, end-to-end tests and rollout.
