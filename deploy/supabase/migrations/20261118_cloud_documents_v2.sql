@@ -42,6 +42,7 @@ create table if not exists public.document_variants (
   tariff_revision bigint,
   state text not null default 'PREPARING'
     check (state in ('PREPARING','READY','FAILED','EXPIRED')),
+  lease_expires_at timestamptz,
   error_code text,
   created_at timestamptz not null default now(),
   expires_at timestamptz not null,
