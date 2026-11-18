@@ -8,6 +8,7 @@ import (
  "encoding/json"
  "errors"
  "net/http"
+ "os"
  "strings"
  "time"
 
@@ -47,8 +48,12 @@ func respondCloudOrder(w http.ResponseWriter, order *store.Order, revision int64
  })
 }
 
+func cloudCheckoutEnabled() bool { return cloudUploadsEnabled() && strings.TrimSpace(strings.ToLower(strings.TrimSpace(getCloudCheckoutEnv())))=="1" }
+
+func getCloudCheckoutEnv() string { return os.Getenv("XEROXGO_CLOUD_CHECKOUT_ENABLED") }
+
 func (s *appServer) handleCloudReferenceCheckout(w http.ResponseWriter,r *http.Request) {
- if !cloudUploadsEnabled(){http.NotFound(w,r);return}
+ if !cloudCheckoutEnabled(){http.NotFound(w,r);return}
  if r.Method!=http.MethodPost{http.Error(w,"method not allowed",http.StatusMethodNotAllowed);return}
  if s.db==nil{http.Error(w,"database unavailable",http.StatusServiceUnavailable);return}
  r.Body=http.MaxBytesReader(w,r.Body,8192)
