@@ -2221,3 +2221,336 @@ func TestPaymentSafety_Webhook_InvalidAmount_Rejected(t *testing.T) {
 	}
 }
 
+func TestPaymentSafety_CaptureFailure_RetrySucceedsWithoutBeingIgnored(t *testing.T) {
+	kioskID := "kiosk-fail-retry"
+	orderID := "ord_fail_retry_001"
+	pin := "9911"
+	pricePaise := int64(600)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	// 1. Claim session & initiate payment
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBody map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBody)
+	claimResp.Body.Close()
+	sessID := claimBody["session_id"].(string)
+
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, _ := http.DefaultClient.Do(initReq)
+	var initBody map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initBody)
+	initResp.Body.Close()
+	providerOrderID := initBody["provider_order_id"].(string)
+
+	paymentID := "pay_fail_and_retry_123"
+	payload := map[string]interface{}{
+		"event": "payment.captured",
+		"payload": map[string]interface{}{
+			"payment": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":       paymentID,
+					"order_id": providerOrderID,
+					"amount":   pricePaise,
+					"currency": "INR",
+					"status":   "captured",
+					"notes": map[string]string{
+						"order_id":   orderID,
+						"session_id": sessID,
+						"kiosk_id":   kioskID,
+					},
+				},
+			},
+		},
+	}
+	rawBytes, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(whSec))
+	mac.Write(rawBytes)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	// Inject failure into payments table
+	_, err := st.DB().Exec(`CREATE TRIGGER fail_capture_pay BEFORE INSERT ON payments BEGIN SELECT RAISE(ABORT, 'injected db failure during capture'); END;`)
+	if err != nil {
+		t.Fatalf("failed to create fail trigger: %v", err)
+	}
+
+	// First webhook attempt: capture MUST fail
+	whReq1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq1.Header.Set("Content-Type", "application/json")
+	whReq1.Header.Set("X-Razorpay-Signature", sig)
+	whResp1, err := http.DefaultClient.Do(whReq1)
+	if err != nil {
+		t.Fatalf("webhook request 1 failed: %v", err)
+	}
+	defer whResp1.Body.Close()
+
+	if whResp1.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error on capture failure, got %d", whResp1.StatusCode)
+	}
+
+	// CRITICAL INVARIANT: payment_webhooks must NOT contain paymentID after failed capture!
+	var whCount int
+	_ = st.DB().QueryRow(`SELECT COUNT(*) FROM payment_webhooks WHERE webhook_id = ?;`, paymentID).Scan(&whCount)
+	if whCount != 0 {
+		t.Fatalf("CRITICAL BUG: payment_webhooks recorded webhook ID before capture succeeded! count=%d", whCount)
+	}
+
+	// Remove the failure trigger
+	_, err = st.DB().Exec(`DROP TRIGGER fail_capture_pay;`)
+	if err != nil {
+		t.Fatalf("failed to drop trigger: %v", err)
+	}
+
+	// Second webhook attempt (Razorpay retry with the EXACT same payload & event ID): MUST SUCCEED!
+	whReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq2.Header.Set("Content-Type", "application/json")
+	whReq2.Header.Set("X-Razorpay-Signature", sig)
+	whResp2, err := http.DefaultClient.Do(whReq2)
+	if err != nil {
+		t.Fatalf("webhook retry failed: %v", err)
+	}
+	defer whResp2.Body.Close()
+
+	if whResp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on webhook retry, got %d", whResp2.StatusCode)
+	}
+	var res2 map[string]string
+	_ = json.NewDecoder(whResp2.Body).Decode(&res2)
+	if res2["status"] != "dispatched" {
+		t.Fatalf("expected retry status 'dispatched', got %q", res2["status"])
+	}
+
+	// Verify order is now DISPATCHED
+	ord, err := st.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusDispatched {
+		t.Fatalf("expected order to be DISPATCHED after retry, got %v (err=%v)", ord.Status, err)
+	}
+
+	// Verify payment is now recorded in payments and payment_webhooks
+	var payCount int
+	_ = st.DB().QueryRow(`SELECT COUNT(*) FROM payments WHERE payment_id = ?;`, paymentID).Scan(&payCount)
+	if payCount != 1 {
+		t.Fatalf("expected exactly 1 payment record, got %d", payCount)
+	}
+	_ = st.DB().QueryRow(`SELECT COUNT(*) FROM payment_webhooks WHERE webhook_id = ?;`, paymentID).Scan(&whCount)
+	if whCount != 1 {
+		t.Fatalf("expected exactly 1 payment_webhooks record, got %d", whCount)
+	}
+}
+
+func TestPaymentSafety_DuplicateCallbacks_StrictSingleDispatch(t *testing.T) {
+	kioskID := "kiosk-dup-strict"
+	orderID := "ord_dup_strict_001"
+	pin := "8822"
+	pricePaise := int64(500)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	// Claim session
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBody map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBody)
+	claimResp.Body.Close()
+	sessID := claimBody["session_id"].(string)
+
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, _ := http.DefaultClient.Do(initReq)
+	var initBody map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initBody)
+	initResp.Body.Close()
+	providerOrderID := initBody["provider_order_id"].(string)
+
+	paymentID := "pay_dup_strict_evt_1"
+	body, sig := generateSignedWebhookPayload(orderID, paymentID, sessID, kioskID, pricePaise, whSec)
+	_ = providerOrderID
+
+	// 1st callback: captures and dispatches
+	req1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-Razorpay-Signature", sig)
+	r1, _ := http.DefaultClient.Do(req1)
+	var res1 map[string]string
+	_ = json.NewDecoder(r1.Body).Decode(&res1)
+	r1.Body.Close()
+	if res1["status"] != "dispatched" {
+		t.Fatalf("expected first callback status dispatched, got %v", res1)
+	}
+
+	// 2nd callback: returns already_processed
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Razorpay-Signature", sig)
+	r2, _ := http.DefaultClient.Do(req2)
+	var res2 map[string]string
+	_ = json.NewDecoder(r2.Body).Decode(&res2)
+	r2.Body.Close()
+	if res2["status"] != "already_processed" && res2["status"] != "duplicate" {
+		t.Fatalf("expected 2nd callback status already_processed/duplicate, got %v", res2)
+	}
+
+	// 3rd callback: still already_processed
+	req3, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req3.Header.Set("Content-Type", "application/json")
+	req3.Header.Set("X-Razorpay-Signature", sig)
+	r3, _ := http.DefaultClient.Do(req3)
+	var res3 map[string]string
+	_ = json.NewDecoder(r3.Body).Decode(&res3)
+	r3.Body.Close()
+	if res3["status"] != "already_processed" && res3["status"] != "duplicate" {
+		t.Fatalf("expected 3rd callback status already_processed/duplicate, got %v", res3)
+	}
+
+	// Verify DB: exactly 1 payment record and exactly 1 dispatch intent
+	var payCount int
+	_ = st.DB().QueryRow(`SELECT COUNT(*) FROM payments WHERE payment_id = ?;`, paymentID).Scan(&payCount)
+	if payCount != 1 {
+		t.Fatalf("expected exactly 1 payment, got %d", payCount)
+	}
+	var intentCount int
+	_ = st.DB().QueryRow(`SELECT COUNT(*) FROM dispatch_intents WHERE order_id = ?;`, orderID).Scan(&intentCount)
+	if intentCount != 1 {
+		t.Fatalf("expected exactly 1 dispatch intent, got %d", intentCount)
+	}
+}
+
+func TestPaymentSafety_ConcurrentDuplicateCallbacks_SamePaymentID(t *testing.T) {
+	kioskID := "kiosk-conc-same"
+	orderID := "ord_conc_same_001"
+	pin := "7733"
+	pricePaise := int64(700)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	// Claim session
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBody map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBody)
+	claimResp.Body.Close()
+	sessID := claimBody["session_id"].(string)
+
+	paymentID := "pay_conc_identical_999"
+	body, sig := generateSignedWebhookPayload(orderID, paymentID, sessID, kioskID, pricePaise, whSec)
+
+	const concurrency = 6
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	var dispatchedCount int32
+	var alreadyProcessedCount int32
+
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Razorpay-Signature", sig)
+			r, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer r.Body.Close()
+
+			var m map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			if m["status"] == "dispatched" {
+				atomic.AddInt32(&dispatchedCount, 1)
+			} else if m["status"] == "already_processed" || m["status"] == "duplicate" {
+				atomic.AddInt32(&alreadyProcessedCount, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if dispatchedCount != 1 {
+		t.Fatalf("expected exactly 1 dispatched webhook, got %d (already_processed=%d)", dispatchedCount, alreadyProcessedCount)
+	}
+	if dispatchedCount+alreadyProcessedCount != concurrency {
+		t.Fatalf("expected total %d responses, got dispatched=%d, already_processed=%d", concurrency, dispatchedCount, alreadyProcessedCount)
+	}
+
+	var payCount int
+	_ = st.DB().QueryRow(`SELECT COUNT(*) FROM payments WHERE payment_id = ?;`, paymentID).Scan(&payCount)
+	if payCount != 1 {
+		t.Fatalf("expected exactly 1 payment record, got %d", payCount)
+	}
+}
+
+func TestPaymentSafety_InterruptedProcessing_KioskOffline_DurableIntentPreserved(t *testing.T) {
+	kioskID := "kiosk-offline-proc"
+	orderID := "ord_offline_proc_001"
+	pin := "6644"
+	pricePaise := int64(800)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	app, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+	app.hub = ws.NewHub(st)
+	app.hub.SetKioskSecret([]byte(kSec))
+	// NOTE: Kiosk is NOT connected to app.hub (kiosk is offline)
+
+	// Claim session
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBody map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBody)
+	claimResp.Body.Close()
+	sessID := claimBody["session_id"].(string)
+
+	paymentID := "pay_offline_durable_123"
+	body, sig := generateSignedWebhookPayload(orderID, paymentID, sessID, kioskID, pricePaise, whSec)
+
+	// Webhook arrives while kiosk is offline
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq.Header.Set("Content-Type", "application/json")
+	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatalf("webhook request failed: %v", err)
+	}
+	defer whResp.Body.Close()
+
+	if whResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from webhook even if kiosk is offline, got %d", whResp.StatusCode)
+	}
+
+	// Verify order status is DISPATCHED
+	ord, err := st.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusDispatched {
+		t.Fatalf("expected order to be DISPATCHED, got %v (err=%v)", ord.Status, err)
+	}
+
+	// Verify dispatch intent is durably saved in PENDING status in DB
+	intentStatus, _, err := st.GetJobDispatchIntentStatus(context.Background(), "job_"+orderID)
+	if err != nil || intentStatus != "PENDING" {
+		t.Fatalf("expected dispatch intent status PENDING, got %q (err=%v)", intentStatus, err)
+	}
+
+	// When kiosk reconnects, GetPendingDispatchOrders returns the command
+	pendingCmds, err := st.GetPendingDispatchOrders(context.Background(), kioskID)
+	if err != nil {
+		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
+	}
+	found := false
+	for _, cmd := range pendingCmds {
+		if cmd.JobID == "job_"+orderID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected pending command for job_%s, got %+v", orderID, pendingCmds)
+	}
+}
+

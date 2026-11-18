@@ -914,22 +914,6 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	webhookID := "evt_sim_" + orderID
-	recorded, err := s.db.RecordWebhook(r.Context(), webhookID)
-	if err != nil {
-		http.Error(w, "failed to record webhook", http.StatusInternalServerError)
-		return
-	}
-	if !recorded {
-		// Idempotent repetition
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"order_id": orderID,
-			"status":   string(order.Status),
-		})
-		return
-	}
-
 	requireSession := r.URL.Query().Get("require_session") == "1" || r.URL.Query().Get("strict_session") == "1"
 	now := time.Now().UTC()
 
@@ -1174,17 +1158,6 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 	}
 
 	eventID := entity.ID
-	recorded, err := s.db.RecordWebhook(r.Context(), eventID)
-	if err != nil {
-		http.Error(w, "failed to record webhook", http.StatusInternalServerError)
-		return
-	}
-	if !recorded {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"duplicate"}`))
-		return
-	}
-
 	now := time.Now().UTC()
 	captureRes, err := s.db.CapturePaymentAndCheckDispatch(r.Context(), store.PaymentRecord{
 		PaymentID:   eventID,
@@ -1200,7 +1173,7 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 			http.Error(w, "order not found", http.StatusBadRequest)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 

@@ -3363,10 +3363,55 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 `)
 		resPay, err := tx.ExecContext(ctx, insertPay, p.PaymentID, p.OrderID, orderKioskID, p.SessionID, pricePaise, p.Status, p.Provider, nowNS)
 		if err != nil {
+			_ = tx.Rollback()
+			var (
+				cOrderID  string
+				cAmount   int64
+				cStatus   string
+				cProvider string
+			)
+			qCheck := s.rebind(`SELECT order_id, amount_paise, status, provider FROM payments WHERE payment_id = ?;`)
+			if sErr := s.db.QueryRowContext(ctx, qCheck, p.PaymentID).Scan(&cOrderID, &cAmount, &cStatus, &cProvider); sErr == nil {
+				if cOrderID == p.OrderID && cAmount == pricePaise && cProvider == p.Provider && IsVerifiedCapturedStatus(cStatus) {
+					order, _ := s.GetOrder(ctx, p.OrderID)
+					var cmd *contracts.PrintJobCommand
+					var cmds []contracts.PrintJobCommand
+					if order != nil {
+						cmd = &order.Command
+						if len(order.Documents) > 0 {
+							cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+							for i, doc := range order.Documents {
+								cmds[i] = doc.Command(orderKioskID, order.Command.DisplayCode, len(order.Documents))
+							}
+						} else {
+							cmds = []contracts.PrintJobCommand{order.Command}
+						}
+					}
+					return &PaymentCaptureResult{
+						OrderStatus:      currentStatus,
+						DispatchEligible: false,
+						AlreadyProcessed: true,
+						PricePaise:       pricePaise,
+						KioskID:          orderKioskID,
+						Command:          cmd,
+						Commands:         cmds,
+					}, nil
+				}
+			}
 			return nil, fmt.Errorf("capture payment: insert payment record (already dispatched): %w", err)
 		}
 		if _, err := resPay.RowsAffected(); err != nil {
 			return nil, fmt.Errorf("capture payment: insert payment rows affected (already dispatched): %w", err)
+		}
+
+		// Insert into payment_webhooks within the same atomic transaction
+		insertWebhook := s.rebind(`
+INSERT INTO payment_webhooks (webhook_id, received_at_ns)
+VALUES (?, ?)
+ON CONFLICT(webhook_id) DO NOTHING;
+`)
+		if _, err := tx.ExecContext(ctx, insertWebhook, p.PaymentID, nowNS); err != nil {
+			return nil, fmt.Errorf("capture payment: insert payment webhook (already dispatched): %w", err)
 		}
 
 		// Update matching payment_attempts to PAID
@@ -3572,10 +3617,53 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 `)
 	resPay, err := tx.ExecContext(ctx, insertPay, p.PaymentID, p.OrderID, orderKioskID, recordSessionID, pricePaise, p.Status, p.Provider, nowNS)
 	if err != nil {
+		_ = tx.Rollback()
+		var (
+			cOrderID  string
+			cAmount   int64
+			cStatus   string
+			cProvider string
+		)
+		qCheck := s.rebind(`SELECT order_id, amount_paise, status, provider FROM payments WHERE payment_id = ?;`)
+		if sErr := s.db.QueryRowContext(ctx, qCheck, p.PaymentID).Scan(&cOrderID, &cAmount, &cStatus, &cProvider); sErr == nil {
+			if cOrderID == p.OrderID && cAmount == pricePaise && cProvider == p.Provider && IsVerifiedCapturedStatus(cStatus) {
+				order, _ := s.GetOrder(ctx, p.OrderID)
+				var cmds []contracts.PrintJobCommand
+				if order != nil {
+					if len(order.Documents) > 0 {
+						cmds = make([]contracts.PrintJobCommand, len(order.Documents))
+						for i, doc := range order.Documents {
+							cmds[i] = doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
+						}
+					} else {
+						cmds = []contracts.PrintJobCommand{order.Command}
+					}
+				}
+				return &PaymentCaptureResult{
+					OrderStatus:      order.Status,
+					AlreadyProcessed: true,
+					DispatchEligible: false,
+					PricePaise:       order.PricePaise,
+					KioskID:          order.Command.KioskID,
+					Command:          &order.Command,
+					Commands:         cmds,
+				}, nil
+			}
+		}
 		return nil, fmt.Errorf("capture payment: insert payment record: %w", err)
 	}
 	if _, err := resPay.RowsAffected(); err != nil {
 		return nil, fmt.Errorf("capture payment: insert payment rows affected: %w", err)
+	}
+
+	// Insert into payment_webhooks within the same atomic transaction
+	insertWebhook := s.rebind(`
+INSERT INTO payment_webhooks (webhook_id, received_at_ns)
+VALUES (?, ?)
+ON CONFLICT(webhook_id) DO NOTHING;
+`)
+	if _, err := tx.ExecContext(ctx, insertWebhook, p.PaymentID, nowNS); err != nil {
+		return nil, fmt.Errorf("capture payment: insert payment webhook: %w", err)
 	}
 
 	// Update matching payment_attempts to PAID
