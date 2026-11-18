@@ -99,3 +99,14 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 - The separate delivery flag remains ON for all in-flight cloud orders even during checkout rollback. Cleanup currently errs toward preserving all referenced order files indefinitely; a reviewed terminal-order retention policy and order-aware final deletion are still required to avoid unbounded long-term storage.
 - Long-lived uploaded objects and orphan artifacts with no matching database row remain a separate reconciliation requirement. This cleanup covers **database-known** expired unreferenced objects only.
 - No changes were applied to live Supabase Storage or production. Schema and worker remain in the draft PR until deployment/security gates.
+
+
+## Durable background canonical preparation (draft, 2026-11-18)
+- Added private `cloud_preparation_jobs` table with an idempotent unique tuple `(upload_id, settings_hash, normalizer_version)`, JSON print options, tariff revision, worker state and attempt count. This migration is **not applied**.
+- Opt-in `XEROXGO_CLOUD_ASYNC_PREP_ENABLED=1` changes `POST /api/documents/variants/prepare` from synchronous processing to a short database enqueue returning HTTP 202 and `preparation_id`. Existing V2 synchronous behavior remains when this flag is OFF.
+- A separate Render goroutine claims jobs using a single conditional SQL UPDATE with RETURNING, independently of browser request context. A claimed preparation is run against a verified private original with canonical normalization, checksum and immutable Storage publication. Background work is capped at eight minutes.
+- Worker job leases expire after eleven minutes, deliberately longer than the ten-minute canonical-variant lease; a new worker can retry a crashed attempt without allowing the old variant to overwrite the replacement. At most three automatic attempts. A final exhausted crashed worker is marked FAILED rather than endlessly PROCESSING.
+- Capability-protected `POST /api/documents/preparations/status` reports QUEUED, PROCESSING, RECOVERING, READY or FAILED and exposes the READY variant ID and confirmed price only after publication. **The upload capability must remain in memory and never enter URLs or logs.**
+- This is a **durable database queue**, not a separately provisioned message broker. Multiple Render workers coordinate claims in PostgreSQL; actual worker crash, multi-instance, forced restart and long-running Ghostscript cases require staging tests.
+- The existing cart is not wired to the async queue yet. Without a browser progress integration it is not a production-ready UX; the old checkout remains unchanged.
+- Important release blockers remain: trusted global upload abuse prevention, safe cross-version tariff change handling and explicit user retry after exhausted attempts, orphan reconciliation, mixed document print fidelity and staged private Storage and Pi validation. No live Supabase modifications.
