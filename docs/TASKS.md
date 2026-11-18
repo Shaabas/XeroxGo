@@ -12,7 +12,7 @@ Statuses: TODO / IN_PROGRESS / BLOCKED / REVIEW / DONE. A merged PR needs eviden
 | XG-006 | TODO | ChatGPT | Assess existing Supabase table RLS/grants without breaking backend | Analysis-only first |
 | XG-007 | TODO | Joint | Verify Antigravity discovery of `.agents/skills` in actual local checkout | User/local check required |
 | XG-CHECKOUT-FAST-1 | DONE (GitHub scope) | ChatGPT | PR #16 merged at 0b40181; removed synchronous checkout re-quotes and added real upload progress + Gate 6 tests | Benchmark live checkout separately; quote preparation remains expensive |
-| XG-CLOUD-DOCS-V2 | IN_PROGRESS (foundation only) | ChatGPT | `feat/cloud-first-documents-v2`: private Storage migration file, feature-gated signed upload/verification APIs, browser transport + tests; old checkout untouched | Validate Gate 1–6, inspect storage credentials/config/security, then implement durable preparation and reference-only checkout as separate reviewed slice |
+| XG-CLOUD-DOCS-V2 | IN_PROGRESS (foundation only) | ChatGPT | `feat/cloud-first-documents-v2`: private Storage migration file, signed upload/verification APIs, canonical immutable variant preparation and deduplication, isolated browser transport + tests; old checkout untouched | Validate Gate 1–6, inspect storage credentials/config/security, then implement durable preparation and reference-only checkout as separate reviewed slice |
 
 ## Historical task: XG-CHECKOUT-FAST-1
 - **Architecture:** front-end reuses server-confirmed quote and tariff revision for the final order request; server still recalculates price against normalized output and rejects stale/mismatched submissions.
@@ -50,3 +50,5 @@ These are lower-priority investigations than the approved planning work for XG-C
 - Architecture details, acceptance criteria and rollback are in `docs/architecture/cloud-first-documents-v2.md`.
 - Do NOT turn `XEROXGO_CLOUD_UPLOADS_ENABLED` on until server-side upload rate limits/quotas, Supabase CORS, preflight tests and object cleanup have been implemented.
 - Pending implementation: secure prepared variants, reference-only checkout, order idempotency, Storage-backed printer downloads, end-to-end tests and rollout.
+
+- Prepared-variant foundation now implemented: verified original re-download, canonical normalization, immutable private Storage output, DB CAS READY, exact-setting reuse and tests. **Not yet async/durable**; request crashes can leave PREPARING and no retry lease exists. Do not enable.
