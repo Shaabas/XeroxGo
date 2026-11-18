@@ -1193,7 +1193,7 @@ func TestPaymentSafety_KioskAckTransitionsIntentToAcknowledged(t *testing.T) {
 	var ackedNS int64
 	var intentStatus string
 	for time.Now().Before(deadline) {
-		intentStatus, ackedNS, _ = st.GetDispatchIntentStatus(context.Background(), orderID)
+		intentStatus, ackedNS, _ = st.GetJobDispatchIntentStatus(context.Background(), jobCmd.JobID)
 		if intentStatus == "ACKNOWLEDGED" && ackedNS > 0 {
 			break
 		}
@@ -1295,7 +1295,7 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	}
 
 	// 5. Verify Dispatch Intent is recorded as SENT
-	intentStatus, _, _ := st.GetDispatchIntentStatus(context.Background(), orderID)
+	intentStatus, _, _ := st.GetJobDispatchIntentStatus(context.Background(), "job_"+orderID)
 	if intentStatus != "SENT" && intentStatus != "ACKNOWLEDGED" {
 		t.Fatalf("expected dispatch intent status SENT or ACKNOWLEDGED, got %s", intentStatus)
 	}
@@ -1338,7 +1338,7 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var ackedNS int64
 	for time.Now().Before(deadline) {
-		intentStatus, ackedNS, _ = st.GetDispatchIntentStatus(context.Background(), orderID)
+		intentStatus, ackedNS, _ = st.GetJobDispatchIntentStatus(context.Background(), jobCmd.JobID)
 		if intentStatus == "ACKNOWLEDGED" && ackedNS > 0 {
 			break
 		}
@@ -1398,7 +1398,7 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	if err != nil || ord.Status != contracts.JobStatusCompleted {
 		t.Fatalf("expected order status COMPLETED, got %v (err=%v)", ord.Status, err)
 	}
-	intentStatus, _, _ = st.GetDispatchIntentStatus(context.Background(), orderID)
+	intentStatus, _, _ = st.GetJobDispatchIntentStatus(context.Background(), jobCmd.JobID)
 	if intentStatus != "COMPLETED" {
 		t.Fatalf("expected dispatch intent status COMPLETED, got %s", intentStatus)
 	}

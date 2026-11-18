@@ -3255,12 +3255,27 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 	defer func() { _ = tx.Rollback() }()
 
 	// 1. Check if payment record already exists
-	var existingPaymentStatus string
-	checkPayQuery := s.rebind(`SELECT status FROM payments WHERE payment_id = ?;`)
-	err = tx.QueryRowContext(ctx, checkPayQuery, p.PaymentID).Scan(&existingPaymentStatus)
+	var (
+		existingOrderID  string
+		existingAmount   int64
+		existingStatus   string
+		existingProvider string
+	)
+	checkPayQuery := s.rebind(`SELECT order_id, amount_paise, status, provider FROM payments WHERE payment_id = ?;`)
+	err = tx.QueryRowContext(ctx, checkPayQuery, p.PaymentID).Scan(&existingOrderID, &existingAmount, &existingStatus, &existingProvider)
 	if err == nil {
-		// Already recorded: rollback transaction immediately to release connection
+		// Already recorded: verify it belongs to the same order and matching payment details
 		_ = tx.Rollback()
+		if existingOrderID != p.OrderID {
+			return nil, fmt.Errorf("payment %s already exists for conflicting order %s (cannot be reused for order %s)", p.PaymentID, existingOrderID, p.OrderID)
+		}
+		if p.AmountPaise > 0 && p.AmountPaise != existingAmount {
+			return nil, fmt.Errorf("payment %s amount mismatch for order %s: existing %d paise vs requested %d paise", p.PaymentID, p.OrderID, existingAmount, p.AmountPaise)
+		}
+		if p.Provider != "" && existingProvider != "" && p.Provider != existingProvider {
+			return nil, fmt.Errorf("payment %s provider mismatch for order %s: existing %s vs requested %s", p.PaymentID, p.OrderID, existingProvider, p.Provider)
+		}
+
 		order, oErr := s.GetOrder(ctx, p.OrderID)
 		if oErr != nil || order == nil {
 			return &PaymentCaptureResult{AlreadyProcessed: true}, nil
@@ -3832,71 +3847,116 @@ WHERE order_id = ?;
 	return tx.Commit()
 }
 
-// MarkDispatchIntentSent marks the dispatch intent for an order or job as SENT.
-func (s *Store) MarkDispatchIntentSent(ctx context.Context, orderOrJobID string) error {
+// MarkDispatchIntentSent marks the dispatch intent for a specific job as SENT.
+func (s *Store) MarkDispatchIntentSent(ctx context.Context, jobID string) error {
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
-	orderOrJobID = strings.TrimSpace(orderOrJobID)
-	if orderOrJobID == "" {
-		return errors.New("orderOrJobID cannot be empty")
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("jobID cannot be empty")
 	}
 	nowNS := time.Now().UTC().UnixNano()
 	query := s.rebind(`
 UPDATE dispatch_intents
 SET status = 'SENT', dispatched_at_ns = ?, updated_at_ns = ?
-WHERE (order_id = ? OR job_id = ?) AND status = 'PENDING';
+WHERE job_id = ? AND status = 'PENDING';
 `)
-	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, orderOrJobID, orderOrJobID)
+	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID)
 	return err
 }
 
-// MarkDispatchIntentAcknowledged records that the kiosk daemon has durably accepted and persisted the job.
-func (s *Store) MarkDispatchIntentAcknowledged(ctx context.Context, orderOrJobID string) error {
+// MarkDispatchIntentAcknowledged records that the kiosk daemon has durably accepted and persisted a specific job.
+func (s *Store) MarkDispatchIntentAcknowledged(ctx context.Context, jobID string) error {
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
-	orderOrJobID = strings.TrimSpace(orderOrJobID)
-	if orderOrJobID == "" {
-		return errors.New("orderOrJobID cannot be empty")
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("jobID cannot be empty")
 	}
 	nowNS := time.Now().UTC().UnixNano()
 	query := s.rebind(`
 UPDATE dispatch_intents
 SET status = 'ACKNOWLEDGED', acknowledged_at_ns = ?, updated_at_ns = ?
-WHERE (order_id = ? OR job_id = ?) AND status IN ('PENDING', 'SENT');
+WHERE job_id = ? AND status IN ('PENDING', 'SENT');
 `)
-	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, orderOrJobID, orderOrJobID)
+	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID)
 	return err
 }
 
-// MarkDispatchIntentCompleted records that physical printing has completed.
-func (s *Store) MarkDispatchIntentCompleted(ctx context.Context, orderOrJobID string) error {
+// MarkDispatchIntentCompleted records that physical printing has completed for a specific job.
+func (s *Store) MarkDispatchIntentCompleted(ctx context.Context, jobID string) error {
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
-	orderOrJobID = strings.TrimSpace(orderOrJobID)
-	if orderOrJobID == "" {
-		return errors.New("orderOrJobID cannot be empty")
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("jobID cannot be empty")
 	}
 	nowNS := time.Now().UTC().UnixNano()
 	query := s.rebind(`
 UPDATE dispatch_intents
 SET status = 'COMPLETED', updated_at_ns = ?
-WHERE (order_id = ? OR job_id = ?) AND status != 'COMPLETED';
+WHERE job_id = ? AND status != 'COMPLETED';
 `)
-	_, err := s.db.ExecContext(ctx, query, nowNS, orderOrJobID, orderOrJobID)
+	_, err := s.db.ExecContext(ctx, query, nowNS, jobID)
 	return err
 }
 
-// GetDispatchIntentStatus returns the status and acknowledged_at_ns for an order's or job's dispatch intent.
-func (s *Store) GetDispatchIntentStatus(ctx context.Context, orderOrJobID string) (status string, acknowledgedAtNS int64, err error) {
+// GetJobDispatchIntentStatus returns the status and acknowledged_at_ns for a specific job's dispatch intent.
+func (s *Store) GetJobDispatchIntentStatus(ctx context.Context, jobID string) (status string, acknowledgedAtNS int64, err error) {
 	if s == nil || s.db == nil {
 		return "", 0, errors.New("store not initialized")
 	}
-	query := s.rebind(`SELECT status, acknowledged_at_ns FROM dispatch_intents WHERE job_id = ? OR order_id = ?;`)
-	err = s.db.QueryRowContext(ctx, query, orderOrJobID, orderOrJobID).Scan(&status, &acknowledgedAtNS)
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return "", 0, errors.New("jobID cannot be empty")
+	}
+	query := s.rebind(`SELECT status, acknowledged_at_ns FROM dispatch_intents WHERE job_id = ?;`)
+	err = s.db.QueryRowContext(ctx, query, jobID).Scan(&status, &acknowledgedAtNS)
 	return status, acknowledgedAtNS, err
+}
+
+// OrderDispatchSummary aggregates dispatch intent states across an entire order.
+type OrderDispatchSummary struct {
+	TotalCount        int
+	PendingCount      int
+	SentCount         int
+	AcknowledgedCount int
+	CompletedCount    int
+	CanceledCount     int
+}
+
+// GetOrderDispatchSummary returns aggregated dispatch intent counts for all child jobs under an order.
+func (s *Store) GetOrderDispatchSummary(ctx context.Context, orderID string) (OrderDispatchSummary, error) {
+	if s == nil || s.db == nil {
+		return OrderDispatchSummary{}, errors.New("store not initialized")
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return OrderDispatchSummary{}, errors.New("orderID cannot be empty")
+	}
+	query := s.rebind(`
+SELECT
+    COUNT(1),
+    COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'SENT' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'ACKNOWLEDGED' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'CANCELED' THEN 1 ELSE 0 END), 0)
+FROM dispatch_intents
+WHERE order_id = ?;
+`)
+	var sum OrderDispatchSummary
+	err := s.db.QueryRowContext(ctx, query, orderID).Scan(
+		&sum.TotalCount, &sum.PendingCount, &sum.SentCount,
+		&sum.AcknowledgedCount, &sum.CompletedCount, &sum.CanceledCount,
+	)
+	if err != nil {
+		return OrderDispatchSummary{}, fmt.Errorf("get order dispatch summary for %s: %w", orderID, err)
+	}
+	return sum, nil
 }
 
 // DispatchIntent represents a persisted job dispatch intent.
@@ -4027,7 +4087,7 @@ ORDER BY created_at_ns ASC;
 			err := s.db.QueryRowContext(ctx, qSess, cand.sessionID).Scan(&sessStatus, &sessExpNS)
 			if err != nil || sessStatus == "CANCELED" || sessStatus == "EXPIRED" || (sessStatus == "PAYMENT_PENDING" && sessExpNS <= nowNS) {
 				// Cancel intent and revert order to PAID_WAITING to avoid unattended ghost printing
-				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ? OR order_id = ?;`), nowNS, cand.jobID, cand.orderID)
+				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE order_id = ?;`), nowNS, cand.orderID)
 				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE orders SET status = ?, updated_at_ns = ? WHERE order_id = ? AND status = ?;`),
 					string(contracts.JobStatusPaidWaiting), nowNS, cand.orderID, string(contracts.JobStatusDispatched))
 				continue
@@ -4038,33 +4098,55 @@ ORDER BY created_at_ns ASC;
 		_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET retry_count = retry_count + 1, updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
 
 		ord, err := s.GetOrder(ctx, cand.orderID)
-		if err == nil && ord != nil {
-			// Never dispatch unpaid, canceled, expired, or unauthorized orders
-			if ord.Status != contracts.JobStatusDispatched {
-				if ord.Status == contracts.JobStatusFailedRefundable || string(ord.Status) == "CANCELED" {
-					_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
-				}
-				continue
-			}
-			var payCount int
-			_ = s.db.QueryRowContext(ctx, s.rebind(`SELECT COUNT(1) FROM payments WHERE order_id = ?;`), cand.orderID).Scan(&payCount)
-			if payCount == 0 {
-				continue
-			}
-			doc, errDoc := s.GetOrderDocument(ctx, cand.jobID)
-			if errDoc == nil && doc != nil {
-				totalDocs := len(ord.Documents)
-				if totalDocs == 0 {
-					totalDocs = ord.Command.TotalDocuments
-				}
-				if totalDocs == 0 {
-					totalDocs = 1
-				}
-				cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, totalDocs))
-			} else {
-				cmds = append(cmds, ord.Command)
-			}
+		if err != nil {
+			return nil, fmt.Errorf("get pending dispatch orders: fetch order %s: %w", cand.orderID, err)
 		}
+		if ord == nil {
+			return nil, fmt.Errorf("get pending dispatch orders: order %s not found", cand.orderID)
+		}
+
+		// Never dispatch unpaid, canceled, expired, or unauthorized orders
+		if ord.Status != contracts.JobStatusDispatched {
+			if ord.Status == contracts.JobStatusFailedRefundable || string(ord.Status) == "CANCELED" {
+				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
+			}
+			continue
+		}
+
+		// Validate payment status explicitly
+		var payStatus string
+		qPay := s.rebind(`
+SELECT status
+FROM payments
+WHERE order_id = ? AND status IN ('captured', 'paid', 'COMPLETED', 'authorized', 'success')
+LIMIT 1;
+`)
+		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID).Scan(&payStatus)
+		if errPay != nil {
+			if errors.Is(errPay, sql.ErrNoRows) {
+				// No captured/authorized payment exists for this order; do not dispatch!
+				continue
+			}
+			return nil, fmt.Errorf("get pending dispatch orders: check payment for order %s: %w", cand.orderID, errPay)
+		}
+
+		// Retrieve child document job - never fall back to parent print command
+		doc, errDoc := s.GetOrderDocument(ctx, cand.jobID)
+		if errDoc != nil {
+			return nil, fmt.Errorf("get pending dispatch orders: child document %s for order %s lookup failed: %w", cand.jobID, cand.orderID, errDoc)
+		}
+		if doc == nil {
+			return nil, fmt.Errorf("get pending dispatch orders: child document %s for order %s not found in order_documents (corrupted dispatch intent)", cand.jobID, cand.orderID)
+		}
+
+		totalDocs := len(ord.Documents)
+		if totalDocs == 0 {
+			totalDocs = ord.Command.TotalDocuments
+		}
+		if totalDocs == 0 {
+			totalDocs = 1
+		}
+		cmds = append(cmds, doc.Command(ord.Command.KioskID, ord.Command.DisplayCode, totalDocs))
 	}
 	return cmds, nil
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,9 +540,9 @@ func TestSingleDocumentPaymentAndDispatch_Succeeds(t *testing.T) {
 	}
 
 	// Verify intent is recorded
-	st, _, err := s.GetDispatchIntentStatus(ctx, "job-single-1")
+	st, _, err := s.GetJobDispatchIntentStatus(ctx, "job-single-1")
 	if err != nil {
-		t.Fatalf("GetDispatchIntentStatus failed: %v", err)
+		t.Fatalf("GetJobDispatchIntentStatus failed: %v", err)
 	}
 	if st != "PENDING" {
 		t.Errorf("expected PENDING status, got %s", st)
@@ -1128,15 +1129,15 @@ func TestMultiDocumentDispatch_Reconnects_PreservesDocumentOrderAndIdentity(t *t
 	}
 
 	// Verify intent statuses: doc 0 stays ACKNOWLEDGED; doc 1 and 2 reset to PENDING
-	st0, _, _ := s.GetDispatchIntentStatus(ctx, "job-rec-0")
+	st0, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-rec-0")
 	if st0 != "ACKNOWLEDGED" {
 		t.Errorf("expected doc0 to remain ACKNOWLEDGED, got %s", st0)
 	}
-	st1, _, _ := s.GetDispatchIntentStatus(ctx, "job-rec-1")
+	st1, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-rec-1")
 	if st1 != "PENDING" {
 		t.Errorf("expected doc1 to revert to PENDING, got %s", st1)
 	}
-	st2, _, _ := s.GetDispatchIntentStatus(ctx, "job-rec-2")
+	st2, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-rec-2")
 	if st2 != "PENDING" {
 		t.Errorf("expected doc2 to revert to PENDING, got %s", st2)
 	}
@@ -1260,7 +1261,7 @@ func TestMultiDocumentDispatch_NeverDispatchesUnpaidOrCanceled(t *testing.T) {
 	}
 
 	// Verify canceled order's intent was cleaned up to CANCELED
-	stCanc, _, _ := s.GetDispatchIntentStatus(ctx, "job-canc-0")
+	stCanc, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-canc-0")
 	if stCanc != "CANCELED" {
 		t.Errorf("expected canceled intent status=CANCELED, got %s", stCanc)
 	}
@@ -1347,5 +1348,330 @@ func TestMultiDocumentDispatch_ReleasePaidOrder_CreatesIntentsInOrder(t *testing
 	}
 	if intents[1].CreatedAtNS < intents[0].CreatedAtNS {
 		t.Errorf("expected strictly ascending CreatedAtNS: %d vs %d", intents[0].CreatedAtNS, intents[1].CreatedAtNS)
+	}
+}
+
+func TestDispatchIntent_JobScopedMutations_DoesNotAffectSiblings(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+
+	orderID := "ord-sib-test"
+	kioskID := "kiosk-sib"
+	now := time.Now().UTC()
+
+	docs := []OrderDocument{
+		{JobID: "job-sib-0", OrderID: orderID, DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 100},
+		{JobID: "job-sib-1", OrderID: orderID, DocumentIndex: 1, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 100},
+		{JobID: "job-sib-2", OrderID: orderID, DocumentIndex: 2, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 100},
+	}
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1122"},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  300,
+		TotalPages:  3,
+		TotalSheets: 3,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	sess, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 10, 15*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+
+	pay := PaymentRecord{
+		PaymentID:   "pay-sib-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		SessionID:   sess.SessionID,
+		AmountPaise: 300,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}
+	res, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+	if err != nil || !res.DispatchEligible {
+		t.Fatalf("CapturePaymentAndCheckDispatch failed: %v", err)
+	}
+
+	// All 3 intents start as PENDING
+	for _, id := range []string{"job-sib-0", "job-sib-1", "job-sib-2"} {
+		st, _, err := s.GetJobDispatchIntentStatus(ctx, id)
+		if err != nil || st != "PENDING" {
+			t.Fatalf("expected job %s to be PENDING, got %s (err=%v)", id, st, err)
+		}
+	}
+
+	// 1. Attempting to pass orderID to MarkDispatchIntentSent must NOT mutate any child jobs!
+	_ = s.MarkDispatchIntentSent(ctx, orderID)
+	for _, id := range []string{"job-sib-0", "job-sib-1", "job-sib-2"} {
+		st, _, _ := s.GetJobDispatchIntentStatus(ctx, id)
+		if st != "PENDING" {
+			t.Fatalf("VIOLATION: orderID mutation caused child %s to transition to %s!", id, st)
+		}
+	}
+
+	// 2. Mark job-sib-0 as SENT: siblings job-sib-1 and job-sib-2 must remain PENDING
+	if err := s.MarkDispatchIntentSent(ctx, "job-sib-0"); err != nil {
+		t.Fatalf("MarkDispatchIntentSent(job-sib-0) failed: %v", err)
+	}
+	st0, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-sib-0")
+	if st0 != "SENT" {
+		t.Errorf("expected job-sib-0 to be SENT, got %s", st0)
+	}
+	st1, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-sib-1")
+	st2, _, _ := s.GetJobDispatchIntentStatus(ctx, "job-sib-2")
+	if st1 != "PENDING" || st2 != "PENDING" {
+		t.Errorf("sibling jobs mutated accidentally: st1=%s, st2=%s", st1, st2)
+	}
+
+	// 3. Attempting to pass orderID to MarkDispatchIntentAcknowledged must NOT mutate child jobs!
+	_ = s.MarkDispatchIntentAcknowledged(ctx, orderID)
+	st0, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-0")
+	if st0 != "SENT" {
+		t.Errorf("job-sib-0 mutated by orderID ack: got %s", st0)
+	}
+
+	// 4. Mark job-sib-0 as ACKNOWLEDGED: siblings remain untouched
+	if err := s.MarkDispatchIntentAcknowledged(ctx, "job-sib-0"); err != nil {
+		t.Fatalf("MarkDispatchIntentAcknowledged(job-sib-0) failed: %v", err)
+	}
+	st0, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-0")
+	if st0 != "ACKNOWLEDGED" {
+		t.Errorf("expected job-sib-0 ACKNOWLEDGED, got %s", st0)
+	}
+	st1, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-1")
+	if st1 != "PENDING" {
+		t.Errorf("job-sib-1 mutated accidentally: %s", st1)
+	}
+
+	// 5. Attempting to pass orderID to MarkDispatchIntentCompleted must NOT mutate child jobs!
+	_ = s.MarkDispatchIntentCompleted(ctx, orderID)
+	st0, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-0")
+	st1, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-1")
+	if st0 != "ACKNOWLEDGED" || st1 != "PENDING" {
+		t.Errorf("orderID complete mutated child jobs: st0=%s, st1=%s", st0, st1)
+	}
+
+	// 6. Mark job-sib-0 COMPLETED: job-sib-1 remains PENDING
+	if err := s.MarkDispatchIntentCompleted(ctx, "job-sib-0"); err != nil {
+		t.Fatalf("MarkDispatchIntentCompleted(job-sib-0) failed: %v", err)
+	}
+	st0, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-0")
+	if st0 != "COMPLETED" {
+		t.Errorf("expected job-sib-0 COMPLETED, got %s", st0)
+	}
+	st1, _, _ = s.GetJobDispatchIntentStatus(ctx, "job-sib-1")
+	if st1 != "PENDING" {
+		t.Errorf("job-sib-1 mutated accidentally: %s", st1)
+	}
+
+	// 7. GetJobDispatchIntentStatus with orderID fails cleanly
+	_, _, err = s.GetJobDispatchIntentStatus(ctx, orderID)
+	if err == nil {
+		t.Errorf("expected GetJobDispatchIntentStatus(%s) to fail with not found, got nil", orderID)
+	}
+
+	// 8. OrderDispatchSummary reflects exact counts
+	summary, err := s.GetOrderDispatchSummary(ctx, orderID)
+	if err != nil {
+		t.Fatalf("GetOrderDispatchSummary failed: %v", err)
+	}
+	if summary.TotalCount != 3 || summary.CompletedCount != 1 || summary.PendingCount != 2 {
+		t.Errorf("unexpected summary: %+v", summary)
+	}
+}
+
+func TestCapturePayment_ConflictingPaymentIDReuse_Rejected(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-conf"
+
+	// Create Order A
+	ordA := Order{
+		OrderID:     "ord-conf-A",
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "1111"},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  200,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   []OrderDocument{{JobID: "job-conf-A", OrderID: "ord-conf-A", DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 200}},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ordA); err != nil {
+		t.Fatalf("CreateOrder A failed: %v", err)
+	}
+
+	// Create Order B
+	ordB := Order{
+		OrderID:     "ord-conf-B",
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "2222"},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  200,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   []OrderDocument{{JobID: "job-conf-B", OrderID: "ord-conf-B", DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 200}},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ordB); err != nil {
+		t.Fatalf("CreateOrder B failed: %v", err)
+	}
+
+	sessA, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord-conf-A", 10, 15*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck A failed: %v", err)
+	}
+
+	// Capture payment for Order A
+	payA := PaymentRecord{
+		PaymentID:   "pay-unique-123",
+		OrderID:     "ord-conf-A",
+		KioskID:     kioskID,
+		SessionID:   sessA.SessionID,
+		AmountPaise: 200,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	resA, err := s.CapturePaymentAndCheckDispatch(ctx, payA, now)
+	if err != nil || !resA.DispatchEligible {
+		t.Fatalf("CapturePaymentAndCheckDispatch A failed: %v", err)
+	}
+
+	// Attempting to reuse same paymentID for Order B must be explicitly rejected!
+	payBConflicting := PaymentRecord{
+		PaymentID:   "pay-unique-123",
+		OrderID:     "ord-conf-B",
+		KioskID:     kioskID,
+		AmountPaise: 200,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	_, err = s.CapturePaymentAndCheckDispatch(ctx, payBConflicting, now)
+	if err == nil {
+		t.Fatal("expected error on conflicting payment ID reuse for different order, got nil")
+	}
+	if !strings.Contains(err.Error(), "conflicting order") {
+		t.Errorf("expected error message to mention conflicting order, got %v", err)
+	}
+
+	// Attempting to reuse same paymentID for Order A but with mismatched amount must be rejected!
+	payAMismatchedAmount := PaymentRecord{
+		PaymentID:   "pay-unique-123",
+		OrderID:     "ord-conf-A",
+		KioskID:     kioskID,
+		AmountPaise: 500, // Mismatched!
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	_, err = s.CapturePaymentAndCheckDispatch(ctx, payAMismatchedAmount, now)
+	if err == nil {
+		t.Fatal("expected error on payment amount mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "amount mismatch") {
+		t.Errorf("expected error message to mention amount mismatch, got %v", err)
+	}
+}
+
+func TestGetPendingDispatchOrders_ChildDocumentReadFailure_FailsSafely(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-missing-doc"
+	orderID := "ord-missing-doc-1"
+
+	// Create order in DISPATCHED status
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{JobID: "parent-job", KioskID: kioskID, DisplayCode: "5555", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1},
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  100,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   nil, // No documents!
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Add verified captured payment
+	_, err := s.db.Exec(`INSERT INTO payments (payment_id, order_id, kiosk_id, amount_paise, status, provider, created_at_ns) VALUES ('pay-m-1', ?, ?, 100, 'captured', 'DEMO', ?);`,
+		orderID, kioskID, now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert payment failed: %v", err)
+	}
+
+	// Insert dispatch intent referencing a child job that does NOT exist in order_documents
+	_, err = s.db.Exec(`INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, status, created_at_ns, updated_at_ns) VALUES ('nonexistent-job-xyz', ?, ?, 'PENDING', ?, ?);`,
+		orderID, kioskID, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert intent failed: %v", err)
+	}
+
+	// GetPendingDispatchOrders MUST FAIL SAFELY and NEVER fall back to ord.Command!
+	cmds, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err == nil {
+		t.Fatalf("expected GetPendingDispatchOrders to fail on missing child document, got cmds: %+v", cmds)
+	}
+	if !strings.Contains(err.Error(), "not found in order_documents") {
+		t.Errorf("expected error to mention child document not found in order_documents, got: %v", err)
+	}
+}
+
+func TestGetPendingDispatchOrders_FailedPaymentStatus_NotDispatched(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-pay-status"
+	orderID := "ord-pay-failed-1"
+
+	docs := []OrderDocument{
+		{JobID: "job-pf-0", OrderID: orderID, DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 100},
+	}
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "9988"},
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  100,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Add payment with status "failed"
+	_, err := s.db.Exec(`INSERT INTO payments (payment_id, order_id, kiosk_id, amount_paise, status, provider, created_at_ns) VALUES ('pay-failed-1', ?, ?, 100, 'failed', 'DEMO', ?);`,
+		orderID, kioskID, now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert payment failed: %v", err)
+	}
+
+	// Insert pending intent
+	_, err = s.db.Exec(`INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, status, created_at_ns, updated_at_ns) VALUES ('job-pf-0', ?, ?, 'PENDING', ?, ?);`,
+		orderID, kioskID, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert intent failed: %v", err)
+	}
+
+	// GetPendingDispatchOrders must skip this order because payment status is failed
+	cmds, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil {
+		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
+	}
+	for _, c := range cmds {
+		if c.OrderID == orderID {
+			t.Fatalf("VIOLATION: order with failed payment was dispatched!")
+		}
 	}
 }
