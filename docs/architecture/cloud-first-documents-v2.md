@@ -74,7 +74,15 @@ Keep the original multipart pipeline live until Stage 5 validation. Do not migra
 - Storage-backed Pi artifact download currently reuses the signed Render path and verifies the checksum; needs integration test on a real private bucket and recovery tests.
 - No switch to cloud checkout until new API/Storage/order idempotency tests and end-to-end printer lifecycle tests pass.
 
-### Feature flags (both OFF by default)
+### Feature flags (all OFF by default)
 - `XEROXGO_CLOUD_UPLOADS_ENABLED=1` exposes signed uploads, verification, preparation and variant status for controlled development only. This is NOT safe to enable publicly before quotas/rate limits and storage cleanup exist.
 - `XEROXGO_CLOUD_DELIVERY_ENABLED=1` makes already-created cloud orders readable through the existing signed Render-to-Pi endpoint. This must remain enabled until **every** V2 order has reached an irreversible terminal state and its recovery window has ended, even if checkout is rolled back.\n- `XEROXGO_CLOUD_CHECKOUT_ENABLED=1` requires both upload and delivery flags and allows new reference-only orders. Disabling checkout blocks new orders but does **not** disable cloud delivery for existing ones.
 - A rollout must enable cloud delivery before checkout only after the upload workflow has been validated with private Storage and correct migrations. Production `main` remains on the original flow.
+
+## Preparation recovery milestone — 2026-11-18
+- The exact-settings reservation now includes a **10-minute lease** stored in PostgreSQL. If Render dies while processing, the next authorized preparation request can reclaim a stale PREPARING record; a known FAILED record may be reclaimed immediately.
+- Reclamation changes the variant identity atomically. A previous worker attempting to publish under its old identity fails closed, preventing an obsolete checksum/object from replacing a newer preparation.
+- Normalization/download/upload work is bounded by an 8-minute context, less than the lease. A live lease is never taken over early, and a READY artifact is never reclaimed.
+- **Not a durable background queue yet**: the client still starts synchronous preparation; after a crash it must request preparation again, and recovery can take up to the lease duration. A clean cancellation marks FAILED. A true queue/worker and progress events remain release improvements.
+- A partially uploaded object from an abandoned worker can become an orphan. Lifecycle cleanup is still required; do not enable publicly.
+- Multi-file output is intentionally blocked pending `docs/architecture/multi-document-fidelity-gate.md`. The current legacy merge has one global duplex/color mode that can lose per-document printing intent.
