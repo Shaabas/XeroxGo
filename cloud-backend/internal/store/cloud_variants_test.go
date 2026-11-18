@@ -16,7 +16,7 @@ func TestCloudVariantReservationAndImmutablePublish(t *testing.T) {
   settings_hash TEXT NOT NULL, normalizer_version TEXT NOT NULL,
   storage_key TEXT UNIQUE, checksum_sha256 TEXT, billable_sides INTEGER,
   total_sheets INTEGER, canonical_price_paise BIGINT, tariff_revision BIGINT,
-  state TEXT NOT NULL, expires_at TIMESTAMP NOT NULL,
+  state TEXT NOT NULL, error_code TEXT, expires_at TIMESTAMP NOT NULL,
   UNIQUE(upload_id,settings_hash,normalizer_version)
  )`)
  if err!=nil {t.Fatal(err)}
