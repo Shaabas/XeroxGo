@@ -661,7 +661,7 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 
 	// V2 order artifacts live in private Storage, not Render's ephemeral disk.
 	// Legacy jobs continue to use the existing disk-backed path unchanged.
-	if cloudUploadsEnabled() {
+	if cloudCheckoutEnabled() {
 		key, checksum, cloud, lookupErr := s.db.CloudOrderPreparedObject(r.Context(), orderID)
 		if lookupErr != nil {
 			http.Error(w, "document reference unavailable", http.StatusServiceUnavailable)
