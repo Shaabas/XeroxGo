@@ -2542,3 +2542,300 @@ func TestMultiDoc_LargerThanQueueCapacity_RestartReconnect(t *testing.T) {
 		}
 	}
 }
+
+// TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum verifies:
+// 1. Independent CUPS command line options (-n copies, -o sides=..., -o print-color-mode=...)
+//    are faithfully constructed and applied per document.
+// 2. Tampered checksum on any document in a multi-document order fails closed immediately,
+//    transitions the failing document to PAUSED_ERROR, halts subsequent siblings before physical submission,
+//    and ensures zero physical output for the failed or subsequent documents.
+func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "cups_opts_tamper.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var lpCallsMu sync.Mutex
+	type lpCall struct {
+		name string
+		args []string
+	}
+	var lpInvocations []lpCall
+
+	var currentLife atomic.Int64
+	currentLife.Store(1000)
+
+	var job0PollCount atomic.Int32
+	var job1PollCount atomic.Int32
+	mockRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			lpCallsMu.Lock()
+			lpInvocations = append(lpInvocations, lpCall{name: name, args: args})
+			reqID := fmt.Sprintf("MockQueue-%d", len(lpInvocations))
+			lpCallsMu.Unlock()
+			return []byte(fmt.Sprintf("request id is %s (1 file(s))\n", reqID)), nil
+		}
+		if name == "lpstat" {
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("MockQueue-1 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully\nMockQueue-2 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+				}
+			}
+			return []byte(""), nil
+		}
+		if name == "ipptool" {
+			for _, arg := range args {
+				if strings.Contains(arg, "/jobs/1") {
+					calls := job0PollCount.Add(1)
+					if calls == 1 {
+						currentLife.Add(1) // 1001 (1 of 2 sheets)
+						return []byte("job-state (enum) = processing\njob-state-reasons (keyword) = none\njob-media-sheets-completed (integer) = 1\n"), nil
+					}
+					if calls == 2 {
+						currentLife.Add(1) // 1002 (2 of 2 sheets)
+						return []byte("job-state (enum) = processing\njob-state-reasons (keyword) = none\njob-media-sheets-completed (integer) = 2\n"), nil
+					}
+					return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 2\n"), nil
+				}
+				if strings.Contains(arg, "/jobs/2") {
+					calls := job1PollCount.Add(1)
+					if calls == 1 {
+						currentLife.Add(1) // 1003 (1 of 1 sheet)
+						return []byte("job-state (enum) = processing\njob-state-reasons (keyword) = none\njob-media-sheets-completed (integer) = 1\n"), nil
+					}
+					return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\njob-media-sheets-completed (integer) = 1\n"), nil
+				}
+			}
+			return []byte("printer-state (enum) = idle\nprinter-is-accepting-jobs (boolean) = true\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+		return printer.HardwareTelemetry{
+			Online:    true,
+			HasLife:   true,
+			LifeCount: currentLife.Load(),
+		}
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-cups-opts",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		CUPSRunner:    mockRunner,
+		SNMPPoller:    snmpPoller,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Explicitly set printer capabilities: Monochrome and Color supported
+	client.capsMu.Lock()
+	client.capabilities = printer.PrinterCapabilities{
+		ColorSupport:          printer.CapabilitySupported,
+		MonochromeSupport:     printer.CapabilitySupported,
+		DuplexLongEdgeSupport: printer.CapabilitySupported,
+		SimplexSupport:        printer.CapabilitySupported,
+	}
+	client.capsMu.Unlock()
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Part 1: Order with 2 documents having distinct options (copies, duplex, color)
+	orderID := "ord_cups_opts_001"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_opts_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-cups-opts",
+		DisplayCode:    "1111",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    2,
+		Copies:         2,
+		Duplex:         contracts.DuplexLongEdge,
+		ColorMode:      "COLOR",
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_opts_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-cups-opts",
+		DisplayCode:    "1111",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		ColorMode:      "BW",
+		StartFromPage:  1,
+	}
+
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Wait for ord_cups_opts_001 to complete
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		completed, err := store.IsOrderCompleted(ctx, orderID)
+		if err == nil && completed {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	completed, err := store.IsOrderCompleted(ctx, orderID)
+	if err != nil || !completed {
+		t.Fatalf("expected order %s to complete, got %v (err=%v)", orderID, completed, err)
+	}
+
+	lpCallsMu.Lock()
+	if len(lpInvocations) != 2 {
+		t.Fatalf("expected 2 lp submissions, got %d", len(lpInvocations))
+	}
+	// Verify doc 0 options: -n 2, -o sides=two-sided-long-edge, -o print-color-mode=color
+	args0 := strings.Join(lpInvocations[0].args, " ")
+	if !strings.Contains(args0, "-n 2") {
+		t.Errorf("doc 0 missing -n 2: %s", args0)
+	}
+	if !strings.Contains(args0, "sides=two-sided-long-edge") {
+		t.Errorf("doc 0 missing sides=two-sided-long-edge: %s", args0)
+	}
+	if !strings.Contains(args0, "print-color-mode=color") {
+		t.Errorf("doc 0 missing print-color-mode=color: %s", args0)
+	}
+
+	// Verify doc 1 options: -n 1, -o print-color-mode=monochrome, no duplex
+	args1 := strings.Join(lpInvocations[1].args, " ")
+	if !strings.Contains(args1, "-n 1") {
+		t.Errorf("doc 1 missing -n 1: %s", args1)
+	}
+	if strings.Contains(args1, "sides=two-sided") {
+		t.Errorf("doc 1 unexpectedly has duplex option: %s", args1)
+	}
+	if !strings.Contains(args1, "print-color-mode=monochrome") {
+		t.Errorf("doc 1 missing print-color-mode=monochrome: %s", args1)
+	}
+	lpCallsMu.Unlock()
+
+	// Part 2: Order with 2 documents where doc 0 has tampered checksum
+	orderTamper := "ord_tamper_002"
+	cmdTamper0 := contracts.PrintJobCommand{
+		JobID:          "job_tamper_0",
+		OrderID:        orderTamper,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-cups-opts",
+		DisplayCode:    "2222",
+		DownloadURL:    fileServer.URL + "/doc_tamper.pdf",
+		SHA256Checksum: "0000000000000000000000000000000000000000000000000000000000000000", // Tampered
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		ColorMode:      "BW",
+		StartFromPage:  1,
+	}
+	cmdTamper1 := contracts.PrintJobCommand{
+		JobID:          "job_tamper_1",
+		OrderID:        orderTamper,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-cups-opts",
+		DisplayCode:    "2222",
+		DownloadURL:    fileServer.URL + "/doc_tamper_valid.pdf",
+		SHA256Checksum: pdfChecksum, // Valid
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		ColorMode:      "BW",
+		StartFromPage:  1,
+	}
+
+	lpCallsMu.Lock()
+	lpBefore := len(lpInvocations)
+	lpCallsMu.Unlock()
+
+	client.handleIncomingJob(cmdTamper0)
+	client.handleIncomingJob(cmdTamper1)
+
+	// Wait for processing of both tampered order jobs
+	deadlineTamper := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadlineTamper) {
+		job1, err := store.GetJob(ctx, "job_tamper_1")
+		if err == nil && job1.Status == contracts.JobStatusPausedError {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify job_tamper_0 is in PAUSED_ERROR state due to checksum failure
+	job0, err := store.GetJob(ctx, "job_tamper_0")
+	if err != nil {
+		t.Fatalf("failed to get job_tamper_0: %v", err)
+	}
+	if job0.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job_tamper_0 status PAUSED_ERROR, got %s", job0.Status)
+	}
+	if !strings.Contains(job0.ErrorReason, "checksum mismatch") {
+		t.Errorf("expected checksum mismatch error reason, got %q", job0.ErrorReason)
+	}
+
+	// Verify job_tamper_1 is in PAUSED_ERROR state due to sibling failure
+	job1, err := store.GetJob(ctx, "job_tamper_1")
+	if err != nil {
+		t.Fatalf("failed to get job_tamper_1: %v", err)
+	}
+	if job1.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job_tamper_1 status PAUSED_ERROR, got %s", job1.Status)
+	}
+	if !strings.Contains(job1.ErrorReason, "order paused due to error in sibling document") {
+		t.Errorf("expected sibling pause error reason, got %q", job1.ErrorReason)
+	}
+
+	// Verify no new lp invocations were made for either job in ord_tamper_002
+	lpCallsMu.Lock()
+	lpAfter := len(lpInvocations)
+	lpCallsMu.Unlock()
+	if lpAfter != lpBefore {
+		t.Errorf("expected no lp calls for tampered order, got %d additional calls", lpAfter-lpBefore)
+	}
+
+	// Order must NOT be completed
+	comp, _ := store.IsOrderCompleted(ctx, orderTamper)
+	if comp {
+		t.Errorf("tampered order must not be completed")
+	}
+}

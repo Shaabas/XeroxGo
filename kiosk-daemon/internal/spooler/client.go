@@ -101,6 +101,7 @@ type ClientConfig struct {
 	MockCUPSHealthDiag       func(ctx context.Context, estimatedSheets int) (contracts.PrinterHealth, error)
 	MockSNMPHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockIPPState             func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error)
+	JobQueueCapacity         int
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -336,11 +337,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		}
 	}
 
+	queueCap := cfg.JobQueueCapacity
+	if queueCap <= 0 {
+		queueCap = 16
+	}
+
 	runCtx, runCancel := context.WithCancel(context.Background())
 	client := &Client{
 		cfg:                   cfg,
 		normalizedURL:         normalizedURL,
-		jobQueue:              make(chan contracts.PrintJobCommand, 16),
+		jobQueue:              make(chan contracts.PrintJobCommand, queueCap),
 		activeJobs:            make(map[string]bool),
 		deferredJobs:          make([]contracts.PrintJobCommand, 0),
 		pendingQueue:          make([]contracts.PrintJobCommand, 0),
