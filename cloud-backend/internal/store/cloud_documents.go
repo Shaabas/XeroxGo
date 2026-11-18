@@ -18,6 +18,10 @@ type CloudDocumentUpload struct {
 }
 
 var ErrCloudUploadUnauthorized = errors.New("cloud document upload not found or unauthorized")
+var ErrCloudUploadQuota = errors.New("cloud document upload hourly quota exceeded")
+
+const cloudMaxUploadsPerKioskHour = 20
+const cloudMaxDeclaredBytesPerKioskHour int64 = 100 * 1024 * 1024
 
 func (s *Store) ReserveCloudDocumentUpload(ctx context.Context, u CloudDocumentUpload) error {
     if s == nil || s.db == nil {
@@ -26,13 +30,33 @@ func (s *Store) ReserveCloudDocumentUpload(ctx context.Context, u CloudDocumentU
     if u.ID == "" || u.TokenHash == "" || u.ObjectKey == "" || u.DeclaredBytes <= 0 {
         return errors.New("invalid cloud upload record")
     }
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil { return err }
+    defer tx.Rollback()
+
+    // This transaction serializes quota checks per kiosk across Render
+    // instances; SQLite already serializes writers. A kiosk ID is NOT an
+    // authentication credential, so edge/IP quotas are still necessary.
+    if s.dialect == "postgres" {
+        if _, err = tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", "cloud-upload:"+u.KioskID); err != nil { return err }
+    }
+    quotaQ := s.rebind(`SELECT COUNT(*), COALESCE(SUM(declared_bytes), 0)
+        FROM document_uploads WHERE kiosk_id=? AND created_at>=?`)
+    var count int64
+    var bytesUsed int64
+    err = tx.QueryRowContext(ctx, quotaQ, u.KioskID, time.Now().UTC().Add(-time.Hour)).Scan(&count, &bytesUsed)
+    if err != nil { return err }
+    if count >= cloudMaxUploadsPerKioskHour ||
+        bytesUsed > cloudMaxDeclaredBytesPerKioskHour-u.DeclaredBytes {
+        return ErrCloudUploadQuota
+    }
     q := s.rebind(`INSERT INTO document_uploads
         (upload_id, upload_token_hash, kiosk_id, original_name, object_key,
          content_type, declared_bytes, state, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_UPLOAD', ?)`)
-    _, err := s.db.ExecContext(ctx, q, u.ID, u.TokenHash, u.KioskID,
-        u.OriginalName, u.ObjectKey, u.ContentType, u.DeclaredBytes, u.ExpiresAt)
-    return err
+    if _, err = tx.ExecContext(ctx, q, u.ID, u.TokenHash, u.KioskID,
+        u.OriginalName, u.ObjectKey, u.ContentType, u.DeclaredBytes, u.ExpiresAt); err != nil { return err }
+    return tx.Commit()
 }
 
 // AuthorizeCloudDocumentUpload checks an opaque capability and its TTL.
