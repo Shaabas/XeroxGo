@@ -85,3 +85,27 @@ create table if not exists public.cloud_order_requests (
 );
 alter table public.cloud_order_requests enable row level security;
 revoke all on public.cloud_order_requests from PUBLIC, anon, authenticated;
+
+
+-- Durable request-driven preparation queue. All inputs originate from Render,
+-- never browser-accessible via Data API. Only one worker may lease a job.
+create table if not exists public.cloud_preparation_jobs (
+  job_id text primary key,
+  upload_id text not null references public.document_uploads(upload_id),
+  settings_hash text not null,
+  normalizer_version text not null,
+  options_json text not null,
+  tariff_revision bigint not null check (tariff_revision > 0),
+  variant_id text references public.document_variants(variant_id),
+  state text not null default 'QUEUED'
+    check (state in ('QUEUED','PROCESSING','READY','FAILED')),
+  attempts integer not null default 0 check (attempts between 0 and 3),
+  lease_expires_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (upload_id, settings_hash, normalizer_version)
+);
+create index if not exists cloud_prep_claim_idx
+  on public.cloud_preparation_jobs (state, lease_expires_at, created_at);
+alter table public.cloud_preparation_jobs enable row level security;
+revoke all on public.cloud_preparation_jobs from PUBLIC, anon, authenticated;
