@@ -119,7 +119,7 @@ func (s *Store) CreateCloudOrderAtomic(ctx context.Context, in CloudOrderInput) 
   string(contracts.JobStatusPendingPayment),price,createdNS,createdNS,expiry.UnixNano(),o.ClaimToken)
  if err!=nil {return "",false,fmt.Errorf("insert cloud order: %w",err)}
 
- color:=strings.ToUpper(strings.TrimSpace(o.ColorMode))
+ color=strings.ToUpper(strings.TrimSpace(o.ColorMode))
  if color=="" {color="BW"}
  _,err=tx.ExecContext(ctx,s.rebind(`INSERT INTO print_configs
   (order_id,download_url,sha256_checksum,total_pages,total_sheets,
