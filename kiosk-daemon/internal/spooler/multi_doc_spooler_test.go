@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"net/http"
 	"net/http/httptest"
@@ -1596,4 +1597,524 @@ func TestMultiDoc_FailClosedOnStoreErrorsAndInconsistency(t *testing.T) {
 	if mockCalled {
 		t.Fatalf("MockCUPSPrint was invoked for already-completed inconsistent doc 1!")
 	}
+}
+
+// TestMultiDoc_QueueSaturation_FIFOOrder verifies that when jobQueue is saturated (constrained buffer capacity),
+// the single ordered producer queues and feeds documents strictly in DocumentIndex order without race-induced reordering.
+func TestMultiDoc_QueueSaturation_FIFOOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "queue_sat.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-sat-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Create a constrained jobQueue channel of capacity 2 to test saturation deterministically
+	client.jobQueue = make(chan contracts.PrintJobCommand, 2)
+
+	orderID := "ord_sat_123"
+	totalDocs := 5
+	var cmds []contracts.PrintJobCommand
+	for i := 0; i < totalDocs; i++ {
+		cmd := contracts.PrintJobCommand{
+			JobID:          fmt.Sprintf("job_sat_%d", i),
+			OrderID:        orderID,
+			DocumentIndex:  i,
+			TotalDocuments: totalDocs,
+			KioskID:        "kiosk-sat-1",
+			DisplayCode:    "5555",
+			DownloadURL:    fileServer.URL + fmt.Sprintf("/doc%d.pdf", i),
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		cmds = append(cmds, cmd)
+	}
+
+	// Admit the order. Since cap is 2 and there are 5 docs, the queue will saturate immediately.
+	// The single ordered producer must handle the saturation without reordering.
+	client.checkAndAdmitOrder(orderID, totalDocs)
+
+	// Consume all 5 jobs from jobQueue in sequence
+	var receivedIndices []int
+	for i := 0; i < totalDocs; i++ {
+		select {
+		case j := <-client.jobQueue:
+			receivedIndices = append(receivedIndices, j.DocumentIndex)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout waiting for job index %d; received so far: %v", i, receivedIndices)
+		}
+	}
+
+	// Verify exact sequence 0, 1, 2, 3, 4
+	for i := 0; i < totalDocs; i++ {
+		if receivedIndices[i] != i {
+			t.Fatalf("expected document index %d at position %d, got %d (full sequence: %v)",
+				i, i, receivedIndices[i], receivedIndices)
+		}
+	}
+}
+
+// TestMultiDoc_DeferredOrder_Sequencing verifies that deferred orders resume strictly in FIFO document order
+// once the kiosk becomes idle, without reordering or skipped documents.
+func TestMultiDoc_DeferredOrder_Sequencing(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "deferred_seq.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-def-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Mark kiosk busy with an active job
+	client.activeMu.Lock()
+	client.activeJobs["active_blocking_job"] = true
+	client.activeMu.Unlock()
+
+	// Order A (3 docs) arrives while busy
+	orderA := "ord_deferred_A"
+	for i := 0; i < 3; i++ {
+		cmd := contracts.PrintJobCommand{
+			JobID:          fmt.Sprintf("job_A_%d", i),
+			OrderID:        orderA,
+			DocumentIndex:  i,
+			TotalDocuments: 3,
+			KioskID:        "kiosk-def-1",
+			DisplayCode:    "1111",
+			DownloadURL:    fileServer.URL + fmt.Sprintf("/docA_%d.pdf", i),
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+	}
+	client.checkAndAdmitOrder(orderA, 3)
+
+	// Since kiosk is busy, all 3 jobs must be in deferredJobs, nothing in jobQueue
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected 0 jobs in queue while busy, got %d", len(client.jobQueue))
+	}
+	client.deferredMu.Lock()
+	defCount := len(client.deferredJobs)
+	client.deferredMu.Unlock()
+	if defCount != 3 {
+		t.Fatalf("expected 3 deferred jobs, got %d", defCount)
+	}
+
+	// Now clear the active blocking job so kiosk becomes idle
+	client.activeMu.Lock()
+	delete(client.activeJobs, "active_blocking_job")
+	client.activeMu.Unlock()
+
+	// Drain deferred jobs
+	client.drainDeferredJobsIfSafe(ctx)
+
+	// Verify all 3 jobs of Order A are queued in strict DocumentIndex order
+	for i := 0; i < 3; i++ {
+		select {
+		case j := <-client.jobQueue:
+			if j.DocumentIndex != i || j.JobID != fmt.Sprintf("job_A_%d", i) {
+				t.Fatalf("expected Order A doc %d, got idx=%d job=%s", i, j.DocumentIndex, j.JobID)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for deferred job %d", i)
+		}
+	}
+}
+
+// TestMultiDoc_StartupRecovery_FIFOOrder verifies that startup recovery resumes unsubmitted jobs in strict
+// DocumentIndex order even if the queue buffer is constrained, preserving prefix completions and sequence.
+func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "startup_seq.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	orderID := "ord_startup_order"
+	totalDocs := 4
+	for i := 0; i < totalDocs; i++ {
+		cmd := contracts.PrintJobCommand{
+			JobID:          fmt.Sprintf("job_startup_%d", i),
+			OrderID:        orderID,
+			DocumentIndex:  i,
+			TotalDocuments: totalDocs,
+			KioskID:        "kiosk-startup-1",
+			DisplayCode:    "3333",
+			DownloadURL:    fileServer.URL + fmt.Sprintf("/doc%d.pdf", i),
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		// Save doc 0 as COMPLETED, and docs 1, 2, 3 as unsubmitted SPOOLING
+		status := contracts.JobStatusSpooling
+		if i == 0 {
+			status = contracts.JobStatusCompleted
+		}
+		_ = store.SaveJob(ctx, cmd, status)
+	}
+
+	var printedDocs []int
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedDocs = append(printedDocs, cmd.DocumentIndex)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+	mockRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("printer-state=idle\nprinter-is-accepting-jobs=true\n"), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-startup-1",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		CUPSRunner:    mockRunner,
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Use a constrained jobQueue buffer to verify startup recovery ordering under saturation
+	client.jobQueue = make(chan contracts.PrintJobCommand, 1)
+
+	// Trigger startup recovery via client.Run with a cancelable context
+	runCtx, runCancel := context.WithCancel(ctx)
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+	defer runCancel()
+
+	// Wait for all 3 uncompleted documents (1, 2, 3) to be submitted via MockCUPSPrint in FIFO order
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		printMu.Lock()
+		cnt := len(printedDocs)
+		printMu.Unlock()
+		if cnt >= 3 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	printMu.Lock()
+	defer printMu.Unlock()
+	if len(printedDocs) != 3 {
+		t.Fatalf("expected 3 recovered documents to be printed, got %d (%v)", len(printedDocs), printedDocs)
+	}
+	if printedDocs[0] != 1 || printedDocs[1] != 2 || printedDocs[2] != 3 {
+		t.Fatalf("expected FIFO execution order [1, 2, 3], got %v", printedDocs)
+	}
+}
+
+// TestMultiDoc_StartupRecovery_InjectedSQLiteFailure verifies that when GetJobsByOrderID fails or returns empty,
+// startup recovery fails closed: incomplete jobs are never substituted or queued, no automatic physical
+// submissions occur, and jobs are transitioned to PAUSED_ERROR reporting the database inconsistency.
+func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
+	ctx := context.Background()
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte("printer-state=idle\nprinter-is-accepting-jobs=true\n"), nil
+	}
+
+	// Case A: GetJobsByOrderID returns an injected SQLite query error
+	t.Run("injected query error fails closed and never submits", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "sqlite_inj_a.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+		defer store.Close()
+		_ = store.ResetPaperTray(ctx, 100)
+
+		var physicalSubmissionCount int64
+		mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+			atomic.AddInt64(&physicalSubmissionCount, 1)
+			return nil
+		}
+
+		orderID := "ord_inj_err_1"
+		cmd0 := contracts.PrintJobCommand{
+			JobID:          "job_inj_0",
+			OrderID:        orderID,
+			DocumentIndex:  0,
+			TotalDocuments: 2,
+			KioskID:        "kiosk-inj-1",
+			DisplayCode:    "7777",
+			DownloadURL:    fileServer.URL + "/doc0.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		cmd1 := contracts.PrintJobCommand{
+			JobID:          "job_inj_1",
+			OrderID:        orderID,
+			DocumentIndex:  1,
+			TotalDocuments: 2,
+			KioskID:        "kiosk-inj-1",
+			DisplayCode:    "7777",
+			DownloadURL:    fileServer.URL + "/doc1.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+
+		// Inject query failure into GetJobsByOrderID
+		errInj := errors.New("injected SQLite disk read error")
+		store.SetInjectedGetJobsByOrderIDErr(errInj)
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+			KioskID:       "kiosk-inj-1",
+			StateStore:    store,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://example.com/qr",
+			ScreenSink:    func(*image.RGBA) error { return nil },
+			HTTPClient:    fileServer.Client(),
+			CUPSQueue:     "MockQueue",
+			CUPSRunner:    mockRunner,
+			MockCUPSPrint: mockCUPS,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		runCtx, runCancel := context.WithCancel(ctx)
+		go func() {
+			_ = client.Run(runCtx)
+		}()
+		defer runCancel()
+
+		// Poll until jobs are marked PAUSED_ERROR with database inconsistency
+		deadline := time.Now().Add(5 * time.Second)
+		var j0, j1 *state.StoredJob
+		for time.Now().Before(deadline) {
+			j0, _ = store.GetJob(ctx, "job_inj_0")
+			j1, _ = store.GetJob(ctx, "job_inj_1")
+			if j0 != nil && j0.Status == contracts.JobStatusPausedError &&
+				j1 != nil && j1.Status == contracts.JobStatusPausedError {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		// 1. Must never substitute incomplete list or queue jobs
+		if len(client.jobQueue) != 0 {
+			t.Fatalf("expected 0 jobs queued on injected SQLite error, got %d", len(client.jobQueue))
+		}
+
+		// 2. Must never trigger automatic physical submission
+		if atomic.LoadInt64(&physicalSubmissionCount) != 0 {
+			t.Fatalf("injected SQLite error triggered physical submission!")
+		}
+
+		// 3. Jobs in store must be transitioned to PAUSED_ERROR reporting database inconsistency
+		if j0 == nil || j0.Status != contracts.JobStatusPausedError || !strings.Contains(j0.ErrorReason, "database inconsistency") {
+			t.Fatalf("expected job 0 in PAUSED_ERROR with database inconsistency, got status=%v reason=%q", j0.Status, j0.ErrorReason)
+		}
+		if j1 == nil || j1.Status != contracts.JobStatusPausedError || !strings.Contains(j1.ErrorReason, "database inconsistency") {
+			t.Fatalf("expected job 1 in PAUSED_ERROR with database inconsistency, got status=%v reason=%q", j1.Status, j1.ErrorReason)
+		}
+	})
+
+	// Case B: GetJobsByOrderID returns empty slice (unexpected empty result)
+	t.Run("unexpected empty order jobs fails closed and never submits", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		store, err := state.Open(filepath.Join(tmpDir, "sqlite_inj_b.db"))
+		if err != nil {
+			t.Fatalf("state.Open failed: %v", err)
+		}
+		defer store.Close()
+		_ = store.ResetPaperTray(ctx, 100)
+
+		var physicalSubmissionCount int64
+		mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+			atomic.AddInt64(&physicalSubmissionCount, 1)
+			return nil
+		}
+
+		orderID := "ord_inj_empty_2"
+		cmd := contracts.PrintJobCommand{
+			JobID:          "job_inj_empty_0",
+			OrderID:        orderID,
+			DocumentIndex:  0,
+			TotalDocuments: 1,
+			KioskID:        "kiosk-inj-2",
+			DisplayCode:    "7778",
+			DownloadURL:    fileServer.URL + "/doc0.pdf",
+			SHA256Checksum: pdfChecksum,
+			TotalPages:     1,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			StartFromPage:  1,
+		}
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+
+		// Inject empty result into GetJobsByOrderID
+		store.SetInjectedGetJobsByOrderIDEmpty(true)
+
+		client, err := NewClient(ClientConfig{
+			CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+			KioskID:       "kiosk-inj-2",
+			StateStore:    store,
+			DownloadDir:   tmpDir,
+			IdleQRContent: "https://example.com/qr",
+			ScreenSink:    func(*image.RGBA) error { return nil },
+			HTTPClient:    fileServer.Client(),
+			CUPSQueue:     "MockQueue",
+			CUPSRunner:    mockRunner,
+			MockCUPSPrint: mockCUPS,
+		})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		runCtx, runCancel := context.WithCancel(ctx)
+		go func() {
+			_ = client.Run(runCtx)
+		}()
+		defer runCancel()
+
+		// Poll until job is marked PAUSED_ERROR with database inconsistency
+		deadline := time.Now().Add(5 * time.Second)
+		var j *state.StoredJob
+		for time.Now().Before(deadline) {
+			j, _ = store.GetJob(ctx, "job_inj_empty_0")
+			if j != nil && j.Status == contracts.JobStatusPausedError {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		// 1. Must never substitute incomplete list or queue jobs
+		if len(client.jobQueue) != 0 {
+			t.Fatalf("expected 0 jobs queued on unexpected empty order jobs, got %d", len(client.jobQueue))
+		}
+
+		// 2. Must never trigger automatic physical submission
+		if atomic.LoadInt64(&physicalSubmissionCount) != 0 {
+			t.Fatalf("unexpected empty order jobs triggered physical submission!")
+		}
+
+		// 3. Job in store must be marked PAUSED_ERROR reporting database inconsistency
+		if j == nil || j.Status != contracts.JobStatusPausedError || !strings.Contains(j.ErrorReason, "database inconsistency") {
+			t.Fatalf("expected job in PAUSED_ERROR with database inconsistency, got status=%v reason=%q", j.Status, j.ErrorReason)
+		}
+	})
 }

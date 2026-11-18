@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,7 +15,10 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db                            *sql.DB
+	testHookMu                   sync.RWMutex
+	injectedGetJobsByOrderIDErr   error
+	injectedGetJobsByOrderIDEmpty bool
 }
 
 type StoredJob struct {
@@ -813,6 +817,26 @@ WHERE job_id = ?;`
 	return job, nil
 }
 
+// SetInjectedGetJobsByOrderIDErr sets an error to be returned by GetJobsByOrderID in tests.
+func (s *Store) SetInjectedGetJobsByOrderIDErr(err error) {
+	if s == nil {
+		return
+	}
+	s.testHookMu.Lock()
+	defer s.testHookMu.Unlock()
+	s.injectedGetJobsByOrderIDErr = err
+}
+
+// SetInjectedGetJobsByOrderIDEmpty forces GetJobsByOrderID to return an empty slice in tests.
+func (s *Store) SetInjectedGetJobsByOrderIDEmpty(empty bool) {
+	if s == nil {
+		return
+	}
+	s.testHookMu.Lock()
+	defer s.testHookMu.Unlock()
+	s.injectedGetJobsByOrderIDEmpty = empty
+}
+
 // GetJobsByOrderID returns all jobs belonging to an order, ordered by document_index.
 func (s *Store) GetJobsByOrderID(
 	ctx context.Context,
@@ -826,6 +850,16 @@ func (s *Store) GetJobsByOrderID(
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	s.testHookMu.RLock()
+	injErr := s.injectedGetJobsByOrderIDErr
+	injEmpty := s.injectedGetJobsByOrderIDEmpty
+	s.testHookMu.RUnlock()
+	if injErr != nil {
+		return nil, injErr
+	}
+	if injEmpty {
+		return []StoredJob{}, nil
 	}
 	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {

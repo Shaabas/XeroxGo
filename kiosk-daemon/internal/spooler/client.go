@@ -103,6 +103,12 @@ type Client struct {
 	deferredMu   sync.Mutex
 	deferredJobs []contracts.PrintJobCommand
 
+	queueMu         sync.Mutex
+	pendingQueue    []contracts.PrintJobCommand
+	producerRunning bool
+	runCtx          context.Context
+	runCancel       context.CancelFunc
+
 	idleMu    sync.Mutex
 	idleTimer *time.Timer
 
@@ -313,12 +319,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		}
 	}
 
+	runCtx, runCancel := context.WithCancel(context.Background())
 	client := &Client{
 		cfg:                   cfg,
 		normalizedURL:         normalizedURL,
 		jobQueue:              make(chan contracts.PrintJobCommand, 16),
 		activeJobs:            make(map[string]bool),
 		deferredJobs:          make([]contracts.PrintJobCommand, 0),
+		pendingQueue:          make([]contracts.PrintJobCommand, 0),
+		runCtx:                runCtx,
+		runCancel:             runCancel,
 		minBackoff:            1 * time.Second,
 		maxBackoff:            30 * time.Second,
 		heartbeatInterval:     15 * time.Second,
@@ -466,6 +476,11 @@ func (c *Client) DiscoverStartupPrinterState(ctx context.Context) printer.IPPPri
 
 // Run executes the spooler client loops until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
+	runCtx, runCancel := context.WithCancel(ctx)
+	c.runCtx = runCtx
+	c.runCancel = runCancel
+	defer c.runCancel()
+
 	defer func() {
 		c.idleMu.Lock()
 		if c.idleTimer != nil {
@@ -512,12 +527,75 @@ func (c *Client) Run(ctx context.Context) error {
 			incList := orderIncompleteMap[oid]
 			allOrderJobs, err := c.cfg.StateStore.GetJobsByOrderID(ctx, oid)
 			if err != nil || len(allOrderJobs) == 0 {
-				allOrderJobs = incList
+				reason := fmt.Sprintf("startup recovery: failed to read order %s jobs (err: %v, count: %d); database inconsistency, manual reconciliation required", oid, err, len(allOrderJobs))
+				log.Printf("[SPOOLER] %s", reason)
+				for _, incomplete := range incList {
+					evt := contracts.JobProgressEvent{
+						JobID:         incomplete.Command.JobID,
+						KioskID:       incomplete.Command.KioskID,
+						Status:        contracts.JobStatusPausedError,
+						PagesPrinted:  incomplete.PagesPrinted,
+						SheetsPrinted: incomplete.SheetsPrinted,
+						ErrorReason:   reason,
+						Timestamp:     time.Now().UTC(),
+					}
+					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+					c.sendProgress(ctx, evt)
+				}
+				continue
 			}
 
 			totalDocs := allOrderJobs[0].Command.TotalDocuments
 			if totalDocs < 1 {
 				totalDocs = 1
+			}
+
+			if len(allOrderJobs) != totalDocs {
+				reason := fmt.Sprintf("startup recovery: order %s has inconsistent document count (expected %d, found %d); database inconsistency, manual reconciliation required", oid, totalDocs, len(allOrderJobs))
+				log.Printf("[SPOOLER] %s", reason)
+				for _, incomplete := range incList {
+					evt := contracts.JobProgressEvent{
+						JobID:         incomplete.Command.JobID,
+						KioskID:       incomplete.Command.KioskID,
+						Status:        contracts.JobStatusPausedError,
+						PagesPrinted:  incomplete.PagesPrinted,
+						SheetsPrinted: incomplete.SheetsPrinted,
+						ErrorReason:   reason,
+						Timestamp:     time.Now().UTC(),
+					}
+					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+					c.sendProgress(ctx, evt)
+				}
+				continue
+			}
+
+			docIdxMap := make(map[int]bool)
+			validIndices := true
+			for _, oj := range allOrderJobs {
+				idx := oj.Command.DocumentIndex
+				if idx < 0 || idx >= totalDocs || docIdxMap[idx] {
+					validIndices = false
+					break
+				}
+				docIdxMap[idx] = true
+			}
+			if !validIndices || len(docIdxMap) != totalDocs {
+				reason := fmt.Sprintf("startup recovery: order %s has invalid or duplicate document indices; database inconsistency, manual reconciliation required", oid)
+				log.Printf("[SPOOLER] %s", reason)
+				for _, incomplete := range incList {
+					evt := contracts.JobProgressEvent{
+						JobID:         incomplete.Command.JobID,
+						KioskID:       incomplete.Command.KioskID,
+						Status:        contracts.JobStatusPausedError,
+						PagesPrinted:  incomplete.PagesPrinted,
+						SheetsPrinted: incomplete.SheetsPrinted,
+						ErrorReason:   reason,
+						Timestamp:     time.Now().UTC(),
+					}
+					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+					c.sendProgress(ctx, evt)
+				}
+				continue
 			}
 
 			// Check if any job in this order had an actual error or was partially submitted/printed
@@ -740,6 +818,21 @@ func (c *Client) Run(ctx context.Context) error {
 					}
 				}
 
+				// Verify contiguous sequence of resume indices:
+				// documents from firstResumeIdx to totalDocs-1 must all be present in jobsToResume
+				if canResume {
+					expectedSuffixCount := totalDocs - firstResumeIdx
+					if len(jobsToResume) != expectedSuffixCount {
+						canResume = false
+					}
+					for k, j := range jobsToResume {
+						if j.DocumentIndex != firstResumeIdx+k {
+							canResume = false
+							break
+						}
+					}
+				}
+
 				if canResume {
 					c.activeMu.Lock()
 					for _, j := range jobsToResume {
@@ -747,14 +840,22 @@ func (c *Client) Run(ctx context.Context) error {
 					}
 					c.activeMu.Unlock()
 
+					c.enqueueJobs(jobsToResume)
+				} else if len(jobsToResume) > 0 {
+					reason := fmt.Sprintf("startup recovery: order %s has non-contiguous completion gap; manual reconciliation required", oid)
+					log.Printf("[SPOOLER] %s", reason)
 					for _, j := range jobsToResume {
-						select {
-						case c.jobQueue <- j:
-						default:
-							go func(cmd contracts.PrintJobCommand) {
-								c.jobQueue <- cmd
-							}(j)
+						evt := contracts.JobProgressEvent{
+							JobID:         j.JobID,
+							KioskID:       j.KioskID,
+							Status:        contracts.JobStatusPausedError,
+							PagesPrinted:  0,
+							SheetsPrinted: 0,
+							ErrorReason:   reason,
+							Timestamp:     time.Now().UTC(),
 						}
+						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+						c.sendProgress(ctx, evt)
 					}
 				}
 			}
@@ -1238,19 +1339,15 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 	}
 	c.activeMu.Unlock()
 
-	// Queue uncompleted documents in strict DocumentIndex order
+	// Queue uncompleted documents in strict DocumentIndex order via single ordered producer
+	var toQueue []contracts.PrintJobCommand
 	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
 		dCmd := docMap[idx].Command
-		select {
-		case c.jobQueue <- dCmd:
-			log.Printf("[SPOOLER] Queued print job %s (order %s, doc %d/%d, pages=%d, sheets=%d, copies=%d, duplex=%s)",
-				dCmd.JobID, orderID, idx+1, totalDocs, dCmd.TotalPages, dCmd.TotalSheets, dCmd.Copies, dCmd.Duplex)
-		default:
-			go func(cmd contracts.PrintJobCommand) {
-				c.jobQueue <- cmd
-			}(dCmd)
-		}
+		log.Printf("[SPOOLER] Queued print job %s (order %s, doc %d/%d, pages=%d, sheets=%d, copies=%d, duplex=%s)",
+			dCmd.JobID, orderID, idx+1, totalDocs, dCmd.TotalPages, dCmd.TotalSheets, dCmd.Copies, dCmd.Duplex)
+		toQueue = append(toQueue, dCmd)
 	}
+	c.enqueueJobs(toQueue)
 }
 
 func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
@@ -1385,7 +1482,10 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 
 	// Queue full check: after durable persistence in SQLite, if jobQueue is full, do not admit or send job_ack
-	if cap(c.jobQueue) > 0 && len(c.jobQueue) >= cap(c.jobQueue) {
+	c.queueMu.Lock()
+	isQueueFull := cap(c.jobQueue) > 0 && (len(c.jobQueue)+len(c.pendingQueue) >= cap(c.jobQueue))
+	c.queueMu.Unlock()
+	if isQueueFull {
 		c.connMu.Lock()
 		conn := c.conn
 		c.connMu.Unlock()
@@ -1615,6 +1715,83 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 	}
 }
 
+// enqueueJobs queues jobs in strict sequence using a single ordered producer mechanism.
+// If jobQueue has available capacity, jobs are queued immediately and synchronously.
+// Under queue saturation, remaining jobs are buffered in pendingQueue and fed to
+// jobQueue strictly in FIFO document-index order by a single producer goroutine.
+func (c *Client) enqueueJobs(jobs []contracts.PrintJobCommand) {
+	if len(jobs) == 0 {
+		return
+	}
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+
+	// If producer is already running, earlier jobs are pending;
+	// append to pendingQueue to guarantee FIFO document order.
+	if c.producerRunning {
+		c.pendingQueue = append(c.pendingQueue, jobs...)
+		return
+	}
+
+	// No producer currently active: try to push as many as possible directly into c.jobQueue
+	c.pendingQueue = append(c.pendingQueue, jobs...)
+	for len(c.pendingQueue) > 0 {
+		select {
+		case c.jobQueue <- c.pendingQueue[0]:
+			c.pendingQueue = c.pendingQueue[1:]
+		default:
+			// c.jobQueue is saturated. Launch the single ordered producer.
+			c.producerRunning = true
+			go c.runProducer()
+			return
+		}
+	}
+}
+
+func (c *Client) runProducer() {
+	for {
+		c.queueMu.Lock()
+		if len(c.pendingQueue) == 0 {
+			c.producerRunning = false
+			c.queueMu.Unlock()
+			return
+		}
+		nextJob := c.pendingQueue[0]
+		c.queueMu.Unlock()
+
+		var ctx context.Context
+		if c.runCtx != nil {
+			ctx = c.runCtx
+		} else {
+			ctx = context.Background()
+		}
+
+		select {
+		case <-ctx.Done():
+			c.queueMu.Lock()
+			c.producerRunning = false
+			c.queueMu.Unlock()
+			return
+		case c.jobQueue <- nextJob:
+			c.queueMu.Lock()
+			if len(c.pendingQueue) > 0 && c.pendingQueue[0].JobID == nextJob.JobID {
+				c.pendingQueue = c.pendingQueue[1:]
+			}
+			// Drain opportunistically while c.jobQueue has space
+			for len(c.pendingQueue) > 0 {
+				select {
+				case c.jobQueue <- c.pendingQueue[0]:
+					c.pendingQueue = c.pendingQueue[1:]
+				default:
+					goto nextIter
+				}
+			}
+		nextIter:
+			c.queueMu.Unlock()
+		}
+	}
+}
+
 func (c *Client) jobWorker(ctx context.Context) {
 	for {
 		select {
@@ -1790,15 +1967,7 @@ func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 	c.activeMu.Unlock()
 
 	log.Printf("[SPOOLER] Resuming %d deferred jobs for order %s now that kiosk is idle", len(orderJobs), targetOrderID)
-	for _, j := range orderJobs {
-		select {
-		case c.jobQueue <- j:
-		default:
-			go func(cmd contracts.PrintJobCommand) {
-				c.jobQueue <- cmd
-			}(j)
-		}
-	}
+	c.enqueueJobs(orderJobs)
 }
 
 func formatCUPSHoldOutcomeReason(baseReason string, cupsJobID string, holdRes printer.HoldResult) string {
@@ -3391,12 +3560,7 @@ func (c *Client) RequestCloudRecovery(
 	c.activeJobs[cmd.JobID] = true
 	c.activeMu.Unlock()
 
-	select {
-	case c.jobQueue <- cmd:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
+	c.enqueueJobs([]contracts.PrintJobCommand{cmd})
 	return &cmd, nil
 }
 
