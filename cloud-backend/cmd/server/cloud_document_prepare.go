@@ -12,7 +12,6 @@ import (
  "io"
  "net/http"
  "os"
- "path/filepath"
  "strconv"
  "strings"
  "time"
@@ -191,6 +190,3 @@ func (s *appServer) handleCloudVariantPrepare(w http.ResponseWriter,r *http.Requ
  })
 }
 
-// Compile-time guard against accidentally using a user-controlled filesystem
-// path. All temp paths originate from a Render-controlled scratch directory.
-var _ = filepath.Base
