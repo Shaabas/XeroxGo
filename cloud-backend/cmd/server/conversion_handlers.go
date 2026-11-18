@@ -288,6 +288,7 @@ func (s *appServer) startConversionWorker(ctx context.Context) {
 		case <-cleanupTicker.C:
 			s.cleanupExpiredConversions(ctx)
 			s.cleanupExpiredOrderArtifacts(ctx)
+			s.cleanupExpiredCloudDocuments(ctx)
 		case <-s.convWake:
 			s.processQueuedConversions(ctx)
 		case <-pollTicker.C:
