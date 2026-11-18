@@ -3228,6 +3228,14 @@ type PaymentCaptureResult struct {
 	Commands         []contracts.PrintJobCommand
 }
 
+// IsVerifiedCapturedStatus reports whether a payment status string represents
+// verified successful capture (e.g. "captured" or "paid"). Merely "authorized",
+// "pending", or "failed" payments are NOT sufficient for physical printing.
+func IsVerifiedCapturedStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	return s == "captured" || s == "paid"
+}
+
 // CapturePaymentAndCheckDispatch atomically records payment, transitions order status to PAID_WAITING,
 // and determines whether an active unexpired kiosk session authorizes physical print dispatch.
 // If an active session authorizes dispatch, the session is completed, order transitions to DISPATCHED,
@@ -3243,8 +3251,20 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 	}
 	p.OrderID = strings.TrimSpace(p.OrderID)
 	p.PaymentID = strings.TrimSpace(p.PaymentID)
+	p.Provider = strings.TrimSpace(p.Provider)
+	p.Status = strings.TrimSpace(p.Status)
+
 	if p.OrderID == "" || p.PaymentID == "" {
 		return nil, errors.New("orderID and paymentID cannot be empty")
+	}
+	if p.Provider == "" {
+		return nil, errors.New("payment provider identity cannot be empty")
+	}
+	if p.AmountPaise <= 0 {
+		return nil, fmt.Errorf("payment amount must be greater than zero, got %d", p.AmountPaise)
+	}
+	if !IsVerifiedCapturedStatus(p.Status) {
+		return nil, fmt.Errorf("payment %s status %q is not verified captured: physical printing requires verified successful capture", p.PaymentID, p.Status)
 	}
 	nowNS := now.UTC().UnixNano()
 
@@ -3269,11 +3289,14 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 		if existingOrderID != p.OrderID {
 			return nil, fmt.Errorf("payment %s already exists for conflicting order %s (cannot be reused for order %s)", p.PaymentID, existingOrderID, p.OrderID)
 		}
-		if p.AmountPaise > 0 && p.AmountPaise != existingAmount {
+		if existingAmount <= 0 || p.AmountPaise != existingAmount {
 			return nil, fmt.Errorf("payment %s amount mismatch for order %s: existing %d paise vs requested %d paise", p.PaymentID, p.OrderID, existingAmount, p.AmountPaise)
 		}
-		if p.Provider != "" && existingProvider != "" && p.Provider != existingProvider {
+		if existingProvider == "" || p.Provider != existingProvider {
 			return nil, fmt.Errorf("payment %s provider mismatch for order %s: existing %s vs requested %s", p.PaymentID, p.OrderID, existingProvider, p.Provider)
+		}
+		if !IsVerifiedCapturedStatus(existingStatus) {
+			return nil, fmt.Errorf("payment %s existing status %q is not verified captured", p.PaymentID, existingStatus)
 		}
 
 		order, oErr := s.GetOrder(ctx, p.OrderID)
@@ -3323,7 +3346,7 @@ WHERE order_id = ?;
 	}
 
 	// 3. Verify amount against authoritative price
-	if p.AmountPaise > 0 && p.AmountPaise != pricePaise {
+	if p.AmountPaise != pricePaise {
 		return nil, fmt.Errorf("payment amount mismatch: expected %d paise, got %d paise", pricePaise, p.AmountPaise)
 	}
 
@@ -4113,21 +4136,32 @@ ORDER BY created_at_ns ASC;
 			continue
 		}
 
-		// Validate payment status explicitly
-		var payStatus string
+		// Validate payment status explicitly: require verified captured payment record
+		var (
+			payStatus   string
+			payAmount   int64
+			payProvider string
+		)
 		qPay := s.rebind(`
-SELECT status
+SELECT status, amount_paise, provider
 FROM payments
-WHERE order_id = ? AND status IN ('captured', 'paid', 'COMPLETED', 'authorized', 'success')
+WHERE order_id = ? AND status IN ('captured', 'paid')
+ORDER BY created_at_ns DESC
 LIMIT 1;
 `)
-		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID).Scan(&payStatus)
+		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID).Scan(&payStatus, &payAmount, &payProvider)
 		if errPay != nil {
 			if errors.Is(errPay, sql.ErrNoRows) {
-				// No captured/authorized payment exists for this order; do not dispatch!
+				// No verified captured payment exists for this order; do not dispatch!
 				continue
 			}
 			return nil, fmt.Errorf("get pending dispatch orders: check payment for order %s: %w", cand.orderID, errPay)
+		}
+		if payAmount <= 0 || payAmount != ord.PricePaise {
+			return nil, fmt.Errorf("get pending dispatch orders: payment amount mismatch for order %s: expected %d paise, got %d paise", cand.orderID, ord.PricePaise, payAmount)
+		}
+		if strings.TrimSpace(payProvider) == "" {
+			return nil, fmt.Errorf("get pending dispatch orders: missing payment provider for order %s", cand.orderID)
 		}
 
 		// Retrieve child document job - never fall back to parent print command

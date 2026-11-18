@@ -1675,3 +1675,366 @@ func TestGetPendingDispatchOrders_FailedPaymentStatus_NotDispatched(t *testing.T
 		}
 	}
 }
+
+func TestCapturePayment_AuthorizedStatus_Rejected(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-auth-rej"
+	orderID := "ord-auth-rej-1"
+
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{JobID: "job_" + orderID, KioskID: kioskID, DisplayCode: "1234", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  100,
+		TotalPages:  1,
+		TotalSheets: 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Attempt capture with status "authorized" - MUST BE REJECTED!
+	pay := PaymentRecord{
+		PaymentID:   "pay-auth-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 100,
+		Status:      "authorized",
+		Provider:    "razorpay",
+	}
+	_, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+	if err == nil {
+		t.Fatal("expected error when capturing merely authorized payment, got nil")
+	}
+	if !strings.Contains(err.Error(), "not verified captured") {
+		t.Errorf("expected error to mention 'not verified captured', got: %v", err)
+	}
+
+	// Verify order is STILL in PENDING_PAYMENT
+	freshOrd, _ := s.GetOrder(ctx, orderID)
+	if freshOrd.Status != contracts.JobStatusPendingPayment {
+		t.Errorf("expected order status PENDING_PAYMENT, got %v", freshOrd.Status)
+	}
+}
+
+func TestCapturePayment_FailedStatus_Rejected(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-fail-rej"
+	orderID := "ord-fail-rej-1"
+
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{JobID: "job_" + orderID, KioskID: kioskID, DisplayCode: "1234", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  100,
+		TotalPages:  1,
+		TotalSheets: 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Attempt capture with status "failed"
+	pay := PaymentRecord{
+		PaymentID:   "pay-fail-1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 100,
+		Status:      "failed",
+		Provider:    "razorpay",
+	}
+	_, err := s.CapturePaymentAndCheckDispatch(ctx, pay, now)
+	if err == nil {
+		t.Fatal("expected error when capturing failed payment, got nil")
+	}
+	if !strings.Contains(err.Error(), "not verified captured") {
+		t.Errorf("expected error to mention 'not verified captured', got: %v", err)
+	}
+}
+
+func TestCapturePayment_InvalidAmountAndProvider_Rejected(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-inv-pay"
+	orderID := "ord-inv-pay-1"
+
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{JobID: "job_" + orderID, KioskID: kioskID, DisplayCode: "1234", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  200,
+		TotalPages:  1,
+		TotalSheets: 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Zero amount
+	payZero := PaymentRecord{
+		PaymentID:   "pay-zero",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 0,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, payZero, now); err == nil {
+		t.Fatal("expected error for zero amount, got nil")
+	}
+
+	// Negative amount
+	payNeg := PaymentRecord{
+		PaymentID:   "pay-neg",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: -50,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, payNeg, now); err == nil {
+		t.Fatal("expected error for negative amount, got nil")
+	}
+
+	// Empty provider
+	payNoProv := PaymentRecord{
+		PaymentID:   "pay-noprov",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 200,
+		Status:      "captured",
+		Provider:    "",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, payNoProv, now); err == nil {
+		t.Fatal("expected error for empty provider, got nil")
+	}
+}
+
+func TestCapturePayment_Replay_IncompleteOrConflictingDetails_Rejected(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-rep-det"
+	orderID := "ord-rep-det-1"
+
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{JobID: "job_" + orderID, KioskID: kioskID, DisplayCode: "5678", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  300,
+		TotalPages:  1,
+		TotalSheets: 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Capture initially with valid details
+	initialPay := PaymentRecord{
+		PaymentID:   "pay-rep-orig",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 300,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	res1, err := s.CapturePaymentAndCheckDispatch(ctx, initialPay, now)
+	if err != nil {
+		t.Fatalf("initial capture failed: %v", err)
+	}
+	if res1.AlreadyProcessed {
+		t.Fatal("expected initial capture to not be marked already processed")
+	}
+
+	// Replay with zero amount - rejected
+	repZero := PaymentRecord{
+		PaymentID:   "pay-rep-orig",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 0,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, repZero, now); err == nil {
+		t.Fatal("expected error when replaying with zero amount")
+	}
+
+	// Replay with empty provider - rejected
+	repNoProv := PaymentRecord{
+		PaymentID:   "pay-rep-orig",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 300,
+		Status:      "captured",
+		Provider:    "",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, repNoProv, now); err == nil {
+		t.Fatal("expected error when replaying with empty provider")
+	}
+
+	// Replay with conflicting provider - rejected
+	repDiffProv := PaymentRecord{
+		PaymentID:   "pay-rep-orig",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 300,
+		Status:      "captured",
+		Provider:    "stripe",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, repDiffProv, now); err == nil {
+		t.Fatal("expected error when replaying with conflicting provider")
+	}
+
+	// Replay with conflicting amount - rejected
+	repDiffAmount := PaymentRecord{
+		PaymentID:   "pay-rep-orig",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 400,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	if _, err := s.CapturePaymentAndCheckDispatch(ctx, repDiffAmount, now); err == nil {
+		t.Fatal("expected error when replaying with conflicting amount")
+	}
+
+	// Replay with identical valid details - succeeds idempotently
+	repIdentical := PaymentRecord{
+		PaymentID:   "pay-rep-orig",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		AmountPaise: 300,
+		Status:      "captured",
+		Provider:    "razorpay",
+	}
+	resRep, err := s.CapturePaymentAndCheckDispatch(ctx, repIdentical, now)
+	if err != nil {
+		t.Fatalf("replay with identical details failed: %v", err)
+	}
+	if !resRep.AlreadyProcessed {
+		t.Fatal("expected replay with identical details to be marked already processed")
+	}
+	if resRep.DispatchEligible {
+		t.Fatal("expected replay with identical details to NOT be dispatch eligible")
+	}
+}
+
+func TestGetPendingDispatchOrders_AuthorizedPayment_NotDispatched(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-auth-not-disp"
+	orderID := "ord-auth-not-disp-1"
+
+	docs := []OrderDocument{
+		{JobID: "job-auth-0", OrderID: orderID, DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 150},
+	}
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "7777"},
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  150,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Add payment with status "authorized" (NOT captured!)
+	_, err := s.db.Exec(`INSERT INTO payments (payment_id, order_id, kiosk_id, amount_paise, status, provider, created_at_ns) VALUES ('pay-auth-rec-1', ?, ?, 150, 'authorized', 'razorpay', ?);`,
+		orderID, kioskID, now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert payment failed: %v", err)
+	}
+
+	// Insert pending intent
+	_, err = s.db.Exec(`INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, status, created_at_ns, updated_at_ns) VALUES ('job-auth-0', ?, ?, 'PENDING', ?, ?);`,
+		orderID, kioskID, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert intent failed: %v", err)
+	}
+
+	// GetPendingDispatchOrders MUST NEVER dispatch merely authorized orders!
+	cmds, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil {
+		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
+	}
+	for _, c := range cmds {
+		if c.OrderID == orderID {
+			t.Fatalf("VIOLATION: order with merely authorized payment was dispatched!")
+		}
+	}
+}
+
+func TestGetPendingDispatchOrders_CapturedPayment_SuccessfullyDispatched(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	kioskID := "kiosk-cap-disp"
+	orderID := "ord-cap-disp-1"
+
+	docs := []OrderDocument{
+		{JobID: "job-cap-0", OrderID: orderID, DocumentIndex: 0, TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, PricePaise: 250},
+	}
+	ord := Order{
+		OrderID:     orderID,
+		Command:     contracts.PrintJobCommand{KioskID: kioskID, DisplayCode: "8888"},
+		Status:      contracts.JobStatusDispatched,
+		PricePaise:  250,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents:   docs,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Add verified captured payment
+	_, err := s.db.Exec(`INSERT INTO payments (payment_id, order_id, kiosk_id, amount_paise, status, provider, created_at_ns) VALUES ('pay-cap-rec-1', ?, ?, 250, 'captured', 'razorpay', ?);`,
+		orderID, kioskID, now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert payment failed: %v", err)
+	}
+
+	// Insert pending intent
+	_, err = s.db.Exec(`INSERT INTO dispatch_intents (job_id, order_id, kiosk_id, status, created_at_ns, updated_at_ns) VALUES ('job-cap-0', ?, ?, 'PENDING', ?, ?);`,
+		orderID, kioskID, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		t.Fatalf("insert intent failed: %v", err)
+	}
+
+	// GetPendingDispatchOrders MUST return the command!
+	cmds, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil {
+		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
+	}
+	found := false
+	for _, c := range cmds {
+		if c.OrderID == orderID && c.JobID == "job-cap-0" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected order %s job job-cap-0 to be dispatched, got cmds: %+v", orderID, cmds)
+	}
+}

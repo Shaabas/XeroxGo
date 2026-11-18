@@ -469,6 +469,16 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 	}
 
 	now := time.Now().UTC()
+	if att.AmountPaise <= 0 {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "payment amount must be greater than zero"})
+			return
+		}
+		s.renderDemoErrorPage(w, http.StatusBadRequest, "Invalid Payment", "Payment amount must be greater than zero.")
+		return
+	}
 	if now.After(att.ExpiresAt) {
 		if isJSONRequest(r) {
 			w.Header().Set("Content-Type", "application/json")

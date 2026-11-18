@@ -1115,7 +1115,11 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 
 	if attempt != nil {
 		// Strictly enforce attempt binding
-		if entity.Amount > 0 && entity.Amount != attempt.AmountPaise {
+		if entity.Amount <= 0 {
+			http.Error(w, "payment amount must be greater than zero", http.StatusBadRequest)
+			return
+		}
+		if entity.Amount != attempt.AmountPaise {
 			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", attempt.AmountPaise, entity.Amount), http.StatusBadRequest)
 			return
 		}
@@ -1145,7 +1149,11 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 			http.Error(w, "unassociated payment attempt: no matching stored attempt or order found", http.StatusBadRequest)
 			return
 		}
-		if entity.Amount > 0 && entity.Amount != order.PricePaise {
+		if entity.Amount <= 0 {
+			http.Error(w, "payment amount must be greater than zero", http.StatusBadRequest)
+			return
+		}
+		if entity.Amount != order.PricePaise {
 			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", order.PricePaise, entity.Amount), http.StatusBadRequest)
 			return
 		}

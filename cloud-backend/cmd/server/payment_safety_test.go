@@ -1944,3 +1944,280 @@ func TestPaymentPhase1_Webhook_FullLifecycleAndDispatch(t *testing.T) {
 	_ = sessionID
 }
 
+func TestPaymentSafety_Webhook_AuthorizedEvent_Ignored(t *testing.T) {
+	kioskID := "kiosk-wh-auth"
+	orderID := "ord_wh_auth_001"
+	pin := "1122"
+	pricePaise := int64(800)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	// 1. Claim session
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, err := http.DefaultClient.Do(claimReq)
+	if err != nil || claimResp.StatusCode != http.StatusOK {
+		t.Fatalf("claim failed: %v", err)
+	}
+	claimResp.Body.Close()
+
+	// 2. Initiate payment
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil || initResp.StatusCode != http.StatusOK {
+		t.Fatalf("initiate payment failed: %v", err)
+	}
+	var initBody map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initBody)
+	initResp.Body.Close()
+	providerOrderID := initBody["provider_order_id"].(string)
+
+	// 3. Send payment.authorized webhook (merely authorized, NOT captured!)
+	payload := map[string]interface{}{
+		"event": "payment.authorized",
+		"payload": map[string]interface{}{
+			"payment": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":       "pay_auth_test_123",
+					"order_id": providerOrderID,
+					"amount":   pricePaise,
+					"currency": "INR",
+					"status":   "authorized",
+				},
+			},
+		},
+	}
+	rawBytes, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(whSec))
+	mac.Write(rawBytes)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq.Header.Set("Content-Type", "application/json")
+	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatalf("webhook request failed: %v", err)
+	}
+	defer whResp.Body.Close()
+
+	if whResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from webhook for ignored authorized event, got %d", whResp.StatusCode)
+	}
+	var whRes map[string]string
+	_ = json.NewDecoder(whResp.Body).Decode(&whRes)
+	if whRes["status"] != "ignored" {
+		t.Fatalf("expected status 'ignored' for payment.authorized event, got %q", whRes["status"])
+	}
+
+	// 4. Verify order is still PENDING_PAYMENT
+	ord, err := st.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusPendingPayment {
+		t.Fatalf("expected order to remain PENDING_PAYMENT, got %v (err=%v)", ord.Status, err)
+	}
+
+	// 5. Verify no dispatch intents exist
+	summary, err := st.GetOrderDispatchSummary(context.Background(), orderID)
+	if err != nil {
+		t.Fatalf("GetOrderDispatchSummary failed: %v", err)
+	}
+	if summary.TotalCount != 0 {
+		t.Fatalf("expected 0 dispatch intents for authorized payment, got %d", summary.TotalCount)
+	}
+}
+
+func TestPaymentSafety_Webhook_CapturedEvent_AuthorizedStatus_Rejected(t *testing.T) {
+	kioskID := "kiosk-wh-stat-auth"
+	orderID := "ord_wh_stat_auth_001"
+	pin := "3344"
+	pricePaise := int64(800)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	// Claim session & initiate payment
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, err := http.DefaultClient.Do(claimReq)
+	if err != nil || claimResp.StatusCode != http.StatusOK {
+		t.Fatalf("claim failed: %v", err)
+	}
+	claimResp.Body.Close()
+
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil || initResp.StatusCode != http.StatusOK {
+		t.Fatalf("initiate payment failed: %v", err)
+	}
+	var initBody map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initBody)
+	initResp.Body.Close()
+	providerOrderID := initBody["provider_order_id"].(string)
+
+	// Send payment.captured event BUT entity.status is "authorized"
+	payload := map[string]interface{}{
+		"event": "payment.captured",
+		"payload": map[string]interface{}{
+			"payment": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":       "pay_auth_spoof_123",
+					"order_id": providerOrderID,
+					"amount":   pricePaise,
+					"currency": "INR",
+					"status":   "authorized", // INVALID: entity status is not captured!
+				},
+			},
+		},
+	}
+	rawBytes, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(whSec))
+	mac.Write(rawBytes)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq.Header.Set("Content-Type", "application/json")
+	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatalf("webhook request failed: %v", err)
+	}
+	defer whResp.Body.Close()
+
+	if whResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-captured entity status, got %d", whResp.StatusCode)
+	}
+
+	// Verify order is still PENDING_PAYMENT
+	ord, err := st.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusPendingPayment {
+		t.Fatalf("expected order to remain PENDING_PAYMENT, got %v (err=%v)", ord.Status, err)
+	}
+}
+
+func TestPaymentSafety_Webhook_FailedEvent_Ignored(t *testing.T) {
+	kioskID := "kiosk-wh-fail"
+	orderID := "ord_wh_fail_001"
+	pin := "5566"
+	pricePaise := int64(800)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, st := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	// Claim session & initiate payment
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	claimResp.Body.Close()
+
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, _ := http.DefaultClient.Do(initReq)
+	var initBody map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initBody)
+	initResp.Body.Close()
+	providerOrderID := initBody["provider_order_id"].(string)
+
+	// Send payment.failed webhook
+	payload := map[string]interface{}{
+		"event": "payment.failed",
+		"payload": map[string]interface{}{
+			"payment": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":       "pay_fail_test_123",
+					"order_id": providerOrderID,
+					"amount":   pricePaise,
+					"currency": "INR",
+					"status":   "failed",
+				},
+			},
+		},
+	}
+	rawBytes, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(whSec))
+	mac.Write(rawBytes)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq.Header.Set("Content-Type", "application/json")
+	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatalf("webhook request failed: %v", err)
+	}
+	defer whResp.Body.Close()
+
+	if whResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from webhook for ignored failed event, got %d", whResp.StatusCode)
+	}
+	var whRes map[string]string
+	_ = json.NewDecoder(whResp.Body).Decode(&whRes)
+	if whRes["status"] != "ignored" {
+		t.Fatalf("expected status 'ignored' for payment.failed event, got %q", whRes["status"])
+	}
+
+	// Verify order is still PENDING_PAYMENT
+	ord, err := st.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusPendingPayment {
+		t.Fatalf("expected order to remain PENDING_PAYMENT, got %v (err=%v)", ord.Status, err)
+	}
+}
+
+func TestPaymentSafety_Webhook_InvalidAmount_Rejected(t *testing.T) {
+	kioskID := "kiosk-wh-inv-amt"
+	orderID := "ord_wh_inv_amt_001"
+	pin := "7788"
+	pricePaise := int64(800)
+	pinExpiry := time.Now().UTC().Add(15 * time.Minute)
+
+	_, kSec, whSec, ts, _ := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
+
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	claimResp.Body.Close()
+
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, _ := http.DefaultClient.Do(initReq)
+	var initBody map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initBody)
+	initResp.Body.Close()
+	providerOrderID := initBody["provider_order_id"].(string)
+
+	// Send payment.captured with 0 amount
+	payload := map[string]interface{}{
+		"event": "payment.captured",
+		"payload": map[string]interface{}{
+			"payment": map[string]interface{}{
+				"entity": map[string]interface{}{
+					"id":       "pay_zero_amt_123",
+					"order_id": providerOrderID,
+					"amount":   0,
+					"currency": "INR",
+					"status":   "captured",
+				},
+			},
+		},
+	}
+	rawBytes, _ := json.Marshal(payload)
+	mac := hmac.New(sha256.New, []byte(whSec))
+	mac.Write(rawBytes)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq.Header.Set("Content-Type", "application/json")
+	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatalf("webhook request failed: %v", err)
+	}
+	defer whResp.Body.Close()
+
+	if whResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for zero payment amount, got %d", whResp.StatusCode)
+	}
+}
+
