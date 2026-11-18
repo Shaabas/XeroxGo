@@ -48,8 +48,13 @@ func respondCloudOrder(w http.ResponseWriter, order *store.Order, revision int64
  })
 }
 
+func cloudDeliveryEnabled() bool {
+ return os.Getenv("XEROXGO_CLOUD_DELIVERY_ENABLED")=="1"
+}
+
 func cloudCheckoutEnabled() bool {
- return cloudUploadsEnabled() && os.Getenv("XEROXGO_CLOUD_CHECKOUT_ENABLED")=="1"
+ return cloudUploadsEnabled() && cloudDeliveryEnabled() &&
+  os.Getenv("XEROXGO_CLOUD_CHECKOUT_ENABLED")=="1"
 }
 
 func (s *appServer) handleCloudReferenceCheckout(w http.ResponseWriter,r *http.Request) {
