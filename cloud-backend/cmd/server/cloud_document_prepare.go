@@ -159,19 +159,23 @@ func (s *appServer) handleCloudVariantPrepare(w http.ResponseWriter,r *http.Requ
    _=json.NewEncoder(w).Encode(map[string]any{"variant_id":variant.ID,"status":"PREPARING"});return}
   http.Error(w,"variant is unavailable; upload a new document",409);return
  }
+ // Work is strictly shorter than the 10-minute lease, preventing an old
+ // worker from overlapping a successful lease takeover.
+ workCtx,cancel:=context.WithTimeout(r.Context(),8*time.Minute)
+ defer cancel()
  published:=false
  defer func(){if !published {_=s.db.FailCloudVariant(context.Background(),variant.ID)}}()
- source,err:=readVerifiedOriginalToTemp(r.Context(),base,secret,item,s.cfg.jobsDir)
+ source,err:=readVerifiedOriginalToTemp(workCtx,base,secret,item,s.cfg.jobsDir)
  if err!=nil {http.Error(w,"cloud source could not be verified",422);return}
  defer os.Remove(source)
  output,err:=os.CreateTemp(s.cfg.jobsDir,"cloud_variant_*.pdf")
  if err!=nil {http.Error(w,"cannot create normalization workspace",500);return}
  outputPath:=output.Name();_ = output.Close()
  defer os.Remove(outputPath)
- normalized,err:=s.executeNormalizationAndPricing(r.Context(),source,outputPath,opts,tariff)
+ normalized,err:=s.executeNormalizationAndPricing(workCtx,source,outputPath,opts,tariff)
  if err!=nil {http.Error(w,"document normalization failed",422);return}
  storageKey:="variants/"+variant.ID+"/output.pdf"
- checksum,err:=uploadPreparedVariant(r.Context(),base,secret,storageKey,outputPath)
+ checksum,err:=uploadPreparedVariant(workCtx,base,secret,storageKey,outputPath)
  if err!=nil {http.Error(w,"prepared file could not be stored",502);return}
  variant.StorageKey=storageKey
  variant.Checksum=checksum
@@ -182,7 +186,7 @@ func (s *appServer) handleCloudVariantPrepare(w http.ResponseWriter,r *http.Requ
  variant.Copies=opts.Copies
  variant.Duplex=string(opts.Duplex)
  variant.ColorMode=opts.ColorMode
- published,err=s.db.PublishCloudVariant(r.Context(),variant)
+ published,err=s.db.PublishCloudVariant(workCtx,variant)
  if err!=nil || !published {http.Error(w,"prepared file could not be registered",503);return}
  w.Header().Set("Cache-Control","no-store")
  w.Header().Set("Content-Type","application/json")
