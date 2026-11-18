@@ -717,19 +717,44 @@ func (c *Client) Run(ctx context.Context) error {
 				sort.Slice(jobsToResume, func(i, j int) bool {
 					return jobsToResume[i].DocumentIndex < jobsToResume[j].DocumentIndex
 				})
-				c.activeMu.Lock()
-				for _, j := range jobsToResume {
-					c.activeJobs[j.JobID] = true
-				}
-				c.activeMu.Unlock()
 
-				for _, j := range jobsToResume {
-					select {
-					case c.jobQueue <- j:
-					default:
-						go func(cmd contracts.PrintJobCommand) {
-							c.jobQueue <- cmd
-						}(j)
+				// Verify contiguous completed prefix: all documents before jobsToResume[0] must be COMPLETED
+				firstResumeIdx := jobsToResume[0].DocumentIndex
+				canResume := true
+				for i := 0; i < firstResumeIdx; i++ {
+					found := false
+					for _, oj := range allOrderJobs {
+						if oj.Command.DocumentIndex == i {
+							found = true
+							if oj.Status != contracts.JobStatusCompleted {
+								canResume = false
+							}
+							break
+						}
+					}
+					if !found || !canResume {
+						canResume = false
+						log.Printf("[SPOOLER] Startup recovery: order %s cannot resume doc %d because earlier doc %d is not completed",
+							oid, firstResumeIdx, i)
+						break
+					}
+				}
+
+				if canResume {
+					c.activeMu.Lock()
+					for _, j := range jobsToResume {
+						c.activeJobs[j.JobID] = true
+					}
+					c.activeMu.Unlock()
+
+					for _, j := range jobsToResume {
+						select {
+						case c.jobQueue <- j:
+						default:
+							go func(cmd contracts.PrintJobCommand) {
+								c.jobQueue <- cmd
+							}(j)
+						}
 					}
 				}
 			}
@@ -1071,7 +1096,7 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 
 	siblings, err := c.cfg.StateStore.GetJobsByOrderID(context.Background(), orderID)
 	if err != nil {
-		log.Printf("[SPOOLER] checkAndAdmitOrder query failed for %s: %v", orderID, err)
+		log.Printf("[SPOOLER] checkAndAdmitOrder query failed for %s: %v; failing closed", orderID, err)
 		return
 	}
 
@@ -1081,28 +1106,99 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 		return
 	}
 
-	docMap := make(map[int]contracts.PrintJobCommand)
-	allValid := true
+	if len(siblings) > totalDocs {
+		log.Printf("[SPOOLER] Order %s: sibling count %d exceeds total_documents %d; inconsistent state, failing closed",
+			orderID, len(siblings), totalDocs)
+		return
+	}
+
+	docMap := make(map[int]state.StoredJob)
 	for _, sib := range siblings {
+		sibOrderID := sib.Command.OrderID
+		if sibOrderID == "" {
+			sibOrderID = sib.Command.JobID
+		}
+		if sibOrderID != orderID || sib.Command.TotalDocuments != totalDocs {
+			log.Printf("[SPOOLER] Order %s: sibling %s has mismatched order_id %q or total_documents %d; failing closed",
+				orderID, sib.Command.JobID, sibOrderID, sib.Command.TotalDocuments)
+			return
+		}
 		if sib.Command.DocumentIndex < 0 || sib.Command.DocumentIndex >= totalDocs {
-			allValid = false
-			break
+			log.Printf("[SPOOLER] Order %s: document index %d out of bounds [0, %d); failing closed",
+				orderID, sib.Command.DocumentIndex, totalDocs)
+			return
 		}
 		if _, exists := docMap[sib.Command.DocumentIndex]; exists {
-			allValid = false
-			break
+			log.Printf("[SPOOLER] Order %s: duplicate document index %d; failing closed",
+				orderID, sib.Command.DocumentIndex)
+			return
 		}
-		docMap[sib.Command.DocumentIndex] = sib.Command
+		docMap[sib.Command.DocumentIndex] = sib
 	}
-	if !allValid || len(docMap) != totalDocs {
+	if len(docMap) != totalDocs {
 		log.Printf("[SPOOLER] Order %s: documents invalid or incomplete indices; waiting", orderID)
 		return
 	}
 
-	c.activeMu.Lock()
-	// Check if any job of this order is already active in memory
+	// 1. Evaluate sibling error/paused states:
+	// If ANY sibling has an actual error or was paused after submission, the order cannot be admitted for fresh printing.
 	for idx := 0; idx < totalDocs; idx++ {
-		if c.activeJobs[docMap[idx].JobID] {
+		sib := docMap[idx]
+		sibDefinitelyNotSubmitted := !sib.SubmittedToPrinter &&
+			sib.CUPSJobID == "" &&
+			sib.SheetsPrinted == 0 &&
+			sib.PagesPrinted == 0 &&
+			sib.ErrorReason == ""
+		if !sibDefinitelyNotSubmitted && (sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable) {
+			log.Printf("[SPOOLER] Order %s has paused/failed document %d (%s, status: %s); not admitting for fresh printing",
+				orderID, idx, sib.Command.JobID, sib.Status)
+			return
+		}
+	}
+
+	// 2. Determine contiguous completion prefix:
+	// Find the first uncompleted document index k.
+	firstUncompletedIdx := totalDocs
+	for idx := 0; idx < totalDocs; idx++ {
+		if docMap[idx].Status != contracts.JobStatusCompleted {
+			firstUncompletedIdx = idx
+			break
+		}
+	}
+
+	// If all documents are already completed, order is done; nothing to queue.
+	if firstUncompletedIdx == totalDocs {
+		log.Printf("[SPOOLER] Order %s: all %d documents already completed; nothing to queue", orderID, totalDocs)
+		return
+	}
+
+	// Strict document ordering requirement:
+	// All documents before firstUncompletedIdx are COMPLETED.
+	// No document from firstUncompletedIdx onward may be COMPLETED.
+	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
+		if docMap[idx].Status == contracts.JobStatusCompleted {
+			log.Printf("[SPOOLER] Order %s: inconsistent document completion state (doc %d completed while doc %d is not); failing closed",
+				orderID, idx, firstUncompletedIdx)
+			return
+		}
+	}
+
+	// 3. Evaluate uncompleted documents for prior submission or physical uncertainty:
+	// Never requeue already-submitted, CUPS-queued, or physically started jobs for fresh printing.
+	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
+		sib := docMap[idx]
+		if sib.SubmittedToPrinter || sib.CUPSJobID != "" || sib.SheetsPrinted > 0 {
+			log.Printf("[SPOOLER] Order %s doc %d (%s) already submitted or physically started (submitted=%v, cupsID=%s, sheets=%d); not admitting for fresh printing",
+				orderID, idx, sib.Command.JobID, sib.SubmittedToPrinter, sib.CUPSJobID, sib.SheetsPrinted)
+			return
+		}
+	}
+
+	// 4. Check in-memory state:
+	// Check if any of the uncompleted jobs are already in activeJobs
+	c.activeMu.Lock()
+	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
+		if c.activeJobs[docMap[idx].Command.JobID] {
 			c.activeMu.Unlock()
 			return
 		}
@@ -1124,26 +1220,27 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 
 	isBusy := len(c.activeJobs) > 0
 	if isBusy {
-		// Defer all documents of this order in index order 0..totalDocs-1
-		for idx := 0; idx < totalDocs; idx++ {
-			c.deferredJobs = append(c.deferredJobs, docMap[idx])
+		// Defer uncompleted documents in strict index order
+		for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
+			c.deferredJobs = append(c.deferredJobs, docMap[idx].Command)
 		}
 		c.deferredMu.Unlock()
 		c.activeMu.Unlock()
-		log.Printf("[SPOOLER] Order %s complete (%d docs) but kiosk is busy; deferred", orderID, totalDocs)
+		log.Printf("[SPOOLER] Order %s uncompleted documents (%d..%d of %d) deferred; kiosk is busy",
+			orderID, firstUncompletedIdx+1, totalDocs, totalDocs)
 		return
 	}
 	c.deferredMu.Unlock()
 
-	// Not busy: reserve all jobs of this order in activeJobs
-	for idx := 0; idx < totalDocs; idx++ {
-		c.activeJobs[docMap[idx].JobID] = true
+	// Not busy: reserve uncompleted jobs in activeJobs
+	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
+		c.activeJobs[docMap[idx].Command.JobID] = true
 	}
 	c.activeMu.Unlock()
 
-	// Queue all documents in strict DocumentIndex order (0 to totalDocs-1)
-	for idx := 0; idx < totalDocs; idx++ {
-		dCmd := docMap[idx]
+	// Queue uncompleted documents in strict DocumentIndex order
+	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
+		dCmd := docMap[idx].Command
 		select {
 		case c.jobQueue <- dCmd:
 			log.Printf("[SPOOLER] Queued print job %s (order %s, doc %d/%d, pages=%d, sheets=%d, copies=%d, duplex=%s)",
@@ -1781,26 +1878,99 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		orderID = cmd.JobID
 	}
 
-	// Sibling failure and already-completed checks
+	// 0. Printer Capability Validation
+	caps := c.Capabilities()
+	colorMode := strings.ToUpper(strings.TrimSpace(cmd.ColorMode))
+	if colorMode == "COLOR" && caps.ColorSupport == printer.CapabilityUnsupported {
+		reason := "printer does not support requested COLOR printing mode"
+		log.Printf("[SPOOLER] Job %s rejected: %s", cmd.JobID, reason)
+		c.handleJobError(ctx, cmd, 0, 0, reason)
+		return
+	}
+	if (colorMode == "BW" || colorMode == "MONOCHROME") && caps.MonochromeSupport == printer.CapabilityUnsupported {
+		reason := "printer does not support requested BW/MONOCHROME printing mode"
+		log.Printf("[SPOOLER] Job %s rejected: %s", cmd.JobID, reason)
+		c.handleJobError(ctx, cmd, 0, 0, reason)
+		return
+	}
+
+	// Early durable state & sibling checks
 	if c.cfg.StateStore != nil {
-		if stored, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID); err == nil && stored != nil {
+		stored, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			log.Printf("[SPOOLER] Early check failed: SQLite read error for job %s: %v; failing closed", cmd.JobID, err)
+			c.handleJobError(ctx, cmd, 0, 0, fmt.Sprintf("state store read error: %v", err))
+			return
+		}
+		if stored != nil {
 			if stored.Status == contracts.JobStatusCompleted {
 				log.Printf("[SPOOLER] Job %s is already completed; skipping redundant processing", cmd.JobID)
+				return
+			}
+			storedDefinitelyNotSubmitted := !stored.SubmittedToPrinter &&
+				stored.CUPSJobID == "" &&
+				stored.SheetsPrinted == 0 &&
+				stored.PagesPrinted == 0 &&
+				stored.ErrorReason == ""
+			if !storedDefinitelyNotSubmitted && (stored.Status == contracts.JobStatusPausedError || stored.Status == contracts.JobStatusFailedRefundable) {
+				log.Printf("[SPOOLER] Job %s is in %s state; skipping redundant processing", cmd.JobID, stored.Status)
+				return
+			}
+			if stored.CUPSJobID != "" {
+				if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+					log.Printf("[SPOOLER] Job %s already has CUPS job %s; resuming monitoring instead of re-submitting",
+						cmd.JobID, stored.CUPSJobID)
+					c.resumeCUPSMonitoring(ctx, stored)
+					return
+				}
+				reason := fmt.Sprintf("job %s already has CUPS job %s without CUPS queue configured; manual reconciliation required", cmd.JobID, stored.CUPSJobID)
+				c.handleJobError(ctx, cmd, stored.PagesPrinted, stored.SheetsPrinted, reason)
+				return
+			}
+			if stored.SubmittedToPrinter {
+				reason := fmt.Sprintf("job %s was already marked submitted to printer without recorded completion; physical status uncertain, manual reconciliation required", cmd.JobID)
+				log.Printf("[SPOOLER] %s", reason)
+				c.handleJobError(ctx, cmd, stored.PagesPrinted, stored.SheetsPrinted, reason)
 				return
 			}
 		}
 
 		siblings, err := c.cfg.StateStore.GetJobsByOrderID(ctx, orderID)
-		if err == nil {
-			for _, sib := range siblings {
-				if sib.Command.JobID != cmd.JobID && (sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable) {
-					reason := fmt.Sprintf("order paused due to error in sibling document %d (%s): %s",
-						sib.Command.DocumentIndex+1, sib.Command.JobID, sib.ErrorReason)
-					log.Printf("[SPOOLER] Sibling job %s in order %s is %s; pausing job %s without submitting",
-						sib.Command.JobID, orderID, sib.Status, cmd.JobID)
-					c.handleJobError(ctx, cmd, 0, 0, reason)
-					return
-				}
+		if err != nil {
+			log.Printf("[SPOOLER] Early check failed: SQLite read error for siblings of order %s: %v; failing closed", orderID, err)
+			c.handleJobError(ctx, cmd, 0, 0, fmt.Sprintf("state store read error: %v", err))
+			return
+		}
+		for _, sib := range siblings {
+			if sib.Command.JobID == cmd.JobID {
+				continue
+			}
+			sibDefinitelyNotSubmitted := !sib.SubmittedToPrinter &&
+				sib.CUPSJobID == "" &&
+				sib.SheetsPrinted == 0 &&
+				sib.PagesPrinted == 0 &&
+				sib.ErrorReason == ""
+			if !sibDefinitelyNotSubmitted && (sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable) {
+				reason := fmt.Sprintf("order paused due to error in sibling document %d (%s): %s",
+					sib.Command.DocumentIndex+1, sib.Command.JobID, sib.ErrorReason)
+				log.Printf("[SPOOLER] Sibling job %s in order %s is %s; pausing job %s without submitting",
+					sib.Command.JobID, orderID, sib.Status, cmd.JobID)
+				c.handleJobError(ctx, cmd, 0, 0, reason)
+				return
+			}
+			if sib.Command.DocumentIndex < cmd.DocumentIndex && sib.Status != contracts.JobStatusCompleted {
+				reason := fmt.Sprintf("earlier document %d (%s) in order %s is not completed (status: %s)",
+					sib.Command.DocumentIndex+1, sib.Command.JobID, orderID, sib.Status)
+				log.Printf("[SPOOLER] Strict ordering violated: %s; pausing job %s", reason, cmd.JobID)
+				c.handleJobError(ctx, cmd, 0, 0, reason)
+				return
+			}
+			if sib.Command.DocumentIndex > cmd.DocumentIndex && sib.Status == contracts.JobStatusCompleted {
+				reason := fmt.Sprintf("subsequent document %d (%s) in order %s is already completed while doc %d is not",
+					sib.Command.DocumentIndex+1, sib.Command.JobID, orderID, cmd.DocumentIndex+1)
+				log.Printf("[SPOOLER] Strict ordering violated: %s; pausing job %s", reason, cmd.JobID)
+				c.handleJobError(ctx, cmd, 0, 0, reason)
+				return
 			}
 		}
 	}
@@ -2085,6 +2255,108 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 					Message:         "Printing document...",
 					Detail:          docDetail,
 				})
+			}
+		}
+	}
+
+	// Final durable-state safety check immediately before physical submission to CUPS/PJL
+	if c.cfg.StateStore != nil {
+		freshJob, sErr := c.cfg.StateStore.GetJob(jobCtx, cmd.JobID)
+		if sErr != nil {
+			cancelJob()
+			<-monitorDone
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("pre-submission check failed: SQLite read error: %v", sErr))
+			return
+		}
+		if freshJob == nil {
+			cancelJob()
+			<-monitorDone
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, "pre-submission check failed: job not found in state store")
+			return
+		}
+
+		if freshJob.Status == contracts.JobStatusCompleted {
+			log.Printf("[SPOOLER] Pre-submission safety check: job %s is already COMPLETED; rejecting duplicate submission", cmd.JobID)
+			cancelJob()
+			<-monitorDone
+			return
+		}
+
+		freshJobDefinitelyNotSubmitted := !freshJob.SubmittedToPrinter &&
+			freshJob.CUPSJobID == "" &&
+			freshJob.SheetsPrinted == 0 &&
+			freshJob.PagesPrinted == 0 &&
+			freshJob.ErrorReason == ""
+		if !freshJobDefinitelyNotSubmitted && (freshJob.Status == contracts.JobStatusPausedError || freshJob.Status == contracts.JobStatusFailedRefundable) {
+			log.Printf("[SPOOLER] Pre-submission safety check: job %s is %s; rejecting submission", cmd.JobID, freshJob.Status)
+			cancelJob()
+			<-monitorDone
+			return
+		}
+
+		// Existing CUPS job: resume monitoring or require reconciliation. Never issue a second lp submission.
+		if freshJob.CUPSJobID != "" {
+			cancelJob()
+			<-monitorDone
+			if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
+				log.Printf("[SPOOLER] Pre-submission safety check: job %s has existing CUPS job %s; resuming monitoring", cmd.JobID, freshJob.CUPSJobID)
+				c.resumeCUPSMonitoring(ctx, freshJob)
+				return
+			}
+			reason := fmt.Sprintf("job %s already has CUPS job %s without CUPS queue configured; manual reconciliation required", cmd.JobID, freshJob.CUPSJobID)
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
+			return
+		}
+
+		if freshJob.SubmittedToPrinter {
+			cancelJob()
+			<-monitorDone
+			reason := fmt.Sprintf("job %s was already marked submitted to printer without recorded completion; physical output uncertain, manual reconciliation required", cmd.JobID)
+			log.Printf("[SPOOLER] Pre-submission safety check: %s", reason)
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
+			return
+		}
+
+		// Sibling evaluation immediately before submission
+		sibs, sibErr := c.cfg.StateStore.GetJobsByOrderID(jobCtx, orderID)
+		if sibErr != nil {
+			cancelJob()
+			<-monitorDone
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("pre-submission check failed: SQLite read error for order siblings: %v", sibErr))
+			return
+		}
+		if len(sibs) != cmd.TotalDocuments {
+			cancelJob()
+			<-monitorDone
+			c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("pre-submission check failed: expected %d documents for order %s, found %d", cmd.TotalDocuments, orderID, len(sibs)))
+			return
+		}
+		for _, sib := range sibs {
+			if sib.Command.JobID == cmd.JobID {
+				continue
+			}
+			sibDefinitelyNotSubmitted := !sib.SubmittedToPrinter &&
+				sib.CUPSJobID == "" &&
+				sib.SheetsPrinted == 0 &&
+				sib.PagesPrinted == 0 &&
+				sib.ErrorReason == ""
+			if !sibDefinitelyNotSubmitted && (sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable) {
+				cancelJob()
+				<-monitorDone
+				c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("order paused due to error in sibling document %d (%s): %s", sib.Command.DocumentIndex+1, sib.Command.JobID, sib.ErrorReason))
+				return
+			}
+			if sib.Command.DocumentIndex < cmd.DocumentIndex && sib.Status != contracts.JobStatusCompleted {
+				cancelJob()
+				<-monitorDone
+				c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("pre-submission order violated: earlier document %d (%s) is not completed (status: %s)", sib.Command.DocumentIndex+1, sib.Command.JobID, sib.Status))
+				return
+			}
+			if sib.Command.DocumentIndex > cmd.DocumentIndex && sib.Status == contracts.JobStatusCompleted {
+				cancelJob()
+				<-monitorDone
+				c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("pre-submission order violated: subsequent document %d (%s) is already completed while current document %d is not", sib.Command.DocumentIndex+1, sib.Command.JobID, cmd.DocumentIndex+1))
+				return
 			}
 		}
 	}

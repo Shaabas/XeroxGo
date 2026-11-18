@@ -163,6 +163,80 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 	}
 }
 
+func TestPrintPDFWithCUPS_ColorModes(t *testing.T) {
+	testCases := []struct {
+		name         string
+		colorMode    string
+		wantFlag     string
+		dontWantFlag string
+	}{
+		{
+			name:      "explicit COLOR mode",
+			colorMode: "COLOR",
+			wantFlag:  "-o print-color-mode=color",
+		},
+		{
+			name:      "explicit lowercase color mode",
+			colorMode: "color",
+			wantFlag:  "-o print-color-mode=color",
+		},
+		{
+			name:      "explicit BW mode",
+			colorMode: "BW",
+			wantFlag:  "-o print-color-mode=monochrome",
+		},
+		{
+			name:      "explicit MONOCHROME mode",
+			colorMode: "MONOCHROME",
+			wantFlag:  "-o print-color-mode=monochrome",
+		},
+		{
+			name:         "empty default color mode",
+			colorMode:    "",
+			dontWantFlag: "print-color-mode",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var recordedCmd string
+			runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if name == "lp" {
+					recordedCmd = name + " " + strings.Join(args, " ")
+					return []byte("request id is TEST-1 (1 file(s))\n"), nil
+				}
+				if name == "lpstat" {
+					if len(args) > 1 && args[1] == "completed" {
+						return []byte("TEST-1 username 1024 Tue Nov 3 20:30:00 2026\n\tAlerts: job-completed-successfully\n\tqueued for TestQueue\n"), nil
+					}
+					return []byte(""), nil
+				}
+				return []byte(""), nil
+			}
+
+			cmd := contracts.PrintJobCommand{
+				JobID:       "job-color-test",
+				Copies:      1,
+				TotalPages:  1,
+				TotalSheets: 1,
+				ColorMode:   tc.colorMode,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			_ = PrintPDFWithCUPSCustom(ctx, runner, "TestQueue", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond)
+
+			if tc.wantFlag != "" && !strings.Contains(recordedCmd, tc.wantFlag) {
+				t.Errorf("expected command to contain %q, got: %s", tc.wantFlag, recordedCmd)
+			}
+			if tc.dontWantFlag != "" && strings.Contains(recordedCmd, tc.dontWantFlag) {
+				t.Errorf("expected command NOT to contain %q, got: %s", tc.dontWantFlag, recordedCmd)
+			}
+		})
+	}
+}
+
 func TestPrintPDFWithCUPS_Success_IPP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

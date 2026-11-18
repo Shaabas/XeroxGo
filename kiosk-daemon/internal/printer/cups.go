@@ -510,8 +510,11 @@ func PrintPDFWithCUPSHooksCustom(
 		lpArgs = append(lpArgs, "-o", "sides=two-sided-short-edge")
 	}
 
-	if strings.EqualFold(strings.TrimSpace(cmd.ColorMode), "COLOR") {
+	colorMode := strings.ToUpper(strings.TrimSpace(cmd.ColorMode))
+	if colorMode == "COLOR" {
 		lpArgs = append(lpArgs, "-o", "print-color-mode=color")
+	} else if colorMode == "BW" || colorMode == "MONOCHROME" {
+		lpArgs = append(lpArgs, "-o", "print-color-mode=monochrome")
 	}
 
 	lpArgs = append(lpArgs, pdfPath)

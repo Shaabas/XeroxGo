@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 	"xeroxgo/pkg/contracts"
@@ -811,5 +812,788 @@ func TestMultiDoc_OrderCompletionSemantics(t *testing.T) {
 	client.currentModeMu.Unlock()
 	if mode1 != ui_ipc.ModeCompleted {
 		t.Fatalf("expected mode == ModeCompleted after doc 1, got %s", mode1)
+	}
+}
+
+func TestMultiDoc_DuplicateDispatchAfterRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "dup_restart.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	orderID := "ord_restart_dup_001"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_dup_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-dup-restart",
+		DisplayCode:    "1111",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_dup_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-dup-restart",
+		DisplayCode:    "1111",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Doc 0 was completed before daemon stopped/restarted
+	if err := store.SaveJob(ctx, cmd0, contracts.JobStatusCompleted); err != nil {
+		t.Fatalf("SaveJob doc 0 failed: %v", err)
+	}
+	_ = store.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID:         cmd0.JobID,
+		KioskID:       cmd0.KioskID,
+		Status:        contracts.JobStatusCompleted,
+		PagesPrinted:  1,
+		SheetsPrinted: 1,
+		Timestamp:     time.Now().UTC(),
+	})
+
+	// Doc 1 was saved as Spooling before daemon stopped/restarted (unsubmitted)
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob doc 1 failed: %v", err)
+	}
+
+	var printedJobs []string
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedJobs = append(printedJobs, cmd.JobID)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-dup-restart",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Start daemon (runs startupRecovery)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// Simulate cloud re-delivering duplicate commands for both Doc 0 and Doc 1
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Wait for processing and order completion to settle
+	deadline := time.Now().Add(5 * time.Second)
+	completed := false
+	for time.Now().Before(deadline) {
+		if c, err := store.IsOrderCompleted(ctx, orderID); err == nil && c {
+			completed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !completed {
+		t.Fatalf("expected order %s to be completed", orderID)
+	}
+
+	printMu.Lock()
+	defer printMu.Unlock()
+
+	// Verify doc 0 was NEVER re-printed, and doc 1 was printed exactly once
+	if len(printedJobs) != 1 {
+		t.Fatalf("expected exactly 1 job printed, got %d: %v", len(printedJobs), printedJobs)
+	}
+	if printedJobs[0] != "job_dup_1" {
+		t.Fatalf("expected job_dup_1 printed, got %s", printedJobs[0])
+	}
+}
+
+func TestMultiDoc_DuplicateDispatchOnReconnection(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "dup_reconnect.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	var printedJobs []string
+	var printMu sync.Mutex
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		printMu.Lock()
+		printedJobs = append(printedJobs, cmd.JobID)
+		printMu.Unlock()
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-reconnect-test",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_reconnect_001"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_recon_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-reconnect-test",
+		DisplayCode:    "3333",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_recon_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-reconnect-test",
+		DisplayCode:    "3333",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	// 1st delivery
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Reconnection: duplicate delivery arrives while processing
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Allow jobs to finish processing and order to complete
+	deadline := time.Now().Add(5 * time.Second)
+	completed := false
+	for time.Now().Before(deadline) {
+		if c, err := store.IsOrderCompleted(ctx, orderID); err == nil && c {
+			completed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !completed {
+		t.Fatalf("expected order %s to be completed", orderID)
+	}
+
+	printMu.Lock()
+	defer printMu.Unlock()
+
+	// Assert exactly 2 prints executed: doc 0 and doc 1
+	if len(printedJobs) != 2 {
+		t.Fatalf("expected exactly 2 jobs printed across reconnection, got %d: %v", len(printedJobs), printedJobs)
+	}
+	if printedJobs[0] != "job_recon_0" || printedJobs[1] != "job_recon_1" {
+		t.Fatalf("unexpected print sequence: %v", printedJobs)
+	}
+}
+
+func TestMultiDoc_PartialCompletionAndRepeatedAdmission(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "repeated_admission.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		if onPage != nil {
+			onPage(cmd.TotalSheets)
+		}
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-repeat-admit",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_repeat_admit"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_repeat_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-repeat-admit",
+		DisplayCode:    "4444",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_repeat_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-repeat-admit",
+		DisplayCode:    "4444",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	// Dequeue doc 0 and process it to completion
+	d0 := <-client.jobQueue
+	client.processJob(ctx, d0)
+
+	// Clean up doc 0 from active jobs as jobWorker would
+	client.activeMu.Lock()
+	delete(client.activeJobs, d0.JobID)
+	client.activeMu.Unlock()
+
+	// Repeatedly call checkAndAdmitOrder
+	client.checkAndAdmitOrder(orderID, 2)
+	client.checkAndAdmitOrder(orderID, 2)
+	client.checkAndAdmitOrder(orderID, 2)
+
+	// Assert: jobQueue contains ONLY doc 1 (queued originally), doc 0 was NOT requeued!
+	if len(client.jobQueue) != 1 {
+		t.Fatalf("expected exactly 1 job in queue (doc 1), got %d", len(client.jobQueue))
+	}
+	d1 := <-client.jobQueue
+	if d1.JobID != "job_repeat_1" {
+		t.Fatalf("expected job_repeat_1, got %s", d1.JobID)
+	}
+
+	// Process doc 1 to completion
+	client.processJob(ctx, d1)
+	client.activeMu.Lock()
+	delete(client.activeJobs, d1.JobID)
+	client.activeMu.Unlock()
+
+	// Calling checkAndAdmitOrder after all docs complete must not queue anything
+	client.checkAndAdmitOrder(orderID, 2)
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected empty jobQueue after all docs complete, got %d", len(client.jobQueue))
+	}
+}
+
+func TestMultiDoc_PreSubmissionSafety_UncertainSubmission(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "uncertain_sub.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockCalled := false
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		mockCalled = true
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-uncertain",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_uncertain_sub"
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_uncert_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-uncertain",
+		DisplayCode:    "5555",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_uncert_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-uncertain",
+		DisplayCode:    "5555",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+
+	// Simulate uncertain state: SubmittedToPrinter is set, but no CUPS job ID
+	_ = store.MarkJobSubmitting(ctx, cmd0.JobID)
+
+	// Attempt to process doc 0
+	client.processJob(ctx, cmd0)
+
+	// MockCUPSPrint must NOT have been called
+	if mockCalled {
+		t.Fatalf("MockCUPSPrint was invoked for uncertain job %s; must be rejected!", cmd0.JobID)
+	}
+
+	// Stored state must be paused in PAUSED_ERROR requiring manual reconciliation
+	job0, _ := store.GetJob(ctx, cmd0.JobID)
+	if job0.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job 0 status PAUSED_ERROR, got %s", job0.Status)
+	}
+	if !strings.Contains(job0.ErrorReason, "manual reconciliation required") {
+		t.Fatalf("expected ErrorReason to contain 'manual reconciliation required', got %q", job0.ErrorReason)
+	}
+
+	// Pre-submission check on doc 1 must also halt because sibling doc 0 is PAUSED_ERROR
+	client.processJob(ctx, cmd1)
+	if mockCalled {
+		t.Fatalf("MockCUPSPrint was invoked for doc 1 despite sibling doc 0 error!")
+	}
+	job1, _ := store.GetJob(ctx, cmd1.JobID)
+	if job1.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job 1 status PAUSED_ERROR due to sibling error, got %s", job1.Status)
+	}
+}
+
+func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "existing_cups.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	lpCalled := false
+	lpstatCalls := 0
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lp" {
+			lpCalled = true
+			return []byte("request id is TestQueue-99 (1 file(s))\n"), nil
+		}
+		if name == "lpstat" {
+			lpstatCalls++
+			if len(args) > 1 && args[1] == "completed" {
+				return []byte("TestQueue-99 username 1024 Tue Nov 3 20:30:00 2026\n\tAlerts: job-completed-successfully\n\tqueued for TestQueue\n"), nil
+			}
+			return []byte(""), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-existing-cups",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "TestQueue",
+		CUPSRunner:    runner,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job_existing_cups",
+		OrderID:        "ord_existing_cups",
+		DocumentIndex:  0,
+		TotalDocuments: 1,
+		KioskID:        "kiosk-existing-cups",
+		DisplayCode:    "6666",
+		DownloadURL:    fileServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	// Save job and record existing CUPS job submission
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPrinting)
+	_ = store.RecordJobSubmission(ctx, cmd.JobID, "TestQueue-99")
+
+	// Call processJob on this existing CUPS job
+	client.processJob(ctx, cmd)
+
+	// lp must NOT have been called!
+	if lpCalled {
+		t.Fatalf("lp submission was called second time for existing CUPS job %s!", cmd.JobID)
+	}
+	// lpstat must have been called to resume monitoring
+	if lpstatCalls == 0 {
+		t.Fatalf("expected lpstat monitoring to be called, got 0 calls")
+	}
+}
+
+func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "color_caps.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockCalled := false
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		mockCalled = true
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-color-caps",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Explicitly set printer capabilities: Monochrome ONLY (Color is Unsupported)
+	client.capsMu.Lock()
+	client.capabilities = printer.PrinterCapabilities{
+		ColorSupport:      printer.CapabilityUnsupported,
+		MonochromeSupport: printer.CapabilitySupported,
+	}
+	client.capsMu.Unlock()
+
+	colorCmd := contracts.PrintJobCommand{
+		JobID:          "job_color_unsupported",
+		OrderID:        "ord_color_caps",
+		DocumentIndex:  0,
+		TotalDocuments: 1,
+		KioskID:        "kiosk-color-caps",
+		DisplayCode:    "7777",
+		DownloadURL:    fileServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		ColorMode:      "COLOR",
+		StartFromPage:  1,
+	}
+
+	_ = store.SaveJob(ctx, colorCmd, contracts.JobStatusSpooling)
+	client.processJob(ctx, colorCmd)
+
+	if mockCalled {
+		t.Fatalf("MockCUPSPrint was invoked for unsupported COLOR job!")
+	}
+	stored, _ := store.GetJob(ctx, colorCmd.JobID)
+	if stored.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR for unsupported color, got %s", stored.Status)
+	}
+	if !strings.Contains(stored.ErrorReason, "printer does not support requested COLOR printing mode") {
+		t.Fatalf("unexpected error reason: %s", stored.ErrorReason)
+	}
+
+	// Now test Mono unsupported
+	client.capsMu.Lock()
+	client.capabilities = printer.PrinterCapabilities{
+		ColorSupport:      printer.CapabilitySupported,
+		MonochromeSupport: printer.CapabilityUnsupported,
+	}
+	client.capsMu.Unlock()
+
+	monoCmd := contracts.PrintJobCommand{
+		JobID:          "job_mono_unsupported",
+		OrderID:        "ord_mono_caps",
+		DocumentIndex:  0,
+		TotalDocuments: 1,
+		KioskID:        "kiosk-color-caps",
+		DisplayCode:    "8888",
+		DownloadURL:    fileServer.URL + "/doc.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		ColorMode:      "BW",
+		StartFromPage:  1,
+	}
+
+	mockCalled = false
+	_ = store.SaveJob(ctx, monoCmd, contracts.JobStatusSpooling)
+	client.processJob(ctx, monoCmd)
+
+	if mockCalled {
+		t.Fatalf("MockCUPSPrint was invoked for unsupported BW job!")
+	}
+	storedMono, _ := store.GetJob(ctx, monoCmd.JobID)
+	if storedMono.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job status PAUSED_ERROR for unsupported BW, got %s", storedMono.Status)
+	}
+	if !strings.Contains(storedMono.ErrorReason, "printer does not support requested BW/MONOCHROME printing mode") {
+		t.Fatalf("unexpected error reason: %s", storedMono.ErrorReason)
+	}
+}
+
+func TestMultiDoc_FailClosedOnStoreErrorsAndInconsistency(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "fail_closed.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_ = store.ResetPaperTray(ctx, 100)
+
+	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	hasher := sha256.Sum256(pdfContent)
+	pdfChecksum := hex.EncodeToString(hasher[:])
+
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfContent)
+	}))
+	defer fileServer.Close()
+
+	mockCalled := false
+	mockCUPS := func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error {
+		mockCalled = true
+		return nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:       "kiosk-fail-closed",
+		StateStore:    store,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		HTTPClient:    fileServer.Client(),
+		CUPSQueue:     "MockQueue",
+		MockCUPSPrint: mockCUPS,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	orderID := "ord_inconsistent_seq"
+	// Create inconsistent order state: doc 1 is completed, but doc 0 is NOT completed
+	cmd0 := contracts.PrintJobCommand{
+		JobID:          "job_inconsist_0",
+		OrderID:        orderID,
+		DocumentIndex:  0,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-fail-closed",
+		DisplayCode:    "9999",
+		DownloadURL:    fileServer.URL + "/doc0.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID:          "job_inconsist_1",
+		OrderID:        orderID,
+		DocumentIndex:  1,
+		TotalDocuments: 2,
+		KioskID:        "kiosk-fail-closed",
+		DisplayCode:    "9999",
+		DownloadURL:    fileServer.URL + "/doc1.pdf",
+		SHA256Checksum: pdfChecksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusCompleted)
+
+	// checkAndAdmitOrder must fail closed and refuse to queue because doc 1 is completed while doc 0 is not
+	client.checkAndAdmitOrder(orderID, 2)
+	if len(client.jobQueue) != 0 {
+		t.Fatalf("expected 0 jobs queued for inconsistent order state, got %d", len(client.jobQueue))
+	}
+
+	// Pre-submission check in processJob must also reject doc 1 if somehow dispatched
+	client.processJob(ctx, cmd1)
+	if mockCalled {
+		t.Fatalf("MockCUPSPrint was invoked for already-completed inconsistent doc 1!")
 	}
 }

@@ -338,6 +338,11 @@ func (s *Store) SaveJob(
 		colorMode = "BW"
 	}
 
+	orderID := strings.TrimSpace(cmd.OrderID)
+	if orderID == "" {
+		orderID = cmd.JobID
+	}
+
 	nowNS := time.Now().UTC().UnixNano()
 
 	query := `
@@ -351,7 +356,7 @@ INSERT INTO jobs (
 
 	_, err := s.db.ExecContext(ctx, query,
 		cmd.JobID,
-		cmd.OrderID,
+		orderID,
 		cmd.DocumentIndex,
 		totalDocs,
 		cmd.OriginalFilename,
@@ -688,6 +693,10 @@ func scanStoredJob(scan func(dest ...any) error) (*StoredJob, error) {
 	job.SubmittedToPrinter = submittedInt != 0
 	job.UpdatedAt = time.Unix(0, updatedAtNS).UTC()
 
+	if strings.TrimSpace(job.Command.OrderID) == "" {
+		job.Command.OrderID = job.Command.JobID
+	}
+
 	return &job, nil
 }
 
@@ -830,10 +839,10 @@ SELECT job_id, order_id, document_index, total_documents, original_filename, col
        status, pages_printed, sheets_printed, error_reason,
        cups_job_id, submitted_to_printer, updated_at_ns
 FROM jobs
-WHERE order_id = ?
+WHERE order_id = ? OR (order_id = '' AND job_id = ?)
 ORDER BY document_index ASC;`
 
-	rows, err := s.db.QueryContext(ctx, query, orderID)
+	rows, err := s.db.QueryContext(ctx, query, orderID, orderID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query jobs for order %s: %w", orderID, err)
 	}
