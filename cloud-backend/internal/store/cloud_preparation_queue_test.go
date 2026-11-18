@@ -78,3 +78,25 @@ func TestCloudPreparationRestartReclaimsExpiredLease(t *testing.T){
   t.Fatalf("too many attempts %+v %v",extra,err)
  }
 }
+
+
+func TestCloudQueueExhaustedCrashReconcilesToFailed(t *testing.T) {
+ db:=cloudQueueFixture(t)
+ ctx:=context.Background()
+ job:=CloudPreparationJob{ID:"crashed",UploadID:"upload-1",
+  SettingsHash:"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  NormalizerVersion:"canonical-v1-tariff-1",OptionsJSON:`{"Copies":1}`,
+  TariffRevision:1}
+ if _,err:=db.EnqueueCloudPreparation(ctx,job);err!=nil{t.Fatal(err)}
+ past:=time.Now().UTC().Add(-time.Minute)
+ _,err:=db.DB().Exec(`UPDATE cloud_preparation_jobs
+  SET state='PROCESSING',attempts=3,lease_expires_at=?
+  WHERE job_id='crashed'`,past)
+ if err!=nil{t.Fatal(err)}
+ n,err:=db.FailExhaustedCloudPreparations(ctx,time.Now().UTC())
+ if err!=nil||n!=1{t.Fatalf("exhausted not reaped %d %v",n,err)}
+ result,err:=db.GetCloudPreparationByID(ctx,job.UploadID,job.ID)
+ if err!=nil||result.State!="FAILED"{
+  t.Fatalf("unexpected reconciled state %+v %v",result,err)
+ }
+}
