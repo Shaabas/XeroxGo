@@ -1485,6 +1485,7 @@ func (app *appServer) routes() *http.ServeMux {
 	mux.HandleFunc("/api/documents/uploads/init", app.handleCloudUploadInit)
 	mux.HandleFunc("/api/documents/uploads/complete", app.handleCloudUploadComplete)
 	mux.HandleFunc("/api/documents/variants/prepare", app.handleCloudVariantPrepare)
+	mux.HandleFunc("/api/documents/variants/status", app.handleCloudVariantStatus)
 	mux.HandleFunc("/api/conversions", app.handleCreateConversion)
 	mux.HandleFunc("/api/conversions/", app.handleConversionRoutes)
 	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
