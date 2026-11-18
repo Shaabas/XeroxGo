@@ -9,7 +9,7 @@ Statuses: TODO / IN_PROGRESS / BLOCKED / REVIEW / DONE. A merged PR needs eviden
 | XG-003 | DONE (GitHub scope) | ChatGPT + human | PRs #11, #12, #13, #14 merged; CI and frontend deploy job for main `c3baa56` passed | Live smoke tests still separate |
 | XG-004 | TODO | ChatGPT | Audit multi-document mixed simplex/duplex through merged PDF and Pi CUPS | Analysis and human architecture review before implementation |
 | XG-005 | BLOCKED | Antigravity | Implement an approved XG-004 design | Requires XG-004 decision |
-| XG-006 | TODO | ChatGPT | Assess existing Supabase table RLS/grants without breaking backend | Analysis-only first |
+| XG-006 | REVIEW | ChatGPT | Live read-only Supabase audit confirms 16 public tables have RLS disabled and broad anon/authenticated grants; see docs/security/supabase-rls-audit-2026-11-18.md | Map route dependencies, stage a least-privilege fix and request explicit production authorization |
 | XG-007 | TODO | Joint | Verify Antigravity discovery of `.agents/skills` in actual local checkout | User/local check required |
 | XG-CHECKOUT-FAST-1 | DONE (GitHub scope) | ChatGPT | PR #16 merged at 0b40181; removed synchronous checkout re-quotes and added real upload progress + Gate 6 tests | Benchmark live checkout separately; quote preparation remains expensive |
 | XG-CLOUD-DOCS-V2 | IN_PROGRESS (foundation only) | ChatGPT | `feat/cloud-first-documents-v2`: private Storage migration file, signed upload/verification APIs, canonical immutable variant preparation and deduplication, isolated browser transport + tests; old checkout untouched | Validate Gate 1–6, inspect storage credentials/config/security, then implement durable preparation and reference-only checkout as separate reviewed slice |
