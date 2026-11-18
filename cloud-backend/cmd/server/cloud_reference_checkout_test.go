@@ -8,7 +8,8 @@ import (
 )
 
 func TestReferenceCheckoutIsOffByDefault(t *testing.T) {
- t.Setenv("XEROXGO_CLOUD_UPLOADS_ENABLED","")
+ t.Setenv("XEROXGO_CLOUD_UPLOADS_ENABLED","1")
+ t.Setenv("XEROXGO_CLOUD_CHECKOUT_ENABLED","")
  s:=&appServer{}
  req:=httptest.NewRequest(http.MethodPost,"/api/documents/checkout",strings.NewReader("{}"))
  w:=httptest.NewRecorder()
