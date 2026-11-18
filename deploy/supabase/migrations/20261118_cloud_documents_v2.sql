@@ -25,6 +25,8 @@ create table if not exists public.document_uploads (
 );
 create index if not exists document_uploads_expiry_idx
   on public.document_uploads (expires_at, state);
+create index if not exists document_uploads_kiosk_hour_idx
+  on public.document_uploads (kiosk_id, created_at DESC);
 
 create table if not exists public.document_variants (
   variant_id text primary key,
