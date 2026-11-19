@@ -255,6 +255,7 @@ func (c *Controller) handleIdleEvent(ev input.Event) {
 		c.state = StatePINEntry
 		c.pinBuffer = string(ev.Digit)
 		c.pinError = ""
+		log.Printf("[KEYPAD] Digit pressed: %c | Buffer: %s", ev.Digit, c.pinBuffer)
 		c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
 		c.renderPINEntryLocked()
 	}
@@ -268,26 +269,32 @@ func (c *Controller) handlePINEntryEvent(ev input.Event) {
 		if len(c.pinBuffer) < 4 {
 			c.pinBuffer += string(ev.Digit)
 			c.pinError = ""
+			log.Printf("[KEYPAD] Digit pressed: %c | Buffer: %s", ev.Digit, c.pinBuffer)
 			c.renderPINEntryLocked()
 		}
 	case input.ActionBackspace:
 		if len(c.pinBuffer) > 0 {
 			c.pinBuffer = c.pinBuffer[:len(c.pinBuffer)-1]
 			c.pinError = ""
+			log.Printf("[KEYPAD] Backspace | Buffer: %s", c.pinBuffer)
 			c.renderPINEntryLocked()
 		}
 	case input.ActionClear:
 		c.pinBuffer = ""
 		c.pinError = ""
+		log.Printf("[KEYPAD] Cleared | Buffer reset")
 		c.renderPINEntryLocked()
 	case input.ActionCancel:
+		log.Printf("[KEYPAD] Canceled | Returning to IDLE")
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
 		if len(c.pinBuffer) != 4 {
 			c.pinError = "PIN must be exactly 4 digits"
+			log.Printf("[KEYPAD] Submit rejected: PIN must be 4 digits (got '%s')", c.pinBuffer)
 			c.renderPINEntryLocked()
 			return
 		}
+		log.Printf("[KEYPAD] Submitting PIN: %s", c.pinBuffer)
 		c.startLookupLocked()
 	}
 }
@@ -472,6 +479,7 @@ func (c *Controller) startClaimLocked() {
 
 			c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
 			c.pinError = ""
+			log.Printf("[PAYMENT] Demo checkout link: %s", c.currentQRPayload)
 			c.renderPaymentPendingLocked(tSec)
 		}(targetSeq, sessID, timeoutSec)
 	}(seq, orderID)

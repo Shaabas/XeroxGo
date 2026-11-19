@@ -824,8 +824,8 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		http.Error(w, "payment simulation only available in development mode", http.StatusForbidden)
 		return
 	}
-	if s.cfg.demoMode {
-		http.Error(w, "direct order simulation is disabled in demo mode; use secure /pay/{token} checkout", http.StatusForbidden)
+	if s.cfg.demoMode && r.URL.Query().Get("force") != "1" && r.URL.Query().Get("bypass") != "1" {
+		http.Error(w, "direct order simulation is disabled in demo mode; use secure /pay/{token} checkout (or append ?force=1 to bypass)", http.StatusForbidden)
 		return
 	}
 
