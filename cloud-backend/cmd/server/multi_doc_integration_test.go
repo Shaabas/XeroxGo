@@ -77,6 +77,40 @@ func setupMultiDocCloudTestServer(t *testing.T) (*appServer, *httptest.Server, *
 	return app, ts, st, kioskSecret, webhookSecret
 }
 
+// testDirectStoreCapturePayment is an isolated test fixture helper that performs direct store-level
+// payment capture without exposing or touching any production HTTP route or public bypass header.
+func testDirectStoreCapturePayment(ctx context.Context, app *appServer, orderID, kioskID, sessionID string) (*store.PaymentCaptureResult, error) {
+	ord, err := app.db.GetOrder(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("testDirectStoreCapturePayment: get order: %w", err)
+	}
+	now := time.Now().UTC()
+	captureRes, err := app.db.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID:   "pay_test_" + orderID,
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		SessionID:   sessionID,
+		AmountPaise: ord.PricePaise,
+		Provider:    "test_fixture",
+		Status:      "captured",
+	}, now)
+	if err != nil {
+		return nil, fmt.Errorf("testDirectStoreCapturePayment: capture: %w", err)
+	}
+	if captureRes.DispatchEligible && app.hub != nil {
+		if len(captureRes.Commands) > 0 {
+			for _, cmd := range captureRes.Commands {
+				_ = app.hub.SendJob(ctx, cmd)
+				_ = app.db.MarkDispatchIntentSent(ctx, cmd.JobID)
+			}
+		} else if captureRes.Command != nil {
+			_ = app.hub.SendJob(ctx, *captureRes.Command)
+			_ = app.db.MarkDispatchIntentSent(ctx, captureRes.Command.JobID)
+		}
+	}
+	return captureRes, nil
+}
+
 // uploadMultiDocTestFiles uploads files with metadata to /api/k/<kioskID>/upload.
 func uploadMultiDocTestFiles(t *testing.T, tsURL, kioskID string, files [][]byte, filenames []string, metaJSON string) map[string]interface{} {
 	t.Helper()
@@ -133,7 +167,7 @@ func uploadMultiDocTestFiles(t *testing.T, tsURL, kioskID string, files [][]byte
 // signed PDF download validation → job_ack intent transitions → sequential progress tracking →
 // and order completion only after all child documents are complete.
 func TestMultiDoc_Cloud_FullFlowAndPricing(t *testing.T) {
-	_, ts, st, kSec, _ := setupMultiDocCloudTestServer(t)
+	app, ts, st, kSec, _ := setupMultiDocCloudTestServer(t)
 	kioskID := "kiosk-cloud-multi-1"
 
 	// 1. Upload 3 distinct documents:
@@ -235,18 +269,13 @@ func TestMultiDoc_Cloud_FullFlowAndPricing(t *testing.T) {
 	}
 	defer wsConn.CloseNow()
 
-	// 5. Payment captured via controlled test path
-	payReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment?session_id=%s", ts.URL, orderID, sessionID), nil)
-	payReq.Header.Set("X-Test-Payment-Auth", "test-authorized")
-	payResp, err := http.DefaultClient.Do(payReq)
-	if err != nil || payResp.StatusCode != http.StatusOK {
-		t.Fatalf("simulate payment failed: err=%v, code=%d", err, payResp.StatusCode)
+	// 5. Payment captured via direct store-level capture (isolated test fixture)
+	captureRes, err := testDirectStoreCapturePayment(ctx, app, orderID, kioskID, sessionID)
+	if err != nil {
+		t.Fatalf("testDirectStoreCapturePayment failed: %v", err)
 	}
-	var payData map[string]interface{}
-	_ = json.NewDecoder(payResp.Body).Decode(&payData)
-	payResp.Body.Close()
-	if payData["status"] != string(contracts.JobStatusDispatched) {
-		t.Fatalf("expected status DISPATCHED, got %v", payData["status"])
+	if !captureRes.DispatchEligible {
+		t.Fatalf("expected capture result to be dispatch eligible")
 	}
 
 	// 6. Kiosk reads 3 PrintJobCommands over WebSocket in document index order
@@ -547,7 +576,7 @@ func readNextJobCommand(ctx context.Context, c *websocket.Conn) (*contracts.Prin
 // TestMultiDoc_Cloud_WebSocketReconnectReplay verifies that when a kiosk disconnects mid-order,
 // reconnecting replays uncompleted dispatch intents in document order without duplicating completed jobs.
 func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
-	_, ts, _, kSec, _ := setupMultiDocCloudTestServer(t)
+	app, ts, _, kSec, _ := setupMultiDocCloudTestServer(t)
 	kioskID := "kiosk-cloud-recon-1"
 
 	tmpDir := t.TempDir()
@@ -593,11 +622,10 @@ func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
 		t.Fatalf("websocket 1 dial failed: %v", err)
 	}
 
-	// Trigger payment
-	payReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment?session_id=%s", ts.URL, orderID, sessionID), nil)
-	payReq.Header.Set("X-Test-Payment-Auth", "test-authorized")
-	pResp, _ := http.DefaultClient.Do(payReq)
-	pResp.Body.Close()
+	// Trigger payment via direct store-level capture (isolated test fixture)
+	if _, err := testDirectStoreCapturePayment(ctx1, app, orderID, kioskID, sessionID); err != nil {
+		t.Fatalf("testDirectStoreCapturePayment failed: %v", err)
+	}
 
 	// Read Doc 0 from WS 1
 	jobCmd0, err := readNextJobCommand(ctx1, ws1)
@@ -668,34 +696,53 @@ func TestMultiDoc_Cloud_PublicPaymentGateBlocked(t *testing.T) {
 	orderID := uploadResp["order_id"].(string)
 
 	// Create an active kiosk session for this order
-	if _, err := st.CreateOrGetKioskSessionWithPaperCheck(context.Background(), kioskID, orderID, 100, 5*time.Minute, time.Now().UTC()); err != nil {
+	sess, err := st.CreateOrGetKioskSessionWithPaperCheck(context.Background(), kioskID, orderID, 100, 5*time.Minute, time.Now().UTC())
+	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
 
-	// 1. Customer initiate-payment
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
-	initReq.Header.Set("Authorization", "Bearer "+kSec)
-	initResp, err := http.DefaultClient.Do(initReq)
-	if err != nil || initResp.StatusCode != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict, got %d (err=%v)", initResp.StatusCode, err)
-	}
-	var initData map[string]interface{}
-	_ = json.NewDecoder(initResp.Body).Decode(&initData)
-	initResp.Body.Close()
-	if initData["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
-		t.Errorf("initiate-payment code = %v, want MULTI_DOC_PAYMENT_BLOCKED", initData["code"])
+	bypassHeaders := []map[string]string{
+		{}, // no extra headers
+		{"X-Test-Payment-Auth": "test-authorized"},
+		{"X-Admin-Bypass": "true"},
+		{"X-Bypass-Gate": "1"},
+		{"X-XeroxGo-Proxy-Secret": "bypass"},
+		{"X-Role": "admin"},
+		{"X-Custom-Auth": "super-user"},
 	}
 
-	// 2. Simulate-payment without test authorization header
-	simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment", ts.URL, orderID), nil)
-	simResp, err := http.DefaultClient.Do(simReq)
-	if err != nil || simResp.StatusCode != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict without test header, got %d (err=%v)", simResp.StatusCode, err)
-	}
-	var simData map[string]interface{}
-	_ = json.NewDecoder(simResp.Body).Decode(&simData)
-	simResp.Body.Close()
-	if simData["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
-		t.Errorf("simulate-payment code = %v, want MULTI_DOC_PAYMENT_BLOCKED", simData["code"])
+	for _, headers := range bypassHeaders {
+		// 1. Customer initiate-payment: must fail with MULTI_DOC_PAYMENT_BLOCKED
+		initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+		initReq.Header.Set("Authorization", "Bearer "+kSec)
+		for k, v := range headers {
+			initReq.Header.Set(k, v)
+		}
+		initResp, err := http.DefaultClient.Do(initReq)
+		if err != nil || initResp.StatusCode != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict for initiate-payment with header %v, got %d (err=%v)", headers, initResp.StatusCode, err)
+		}
+		var initData map[string]interface{}
+		_ = json.NewDecoder(initResp.Body).Decode(&initData)
+		initResp.Body.Close()
+		if initData["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
+			t.Errorf("initiate-payment code = %v with header %v, want MULTI_DOC_PAYMENT_BLOCKED", initData["code"], headers)
+		}
+
+		// 2. Simulate-payment: must fail with MULTI_DOC_PAYMENT_BLOCKED regardless of client headers
+		simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment?session_id=%s", ts.URL, orderID, sess.SessionID), nil)
+		for k, v := range headers {
+			simReq.Header.Set(k, v)
+		}
+		simResp, err := http.DefaultClient.Do(simReq)
+		if err != nil || simResp.StatusCode != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict for simulate-payment with header %v, got %d (err=%v)", headers, simResp.StatusCode, err)
+		}
+		var simData map[string]interface{}
+		_ = json.NewDecoder(simResp.Body).Decode(&simData)
+		simResp.Body.Close()
+		if simData["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
+			t.Errorf("simulate-payment code = %v with header %v, want MULTI_DOC_PAYMENT_BLOCKED", simData["code"], headers)
+		}
 	}
 }

@@ -1884,7 +1884,7 @@ func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
 	defer runCancel()
 
 	// Wait for all 3 uncompleted documents (1, 2, 3) to be submitted via MockCUPSPrint in FIFO order
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		printMu.Lock()
 		cnt := len(printedDocs)

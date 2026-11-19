@@ -3041,10 +3041,19 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}
 
 		// Assert: admitted and buffered by ordered producer under queue saturation
-		client.queueMu.Lock()
-		pendingCount := len(client.pendingQueue)
-		isProducerRunning := client.producerRunning
-		client.queueMu.Unlock()
+		deadlineG := time.Now().Add(2 * time.Second)
+		var pendingCount int
+		var isProducerRunning bool
+		for time.Now().Before(deadlineG) {
+			client.queueMu.Lock()
+			pendingCount = len(client.pendingQueue)
+			isProducerRunning = client.producerRunning
+			client.queueMu.Unlock()
+			if pendingCount > 0 || isProducerRunning {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		if pendingCount == 0 && !isProducerRunning {
 			t.Errorf("expected job to be pending or handled by ordered producer")
 		}

@@ -849,8 +849,7 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	isTestPayment := r.Header.Get("X-Test-Payment-Auth") == "test-authorized"
-	if len(order.Documents) > 1 && !isTestPayment {
+	if len(order.Documents) > 1 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
