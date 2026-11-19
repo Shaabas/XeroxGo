@@ -25,6 +25,7 @@ SIMULATED_FAILURE="${SIMULATED_FAILURE:-}"
 SIMULATED_FAILURE_SHEET="${SIMULATED_FAILURE_SHEET:-0}"
 ENABLE_SOUND="${ENABLE_SOUND:-true}"
 VIEWER_DIR="${VIEWER_DIR:-/tmp/xeroxgo-viewer}"
+CUPS_PRINTER="${CUPS_PRINTER:-}"
 
 # Parse optional CLI flags
 while [[ $# -gt 0 ]]; do
@@ -47,11 +48,14 @@ while [[ $# -gt 0 ]]; do
     --simulated-failure-sheet) SIMULATED_FAILURE_SHEET="$2"; shift 2 ;;
     --enable-sound=*) ENABLE_SOUND="${1#*=}"; shift ;;
     --no-sound) ENABLE_SOUND="false"; shift ;;
+    --cups-printer=*) CUPS_PRINTER="${1#*=}"; shift ;;
+    --cups-printer) CUPS_PRINTER="$2"; shift 2 ;;
     --help|-h)
       echo "Usage: $0 [options]"
       echo "Options:"
       echo "  --cloud-url=URL                Cloud WebSocket URL (default: $CLOUD_URL)"
       echo "  --kiosk-id=ID                  Kiosk ID (default: $KIOSK_ID)"
+      echo "  --cups-printer=QUEUE           CUPS printer queue name (if set, uses CUPS instead of mock)"
       echo "  --viewer-port=PORT             Port for live web viewer (default: $VIEWER_PORT)"
       echo "  --viewer-dir=DIR               Dedicated viewer directory (default: $VIEWER_DIR)"
       echo "  --simulated-stock=N            Initial paper stock sheets (default: $SIMULATED_STOCK)"
@@ -101,12 +105,22 @@ if [ -t 0 ]; then
 fi
 
 # 5. Display banner
+PRINTER_ARGS=(--mock-printer)
+if [ -n "${CUPS_PRINTER}" ]; then
+  PRINTER_ARGS=(--cups-printer="${CUPS_PRINTER}")
+fi
+
 echo "=============================================================================="
-echo " XeroxGo Headless Raspberry Pi Kiosk Active"
+echo " XeroxGo Headless Kiosk Active"
 echo "=============================================================================="
 echo " * Kiosk ID:            ${KIOSK_ID}"
 echo " * Cloud Target:        ${CLOUD_URL}"
 echo " * Live Screen Monitor: http://${PRIMARY_IP}:${VIEWER_PORT}/"
+if [ -n "${CUPS_PRINTER}" ]; then
+echo " * Printer Target:      CUPS queue ${CUPS_PRINTER}"
+else
+echo " * Printer Target:      Simulated Mock Printer"
+fi
 echo " * Dedicated Directory: ${VIEWER_DIR} (isolated from root /tmp)"
 echo " * Paper Stock:         ${SIMULATED_STOCK} sheets"
 if [ -n "${SIMULATED_FAILURE}" ]; then
@@ -114,7 +128,7 @@ echo " * Simulated Failure:   ${SIMULATED_FAILURE} (sheet: ${SIMULATED_FAILURE_S
 fi
 echo " * Completion Sound:    ${ENABLE_SOUND}"
 echo "------------------------------------------------------------------------------"
-echo " Interactive SSH Keypad Controls:"
+echo " Interactive Keypad Controls:"
 echo "   [0-9]        Type 4-digit PIN"
 echo "   [Enter]      Submit PIN / Confirm Order Summary"
 echo "   [c] / [C]    Clear PIN buffer"
@@ -124,7 +138,7 @@ echo "==========================================================================
 
 # 6. Execute kiosk daemon
 "${KIOSK_BIN}" \
-  --mock-printer \
+  "${PRINTER_ARGS[@]}" \
   --enable-keypad \
   --preview-png="${PREVIEW_PNG}" \
   --viewer-addr="0.0.0.0:${VIEWER_PORT}" \
