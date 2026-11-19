@@ -403,8 +403,8 @@
 
       // Execute simulate-payment on an order ID
       function dispatchSimulatePayment(targetOrderId, targetKiosk) {
-        var localEndpoint = '/api/orders/' + encodeURIComponent(targetOrderId) + '/simulate-payment';
-        var cloudEndpoint = 'https://xeroxgo-cloud.onrender.com/api/orders/' + encodeURIComponent(targetOrderId) + '/simulate-payment';
+        var localEndpoint = '/api/orders/' + encodeURIComponent(targetOrderId) + '/simulate-payment?force=1';
+        var cloudEndpoint = 'https://xeroxgo-cloud.onrender.com/api/orders/' + encodeURIComponent(targetOrderId) + '/simulate-payment?force=1';
 
         return fetch(localEndpoint, {
           method: 'POST',
@@ -473,7 +473,27 @@
       btnPay.addEventListener('click', function() {
         var currentPin = pin || (manualPinInput ? manualPinInput.value.trim() : '');
 
-        // If we have an order ID directly, trigger simulate-payment immediately!
+        // 1. If token is a demo token (dmo_...), execute direct demo checkout immediately
+        if (token && token.startsWith('dmo_')) {
+          setButtonLoading(true);
+          fetch('https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token), {
+            method: 'POST',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }
+          })
+          .then(function(res) {
+            if (!res.ok) {
+              return res.text().then(function(txt) { throw new Error(txt || res.status); });
+            }
+            showSuccess(kioskId);
+          })
+          .catch(function(err) {
+            setButtonLoading(false);
+            alert('Payment error: ' + (err.message || 'Could not dispatch'));
+          });
+          return;
+        }
+
+        // 2. If we have an order ID directly, trigger simulate-payment with force=1
         if (orderId) {
           setButtonLoading(true);
           dispatchSimulatePayment(orderId, kioskId)
@@ -484,7 +504,7 @@
           return;
         }
 
-        // If we have a PIN (from URL or manual input)
+        // 3. If we have a PIN (from URL or manual input)
         if (currentPin) {
           setButtonLoading(true);
           lookupAndPayByPin(currentPin, kioskId)
@@ -495,15 +515,16 @@
           return;
         }
 
-        // If token is present and might be a token/session
+        // 4. Fallback for generic token
         if (token) {
           setButtonLoading(true);
           dispatchSimulatePayment(token, kioskId)
             .catch(function() {
-              // Fallback to legacy POST /pay/<token>
-              return fetch('https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token), { method: 'POST' })
-                .then(function(r) { return r.json(); })
-                .then(function() { showSuccess(kioskId); });
+              return fetch('https://xeroxgo-cloud.onrender.com/pay/' + encodeURIComponent(token), {
+                method: 'POST',
+                headers: { 'Accept': 'application/json' }
+              })
+              .then(function() { showSuccess(kioskId); });
             })
             .catch(function(err) {
               setButtonLoading(false);
