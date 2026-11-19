@@ -539,8 +539,11 @@ func TestMultiFileUpload_AtomicRollbackOnFailure(t *testing.T) {
 	}
 }
 
-func TestMultiFileUpload_PaymentInitiationBlocked(t *testing.T) {
+func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 	app, _ := setupUploadTestServer(t)
+	app.cfg.devMode = true
+	app.hub = nil
+	app.cfg.webhookSecret = []byte("whsec_test_secret_32_bytes_long_ok")
 	mux := http.NewServeMux()
 	app.cfg.kioskSecret = []byte("mock-kiosk-secret")
 	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
@@ -597,28 +600,28 @@ func TestMultiFileUpload_PaymentInitiationBlocked(t *testing.T) {
 	payRec := httptest.NewRecorder()
 	mux.ServeHTTP(payRec, payReq)
 
-	if payRec.Code != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict for multi-doc payment initiation, got %d: %s", payRec.Code, payRec.Body.String())
+	if payRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for multi-doc payment initiation, got %d: %s", payRec.Code, payRec.Body.String())
 	}
-	var payResp map[string]string
+	var payResp map[string]interface{}
 	_ = json.Unmarshal(payRec.Body.Bytes(), &payResp)
-	if payResp["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
-		t.Errorf("code = %q, want MULTI_DOC_PAYMENT_BLOCKED", payResp["code"])
+	if payResp["attempt_id"] == nil || payResp["attempt_id"] == "" {
+		t.Errorf("expected non-empty attempt_id in payment response, got %v", payResp)
 	}
 
 	// 3. Attempt handleSimulatePayment on multi-doc order in devMode
 	app.cfg.devMode = true
-	simReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/simulate-payment", orderID), nil)
+	simReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/simulate-payment?force=1", orderID), nil)
 	simRec := httptest.NewRecorder()
 	mux.ServeHTTP(simRec, simReq)
 
-	if simRec.Code != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict for multi-doc simulate-payment, got %d: %s", simRec.Code, simRec.Body.String())
+	if simRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for multi-doc simulate-payment, got %d: %s", simRec.Code, simRec.Body.String())
 	}
 	var simResp map[string]interface{}
 	_ = json.Unmarshal(simRec.Body.Bytes(), &simResp)
-	if simResp["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
-		t.Errorf("code = %v, want MULTI_DOC_PAYMENT_BLOCKED", simResp["code"])
+	if simResp["status"] != "DISPATCHED" {
+		t.Errorf("expected status DISPATCHED, got %v", simResp["status"])
 	}
 }
 

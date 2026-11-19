@@ -682,9 +682,9 @@ func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
 	}
 }
 
-// TestMultiDoc_Cloud_PublicPaymentGateBlocked verifies that all public customer endpoints
-// reject multi-document payment initiation with HTTP 409 and MULTI_DOC_PAYMENT_BLOCKED.
-func TestMultiDoc_Cloud_PublicPaymentGateBlocked(t *testing.T) {
+// TestMultiDoc_Cloud_PublicPaymentFlowSupported verifies that multi-document orders
+// successfully support payment initiation and simulation across public endpoints.
+func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 	_, ts, st, kSec, _ := setupMultiDocCloudTestServer(t)
 	kioskID := "kiosk-cloud-block-1"
 
@@ -710,48 +710,73 @@ func TestMultiDoc_Cloud_PublicPaymentGateBlocked(t *testing.T) {
 		t.Fatalf("failed to create session: %v", err)
 	}
 
-	bypassHeaders := []map[string]string{
-		{}, // no extra headers
-		{"X-Test-Payment-Auth": "test-authorized"},
-		{"X-Admin-Bypass": "true"},
-		{"X-Bypass-Gate": "1"},
-		{"X-XeroxGo-Proxy-Secret": "bypass"},
-		{"X-Role": "admin"},
-		{"X-Custom-Auth": "super-user"},
+	// 1. Customer initiate-payment: must succeed with HTTP 200 and return payment attempt details
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq.Header.Set("Authorization", "Bearer "+kSec)
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil || initResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for initiate-payment, got %d (err=%v)", initResp.StatusCode, err)
+	}
+	var initData map[string]interface{}
+	_ = json.NewDecoder(initResp.Body).Decode(&initData)
+	initResp.Body.Close()
+	if initData["attempt_id"] == nil || initData["attempt_id"] == "" {
+		t.Errorf("expected non-empty attempt_id in initiate-payment response, got %v", initData)
 	}
 
-	for _, headers := range bypassHeaders {
-		// 1. Customer initiate-payment: must fail with MULTI_DOC_PAYMENT_BLOCKED
-		initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
-		initReq.Header.Set("Authorization", "Bearer "+kSec)
-		for k, v := range headers {
-			initReq.Header.Set(k, v)
-		}
-		initResp, err := http.DefaultClient.Do(initReq)
-		if err != nil || initResp.StatusCode != http.StatusConflict {
-			t.Fatalf("expected 409 Conflict for initiate-payment with header %v, got %d (err=%v)", headers, initResp.StatusCode, err)
-		}
-		var initData map[string]interface{}
-		_ = json.NewDecoder(initResp.Body).Decode(&initData)
-		initResp.Body.Close()
-		if initData["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
-			t.Errorf("initiate-payment code = %v with header %v, want MULTI_DOC_PAYMENT_BLOCKED", initData["code"], headers)
-		}
+	// 2. Kiosk connects via WebSocket to receive print jobs
+	u, _ := url.Parse(ts.URL)
+	u.Scheme = "ws"
+	u.Path = "/ws"
+	q := u.Query()
+	q.Set("kiosk_id", kioskID)
+	u.RawQuery = q.Encode()
 
-		// 2. Simulate-payment: must fail with MULTI_DOC_PAYMENT_BLOCKED regardless of client headers
-		simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment?session_id=%s", ts.URL, orderID, sess.SessionID), nil)
-		for k, v := range headers {
-			simReq.Header.Set(k, v)
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer wsCancel()
+	wsConn, _, err := websocket.Dial(wsCtx, u.String(), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + kSec}},
+	})
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	// 3. Simulate-payment: must succeed with HTTP 200 and transition order to DISPATCHED
+	simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment?session_id=%s&force=1", ts.URL, orderID, sess.SessionID), nil)
+	simResp, err := http.DefaultClient.Do(simReq)
+	if err != nil || simResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for simulate-payment, got %d (err=%v)", simResp.StatusCode, err)
+	}
+	var simData map[string]interface{}
+	_ = json.NewDecoder(simResp.Body).Decode(&simData)
+	simResp.Body.Close()
+	if simData["status"] != "DISPATCHED" {
+		t.Errorf("simulate-payment status = %v, want DISPATCHED", simData["status"])
+	}
+
+	// 4. Verify the 2 PrintJobCommands are received over WebSocket
+	receivedCmds := make([]*contracts.PrintJobCommand, 0, 2)
+	readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readCancel()
+
+	for len(receivedCmds) < 2 {
+		var rawMsg struct {
+			Type string                     `json:"type"`
+			Job  *contracts.PrintJobCommand `json:"job"`
 		}
-		simResp, err := http.DefaultClient.Do(simReq)
-		if err != nil || simResp.StatusCode != http.StatusConflict {
-			t.Fatalf("expected 409 Conflict for simulate-payment with header %v, got %d (err=%v)", headers, simResp.StatusCode, err)
+		if err := wsjson.Read(readCtx, wsConn, &rawMsg); err != nil {
+			t.Fatalf("failed reading job %d over ws: %v", len(receivedCmds), err)
 		}
-		var simData map[string]interface{}
-		_ = json.NewDecoder(simResp.Body).Decode(&simData)
-		simResp.Body.Close()
-		if simData["code"] != "MULTI_DOC_PAYMENT_BLOCKED" {
-			t.Errorf("simulate-payment code = %v with header %v, want MULTI_DOC_PAYMENT_BLOCKED", simData["code"], headers)
+		if rawMsg.Type == "job" && rawMsg.Job != nil {
+			receivedCmds = append(receivedCmds, rawMsg.Job)
 		}
+	}
+
+	if len(receivedCmds) != 2 {
+		t.Fatalf("expected 2 dispatched commands, got %d", len(receivedCmds))
+	}
+	if receivedCmds[0].DocumentIndex != 0 || receivedCmds[1].DocumentIndex != 1 {
+		t.Errorf("expected document indices [0, 1], got [%d, %d]", receivedCmds[0].DocumentIndex, receivedCmds[1].DocumentIndex)
 	}
 }

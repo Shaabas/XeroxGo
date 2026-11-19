@@ -849,17 +849,6 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if len(order.Documents) > 1 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"order_id": orderID,
-			"error":    "multi-document orders are not yet supported for payment",
-			"code":     "MULTI_DOC_PAYMENT_BLOCKED",
-		})
-		return
-	}
-
 	if order.Status == contracts.JobStatusCompleted ||
 		order.Status == contracts.JobStatusPrinting ||
 		order.Status == contracts.JobStatusSpooling ||

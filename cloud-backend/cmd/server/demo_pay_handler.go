@@ -66,19 +66,6 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 
 	now := time.Now().UTC()
 	order, _ := s.db.GetOrder(r.Context(), att.OrderID)
-	if order != nil && len(order.Documents) > 1 {
-		if isJSONRequest(r) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "multi-document orders are not yet supported for payment",
-				"code":  "MULTI_DOC_PAYMENT_BLOCKED",
-			})
-			return
-		}
-		s.renderDemoErrorPage(w, http.StatusConflict, "Payment Not Supported", "Multi-document orders are not yet supported for payment at this kiosk.")
-		return
-	}
 	sess, _ := s.db.GetKioskSession(r.Context(), att.SessionID, now)
 
 	isExpired := now.After(att.ExpiresAt) || att.Status == "EXPIRED"
@@ -122,9 +109,18 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 	colorModeStr := "Black & White (Mono)"
 
 	if order != nil {
-		totalPages = order.Command.TotalPages
-		totalSheets = order.Command.TotalSheets
+		totalPages = order.TotalPages
+		if totalPages <= 0 {
+			totalPages = order.Command.TotalPages
+		}
+		totalSheets = order.TotalSheets
+		if totalSheets <= 0 {
+			totalSheets = order.Command.TotalSheets
+		}
 		copies = order.Command.Copies
+		if copies <= 0 {
+			copies = 1
+		}
 		if order.Command.Duplex == contracts.DuplexLongEdge || order.Command.Duplex == contracts.DuplexShortEdge {
 			duplexStr = "Double-sided (Duplex)"
 		}
@@ -136,7 +132,7 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 	if isJSONRequest(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		jsonResp := map[string]interface{}{
 			"status":        "ACTIVE",
 			"order_id":      att.OrderID,
 			"session_id":    att.SessionID,
@@ -149,7 +145,11 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 			"duplex":        duplexStr,
 			"color_mode":    colorModeStr,
 			"expires_at":    att.ExpiresAt.Format(time.RFC3339),
-		})
+		}
+		if order != nil && len(order.Documents) > 1 {
+			jsonResp["documents_count"] = len(order.Documents)
+		}
+		_ = json.NewEncoder(w).Encode(jsonResp)
 		return
 	}
 
@@ -491,19 +491,6 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 	}
 
 	order, _ := s.db.GetOrder(r.Context(), att.OrderID)
-	if order != nil && len(order.Documents) > 1 {
-		if isJSONRequest(r) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "multi-document orders are not yet supported for payment",
-				"code":  "MULTI_DOC_PAYMENT_BLOCKED",
-			})
-			return
-		}
-		s.renderDemoErrorPage(w, http.StatusConflict, "Payment Not Supported", "Multi-document orders are not yet supported for payment at this kiosk.")
-		return
-	}
 
 	// Idempotency: if already marked paid, return success immediately
 	if att.Status == "PAID" {
