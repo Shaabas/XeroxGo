@@ -996,6 +996,27 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 		c.heartbeatLoop(connCtx, conn)
 	}()
 
+	// Synchronize any paused/error job states with the cloud upon connection
+	go func() {
+		incList, err := c.cfg.StateStore.GetIncompleteJobs(connCtx)
+		if err == nil {
+			for _, inc := range incList {
+				if inc.Status == contracts.JobStatusPausedError || inc.Status == contracts.JobStatusFailedRefundable {
+					evt := contracts.JobProgressEvent{
+						JobID:         inc.Command.JobID,
+						KioskID:       c.cfg.KioskID,
+						Status:        inc.Status,
+						PagesPrinted:  inc.PagesPrinted,
+						SheetsPrinted: inc.SheetsPrinted,
+						ErrorReason:   inc.ErrorReason,
+						Timestamp:     time.Now().UTC(),
+					}
+					c.sendProgress(connCtx, evt)
+				}
+			}
+		}
+	}()
+
 	// Reader loop
 	for {
 		var msg wireMessage
@@ -1118,7 +1139,7 @@ func isConflictingDuplicate(stored, incoming contracts.PrintJobCommand) bool {
 }
 
 func (c *Client) handleDuplicateDelivery(existing *state.StoredJob, cmd contracts.PrintJobCommand) {
-	// Stored, completed: Never resubmit; report existing completed state via job_ack only
+	// Stored, completed: Never resubmit; report existing completed state via job_ack and progress
 	if existing.Status == contracts.JobStatusCompleted {
 		log.Printf("[SPOOLER] Acknowledging duplicate command for already completed job %s", cmd.JobID)
 		pagesPrinted := existing.PagesPrinted
@@ -1129,21 +1150,23 @@ func (c *Client) handleDuplicateDelivery(existing *state.StoredJob, cmd contract
 		if sheetsPrinted <= 0 {
 			sheetsPrinted = existing.Command.TotalSheets
 		}
-		c.sendJobAck(context.Background(), contracts.JobProgressEvent{
+		evt := contracts.JobProgressEvent{
 			JobID:         cmd.JobID,
 			KioskID:       c.cfg.KioskID,
 			Status:        contracts.JobStatusCompleted,
 			PagesPrinted:  pagesPrinted,
 			SheetsPrinted: sheetsPrinted,
 			Timestamp:     time.Now().UTC(),
-		})
+		}
+		c.sendJobAck(context.Background(), evt)
+		c.sendProgress(context.Background(), evt)
 		return
 	}
 
-	// Stored, already submitted to printer: Never resubmit; acknowledge durable possession via job_ack only
+	// Stored, already submitted to printer: Never resubmit; acknowledge durable possession via job_ack and progress
 	if existing.SubmittedToPrinter || existing.CUPSJobID != "" {
 		log.Printf("[SPOOLER] Acknowledging duplicate command for already submitted job %s (CUPS ID %s, status %s)", cmd.JobID, existing.CUPSJobID, existing.Status)
-		c.sendJobAck(context.Background(), contracts.JobProgressEvent{
+		evt := contracts.JobProgressEvent{
 			JobID:         cmd.JobID,
 			KioskID:       c.cfg.KioskID,
 			Status:        existing.Status,
@@ -1151,14 +1174,16 @@ func (c *Client) handleDuplicateDelivery(existing *state.StoredJob, cmd contract
 			SheetsPrinted: existing.SheetsPrinted,
 			ErrorReason:   existing.ErrorReason,
 			Timestamp:     time.Now().UTC(),
-		})
+		}
+		c.sendJobAck(context.Background(), evt)
+		c.sendProgress(context.Background(), evt)
 		return
 	}
 
-	// Stored, paused or ambiguous: Never automatically resubmit; preserve recovery requirements via job_ack only
+	// Stored, paused or ambiguous: Never automatically resubmit; preserve recovery requirements via job_ack and progress
 	if existing.Status == contracts.JobStatusPausedError || existing.Status == contracts.JobStatusFailedRefundable {
 		log.Printf("[SPOOLER] Acknowledging duplicate command for paused/failed job %s (status %s)", cmd.JobID, existing.Status)
-		c.sendJobAck(context.Background(), contracts.JobProgressEvent{
+		evt := contracts.JobProgressEvent{
 			JobID:         cmd.JobID,
 			KioskID:       c.cfg.KioskID,
 			Status:        existing.Status,
@@ -1166,7 +1191,9 @@ func (c *Client) handleDuplicateDelivery(existing *state.StoredJob, cmd contract
 			SheetsPrinted: existing.SheetsPrinted,
 			ErrorReason:   existing.ErrorReason,
 			Timestamp:     time.Now().UTC(),
-		})
+		}
+		c.sendJobAck(context.Background(), evt)
+		c.sendProgress(context.Background(), evt)
 		return
 	}
 
@@ -2597,6 +2624,12 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 	if printErr != nil {
 		if isHw, reason, _ := isBlockingHardwareFaultString(printErr.Error()); isHw {
+			handleJobHardwareInterruption(reason)
+			return
+		}
+		// Also check live printer health to see if a hardware fault caused the stream failure
+		h := c.CheckPrinterHealth(ctx)
+		if isFault, reason, _ := isBlockingHardwareFault(h); isFault {
 			handleJobHardwareInterruption(reason)
 			return
 		}

@@ -754,8 +754,20 @@ func MonitorCUPSJobWithTelemetryCustom(
 
 			case CUPSJobStateCompleted:
 				log.Printf("[CUPS] Job %s (CUPS ID %s) confirmed completed by CUPS (CUPS counter: %d sheets)", cmd.JobID, cupsJobID, info.SheetsCompleted)
-				// Do not invoke onPage with unverified CUPS counters. Physical progress
-				// requires hardware odometer proof.
+				// Capture final hardware odometer reading upon CUPS completion confirmation
+				if telemetryPoller != nil && hasOdometer {
+					telem := telemetryPoller(ctx)
+					if telem.Online && telem.HasLife {
+						curSheets := int(telem.LifeCount - initialLife)
+						if curSheets > lastOdometerSheets && curSheets <= cmd.TotalSheets {
+							lastOdometerSheets = curSheets
+							log.Printf("[CUPS-SNMP] Final verified physical sheets ejected via odometer: %d/%d", curSheets, cmd.TotalSheets)
+							if onPage != nil {
+								onPage(curSheets)
+							}
+						}
+					}
+				}
 				return nil
 
 			case CUPSJobStateCanceled:

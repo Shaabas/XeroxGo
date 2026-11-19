@@ -174,6 +174,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if jobID != "" && h.db != nil {
 				_ = h.db.MarkDispatchIntentAcknowledged(ctx, jobID)
+				if msg.Progress != nil && msg.Progress.KioskID == kioskID && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
+					_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+				}
 			}
 		case "progress":
 			if msg.Progress == nil {
