@@ -92,6 +92,7 @@ type ClientConfig struct {
 	SummaryTimeout           time.Duration
 	PaymentTimeout           time.Duration
 	PaymentURLBase           string
+	BypassPayment            bool
 	SoundPlayer              audio.Player
 	OnJobCompleted           func(jobID string)
 	TrustedOrigins           []string
@@ -372,6 +373,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				SummaryTimeout:    cfg.SummaryTimeout,
 				PaymentTimeout:    cfg.PaymentTimeout,
 				PaymentURLBase:    cfg.PaymentURLBase,
+				BypassPayment:     cfg.BypassPayment,
 				KioskID:           cfg.KioskID,
 				RenderScreen:      client.renderScreen,
 				LookupClient:      pinClient,

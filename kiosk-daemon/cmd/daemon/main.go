@@ -261,8 +261,9 @@ func main() {
 	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
-	paymentURLBase := flag.String("payment-url-base", "https://xeroxgo.vercel.app/payment", "Base URL for payment QR codes (e.g. https://xeroxgo.vercel.app/payment). If non-empty, wraps payment tokens in this URL")
+	paymentURLBase := flag.String("payment-url-base", "https://xeroxgo.vercel.app/pay", "Base URL for payment QR codes (e.g. https://xeroxgo.vercel.app/pay). If non-empty, wraps payment tokens in this URL")
 	paymentURL := flag.String("payment-url", "", "Alias for -payment-url-base")
+	bypassPayment := flag.Bool("bypass-payment", false, "In demo/test mode, auto-authorize payment and print immediately when order is confirmed on keypad without needing a phone QR scan")
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
 	enableCloudRecovery := flag.Bool("enable-cloud-recovery", true, "Enable cloud-owned print recovery and continuation artifacts (disables Pi-side slicer)")
 	enableKeypad := flag.Bool("enable-keypad", true, "Enable keyboard/keypad input for PIN entry (default true)")
@@ -536,6 +537,7 @@ func main() {
 		SummaryTimeout:           *orderSummaryTimeout,
 		PaymentTimeout:           *paymentPendingTimeout,
 		PaymentURLBase:           *paymentURLBase,
+		BypassPayment:            *bypassPayment,
 		SoundPlayer:              soundPlayer,
 		EnableShadowHealth:       *enableShadowHealth,
 		ShadowHealthInterval:     *shadowHealthInterval,

@@ -117,6 +117,7 @@ type PINLookupClient interface {
 	CancelSession(ctx context.Context, sessionID string) error
 	GetSession(ctx context.Context, sessionID string) (*SessionDetails, error)
 	InitiatePayment(ctx context.Context, sessionID string) (*PaymentAttemptDetails, error)
+	AuthorizeDemoPayment(ctx context.Context, token string) error
 }
 
 // HTTPPINClient implements PINLookupClient using HTTP REST against the cloud backend.
@@ -462,6 +463,41 @@ func (c *HTTPPINClient) InitiatePayment(ctx context.Context, sessionID string) (
 	default:
 		return nil, fmt.Errorf("initiate payment error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
+}
+
+// AuthorizeDemoPayment sends a payment authorization request to the cloud backend for demo/bypass printing.
+func (c *HTTPPINClient) AuthorizeDemoPayment(ctx context.Context, token string) error {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return err
+	}
+	var payURL string
+	if strings.HasPrefix(token, "dmo_") {
+		payURL = fmt.Sprintf("%s://%s/pay/%s", u.Scheme, u.Host, url.PathEscape(token))
+	} else {
+		payURL = fmt.Sprintf("%s://%s/api/orders/%s/simulate-payment?force=1", u.Scheme, u.Host, url.PathEscape(token))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, payURL, nil)
+	if err != nil {
+		return fmt.Errorf("create authorize demo payment request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.kioskSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.kioskSecret)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return &NetworkError{Err: err}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("demo payment failed (%d): %s", resp.StatusCode, string(bodyBytes))
+	}
+	return nil
 }
 
 

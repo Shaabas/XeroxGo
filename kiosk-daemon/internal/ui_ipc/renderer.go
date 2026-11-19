@@ -1249,7 +1249,7 @@ func renderPaymentPending(dst *image.RGBA, state ScreenState) {
 	if state.PINError != "" {
 		drawText(dst, faceBold20, state.PINError, 1140, 670, colorErrorRed)
 	} else {
-		drawText(dst, faceReg20, "Point phone camera at QR code to pay", 1140, 670, colorPrimaryBlue)
+		drawText(dst, faceReg20, "Scan QR with phone OR press [Confirm] on keypad", 1140, 670, colorPrimaryBlue)
 	}
 
 	// QR Code Container Box on right side of Right Card (x: 1510 to 1780, y: 350 to 620 -> 270x270)
@@ -1275,10 +1275,10 @@ func renderPaymentPending(dst *image.RGBA, state ScreenState) {
 		drawText(dst, faceReg20, waitLabel, qrBox.Min.X+(qrBox.Dx()-wW)/2, 510, colorTextSecondary)
 	}
 
-	// Action Bar: Cancel Transaction
+	// Action Bar: Confirm Demo Print & Cancel
 	cancelPill := image.Rect(90, 820, 1830, 900)
 	drawPill(dst, cancelPill, colorBgSlate, colorBorder)
-	drawText(dst, faceBold28, "[Cancel / Esc] Cancel Transaction & Return to Home", 600, 845, colorErrorRed)
+	drawText(dst, faceBold28, "[Confirm / Enter] Demo Pay & Print        [Cancel / Esc] Cancel", 480, 845, colorPrimaryBlue)
 
 	// Countdown Timer
 	if state.TimeoutSeconds > 0 {

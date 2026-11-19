@@ -40,6 +40,7 @@ type Config struct {
 	KioskID           string
 	PrinterModel      string
 	OnTransactionEnd  func()
+	BypassPayment     bool
 }
 
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
@@ -53,6 +54,7 @@ type Controller struct {
 	pinError       string
 	currentOrder     *cloud.OrderDetails
 	currentSession   *cloud.SessionDetails
+	currentAttempt   *cloud.PaymentAttemptDetails
 	currentQRPayload string
 	lookupSeq        uint64 // Monotonically increasing sequence to discard stale responses
 	isClaiming       bool
@@ -195,6 +197,7 @@ func (c *Controller) resetToIdleLocked() {
 	c.isClaiming = false
 	c.currentOrder = nil
 	c.currentSession = nil
+	c.currentAttempt = nil
 	c.currentQRPayload = ""
 
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
@@ -354,14 +357,64 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 					return
 				}
+				c.currentAttempt = attempt
 				c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
 				c.pinError = ""
 				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+
+				token := attempt.DemoToken
+				if token == "" && c.currentOrder != nil {
+					token = c.currentOrder.OrderID
+				}
+				if c.cfg.BypassPayment && token != "" {
+					log.Printf("[PIN-CONTROLLER] BypassPayment enabled: auto-authorizing demo payment for %s", token)
+					c.authorizeDemoPaymentLocked(token)
+				}
 			}(seq, sID)
 		} else {
-			log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
+			token := ""
+			if c.currentAttempt != nil && c.currentAttempt.DemoToken != "" {
+				token = c.currentAttempt.DemoToken
+			} else if c.currentOrder != nil && c.currentOrder.OrderID != "" {
+				token = c.currentOrder.OrderID
+			}
+			if token != "" {
+				log.Printf("[PIN-CONTROLLER] Keypad Confirm: authorizing demo payment for %s", token)
+				c.authorizeDemoPaymentLocked(token)
+			} else {
+				log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
+			}
 		}
 	}
+}
+
+func (c *Controller) authorizeDemoPaymentLocked(token string) {
+	if token == "" || c.cfg.LookupClient == nil {
+		return
+	}
+	c.pinError = "Authorizing payment & preparing print..."
+	c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+
+	seq := atomic.AddUint64(&c.lookupSeq, 1)
+	go func(targetSeq uint64, demoTok string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		err := c.cfg.LookupClient.AuthorizeDemoPayment(ctx, demoTok)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
+			return
+		}
+		if err != nil {
+			log.Printf("[PIN-CONTROLLER] Demo payment authorization failed: %v", err)
+			c.pinError = "Payment failed. Press Confirm to retry or Cancel to exit."
+			c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+			return
+		}
+		log.Printf("[PIN-CONTROLLER] Demo payment authorized successfully for %s! Waiting for spooler dispatch.", demoTok)
+		c.pinError = ""
+		c.resetToIdleLocked()
+	}(seq, token)
 }
 
 func (c *Controller) startClaimLocked() {
@@ -477,10 +530,20 @@ func (c *Controller) startClaimLocked() {
 				return
 			}
 
+			c.currentAttempt = attempt
 			c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
 			c.pinError = ""
 			log.Printf("[PAYMENT] Demo checkout link: %s", c.currentQRPayload)
 			c.renderPaymentPendingLocked(tSec)
+
+			token := attempt.DemoToken
+			if token == "" && c.currentOrder != nil {
+				token = c.currentOrder.OrderID
+			}
+			if c.cfg.BypassPayment && token != "" {
+				log.Printf("[PIN-CONTROLLER] BypassPayment enabled: auto-authorizing demo payment for %s", token)
+				c.authorizeDemoPaymentLocked(token)
+			}
 		}(targetSeq, sessID, timeoutSec)
 	}(seq, orderID)
 }

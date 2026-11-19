@@ -26,6 +26,7 @@ SIMULATED_FAILURE_SHEET="${SIMULATED_FAILURE_SHEET:-0}"
 ENABLE_SOUND="${ENABLE_SOUND:-true}"
 VIEWER_DIR="${VIEWER_DIR:-/tmp/xeroxgo-viewer}"
 CUPS_PRINTER="${CUPS_PRINTER:-}"
+BYPASS_PAYMENT="${BYPASS_PAYMENT:-false}"
 
 # Parse optional CLI flags
 while [[ $# -gt 0 ]]; do
@@ -50,6 +51,8 @@ while [[ $# -gt 0 ]]; do
     --no-sound) ENABLE_SOUND="false"; shift ;;
     --cups-printer=*) CUPS_PRINTER="${1#*=}"; shift ;;
     --cups-printer) CUPS_PRINTER="$2"; shift 2 ;;
+    --bypass-payment=*) BYPASS_PAYMENT="${1#*=}"; shift ;;
+    --bypass-payment) BYPASS_PAYMENT="true"; shift ;;
     --help|-h)
       echo "Usage: $0 [options]"
       echo "Options:"
@@ -150,5 +153,6 @@ echo "==========================================================================
   --simulated-stock="${SIMULATED_STOCK}" \
   --simulated-failure="${SIMULATED_FAILURE}" \
   --simulated-failure-sheet="${SIMULATED_FAILURE_SHEET}" \
+  --bypass-payment="${BYPASS_PAYMENT}" \
   --enable-sound="${ENABLE_SOUND}"
 

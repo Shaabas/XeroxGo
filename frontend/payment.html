@@ -335,6 +335,12 @@
       var kioskId = params.get('kiosk') || 'kiosk-demo';
       var token = params.get('token') || pathToken;
 
+      // If token is a demo token (dmo_...), redirect immediately to the canonical checkout page
+      if (token && token.startsWith('dmo_')) {
+        window.location.replace('/pay/' + encodeURIComponent(token));
+        return;
+      }
+
       // If token looks like an order ID (starts with "ord_") and no order is set:
       if (!orderId && token && token.startsWith('ord_')) {
         orderId = token;
