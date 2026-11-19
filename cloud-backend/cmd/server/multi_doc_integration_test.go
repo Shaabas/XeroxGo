@@ -29,6 +29,11 @@ import (
 
 // setupMultiDocCloudTestServer creates an in-process cloud backend server for integration tests.
 func setupMultiDocCloudTestServer(t *testing.T) (*appServer, *httptest.Server, *store.Store, string, string) {
+	return setupMultiDocCloudTestServerCustom(t, nil)
+}
+
+// setupMultiDocCloudTestServerCustom creates an in-process cloud backend server with an optional HTTP handler wrapper.
+func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Handler) http.Handler) (*appServer, *httptest.Server, *store.Store, string, string) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cloud_multi_integ.db")
@@ -71,7 +76,11 @@ func setupMultiDocCloudTestServer(t *testing.T) (*appServer, *httptest.Server, *
 		convWake: make(chan struct{}, 10),
 	}
 
-	ts := httptest.NewServer(app.routes())
+	var handler http.Handler = app.routes()
+	if wrapHandler != nil {
+		handler = wrapHandler(handler)
+	}
+	ts := httptest.NewServer(handler)
 	t.Cleanup(func() { ts.Close() })
 
 	return app, ts, st, kioskSecret, webhookSecret

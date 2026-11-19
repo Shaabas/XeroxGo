@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -719,7 +721,31 @@ func TestMultiDoc_E2E_HardwareFaultSafety(t *testing.T) {
 func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 	binPath := getE2EKioskDaemonBinary(t)
 
-	app, ts, st, kSec, _ := setupMultiDocCloudTestServer(t)
+	// Synchronization barrier on PDF download: intercepts the first PDF download request
+	// (Document 0) after both jobs are durably admitted into SQLite, but strictly before
+	// MarkJobSubmitting is called or any physical submission attempt is made.
+	var barrierMu sync.Mutex
+	downloadStartedCh := make(chan struct{}, 1)
+	allowDownloadCh := make(chan struct{})
+	interceptEnabled := true
+
+	app, ts, st, kSec, _ := setupMultiDocCloudTestServerCustom(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/pdf") {
+				barrierMu.Lock()
+				shouldIntercept := interceptEnabled
+				barrierMu.Unlock()
+				if shouldIntercept {
+					select {
+					case downloadStartedCh <- struct{}{}:
+					default:
+					}
+					<-allowDownloadCh
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
 	kioskID := "kiosk-e2e-presub-1"
 
 	kioskTmpDir := t.TempDir()
@@ -781,8 +807,7 @@ func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 	job0ID := cloudDocs[0].JobID
 	job1ID := cloudDocs[1].JobID
 
-	// Start daemon instance 1 without mock printer initially running to capture jobs into SQLite
-	// before any physical submission succeeds, then immediately SIGKILL
+	// Start daemon instance 1 to receive and durably commit jobs into SQLite
 	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
 	cmd1 := exec.Command(binPath,
 		"--mock-printer",
@@ -804,41 +829,81 @@ func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 		t.Fatalf("failed to start daemon 1: %v", err)
 	}
 
-	// Poll until both jobs are admitted into kiosk SQLite database
-	var jobsAdmitted bool
-	admitDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(admitDeadline) {
-		kioskDB, err := sql.Open("sqlite", stateDB)
-		if err == nil {
-			var count int
-			_ = kioskDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE order_id = ?", orderID).Scan(&count)
-			kioskDB.Close()
-			if count == 2 {
-				jobsAdmitted = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !jobsAdmitted {
+	// Wait deterministically via synchronization barrier for Doc 0 download to begin
+	select {
+	case <-downloadStartedCh:
+	case <-time.After(10 * time.Second):
 		_ = cmd1.Process.Signal(syscall.SIGKILL)
-		t.Fatalf("jobs were not admitted into SQLite before timeout.\nLogs:\n%s", logs1.String())
+		t.Fatalf("timed out waiting for pre-submission PDF download barrier.\nLogs:\n%s", logs1.String())
 	}
 
-	// Terminate daemon 1 via SIGKILL
+	// Verify both jobs are durably committed in SQLite and have NOT been submitted
+	kioskDBPreKill, err := sql.Open("sqlite", stateDB)
+	if err != nil {
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("failed to open kiosk state DB: %v", err)
+	}
+	var countPreKill int
+	_ = kioskDBPreKill.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE order_id = ?", orderID).Scan(&countPreKill)
+	if countPreKill != 2 {
+		kioskDBPreKill.Close()
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("expected 2 admitted jobs in kiosk DB before kill, found %d", countPreKill)
+	}
+
+	var doc0Sub, doc1Sub, doc0Sheets, doc1Sheets int
+	var doc0Cups, doc1Cups, doc0St, doc1St string
+	_ = kioskDBPreKill.QueryRowContext(ctx, "SELECT submitted_to_printer, cups_job_id, sheets_printed, status FROM jobs WHERE job_id = ?", job0ID).Scan(&doc0Sub, &doc0Cups, &doc0Sheets, &doc0St)
+	_ = kioskDBPreKill.QueryRowContext(ctx, "SELECT submitted_to_printer, cups_job_id, sheets_printed, status FROM jobs WHERE job_id = ?", job1ID).Scan(&doc1Sub, &doc1Cups, &doc1Sheets, &doc1St)
+	kioskDBPreKill.Close()
+
+	if doc0Sub != 0 || doc1Sub != 0 {
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("expected submitted_to_printer=0 before submission, got doc0=%d, doc1=%d", doc0Sub, doc1Sub)
+	}
+	if doc0Cups != "" || doc1Cups != "" {
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("expected empty cups_job_id before submission, got doc0=%q, doc1=%q", doc0Cups, doc1Cups)
+	}
+	if doc0Sheets != 0 || doc1Sheets != 0 {
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("expected 0 sheets printed before submission, got doc0=%d, doc1=%d", doc0Sheets, doc1Sheets)
+	}
+
+	// Verify zero mock printer submission attempts occurred before kill
+	logsPreKill := logs1.String()
+	if strings.Contains(logsPreKill, "Streaming job") || strings.Contains(logsPreKill, "Sending job") {
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("mock printer submission was prematurely attempted before kill:\n%s", logsPreKill)
+	}
+
+	// Terminate daemon 1 via SIGKILL abruptly while interrupted before submission
 	_ = cmd1.Process.Signal(syscall.SIGKILL)
 	_ = cmd1.Wait()
 
-	// Verify both jobs exist in SQLite and have submitted_to_printer = 0 or are uncompleted
-	kioskDB, err := sql.Open("sqlite", stateDB)
+	// Release synchronization barrier and disable interception for daemon 2
+	barrierMu.Lock()
+	interceptEnabled = false
+	barrierMu.Unlock()
+	close(allowDownloadCh)
+
+	// Explicitly assert persisted state immediately after SIGKILL, before restarting
+	kioskDBPostKill, err := sql.Open("sqlite", stateDB)
 	if err != nil {
-		t.Fatalf("failed to open kiosk state DB: %v", err)
+		t.Fatalf("failed to open kiosk state DB post kill: %v", err)
 	}
-	var count int
-	_ = kioskDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE order_id = ?", orderID).Scan(&count)
-	kioskDB.Close()
-	if count != 2 {
-		t.Fatalf("expected 2 admitted jobs in kiosk DB, found %d", count)
+	_ = kioskDBPostKill.QueryRowContext(ctx, "SELECT submitted_to_printer, cups_job_id, sheets_printed, status FROM jobs WHERE job_id = ?", job0ID).Scan(&doc0Sub, &doc0Cups, &doc0Sheets, &doc0St)
+	_ = kioskDBPostKill.QueryRowContext(ctx, "SELECT submitted_to_printer, cups_job_id, sheets_printed, status FROM jobs WHERE job_id = ?", job1ID).Scan(&doc1Sub, &doc1Cups, &doc1Sheets, &doc1St)
+	kioskDBPostKill.Close()
+
+	if doc0Sub != 0 || doc1Sub != 0 {
+		t.Fatalf("persisted state corrupted after SIGKILL: expected submitted_to_printer=0, got doc0=%d, doc1=%d", doc0Sub, doc1Sub)
+	}
+	if doc0Cups != "" || doc1Cups != "" {
+		t.Fatalf("persisted state corrupted after SIGKILL: expected empty cups_job_id, got doc0=%q, doc1=%q", doc0Cups, doc1Cups)
+	}
+	if doc0Sheets != 0 || doc1Sheets != 0 {
+		t.Fatalf("persisted state corrupted after SIGKILL: expected 0 sheets printed, got doc0=%d, doc1=%d", doc0Sheets, doc1Sheets)
 	}
 
 	// Start daemon instance 2 to recover from pre-submission interruption
@@ -966,12 +1031,57 @@ func TestMultiDoc_E2E_CrashRecovery_PhysicallyUncertain_RequiresReconciliation(t
 	job0ID := cloudDocs[0].JobID
 	job1ID := cloudDocs[1].JobID
 
-	// Launch daemon 1 with failure injected during Doc 0 printing (sheet 1)
+	// Create a test-controlled mock printer listener to control printer timing:
+	// The listener reads the PJL header, sends page 1 progress, and holds the connection
+	// open without completing the job, creating a physically uncertain in-flight state.
+	mockPrinterLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind mock printer listener: %v", err)
+	}
+	defer mockPrinterLn.Close()
+	printerAddr := mockPrinterLn.Addr().String()
+
+	submittingDoneCh := make(chan struct{}, 1)
+	go func() {
+		conn, err := mockPrinterLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Read stream until PJL header is received
+		reader := bufio.NewReader(conn)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				break
+			}
+			if strings.Contains(line, "@PJL ENTER LANGUAGE=PDF") {
+				break
+			}
+		}
+
+		// Acknowledge sheet 1 progress to trigger onPage update in daemon
+		_, _ = conn.Write([]byte("@PJL USTATUS PAGE\r\n1\r\n"))
+		select {
+		case submittingDoneCh <- struct{}{}:
+		default:
+		}
+
+		// Hold the connection open without sending JOB END, so physical completion remains uncertain
+		discard := make([]byte, 4096)
+		for {
+			_, err := conn.Read(discard)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Launch daemon 1 configured with our controlled mock printer listener
 	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
 	cmd1 := exec.Command(binPath,
-		"--mock-printer",
-		"--simulated-failure=offline",
-		"--simulated-failure-sheet=1",
+		"--printer-addr="+printerAddr,
 		"--cloud-url="+wsURL,
 		"--kiosk-id="+kioskID,
 		"--kiosk-secret="+kSec,
@@ -990,42 +1100,80 @@ func TestMultiDoc_E2E_CrashRecovery_PhysicallyUncertain_RequiresReconciliation(t
 		t.Fatalf("failed to start daemon 1: %v", err)
 	}
 
-	// Condition-based polling: wait until Doc 0 begins printing and registers sheet 1
-	var sheetPrinted bool
-	pollDeadline := time.Now().Add(10 * time.Second)
+	// Wait for listener to receive PJL header and acknowledge sheet 1
+	select {
+	case <-submittingDoneCh:
+	case <-time.After(10 * time.Second):
+		_ = cmd1.Process.Signal(syscall.SIGKILL)
+		t.Fatalf("timed out waiting for PJL submission in listener.\nLogs:\n%s", logs1.String())
+	}
+
+	// Condition-based polling: wait until Doc 0 durably records submitted_to_printer=1 and status=PRINTING in SQLite
+	var doc0Submitted bool
+	pollDeadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(pollDeadline) {
 		kioskDB, err := sql.Open("sqlite", stateDB)
 		if err == nil {
 			var sheets, submitted int
-			_ = kioskDB.QueryRowContext(ctx, "SELECT sheets_printed, submitted_to_printer FROM jobs WHERE job_id = ?", job0ID).Scan(&sheets, &submitted)
+			var st string
+			_ = kioskDB.QueryRowContext(ctx, "SELECT sheets_printed, submitted_to_printer, status FROM jobs WHERE job_id = ?", job0ID).Scan(&sheets, &submitted, &st)
 			kioskDB.Close()
-			if submitted == 1 || sheets >= 1 {
-				sheetPrinted = true
+			if submitted == 1 && st == "PRINTING" && sheets >= 1 {
+				doc0Submitted = true
 				break
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !sheetPrinted {
+	if !doc0Submitted {
 		_ = cmd1.Process.Signal(syscall.SIGKILL)
-		t.Fatalf("doc 0 was not submitted/printed before deadline.\nLogs:\n%s", logs1.String())
+		t.Fatalf("doc 0 was not durably recorded as submitted/printing before deadline.\nLogs:\n%s", logs1.String())
 	}
 
 	// Immediately kill daemon 1 abruptly with SIGKILL (power-loss / hard kill mid-stream)
 	_ = cmd1.Process.Signal(syscall.SIGKILL)
 	_ = cmd1.Wait()
+	_ = mockPrinterLn.Close()
 
-	// Verify state DB: Doc 0 has submitted_to_printer = 1 and status != 'COMPLETED'
+	// Assert the actual persisted state immediately after SIGKILL, with NO manual state modification
 	kioskDB, err := sql.Open("sqlite", stateDB)
 	if err != nil {
 		t.Fatalf("failed to open kiosk state DB: %v", err)
 	}
-	var doc0Sub int
-	var doc0St string
-	_ = kioskDB.QueryRowContext(ctx, "SELECT submitted_to_printer, status FROM jobs WHERE job_id = ?", job0ID).Scan(&doc0Sub, &doc0St)
-	// Ensure submitted_to_printer is flagged as submitted to test the ambiguous recovery path
-	_, _ = kioskDB.ExecContext(ctx, "UPDATE jobs SET submitted_to_printer = 1, status = 'PRINTING' WHERE job_id = ?", job0ID)
+	var doc0Sub, doc0Sheets int
+	var doc0St, doc0Err, doc0Cups string
+	err = kioskDB.QueryRowContext(ctx, "SELECT submitted_to_printer, status, sheets_printed, error_reason, cups_job_id FROM jobs WHERE job_id = ?", job0ID).Scan(&doc0Sub, &doc0St, &doc0Sheets, &doc0Err, &doc0Cups)
+	if err != nil {
+		kioskDB.Close()
+		t.Fatalf("failed to query doc 0 in kiosk DB immediately after SIGKILL: %v", err)
+	}
+	var doc1Sub, doc1Sheets int
+	var doc1St, doc1Err, doc1Cups string
+	err = kioskDB.QueryRowContext(ctx, "SELECT submitted_to_printer, status, sheets_printed, error_reason, cups_job_id FROM jobs WHERE job_id = ?", job1ID).Scan(&doc1Sub, &doc1St, &doc1Sheets, &doc1Err, &doc1Cups)
+	if err != nil {
+		kioskDB.Close()
+		t.Fatalf("failed to query doc 1 in kiosk DB immediately after SIGKILL: %v", err)
+	}
 	kioskDB.Close()
+
+	if doc0Sub != 1 {
+		t.Fatalf("expected doc 0 submitted_to_printer=1 immediately after SIGKILL, got %d", doc0Sub)
+	}
+	if doc0St != "PRINTING" {
+		t.Fatalf("expected doc 0 status='PRINTING' immediately after SIGKILL, got %q", doc0St)
+	}
+	if doc0Sheets != 1 {
+		t.Fatalf("expected doc 0 sheets_printed=1 immediately after SIGKILL, got %d", doc0Sheets)
+	}
+	if doc0Cups != "" {
+		t.Fatalf("expected doc 0 empty cups_job_id immediately after SIGKILL, got %q", doc0Cups)
+	}
+	if doc1Sub != 0 {
+		t.Fatalf("expected doc 1 submitted_to_printer=0 immediately after SIGKILL, got %d", doc1Sub)
+	}
+	if doc1Sheets != 0 {
+		t.Fatalf("expected doc 1 sheets_printed=0 immediately after SIGKILL, got %d", doc1Sheets)
+	}
 
 	// Launch restarted daemon 2 with normal mock printer
 	cmd2 := exec.Command(binPath,
@@ -1104,17 +1252,17 @@ func TestMultiDoc_E2E_CrashRecovery_PhysicallyUncertain_RequiresReconciliation(t
 	}
 
 	// 3. Assert Doc 1 was NEVER submitted to the printer
-	var doc1Sub, doc1Sheets int
-	var doc1St string
-	_ = kioskDB2.QueryRowContext(ctx, "SELECT submitted_to_printer, sheets_printed, status FROM jobs WHERE job_id = ?", job1ID).Scan(&doc1Sub, &doc1Sheets, &doc1St)
-	if doc1St == "COMPLETED" {
+	var doc1FinalSub, doc1FinalSheets int
+	var doc1FinalSt string
+	_ = kioskDB2.QueryRowContext(ctx, "SELECT submitted_to_printer, sheets_printed, status FROM jobs WHERE job_id = ?", job1ID).Scan(&doc1FinalSub, &doc1FinalSheets, &doc1FinalSt)
+	if doc1FinalSt == "COMPLETED" {
 		t.Errorf("doc 1 must NOT be COMPLETED when sibling is uncertain!")
 	}
-	if doc1Sub != 0 {
-		t.Errorf("doc 1 must not have been submitted to printer (got submitted_to_printer=%d)", doc1Sub)
+	if doc1FinalSub != 0 {
+		t.Errorf("doc 1 must not have been submitted to printer (got submitted_to_printer=%d)", doc1FinalSub)
 	}
-	if doc1Sheets != 0 {
-		t.Errorf("doc 1 must have 0 sheets printed (got %d)", doc1Sheets)
+	if doc1FinalSheets != 0 {
+		t.Errorf("doc 1 must have 0 sheets printed (got %d)", doc1FinalSheets)
 	}
 
 	// 4. Assert daemon 2 logs prove zero duplicate submissions
