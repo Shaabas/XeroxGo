@@ -1241,4 +1241,58 @@ func TestController_BypassPayment_AutoAuthorize(t *testing.T) {
 	}
 }
 
+func TestController_ErrorClearTimeout(t *testing.T) {
+	sim := input.NewSimulatedSource(32)
+	defer sim.Close()
+
+	rnd := &mockRenderer{}
+	client := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return nil, cloud.ErrInvalidOrExpiredPIN
+		},
+	}
+
+	ctrl, err := NewController(Config{
+		InactivityTimeout: 10 * time.Second,
+		ErrorClearTimeout: 80 * time.Millisecond,
+		SummaryTimeout:    10 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      client,
+	}, sim)
+	if err != nil {
+		t.Fatalf("failed to create controller: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Submit < 4 digits (e.g. 2 digits)
+	sim.EmitDigit('1')
+	sim.EmitDigit('2')
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ctrl.GetPINError() != "PIN must be exactly 4 digits" {
+		t.Fatalf("expected PIN error for 2-digit submit, got %q", ctrl.GetPINError())
+	}
+
+	// Wait for ErrorClearTimeout (80ms)
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for ctrl.GetPINError() != "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetPINError() != "" {
+		t.Errorf("expected PIN error to auto-clear after ErrorClearTimeout, got %q", ctrl.GetPINError())
+	}
+	if ctrl.GetPINBuffer() != "" {
+		t.Errorf("expected PIN buffer to clear after ErrorClearTimeout, got %q", ctrl.GetPINBuffer())
+	}
+}
+
+
 

@@ -564,11 +564,11 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	// --- UPPER HALF: QR Code & Mobile Portal ---
 	qrTitle := "Scan QR to Get Started"
 	qrTitleW := measureTextWidth(faceBold28, qrTitle)
-	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 168, colorTextPrimary)
+	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 180, colorTextPrimary)
 
 	qrSub := "Point your phone camera here, or visit website below"
 	qrSubW := measureTextWidth(faceReg18, qrSub)
-	drawText(base, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 202, colorTextSecondary)
+	drawText(base, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 222, colorTextSecondary)
 
 	// Crisp 240x240 QR Code (scaled properly using xdraw so full QR code is visible without clipping)
 	qrImg, err := getQRCodeImage(qrContent)
@@ -576,12 +576,12 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		return nil, err
 	}
 
-	qrBounds := image.Rect(1465, 235, 1705, 475)
+	qrBounds := image.Rect(1465, 260, 1705, 500)
 	xdraw.NearestNeighbor.Scale(base, qrBounds, qrImg, qrImg.Bounds(), draw.Over, nil)
-	strokeRoundedRect(base, image.Rect(1455, 225, 1715, 485), 14, 1, colorBorder)
+	strokeRoundedRect(base, image.Rect(1453, 248, 1717, 512), 14, 1, colorBorder)
 
 	// Action pill under QR with website link
-	pillRect := image.Rect(1415, 502, 1755, 546)
+	pillRect := image.Rect(1415, 542, 1755, 588)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
 	displayLink := "xeroxgo.vercel.app"
 	if strings.TrimSpace(qrContent) != "" {
@@ -595,10 +595,10 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		}
 	}
 	pillW := measureTextWidth(faceBold20, displayLink)
-	drawText(base, faceBold20, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 513, colorPrimaryBlue)
+	drawText(base, faceBold20, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 554, colorPrimaryBlue)
 
 	// --- SECTION DIVIDER: Sleek "OR" divider ---
-	divY := 574
+	divY := 624
 	fillRect(base, image.Rect(1320, divY, 1850, divY+1), colorBorder)
 	orText := "OR"
 	orW := measureTextWidth(faceBold18, orText)
@@ -606,21 +606,21 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	drawText(base, faceBold18, orText, 1585-orW/2, divY-8, colorTextSecondary)
 
 	// --- LOWER HALF: Enter Token Banner ---
-	tokenCard := image.Rect(1320, 604, 1850, 680)
+	tokenCard := image.Rect(1320, 658, 1850, 736)
 	fillRoundedRect(base, tokenCard, 18, colorPillBlueBg)
 	strokeRoundedRect(base, tokenCard, 18, 1, colorPillBlueBorder)
 
 	// App-tile lock icon
-	tileRect := image.Rect(1342, 616, 1394, 668)
+	tileRect := image.Rect(1342, 671, 1394, 723)
 	fillRoundedRect(base, tileRect, 14, colorPrimaryBlue)
-	strokeRoundedRect(base, image.Rect(1357, 626, 1379, 644), 11, 3, colorTextWhite)
-	fillRoundedRect(base, image.Rect(1352, 640, 1384, 660), 4, colorTextWhite)
-	drawCircle(base, 1368, 648, 2, colorPrimaryBlue)
-	fillRect(base, image.Rect(1367, 648, 1370, 654), colorPrimaryBlue)
+	strokeRoundedRect(base, image.Rect(1357, 681, 1379, 699), 11, 3, colorTextWhite)
+	fillRoundedRect(base, image.Rect(1352, 695, 1384, 715), 4, colorTextWhite)
+	drawCircle(base, 1368, 703, 2, colorPrimaryBlue)
+	fillRect(base, image.Rect(1367, 703, 1370, 709), colorPrimaryBlue)
 
 	// Title & Subtitle beside lock icon
-	drawText(base, faceBold24, "Enter Token", 1412, 620, colorTextPrimary)
-	drawText(base, faceReg18, "If you have a 4-digit PIN", 1412, 650, colorTextSecondary)
+	drawText(base, faceBold24, "Enter Token", 1412, 675, colorTextPrimary)
+	drawText(base, faceReg18, "If you have a 4-digit PIN", 1412, 705, colorTextSecondary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
@@ -807,7 +807,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	)
 	rightCard := image.Rect(1280, 140, 1890, 1050)
 	startX := rightCard.Min.X + (rightCard.Dx()-totalW)/2
-	boxY := 706
+	boxY := 766
 
 	for i := 0; i < 4; i++ {
 		bx := startX + i*(boxW+spacing)
@@ -839,7 +839,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	}
 
 	// Action / Status / Error below the 4 boxes
-	btnRect := image.Rect(1320, 830, 1850, 898)
+	btnRect := image.Rect(1320, 892, 1850, 960)
 	if !isNative1080p {
 		btnRect = image.Rect(
 			int(float64(btnRect.Min.X)*sx+0.5),
@@ -856,10 +856,10 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		iconW := 32
 		totalErrW := iconW + 10 + errW
 		startErrX := btnRect.Min.X + (btnRect.Dx()-int(float64(totalErrW)*sx+0.5))/2
-		errY := int(852.0*sy + 0.5)
+		errY := int(914.0*sy + 0.5)
 
 		// Red circle with white exclamation icon
-		drawCircle(dst, startErrX+int(14.0*sx+0.5), errY+int(10.0*sy+0.5), int(12.0*sx+0.5), colorErrorRed)
+		drawCircle(dst, startErrX+int(14.0*sx+0.5), int(926.0*sy+0.5), int(12.0*sx+0.5), colorErrorRed)
 		drawText(dst, faceBold18, "!", startErrX+int(11.0*sx+0.5), errY, colorTextWhite)
 
 		// Red error text
@@ -870,7 +870,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		loadMsg := "Verifying PIN with cloud..."
 		lW := measureTextWidth(faceBold22, loadMsg)
 		lX := btnRect.Min.X + (btnRect.Dx()-int(float64(lW)*sx+0.5))/2
-		lY := int(848.0*sy + 0.5)
+		lY := int(910.0*sy + 0.5)
 		drawText(dst, faceBold22, loadMsg, lX, lY, colorPrimaryBlue)
 	} else {
 		// Default / Typing State (matching Image 2): Vivid blue pill button
@@ -884,7 +884,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		gap := int(18.0*sx + 0.5)
 		contentW := int(float64(btnLabelW)*sx+0.5) + gap + int(float64(arrowW)*sx+0.5)
 		startX := btnRect.Min.X + (btnRect.Dx()-contentW)/2
-		btnY := int(848.0*sy + 0.5)
+		btnY := int(910.0*sy + 0.5)
 
 		drawText(dst, faceBold24, btnLabel, startX, btnY, colorTextWhite)
 		drawText(dst, faceBold24, ">", startX+int(float64(btnLabelW)*sx+0.5)+gap, btnY, colorTextWhite)

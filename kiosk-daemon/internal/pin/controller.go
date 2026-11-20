@@ -30,6 +30,7 @@ const (
 // Config specifies runtime dependencies and timeout policies for the Controller.
 type Config struct {
 	InactivityTimeout time.Duration // Duration of inactivity before returning to IDLE from PIN_ENTRY (default 30s)
+	ErrorClearTimeout time.Duration // Duration before clearing PIN error back to clean state (default 5s)
 	SummaryTimeout    time.Duration // Duration before returning to IDLE from ORDER_SUMMARY (default 60s)
 	PaymentTimeout    time.Duration // Duration before returning to IDLE from PAYMENT_PENDING (default 300s)
 	CountdownInterval time.Duration // Tick interval for countdown timer (default 1s)
@@ -60,6 +61,7 @@ type Controller struct {
 	isClaiming       bool
 
 	inactivityTimer *time.Timer
+	errorTimer      *time.Timer
 	stopCountdown   chan struct{}
 
 	inputSource input.Source
@@ -78,6 +80,9 @@ func NewController(cfg Config, inputSource input.Source) (*Controller, error) {
 	}
 	if cfg.InactivityTimeout <= 0 {
 		cfg.InactivityTimeout = 30 * time.Second
+	}
+	if cfg.ErrorClearTimeout <= 0 {
+		cfg.ErrorClearTimeout = 5 * time.Second
 	}
 	if cfg.SummaryTimeout <= 0 {
 		cfg.SummaryTimeout = 60 * time.Second
@@ -114,6 +119,7 @@ func (c *Controller) Stop() {
 	}
 	c.stopInactivityTimerLocked()
 	c.stopCountdownLocked()
+	c.stopErrorTimerLocked()
 	c.mu.Unlock()
 
 	<-c.done
@@ -190,6 +196,7 @@ func (c *Controller) ResetToIdle() {
 func (c *Controller) resetToIdleLocked() {
 	c.stopInactivityTimerLocked()
 	c.stopCountdownLocked()
+	c.stopErrorTimerLocked()
 	atomic.AddUint64(&c.lookupSeq, 1) // Invalidate any inflight lookups
 	c.state = StateIdle
 	c.pinBuffer = ""
@@ -270,6 +277,7 @@ func (c *Controller) handlePINEntryEvent(ev input.Event) {
 	switch ev.Type {
 	case input.ActionDigit:
 		if len(c.pinBuffer) < 4 {
+			c.stopErrorTimerLocked()
 			c.pinBuffer += string(ev.Digit)
 			c.pinError = ""
 			log.Printf("[KEYPAD] Digit pressed: %c | Buffer: %s", ev.Digit, c.pinBuffer)
@@ -277,23 +285,26 @@ func (c *Controller) handlePINEntryEvent(ev input.Event) {
 		}
 	case input.ActionBackspace:
 		if len(c.pinBuffer) > 0 {
+			c.stopErrorTimerLocked()
 			c.pinBuffer = c.pinBuffer[:len(c.pinBuffer)-1]
 			c.pinError = ""
 			log.Printf("[KEYPAD] Backspace | Buffer: %s", c.pinBuffer)
 			c.renderPINEntryLocked()
 		}
 	case input.ActionClear:
+		c.stopErrorTimerLocked()
 		c.pinBuffer = ""
 		c.pinError = ""
 		log.Printf("[KEYPAD] Cleared | Buffer reset")
 		c.renderPINEntryLocked()
 	case input.ActionCancel:
+		c.stopErrorTimerLocked()
 		log.Printf("[KEYPAD] Canceled | Returning to IDLE")
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
 		if len(c.pinBuffer) != 4 {
-			c.pinError = "PIN must be exactly 4 digits"
 			log.Printf("[KEYPAD] Submit rejected: PIN must be 4 digits (got '%s')", c.pinBuffer)
+			c.setPINErrorLocked("PIN must be exactly 4 digits")
 			c.renderPINEntryLocked()
 			return
 		}
@@ -579,24 +590,26 @@ func (c *Controller) startLookupLocked() {
 			c.pinBuffer = "" // Clear buffer so user enters fresh PIN
 			var rle *cloud.RateLimitError
 			var ne *cloud.NetworkError
+			var errMsg string
 
 			switch {
 			case errors.Is(err, cloud.ErrInvalidOrExpiredPIN):
-				c.pinError = "Invalid or expired PIN. Please try again."
+				errMsg = "Invalid or expired PIN. Please try again."
 			case errors.Is(err, cloud.ErrUnauthorized):
-				c.pinError = "Kiosk authentication error. Please see attendant."
+				errMsg = "Kiosk authentication error. Please see attendant."
 			case errors.As(err, &rle):
 				if rle.RetryAfterSeconds > 0 {
-					c.pinError = fmt.Sprintf("Too many attempts. Please wait %d seconds.", rle.RetryAfterSeconds)
+					errMsg = fmt.Sprintf("Too many attempts. Please wait %d seconds.", rle.RetryAfterSeconds)
 				} else {
-					c.pinError = "Too many failed attempts. Please wait a moment."
+					errMsg = "Too many failed attempts. Please wait a moment."
 				}
 			case errors.As(err, &ne):
-				c.pinError = "Network error connecting to cloud. Please try again."
+				errMsg = "Network error connecting to cloud. Please try again."
 			default:
-				c.pinError = "Lookup failed. Please check PIN and try again."
+				errMsg = "Lookup failed. Please check PIN and try again."
 			}
 
+			c.setPINErrorLocked(errMsg)
 			c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
 			c.renderPINEntryLocked()
 			return
@@ -746,6 +759,32 @@ func (c *Controller) stopInactivityTimerLocked() {
 	if c.inactivityTimer != nil {
 		c.inactivityTimer.Stop()
 		c.inactivityTimer = nil
+	}
+}
+
+func (c *Controller) setPINErrorLocked(errStr string) {
+	c.pinError = errStr
+	c.stopErrorTimerLocked()
+	timeout := c.cfg.ErrorClearTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	c.errorTimer = time.AfterFunc(timeout, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.state == StatePINEntry && c.pinError != "" {
+			log.Printf("[PIN-CONTROLLER] Error clear timeout reached, reverting to clean PIN view")
+			c.pinError = ""
+			c.pinBuffer = ""
+			c.renderPINEntryLocked()
+		}
+	})
+}
+
+func (c *Controller) stopErrorTimerLocked() {
+	if c.errorTimer != nil {
+		c.errorTimer.Stop()
+		c.errorTimer = nil
 	}
 }
 
