@@ -2790,14 +2790,13 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 		statusStr      string
 		pricePaise     int64
 		pinExpiresAtNS int64
-		orderTotalSheets int
 	)
 	queryOrder := s.rebind(`
-SELECT kiosk_id, status, price_paise, pin_expires_at_ns, COALESCE(total_sheets, 0)
+SELECT kiosk_id, status, price_paise, pin_expires_at_ns
 FROM orders
 WHERE order_id = ?;
 `)
-	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS, &orderTotalSheets)
+	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrOrderNotFound
@@ -2877,18 +2876,19 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 
 	// 3. If paper checking is enabled (availableStock >= 0), verify sufficient available sheets
 	if availableStock >= 0 {
-		// orders.total_sheets is the entire order; print_configs is only the first
-		// document for multi-file orders. Older orders may lack an order-level total.
-		totalSheets := orderTotalSheets
-		if totalSheets <= 0 {
-			querySheets := s.rebind(`SELECT total_sheets FROM print_configs WHERE order_id = ?;`)
-			err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return nil, ErrOrderNotFound
-				}
-				return nil, fmt.Errorf("create kiosk session: query legacy print config: %w", err)
+		// Use the full order total, falling back to the first-document config
+		// for legacy rows. Keep requiring a print config as before.
+		var totalSheets int
+		querySheets := s.rebind(`
+SELECT CASE WHEN o.total_sheets > 0 THEN o.total_sheets ELSE pc.total_sheets END
+FROM orders o JOIN print_configs pc ON pc.order_id = o.order_id
+WHERE o.order_id = ?;`)
+		err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrOrderNotFound
 			}
+			return nil, fmt.Errorf("create kiosk session: query print config: %w", err)
 		}
 		if totalSheets <= 0 {
 			totalSheets = 1
