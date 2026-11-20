@@ -562,23 +562,23 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	strokeRoundedRect(base, rightCard, 24, 2, colorBorder)
 
 	// --- UPPER HALF: QR Code & Mobile Portal ---
-	qrTitle := "Scan to Order Online"
+	qrTitle := "Scan QR to Get Started"
 	qrTitleW := measureTextWidth(faceBold28, qrTitle)
 	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 168, colorTextPrimary)
 
-	qrSub := "Point camera to upload files & pay"
+	qrSub := "Point your phone camera here, or visit website below"
 	qrSubW := measureTextWidth(faceReg18, qrSub)
 	drawText(base, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 202, colorTextSecondary)
 
-	// Crisp 240x240 QR Code
+	// Crisp 240x240 QR Code (scaled properly using xdraw so full QR code is visible without clipping)
 	qrImg, err := getQRCodeImage(qrContent)
 	if err != nil {
 		return nil, err
 	}
 
 	qrBounds := image.Rect(1465, 235, 1705, 475)
-	draw.Draw(base, qrBounds, qrImg, image.Point{}, draw.Src)
-	strokeRoundedRect(base, image.Rect(1455, 225, 1715, 485), 12, 1, colorBorder)
+	xdraw.NearestNeighbor.Scale(base, qrBounds, qrImg, qrImg.Bounds(), draw.Over, nil)
+	strokeRoundedRect(base, image.Rect(1455, 225, 1715, 485), 14, 1, colorBorder)
 
 	// Action pill under QR with website link
 	pillRect := image.Rect(1415, 502, 1755, 546)
@@ -597,42 +597,30 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	pillW := measureTextWidth(faceBold20, displayLink)
 	drawText(base, faceBold20, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 513, colorPrimaryBlue)
 
-	// --- SECTION DIVIDER: Sleek "OR ENTER PIN" badge ---
-	divY := 580
-	fillRect(base, image.Rect(1320, divY, 1850, divY+2), colorBorder)
-
-	badgeRect := image.Rect(1510, divY-14, 1660, divY+16)
-	drawPill(base, badgeRect, colorCardBg, colorBorderDark)
-	orText := "OR ENTER PIN"
+	// --- SECTION DIVIDER: Sleek "OR" divider ---
+	divY := 574
+	fillRect(base, image.Rect(1320, divY, 1850, divY+1), colorBorder)
+	orText := "OR"
 	orW := measureTextWidth(faceBold18, orText)
-	drawText(base, faceBold18, orText, badgeRect.Min.X+(badgeRect.Dx()-orW)/2, divY-8, colorTextSecondary)
+	fillRect(base, image.Rect(1585-orW/2-14, divY-10, 1585+orW/2+14, divY+10), colorCardBg)
+	drawText(base, faceBold18, orText, 1585-orW/2, divY-8, colorTextSecondary)
 
-	// --- LOWER HALF: In-Place PIN Entry Header & Static Guides ---
-	pinTitle := "Already Have a 4-Digit PIN?"
-	pinTitleW := measureTextWidth(faceBold24, pinTitle)
-	drawText(base, faceBold24, pinTitle, rightCard.Min.X+(rightCard.Dx()-pinTitleW)/2, 618, colorTextPrimary)
+	// --- LOWER HALF: Enter Token Banner ---
+	tokenCard := image.Rect(1320, 604, 1850, 680)
+	fillRoundedRect(base, tokenCard, 18, colorPillBlueBg)
+	strokeRoundedRect(base, tokenCard, 18, 1, colorPillBlueBorder)
 
-	pinSub := "Type your retrieval code on the keypad below"
-	pinSubW := measureTextWidth(faceReg18, pinSub)
-	drawText(base, faceReg18, pinSub, rightCard.Min.X+(rightCard.Dx()-pinSubW)/2, 650, colorTextSecondary)
+	// App-tile lock icon
+	tileRect := image.Rect(1342, 616, 1394, 668)
+	fillRoundedRect(base, tileRect, 14, colorPrimaryBlue)
+	strokeRoundedRect(base, image.Rect(1357, 626, 1379, 644), 11, 3, colorTextWhite)
+	fillRoundedRect(base, image.Rect(1352, 640, 1384, 660), 4, colorTextWhite)
+	drawCircle(base, 1368, 648, 2, colorPrimaryBlue)
+	fillRect(base, image.Rect(1367, 648, 1370, 654), colorPrimaryBlue)
 
-	// Keypad Prompt Guidance Card
-	infoCard := image.Rect(1330, 856, 1840, 950)
-	fillRoundedRect(base, infoCard, 16, colorBgSlate)
-	strokeRoundedRect(base, infoCard, 16, 1, colorBorder)
-
-	drawCircle(base, 1360, 888, 14, colorPrimaryBlue)
-	drawText(base, faceBold18, "1", 1355, 878, colorTextWhite)
-	drawText(base, faceReg18, "Order from your phone to receive a 4-digit PIN", 1390, 878, colorTextPrimary)
-
-	drawCircle(base, 1360, 922, 14, colorSuccessGreen)
-	drawText(base, faceBold18, "2", 1355, 912, colorTextWhite)
-	drawText(base, faceReg18, "Type the code on the physical keypad to print", 1390, 912, colorTextPrimary)
-
-	// Trust mark / privacy badge at the bottom of the card
-	secText := "Private & Encrypted • Documents auto-deleted after pickup"
-	secW := measureTextWidth(faceReg16, secText)
-	drawText(base, faceReg16, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 988, colorTextSecondary)
+	// Title & Subtitle beside lock icon
+	drawText(base, faceBold24, "Enter Token", 1412, 620, colorTextPrimary)
+	drawText(base, faceReg18, "If you have a 4-digit PIN", 1412, 650, colorTextSecondary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
@@ -810,16 +798,16 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		}
 	}
 
-	// Dynamic PIN input boxes on the right card
+	// Dynamic PIN input boxes on the right card (matching clean concept in Images 2 & 3)
 	const (
-		boxW    = 88
+		boxW    = 92
 		boxH    = 96
 		spacing = 20
 		totalW  = 4*boxW + 3*spacing
 	)
 	rightCard := image.Rect(1280, 140, 1890, 1050)
 	startX := rightCard.Min.X + (rightCard.Dx()-totalW)/2
-	boxY := 682
+	boxY := 706
 
 	for i := 0; i < 4; i++ {
 		bx := startX + i*(boxW+spacing)
@@ -841,73 +829,65 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 			drawX := boxRect.Min.X + (boxRect.Dx()-int(float64(cW)*sx+0.5))/2
 			drawY := boxRect.Min.Y + int(22.0*sy+0.5)
 			drawText(dst, faceBold44, ch, drawX, drawY, colorPrimaryBlue)
-		} else if i == len(state.PINDigits) && len(state.PINDigits) < 4 {
+		} else if i == len(state.PINDigits) {
 			fillRoundedRect(dst, boxRect, 16, colorCardBg)
-			strokeRoundedRect(dst, boxRect, 16, 3, colorPrimaryBlue)
-			dotX := boxRect.Min.X + boxRect.Dx()/2
-			dotY := boxRect.Min.Y + boxRect.Dy()/2
-			dotR := int(5.0*sx + 0.5)
-			if dotR < 3 {
-				dotR = 3
-			}
-			drawCircle(dst, dotX, dotY, dotR, colorPrimaryBlue)
+			strokeRoundedRect(dst, boxRect, 16, 2, colorPrimaryBlue)
 		} else {
-			fillRoundedRect(dst, boxRect, 16, colorBgSlate)
+			fillRoundedRect(dst, boxRect, 16, colorCardBg)
 			strokeRoundedRect(dst, boxRect, 16, 2, colorBorderDark)
-			dotX := boxRect.Min.X + boxRect.Dx()/2
-			dotY := boxRect.Min.Y + boxRect.Dy()/2
-			dotR := int(4.0*sx + 0.5)
-			if dotR < 2 {
-				dotR = 2
-			}
-			drawCircle(dst, dotX, dotY, dotR, colorBorderDark)
 		}
 	}
 
-	// Status / Feedback message
+	// Action / Status / Error below the 4 boxes
+	btnRect := image.Rect(1320, 830, 1850, 898)
+	if !isNative1080p {
+		btnRect = image.Rect(
+			int(float64(btnRect.Min.X)*sx+0.5),
+			int(float64(btnRect.Min.Y)*sy+0.5),
+			int(float64(btnRect.Max.X)*sx+0.5),
+			int(float64(btnRect.Max.Y)*sy+0.5),
+		)
+	}
+
 	if strings.TrimSpace(state.PINError) != "" {
-		errRect := image.Rect(1340, 796, 1830, 838)
-		if !isNative1080p {
-			errRect = image.Rect(
-				int(float64(errRect.Min.X)*sx+0.5),
-				int(float64(errRect.Min.Y)*sy+0.5),
-				int(float64(errRect.Max.X)*sx+0.5),
-				int(float64(errRect.Max.Y)*sy+0.5),
-			)
-		}
-		drawPill(dst, errRect, colorPillRedBg, colorPillRedBorder)
-		eW := measureTextWidth(faceBold18, state.PINError)
-		eX := errRect.Min.X + (errRect.Dx()-int(float64(eW)*sx+0.5))/2
-		eY := int(806.0*sy + 0.5)
-		drawText(dst, faceBold18, state.PINError, eX, eY, colorErrorRed)
+		// Error State (matching Image 3): clean inline red message with (!) icon
+		errText := state.PINError
+		errW := measureTextWidth(faceBold20, errText)
+		iconW := 32
+		totalErrW := iconW + 10 + errW
+		startErrX := btnRect.Min.X + (btnRect.Dx()-int(float64(totalErrW)*sx+0.5))/2
+		errY := int(852.0*sy + 0.5)
+
+		// Red circle with white exclamation icon
+		drawCircle(dst, startErrX+int(14.0*sx+0.5), errY+int(10.0*sy+0.5), int(12.0*sx+0.5), colorErrorRed)
+		drawText(dst, faceBold18, "!", startErrX+int(11.0*sx+0.5), errY, colorTextWhite)
+
+		// Red error text
+		drawText(dst, faceBold20, errText, startErrX+int(float64(iconW+10)*sx+0.5), errY, colorErrorRed)
 	} else if state.PINLoading {
-		loadRect := image.Rect(1360, 796, 1810, 838)
-		if !isNative1080p {
-			loadRect = image.Rect(
-				int(float64(loadRect.Min.X)*sx+0.5),
-				int(float64(loadRect.Min.Y)*sy+0.5),
-				int(float64(loadRect.Max.X)*sx+0.5),
-				int(float64(loadRect.Max.Y)*sy+0.5),
-			)
-		}
-		drawPill(dst, loadRect, colorPillBlueBg, colorPillBlueBorder)
+		// Loading State: soft pill
+		drawPill(dst, btnRect, colorPillBlueBg, colorPillBlueBorder)
 		loadMsg := "Verifying PIN with cloud..."
-		lW := measureTextWidth(faceBold18, loadMsg)
-		lX := loadRect.Min.X + (loadRect.Dx()-int(float64(lW)*sx+0.5))/2
-		lY := int(806.0*sy + 0.5)
-		drawText(dst, faceBold18, loadMsg, lX, lY, colorPrimaryBlue)
-	} else if len(state.PINDigits) > 0 {
-		activeHint := fmt.Sprintf("%d of 4 digits entered • Press [Enter] when done", len(state.PINDigits))
-		aW := measureTextWidth(faceBold18, activeHint)
-		aX := int(float64(rightCard.Min.X)*sx+0.5) + (int(float64(rightCard.Dx())*sx+0.5)-int(float64(aW)*sx+0.5))/2
-		aY := int(806.0*sy + 0.5)
-		drawText(dst, faceBold18, activeHint, aX, aY, colorPrimaryBlue)
+		lW := measureTextWidth(faceBold22, loadMsg)
+		lX := btnRect.Min.X + (btnRect.Dx()-int(float64(lW)*sx+0.5))/2
+		lY := int(848.0*sy + 0.5)
+		drawText(dst, faceBold22, loadMsg, lX, lY, colorPrimaryBlue)
 	} else {
-		guide := "[0-9] Type Code      [Enter] Confirm      [C] Clear"
-		gW := measureTextWidth(faceBold18, guide)
-		gX := int(float64(rightCard.Min.X)*sx+0.5) + (int(float64(rightCard.Dx())*sx+0.5)-int(float64(gW)*sx+0.5))/2
-		gY := int(806.0*sy + 0.5)
-		drawText(dst, faceBold18, guide, gX, gY, colorTextMutedDark)
+		// Default / Typing State (matching Image 2): Vivid blue pill button
+		drawPill(dst, btnRect, colorPrimaryBlue, colorPrimaryBlue)
+		btnLabel := "Press Enter"
+		if len(state.PINDigits) > 0 {
+			btnLabel = "Press Enter to Print"
+		}
+		btnLabelW := measureTextWidth(faceBold24, btnLabel)
+		arrowW := measureTextWidth(faceBold24, ">")
+		gap := int(18.0*sx + 0.5)
+		contentW := int(float64(btnLabelW)*sx+0.5) + gap + int(float64(arrowW)*sx+0.5)
+		startX := btnRect.Min.X + (btnRect.Dx()-contentW)/2
+		btnY := int(848.0*sy + 0.5)
+
+		drawText(dst, faceBold24, btnLabel, startX, btnY, colorTextWhite)
+		drawText(dst, faceBold24, ">", startX+int(float64(btnLabelW)*sx+0.5)+gap, btnY, colorTextWhite)
 	}
 
 	return nil
