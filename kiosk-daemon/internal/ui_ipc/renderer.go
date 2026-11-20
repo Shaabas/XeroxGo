@@ -607,7 +607,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	qrTitleW := measureTextWidth(faceBold28, qrTitle)
 	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 142, colorTextPrimary)
 
-	qrSub := "Point your phone camera here, or visit website below"
+	qrSub := "or visit the website link given below"
 	qrSubW := measureTextWidth(faceReg18, qrSub)
 	drawText(base, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 176, colorTextSecondary)
 
