@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"xeroxgo/pkg/contracts"
 )
@@ -281,6 +282,39 @@ func TestRenderDeterministic(t *testing.T) {
 
 	if !bytes.Equal(img1.Pix, img2.Pix) {
 		t.Fatalf("rendered images for identical state are not pixel-identical")
+	}
+}
+
+// TestClockWidget_NoGhosting verifies that calling drawClockWidget multiple times
+// into the same buffer with different timestamps cleanly wipes previous text and doesn't ghost.
+func TestClockWidget_NoGhosting(t *testing.T) {
+	buf := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	fillRect(buf, buf.Bounds(), colorBgSlate)
+
+	t1 := time.Date(2026, 11, 20, 19, 58, 0, 0, time.Local)
+	t2 := time.Date(2026, 11, 20, 20, 0, 0, 0, time.Local)
+
+	// Render first time (e.g. 07:58 PM)
+	drawClockWidget(buf, 1880, 47, t1)
+
+	// Render second time over same buffer (e.g. 08:00 PM)
+	drawClockWidget(buf, 1880, 47, t2)
+
+	// Render into fresh buffer directly with t2
+	cleanBuf := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	fillRect(cleanBuf, cleanBuf.Bounds(), colorBgSlate)
+	drawClockWidget(cleanBuf, 1880, 47, t2)
+
+	// The clock region must be pixel-identical between the reused buffer and the clean buffer
+	clockRegion := image.Rect(1880-400, 47-26, 1890, 47+13)
+	for y := clockRegion.Min.Y; y < clockRegion.Max.Y; y++ {
+		for x := clockRegion.Min.X; x < clockRegion.Max.X; x++ {
+			c1 := buf.RGBAAt(x, y)
+			c2 := cleanBuf.RGBAAt(x, y)
+			if c1 != c2 {
+				t.Fatalf("mismatch at (%d, %d): reused buffer has %v, clean buffer has %v (indicates ghosting)", x, y, c1, c2)
+			}
+		}
 	}
 }
 

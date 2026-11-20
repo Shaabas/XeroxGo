@@ -196,6 +196,7 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 
 	// 2. Top floating header (no background banner, no horizontal divider line, no pipe separator)
 	drawFloatingHeader(fullCanvas)
+	drawClockWidget(fullCanvas, 1880, 47, time.Now())
 
 	// 4. Mode-specific content
 	switch state.Mode {
@@ -347,6 +348,7 @@ func ConfigureTarget(geom FramebufferGeometry) {
 
 // drawClockWidget renders the top-right date and time widget (Time + Separator + Date)
 // matching: "11:24 AM | Mon, Apr 28" without bolding and without a symbolic icon.
+// It clears its bounding area with colorBgSlate first to prevent any overlapping or ghosting.
 func drawClockWidget(dst *image.RGBA, rightX, y int, now time.Time) {
 	timeStr := now.Format("03:04 PM")
 	dateStr := now.Format("Mon, Jan 2")
@@ -361,6 +363,18 @@ func drawClockWidget(dst *image.RGBA, rightX, y int, now time.Time) {
 	totalW := timeW + gap + sepW + gap + dateW
 	startX := rightX - totalW
 
+	// Clear the bounding area to prevent ghosting or overlapping with previous frames
+	clearW := 400
+	if dst.Bounds().Dx() != ScreenWidth {
+		clearW = int(float64(400)*float64(dst.Bounds().Dx())/float64(ScreenWidth) + 0.5)
+	}
+	clearH := 40
+	if dst.Bounds().Dy() != ScreenHeight {
+		clearH = int(float64(40)*float64(dst.Bounds().Dy())/float64(ScreenHeight) + 0.5)
+	}
+	clearBox := image.Rect(rightX-clearW, y-clearH*2/3, rightX+10, y+clearH/3)
+	fillRect(dst, clearBox, colorBgSlate)
+
 	curX := startX
 	drawText(dst, faceReg20, timeStr, curX, y, colorTextPrimary)
 
@@ -371,7 +385,8 @@ func drawClockWidget(dst *image.RGBA, rightX, y int, now time.Time) {
 	drawText(dst, faceReg20, dateStr, curX, y, colorTextPrimary)
 }
 
-// drawFloatingHeader renders the seamless brand logo, slogan, and header clock in the top header area.
+// drawFloatingHeader renders the seamless brand logo and slogan in the top header area.
+// Note: Dynamic clock is intentionally rendered outside the static base cache to avoid frozen timestamps.
 func drawFloatingHeader(dst *image.RGBA) {
 	logoH := 46
 	var logoW int
@@ -384,9 +399,6 @@ func drawFloatingHeader(dst *image.RGBA) {
 	drawLogo(dst, 40, 36, logoH)
 	sloganX := 40 + logoW + 28
 	drawText(dst, faceReg22, "Upload, Print, Collect - It's that simple!", sloganX, 47, colorTextSecondary)
-
-	// Live clock in top right corner
-	drawClockWidget(dst, 1880, 47, time.Now())
 }
 
 // initScaledAdSlides pre-scales all promotional slides into memory buffers once for the target resolution.
