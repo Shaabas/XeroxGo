@@ -371,7 +371,7 @@ func drawClockWidget(dst *image.RGBA, rightX, y int, now time.Time) {
 	drawText(dst, faceReg20, dateStr, curX, y, colorTextPrimary)
 }
 
-// drawFloatingHeader renders the seamless brand logo, slogan, and network clock in the top header area.
+// drawFloatingHeader renders the seamless brand logo, slogan, and header clock in the top header area.
 func drawFloatingHeader(dst *image.RGBA) {
 	logoH := 46
 	var logoW int
