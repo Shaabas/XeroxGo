@@ -931,6 +931,16 @@ func (c *Client) Run(ctx context.Context) error {
 		}()
 	}
 
+	// 3e. Start background HTTP keep-alive probe to keep cloud backend (Render) warm 24/7
+	healthURL := c.resolveHealthURL()
+	if healthURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.cloudKeepAliveLoop(ctx, healthURL)
+		}()
+	}
+
 	// 4. Connection & reconnection loop
 	delay := c.minBackoff
 	for {
@@ -952,6 +962,7 @@ func (c *Client) Run(ctx context.Context) error {
 
 		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
+			log.Printf("[SPOOLER] WebSocket connection to cloud failed (%v); retrying in %v...", err, delay)
 			select {
 			case <-ctx.Done():
 				wg.Wait()
@@ -965,9 +976,11 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 		}
 
+		log.Printf("[SPOOLER] Connected to cloud WebSocket hub at %s", c.normalizedURL)
 		// Connected successfully: reset backoff delay
 		delay = c.minBackoff
 		c.handleConnection(ctx, conn)
+		log.Printf("[SPOOLER] Cloud WebSocket disconnected; reconnecting...")
 	}
 }
 
@@ -3607,5 +3620,71 @@ func (c *Client) RequestCloudRecovery(
 
 	c.enqueueJobs([]contracts.PrintJobCommand{cmd})
 	return &cmd, nil
+}
+
+func (c *Client) resolveHealthURL() string {
+	rawURL := strings.TrimSpace(c.cfg.CloudURL)
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	scheme := "http"
+	if u.Scheme == "https" || u.Scheme == "wss" {
+		scheme = "https"
+	}
+	host := u.Host
+	if host == "" {
+		host = u.Path
+	}
+	if host == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s://%s/healthz", scheme, host)
+}
+
+func (c *Client) cloudKeepAliveLoop(ctx context.Context, healthURL string) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	httpClient := c.cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	probe := func() {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
+		if err != nil {
+			return
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			log.Printf("[KEEPALIVE] Cloud keep-alive probe to %s failed: %v", healthURL, err)
+			return
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			// Cloud backend is warm and responsive
+		} else {
+			log.Printf("[KEEPALIVE] Cloud keep-alive probe to %s returned status: %d", healthURL, resp.StatusCode)
+		}
+	}
+
+	// Immediate probe on daemon startup to wake backend if cold
+	probe()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probe()
+		}
+	}
 }
 
