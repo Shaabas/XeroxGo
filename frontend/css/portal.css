@@ -68,8 +68,8 @@ body {
 /* Header */
 .header {
   padding: 1.5rem 1rem 1rem;
-  background: var(--card-bg);
-  border-bottom: 1px solid var(--border-color);
+  background: transparent;
+  border-bottom: none;
   text-align: center;
   position: sticky;
   top: 0;
@@ -1202,9 +1202,9 @@ body {
 /* Header */
 .portal-header {
   text-align: center;
-  background: #ffffff;
-  margin: 0 -16px 14px;
-  padding: 10px 16px 12px;
+  background: transparent;
+  margin: 0 0 14px;
+  padding: 12px 0 6px;
 }
 
 .logo-box {
@@ -1214,7 +1214,7 @@ body {
 }
 
 .header-logo-img {
-  height: clamp(36px, 10.5vw, 44px);
+  height: clamp(32px, 9.5vw, 40px);
   max-width: 100%;
   width: auto;
   object-fit: contain;
