@@ -12,7 +12,7 @@ else
     if [ -n "${DETECTED_IP}" ]; then
         PI_HOST="xg1@${DETECTED_IP}"
     else
-        PI_HOST="xg1@10.71.34.225"
+        PI_HOST="xg1@10.108.99.225"
     fi
 fi
 KIOSK_BIN="bin/xeroxgo-kiosk-arm64"
