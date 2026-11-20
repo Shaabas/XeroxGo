@@ -24,8 +24,18 @@ var fontBoldBytes []byte
 //go:embed assets/logo.png
 var logoPNGBytes []byte
 
+//go:embed assets/lucide_globe.png
+var lucideGlobePNGBytes []byte
+
+//go:embed assets/lucide_lock.png
+var lucideLockPNGBytes []byte
+
 var (
 	assetsOnce sync.Once
+
+	rawLogoImg  image.Image
+	rawGlobeImg image.Image
+	rawLockImg  image.Image
 
 	faceReg16 font.Face
 	faceReg18 font.Face
@@ -45,8 +55,6 @@ var (
 	faceBold44 font.Face
 	faceBold48 font.Face
 	faceBold56 font.Face
-
-	rawLogoImg image.Image
 )
 
 func initUIAssets() {
@@ -92,11 +100,20 @@ func initUIAssets() {
 		faceBold48 = makeFace(fBold, 48)
 		faceBold56 = makeFace(fBold, 56)
 
-		// 2. Decode Logo
+		// 2. Decode Assets
 		if len(logoPNGBytes) > 0 {
-			img, err := png.Decode(bytes.NewReader(logoPNGBytes))
-			if err == nil {
+			if img, err := png.Decode(bytes.NewReader(logoPNGBytes)); err == nil {
 				rawLogoImg = img
+			}
+		}
+		if len(lucideGlobePNGBytes) > 0 {
+			if img, err := png.Decode(bytes.NewReader(lucideGlobePNGBytes)); err == nil {
+				rawGlobeImg = img
+			}
+		}
+		if len(lucideLockPNGBytes) > 0 {
+			if img, err := png.Decode(bytes.NewReader(lucideLockPNGBytes)); err == nil {
+				rawLockImg = img
 			}
 		}
 
@@ -628,74 +645,17 @@ func setPixelClamped(dst *image.RGBA, x, y int, col color.RGBA) {
 	}
 }
 
-// drawLucideGlobeIcon renders a vector Lucide-style Globe icon with stroke width 2 centered at (cx, cy)
-func drawLucideGlobeIcon(dst *image.RGBA, cx, cy, r int, col color.RGBA) {
-	for dy := -r - 1; dy <= r+1; dy++ {
-		for dx := -r - 1; dx <= r+1; dx++ {
-			dist := math.Hypot(float64(dx), float64(dy))
-			diff := math.Abs(dist - float64(r))
-			if diff <= 1.0 {
-				alpha := 1.0 - diff
-				c := col
-				c.A = uint8(float64(col.A) * alpha)
-				setPixelClamped(dst, cx+dx, cy+dy, c)
-			}
-		}
-	}
-	for x := -r + 1; x <= r-1; x++ {
-		setPixelClamped(dst, cx+x, cy, col)
-		setPixelClamped(dst, cx+x, cy+1, color.RGBA{R: col.R, G: col.G, B: col.B, A: uint8(float64(col.A) * 0.4)})
-	}
-	rx := float64(r) * 0.45
-	ry := float64(r)
-	for dy := -r + 1; dy <= r-1; dy++ {
-		for dx := -r; dx <= r; dx++ {
-			norm := math.Hypot(float64(dx)/rx, float64(dy)/ry)
-			diff := math.Abs(norm-1.0) * rx
-			if diff <= 0.9 {
-				alpha := 1.0 - (diff / 0.9)
-				c := col
-				c.A = uint8(float64(col.A) * alpha)
-				setPixelClamped(dst, cx+dx, cy+dy, c)
-			}
-		}
+// drawLucideGlobe renders the embedded vector Lucide Globe icon scaled to targetRect
+func drawLucideGlobe(dst *image.RGBA, targetRect image.Rectangle) {
+	if rawGlobeImg != nil {
+		draw.BiLinear.Scale(dst, targetRect, rawGlobeImg, rawGlobeImg.Bounds(), draw.Over, nil)
 	}
 }
 
-// drawLucideLockIcon renders an exact Lucide-style vector Lock icon centered at (cx, cy)
-func drawLucideLockIcon(dst *image.RGBA, cx, cy int, scale float64, col color.RGBA) {
-	bodyW := int(18.0*scale + 0.5)
-	bodyH := int(12.0*scale + 0.5)
-	bodyX := cx - bodyW/2
-	bodyY := cy - int(1.0*scale)
-
-	shackleR := int(5.5*scale + 0.5)
-	shackleTopY := bodyY - int(8.0*scale + 0.5)
-
-	bodyRect := image.Rect(bodyX, bodyY, bodyX+bodyW, bodyY+bodyH)
-	strokeRoundedRect(dst, bodyRect, int(3.0*scale+0.5), 2, col)
-
-	shackleLeftX := cx - shackleR
-	shackleRightX := cx + shackleR
-
-	for y := shackleTopY + shackleR; y <= bodyY; y++ {
-		setPixelClamped(dst, shackleLeftX, y, col)
-		setPixelClamped(dst, shackleLeftX+1, y, col)
-		setPixelClamped(dst, shackleRightX, y, col)
-		setPixelClamped(dst, shackleRightX-1, y, col)
-	}
-
-	for dy := -shackleR - 1; dy <= 0; dy++ {
-		for dx := -shackleR - 1; dx <= shackleR + 1; dx++ {
-			dist := math.Hypot(float64(dx), float64(dy))
-			diff := math.Abs(dist - float64(shackleR))
-			if diff <= 1.0 && dy <= 0 {
-				alpha := 1.0 - diff
-				c := col
-				c.A = uint8(float64(col.A) * alpha)
-				setPixelClamped(dst, cx+dx, shackleTopY+shackleR+dy, c)
-			}
-		}
+// drawLucideLock renders the embedded vector Lucide Lock icon scaled to targetRect
+func drawLucideLock(dst *image.RGBA, targetRect image.Rectangle) {
+	if rawLockImg != nil {
+		draw.BiLinear.Scale(dst, targetRect, rawLockImg, rawLockImg.Bounds(), draw.Over, nil)
 	}
 }
 

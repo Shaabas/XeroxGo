@@ -638,14 +638,14 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 		}
 	}
 	linkW := measureTextWidth(faceBold20, displayLink)
-	globeR := 9
+	globeSize := 20
 	globeGap := 10
-	totalLinkW := 2*globeR + globeGap + linkW
+	totalLinkW := globeSize + globeGap + linkW
 	startX := pillRect.Min.X + (pillRect.Dx()-totalLinkW)/2
-	globeCX := startX + globeR
-	globeCY := pillRect.Min.Y + pillRect.Dy()/2
-	drawLucideGlobeIcon(base, globeCX, globeCY, globeR, colorPrimaryBlue)
-	textX := startX + 2*globeR + globeGap
+	globeY := pillRect.Min.Y + (pillRect.Dy()-globeSize)/2
+	globeRect := image.Rect(startX, globeY, startX+globeSize, globeY+globeSize)
+	drawLucideGlobe(base, globeRect)
+	textX := startX + globeSize + globeGap
 	drawText(base, faceBold20, displayLink, textX, 558, colorPrimaryBlue)
 
 	// --- SECTION DIVIDER: Sleek "OR" divider (generous 36px space above & below) ---
@@ -662,23 +662,22 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	strokeRoundedRect(base, tokenCard, 18, 1, colorPillBlueBorder)
 
 	// Centered Lock Icon + "Enter your 4-digit PIN" group
-	lockScale := 1.25
-	lockW := int(20.0 * lockScale)
+	lockSize := 26
 	pinMsg := "Enter your 4-digit PIN"
 	msgW := measureTextWidth(faceBold24, pinMsg)
 	lockGap := 14
-	groupW := lockW + lockGap + msgW
+	groupW := lockSize + lockGap + msgW
 
 	groupStartX := tokenCard.Min.X + (tokenCard.Dx()-groupW)/2
-	lockCX := groupStartX + lockW/2
-	lockCY := tokenCard.Min.Y + tokenCard.Dy()/2
+	lockY := tokenCard.Min.Y + (tokenCard.Dy()-lockSize)/2
+	lockRect := image.Rect(groupStartX, lockY, groupStartX+lockSize, lockY+lockSize)
 
-	// Pure blue Lucide lock (transparent background, directly on card)
-	drawLucideLockIcon(base, lockCX, lockCY, lockScale, colorPrimaryBlue)
+	// Official Lucide lock (transparent background, directly on card)
+	drawLucideLock(base, lockRect)
 
-	// Single clear label
-	msgX := groupStartX + lockW + lockGap
-	drawText(base, faceBold24, pinMsg, msgX, 706, colorTextPrimary)
+	// Single clear label centered vertically (card center Y = 698; y=684 centers faceBold24 with equal 22px top/bottom padding)
+	msgX := groupStartX + lockSize + lockGap
+	drawText(base, faceBold24, pinMsg, msgX, 684, colorTextPrimary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
