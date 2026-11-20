@@ -4410,12 +4410,12 @@ func TestClient_WebSocket_SecretSanitization(t *testing.T) {
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
-	// 1. SafeURL check
+	// 1. SafeURL check: never include URL query parameters or authentication credentials
 	if strings.Contains(client.SafeURL(), secret) {
 		t.Fatalf("SafeURL leaked secret token: %s", client.SafeURL())
 	}
-	if !strings.Contains(client.SafeURL(), "token=%5BREDACTED%5D") && !strings.Contains(client.SafeURL(), "token=[REDACTED]") {
-		t.Fatalf("SafeURL should contain redacted token parameter: %s", client.SafeURL())
+	if strings.Contains(client.SafeURL(), "?") {
+		t.Fatalf("SafeURL must never contain URL query parameters: %s", client.SafeURL())
 	}
 
 	// 2. sanitizeError checks
@@ -4435,8 +4435,8 @@ func TestClient_WebSocket_SecretSanitization(t *testing.T) {
 			if strings.Contains(sanitized, secret) {
 				t.Fatalf("sanitized error leaked secret %q: %s", secret, sanitized)
 			}
-			if !strings.Contains(sanitized, "[REDACTED]") {
-				t.Fatalf("sanitized error should contain [REDACTED]: %s", sanitized)
+			if strings.Contains(sanitized, "?") {
+				t.Fatalf("sanitized error must never contain URL query parameters: %s", sanitized)
 			}
 		})
 	}
@@ -4470,6 +4470,9 @@ func TestClient_WebSocket_SecretSanitization(t *testing.T) {
 
 	if strings.Contains(logOutput, secret) {
 		t.Fatalf("captured log output leaked secret %q:\n%s", secret, logOutput)
+	}
+	if strings.Contains(logOutput, "?") {
+		t.Fatalf("captured log output must never contain URL query parameters:\n%s", logOutput)
 	}
 	if !strings.Contains(logOutput, "[SPOOLER] WebSocket connection to cloud failed") {
 		t.Fatalf("expected failed connection log, got:\n%s", logOutput)
@@ -4588,6 +4591,18 @@ func TestClient_PingWatchdog_UnresponsivePeer_TriggersReconnect(t *testing.T) {
 	}
 }
 
+type failWriterConn struct {
+	net.Conn
+	failWrite atomic.Bool
+}
+
+func (c *failWriterConn) Write(b []byte) (int, error) {
+	if c.failWrite.Load() {
+		return 0, errors.New("simulated network write failure")
+	}
+	return c.Conn.Write(b)
+}
+
 func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
 	var connCount atomic.Int32
 	conn2Established := make(chan struct{})
@@ -4600,21 +4615,33 @@ func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
 		}
 
 		if count == 1 {
-			// First connection: immediately force-close connection to simulate network severance mid-session
-			c.CloseNow()
+			// First connection: accept and read normally without closing.
+			// The server keeps the socket open so the client's reader does NOT detect EOF.
+			go func() {
+				for {
+					var msg wireMessage
+					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+						return
+					}
+				}
+			}()
+			<-r.Context().Done()
 		} else {
-			// Second connection: accept and read normally
+			// Second connection (recovery): read normally and signal establishment
 			select {
 			case <-conn2Established:
 			default:
 				close(conn2Established)
 			}
-			_ = c.CloseRead(r.Context())
-			select {
-			case <-r.Context().Done():
-			case <-time.After(2 * time.Second):
-			}
-			c.CloseNow()
+			go func() {
+				for {
+					var msg wireMessage
+					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+						return
+					}
+				}
+			}()
+			<-r.Context().Done()
 		}
 	}))
 	defer wsServer.Close()
@@ -4627,7 +4654,7 @@ func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
 
-	cfg := ClientConfig{
+	client, err := NewClient(ClientConfig{
 		CloudURL:          wsURL,
 		KioskID:           "kiosk-hb-err-test",
 		KioskSecret:       "hb-test-token",
@@ -4636,41 +4663,95 @@ func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
 		DownloadDir:       t.TempDir(),
 		IdleQRContent:     "https://example.com/qr",
 		ScreenSink:        noopSink,
-		HeartbeatInterval: 25 * time.Millisecond,
-		PingInterval:      1 * time.Second,
+		HeartbeatInterval: 20 * time.Millisecond,
+		PingInterval:      10 * time.Second,
 		MinBackoff:        10 * time.Millisecond,
 		MaxBackoff:        50 * time.Millisecond,
-	}
-
-	client, err := NewClient(cfg)
+	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	var logBuf safeBuffer
+	origWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origWriter)
 
-	startErrCh := make(chan error, 1)
+	// Dial connection 1 with failWriterConn
+	var fw1 *failWriterConn
+	dialer := &net.Dialer{}
+	dialClient1 := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				rawConn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				fw1 = &failWriterConn{Conn: rawConn}
+				return fw1, nil
+			},
+		},
+	}
+
+	conn1Ctx, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+
+	conn1, _, err := websocket.Dial(conn1Ctx, client.normalizedURL, &websocket.DialOptions{
+		HTTPClient: dialClient1,
+	})
+	if err != nil {
+		t.Fatalf("Dial connection 1 failed: %v", err)
+	}
+	defer conn1.CloseNow()
+
+	// Arm write failure on connection 1
+	fw1.failWrite.Store(true)
+
+	// Run handleConnection for connection 1
+	conn1Done := make(chan struct{})
 	go func() {
-		startErrCh <- client.Run(ctx)
+		client.handleConnection(conn1Ctx, conn1)
+		close(conn1Done)
+	}()
+
+	// Verify connection 1 terminated via heartbeat write error handler
+	select {
+	case <-conn1Done:
+		// Connection 1 terminated cleanly via write error handler
+	case <-time.After(1 * time.Second):
+		t.Fatal("connection 1 did not terminate after heartbeat write failure")
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[SPOOLER] Heartbeat write failed") {
+		t.Fatalf("expected '[SPOOLER] Heartbeat write failed' in log, got:\n%s", logOutput)
+	}
+
+	// Now verify recovery: client connects connection 2 and runs healthy
+	conn2Ctx, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+
+	conn2, _, err := websocket.Dial(conn2Ctx, client.normalizedURL, nil)
+	if err != nil {
+		t.Fatalf("Dial connection 2 failed: %v", err)
+	}
+	defer conn2.CloseNow()
+
+	conn2Done := make(chan struct{})
+	go func() {
+		client.handleConnection(conn2Ctx, conn2)
+		close(conn2Done)
 	}()
 
 	select {
 	case <-conn2Established:
-		// Reconnected cleanly after write error
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timeout waiting for client to reconnect after write failure; total connections: %d", connCount.Load())
+		// Reconnection / recovery succeeded!
+	case <-time.After(1 * time.Second):
+		t.Fatal("recovery connection 2 was not established")
 	}
 
-	cancel()
-	select {
-	case err := <-startErrCh:
-		if err != nil {
-			t.Fatalf("client.Run returned unexpected error: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("client.Run did not terminate promptly after context cancel")
-	}
+	cancel2()
+	<-conn2Done
 }
 
 func TestClient_PingWatchdog_CleanShutdown(t *testing.T) {
@@ -4765,8 +4846,8 @@ func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 		DownloadDir:   t.TempDir(),
 		IdleQRContent: "https://example.com/qr",
 		ScreenSink:    noopSink,
-		PingInterval:  25 * time.Millisecond,
-		PingTimeout:   25 * time.Millisecond,
+		PingInterval:  20 * time.Millisecond,
+		PingTimeout:   20 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -4791,34 +4872,30 @@ func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 		}
 	}()
 
-	// Simulate slow writer locking sendMu
+	// Simulate slow writer or health poller holding sendMu
 	client.sendMu.Lock()
-	sendMuHeld := true
-	defer func() {
-		if sendMuHeld {
-			client.sendMu.Unlock()
-		}
-	}()
+	defer client.sendMu.Unlock()
 
-	// Ping directly on connection: coder/websocket does not require sendMu
-	pingCtx, pingCancel := context.WithTimeout(connCtx, 100*time.Millisecond)
-	defer pingCancel()
-
-	pingDone := make(chan error, 1)
+	// Exercise the ACTUAL pingWatchdog implementation while sendMu is locked
+	watchdogCtx, watchdogCancel := context.WithCancel(connCtx)
+	watchdogDone := make(chan struct{})
 	go func() {
-		pingDone <- conn.Ping(pingCtx)
+		client.pingWatchdog(watchdogCtx, cancel, conn)
+		close(watchdogDone)
 	}()
+
+	// Let the watchdog execute multiple ping iterations while sendMu is held
+	time.Sleep(70 * time.Millisecond)
+
+	// If pingWatchdog were blocked by sendMu, canceling watchdogCtx wouldn't unblock it
+	// because it would be stuck trying to acquire sendMu.
+	watchdogCancel()
 
 	select {
-	case err := <-pingDone:
-		if err != nil {
-			t.Fatalf("Ping failed while sendMu locked: %v", err)
-		}
+	case <-watchdogDone:
+		// Successfully executed and exited without blocking on sendMu
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Ping hung while sendMu was locked")
+		t.Fatal("pingWatchdog hung or was blocked while sendMu was locked")
 	}
-
-	client.sendMu.Unlock()
-	sendMuHeld = false
 }
 

@@ -230,19 +230,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	normalizedURL := u.String()
 
 	safeU := *u
-	safeQ := url.Values{}
-	for k, vs := range u.Query() {
-		if strings.EqualFold(k, "token") || strings.EqualFold(k, "secret") {
-			safeQ.Set(k, "[REDACTED]")
-		} else {
-			safeQ[k] = vs
-		}
-	}
-	safeQ.Set("kiosk_id", cfg.KioskID)
-	if strings.TrimSpace(cfg.KioskSecret) != "" {
-		safeQ.Set("token", "[REDACTED]")
-	}
-	safeU.RawQuery = safeQ.Encode()
+	safeU.RawQuery = ""
 	safeURL := safeU.String()
 
 	httpClient := cfg.HTTPClient
@@ -453,11 +441,11 @@ func (c *Client) PINController() *pin.Controller {
 }
 
 var (
-	secretParamRegex = regexp.MustCompile(`(?i)([\?&](?:token|secret|kiosk_secret|auth|password)=)[^&\s"'` + "`" + `]+`)
-	bearerAuthRegex  = regexp.MustCompile(`(?i)(bearer\s+)[^\s"',;]+`)
+	bearerAuthRegex = regexp.MustCompile(`(?i)(bearer\s+)[^\s"',;]+`)
+	urlQueryRegex   = regexp.MustCompile(`\?[^\s"',;` + "`" + `]+`)
 )
 
-// SafeURL returns the cloud WebSocket URL with sensitive authentication parameters redacted.
+// SafeURL returns the cloud WebSocket URL without any query parameters or authentication credentials.
 func (c *Client) SafeURL() string {
 	return c.safeURL
 }
@@ -474,7 +462,7 @@ func sanitizeErrorMessage(msg string, secret string, rawURL string, safeURL stri
 		msg = strings.ReplaceAll(msg, trimmedSecret, "[REDACTED]")
 	}
 	msg = bearerAuthRegex.ReplaceAllString(msg, "${1}[REDACTED]")
-	msg = secretParamRegex.ReplaceAllString(msg, "${1}[REDACTED]")
+	msg = urlQueryRegex.ReplaceAllString(msg, "")
 	return msg
 }
 
@@ -1172,7 +1160,7 @@ func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, c
 				}
 				log.Printf("[SPOOLER] Heartbeat write failed (%s); terminating connection", c.sanitizeError(err))
 				cancel()
-				_ = conn.Close(websocket.StatusGoingAway, "heartbeat write failed")
+				_ = conn.CloseNow()
 				return
 			}
 
@@ -1192,7 +1180,7 @@ func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, c
 				}
 				log.Printf("[SPOOLER] Health telemetry write failed (%s); terminating connection", c.sanitizeError(err))
 				cancel()
-				_ = conn.Close(websocket.StatusGoingAway, "health write failed")
+				_ = conn.CloseNow()
 				return
 			}
 		}
@@ -1217,7 +1205,7 @@ func (c *Client) pingWatchdog(ctx context.Context, cancel context.CancelFunc, co
 				}
 				log.Printf("[SPOOLER] WebSocket ping watchdog failed (%s); terminating connection", c.sanitizeError(err))
 				cancel()
-				_ = conn.Close(websocket.StatusGoingAway, "ping timeout")
+				_ = conn.CloseNow()
 				return
 			}
 		}
