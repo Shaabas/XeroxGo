@@ -345,8 +345,33 @@ func ConfigureTarget(geom FramebufferGeometry) {
 	}
 }
 
-// drawFloatingHeader renders the seamless brand logo and slogan in the top header area
-// without any surrounding white banner box, horizontal dividing border, or pipe separator.
+// drawClockWidget renders the top-right date and time widget (Time + Separator + Date)
+// matching: "11:24 AM | Mon, Apr 28" without bolding and without a symbolic icon.
+func drawClockWidget(dst *image.RGBA, rightX, y int, now time.Time) {
+	timeStr := now.Format("03:04 PM")
+	dateStr := now.Format("Mon, Jan 2")
+
+	gap := 10
+
+	timeW := measureTextWidth(faceReg20, timeStr)
+	sepStr := "|"
+	sepW := measureTextWidth(faceReg20, sepStr)
+	dateW := measureTextWidth(faceReg20, dateStr)
+
+	totalW := timeW + gap + sepW + gap + dateW
+	startX := rightX - totalW
+
+	curX := startX
+	drawText(dst, faceReg20, timeStr, curX, y, colorTextPrimary)
+
+	curX += timeW + gap
+	drawText(dst, faceReg20, sepStr, curX, y, colorBorderDark)
+
+	curX += sepW + gap
+	drawText(dst, faceReg20, dateStr, curX, y, colorTextPrimary)
+}
+
+// drawFloatingHeader renders the seamless brand logo, slogan, and network clock in the top header area.
 func drawFloatingHeader(dst *image.RGBA) {
 	logoH := 46
 	var logoW int
@@ -359,6 +384,9 @@ func drawFloatingHeader(dst *image.RGBA) {
 	drawLogo(dst, 40, 36, logoH)
 	sloganX := 40 + logoW + 28
 	drawText(dst, faceReg22, "Upload, Print, Collect - It's that simple!", sloganX, 47, colorTextSecondary)
+
+	// Live network clock in top right corner
+	drawClockWidget(dst, 1880, 47, NetworkNow())
 }
 
 // initScaledAdSlides pre-scales all promotional slides into memory buffers once for the target resolution.
@@ -889,6 +917,9 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 		drawText(dst, faceBold24, btnLabel, startX, btnY, colorTextWhite)
 	}
 
+	// Dynamic live clock refresh in top-right header
+	drawClockWidget(dst, int(float64(1880)*sx+0.5), int(float64(47)*sy+0.5), NetworkNow())
+
 	return nil
 }
 
@@ -1068,26 +1099,33 @@ func renderPINEntry(dst *image.RGBA, state ScreenState) {
 	_ = renderIdle(dst, state)
 }
 
-func renderOrderSummary(dst *image.RGBA, state ScreenState) {
+// renderReviewOrderAndPayment renders the unified Review Order & Payment screen.
+func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	card := image.Rect(40, 110, 1880, 1040)
 	fillRoundedRect(dst, card, 24, colorCardBg)
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
-	// Title & Subtitle
-	drawText(dst, faceBold48, "Order Details & Confirmation", 100, 160, colorTextPrimary)
-	drawText(dst, faceReg24, "Review your print job specifications and authoritative cloud price below", 100, 222, colorTextSecondary)
+	// Title & Subtitle at top of container
+	drawText(dst, faceBold48, "Review Order & Payment", 100, 175, colorTextPrimary)
+	drawText(dst, faceReg22, "Review your order details and total amount below", 100, 232, colorTextSecondary)
 
 	summary := state.OrderSummary
 	if summary == nil {
 		return
 	}
 
-	// Left Card: Print Specifications
-	leftCard := image.Rect(100, 280, 1060, 750)
+	colorEmeraldGreen := color.RGBA{R: 4, G: 120, B: 87, A: 255}
+
+	topY := 320
+	cardH := 510
+	bottomY := topY + cardH
+
+	// 1. LEFT CARD: Order Details (NO separators, Order ID at top!)
+	leftCard := image.Rect(100, topY, 940, bottomY)
 	fillRoundedRect(dst, leftCard, 20, colorBgSlate)
 	strokeRoundedRect(dst, leftCard, 20, 2, colorBorder)
 
-	drawText(dst, faceBold28, "Print Specifications", 140, 315, colorTextPrimary)
+	drawText(dst, faceBold28, "Order Details", 140, topY+45, colorTextPrimary)
 
 	duplexDesc := "Single-sided (Simplex)"
 	if summary.Duplex == "long_edge" || summary.Duplex == "short_edge" {
@@ -1097,7 +1135,6 @@ func renderOrderSummary(dst *image.RGBA, state ScreenState) {
 	if strings.ToLower(summary.ColorMode) == "color" {
 		colorDesc = "Full Color"
 	}
-
 	copiesDesc := fmt.Sprintf("%d copy", summary.Copies)
 	if summary.Copies > 1 {
 		copiesDesc = fmt.Sprintf("%d copies", summary.Copies)
@@ -1107,201 +1144,109 @@ func renderOrderSummary(dst *image.RGBA, state ScreenState) {
 		label string
 		val   string
 	}{
+		{"Order ID", summary.OrderID},
 		{"Total Document Pages", fmt.Sprintf("%d pages", summary.TotalPages)},
-		{"Physical Sheets to Print", fmt.Sprintf("%d sheets", summary.TotalSheets)},
+		{"Physical Sheets to Print", fmt.Sprintf("%d sheets (A4 Plain)", summary.TotalSheets)},
 		{"Copies Requested", copiesDesc},
 		{"Print Sides", duplexDesc},
 		{"Color Mode", colorDesc},
 	}
 
-	yRow := 390
+	yRow := topY + 105
+	rowSpacing := 62
 	for _, sp := range specs {
-		drawText(dst, faceReg24, sp.label, 140, yRow, colorTextSecondary)
-		vW := measureTextWidth(faceBold24, sp.val)
-		drawText(dst, faceBold24, sp.val, 1020-vW, yRow, colorTextPrimary)
-		yRow += 68
+		drawText(dst, faceReg22, sp.label, 140, yRow, colorTextSecondary)
+		vW := measureTextWidth(faceBold22, sp.val)
+		drawText(dst, faceBold22, sp.val, 900-vW, yRow, colorTextPrimary)
+		yRow += rowSpacing
 	}
 
-	// Right Card: Authoritative Pricing
-	rightCard := image.Rect(1100, 280, 1820, 750)
+	// 2. RIGHT CARD: Total Amount Due (Same Width 840px, Same Height 510px)
+	rightCard := image.Rect(980, topY, 1820, bottomY)
 	fillRoundedRect(dst, rightCard, 20, colorPillGreenBg)
 	strokeRoundedRect(dst, rightCard, 20, 2, colorPillGreenBorder)
 
-	drawText(dst, faceBold28, "Authoritative Cloud Price", 1140, 315, color.RGBA{R: 4, G: 120, B: 87, A: 255})
-	drawText(dst, faceReg24, "Total Amount", 1140, 395, colorTextSecondary)
+	// Left portion: Price & Verification note
+	drawText(dst, faceBold24, "Total Amount Due", 1015, topY+45, colorEmeraldGreen)
 
 	rupees := float64(summary.TotalPricePaise) / 100.0
 	priceStr := fmt.Sprintf("Rs. %.2f", rupees)
-	drawText(dst, faceBold56, priceStr, 1140, 455, color.RGBA{R: 4, G: 120, B: 87, A: 255})
+	drawText(dst, faceBold56, priceStr, 1015, topY+95, colorEmeraldGreen)
 
-	drawText(dst, faceReg20, "Authoritative price computed by cloud engine.", 1140, 565, colorTextSecondary)
-	drawText(dst, faceReg20, "Duplex blank padding sides are not billed.", 1140, 605, colorTextSecondary)
-	if summary.OrderID != "" {
-		orderIdStr := fmt.Sprintf("Order ID: %s", summary.OrderID)
-		drawText(dst, faceBold20, orderIdStr, 1140, 665, colorTextMutedDark)
-	}
+	drawText(dst, faceReg20, "incl. of all taxes", 1015, topY+175, colorTextSecondary)
 
-	// Status / Error Banner
-	if state.PINLoading {
-		loadPill := image.Rect(100, 755, 1820, 785)
-		drawPill(dst, loadPill, colorPillBlueBg, colorPillBlueBorder)
-		msg := "Verifying printer readiness and creating payment session... please wait"
-		lW := measureTextWidth(faceBold22, msg)
-		drawText(dst, faceBold22, msg, loadPill.Min.X+(loadPill.Dx()-lW)/2, 758, colorPrimaryBlue)
-	} else if strings.TrimSpace(state.PINError) != "" {
-		errPill := image.Rect(100, 755, 1820, 785)
-		drawPill(dst, errPill, colorPillRedBg, colorPillRedBorder)
-		errMsg := "⚠️  " + state.PINError
-		eW := measureTextWidth(faceBold22, errMsg)
-		drawText(dst, faceBold22, errMsg, errPill.Min.X+(errPill.Dx()-eW)/2, 758, colorErrorRed)
-	}
+	// Status note
+	drawText(dst, faceReg18, "Printing begins automatically once", 1015, topY+255, colorTextSecondary)
+	drawText(dst, faceReg18, "payment is verified.", 1015, topY+285, colorTextSecondary)
 
-	// Action Bar: Proceed & Cancel
-	confirmPill := image.Rect(100, 790, 940, 870)
-	if state.PINLoading {
-		drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
-		drawText(dst, faceBold28, "[Please Wait...] Creating Session...", 150, 815, colorPrimaryBlue)
-	} else if strings.TrimSpace(state.PINError) != "" {
-		drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
-		drawText(dst, faceBold28, "[Enter / Submit] Retry Payment", 150, 815, colorPrimaryBlue)
-	} else {
-		drawPill(dst, confirmPill, colorPillBlueBg, colorPillBlueBorder)
-		drawText(dst, faceBold28, "[Enter / Submit] Proceed to Payment", 150, 815, colorPrimaryBlue)
-	}
-
-	cancelPill := image.Rect(980, 790, 1820, 870)
-	drawPill(dst, cancelPill, colorBgSlate, colorBorder)
-	drawText(dst, faceBold28, "[Cancel / Esc] Cancel & Return to Home", 1030, 815, colorTextSecondary)
-
-	// Countdown Timer
-	if state.TimeoutSeconds > 0 {
-		msg := fmt.Sprintf("Screen will return to home in %d seconds of inactivity", state.TimeoutSeconds)
-		mW := measureTextWidth(faceReg22, msg)
-		drawText(dst, faceReg22, msg, (ScreenWidth-mW)/2, 940, colorTextSecondary)
-	}
-}
-
-func renderPaymentPending(dst *image.RGBA, state ScreenState) {
-	card := image.Rect(40, 110, 1880, 1040)
-	fillRoundedRect(dst, card, 24, colorCardBg)
-	strokeRoundedRect(dst, card, 24, 2, colorBorder)
-
-	// Title & Subtitle
-	drawText(dst, faceBold48, "Payment Pending", 100, 160, colorTextPrimary)
-	drawText(dst, faceReg24, "Order confirmed. Complete payment on your phone or at the reader.", 100, 222, colorTextSecondary)
-
-	summary := state.OrderSummary
-	if summary == nil {
-		return
-	}
-
-	// Left Card: Print Specifications
-	leftCard := image.Rect(100, 280, 1040, 760)
-	fillRoundedRect(dst, leftCard, 20, colorBgSlate)
-	strokeRoundedRect(dst, leftCard, 20, 2, colorBorder)
-
-	drawText(dst, faceBold28, "Print Specifications", 140, 315, colorTextPrimary)
-
-	duplexDesc := "Single-sided (Simplex)"
-	if summary.Duplex == "long_edge" || summary.Duplex == "short_edge" {
-		duplexDesc = "Double-sided (Duplex)"
-	}
-	colorDesc := "Black & White (Mono)"
-	if strings.ToLower(summary.ColorMode) == "color" {
-		colorDesc = "Full Color"
-	}
-	copiesDesc := fmt.Sprintf("%d copy", summary.Copies)
-	if summary.Copies > 1 {
-		copiesDesc = fmt.Sprintf("%d copies", summary.Copies)
-	}
-
-	specs := []struct {
-		label string
-		val   string
-	}{
-		{"Total Document Pages", fmt.Sprintf("%d pages", summary.TotalPages)},
-		{"Physical Sheets to Print", fmt.Sprintf("%d sheets", summary.TotalSheets)},
-		{"Copies Requested", copiesDesc},
-		{"Print Sides", duplexDesc},
-		{"Color Mode", colorDesc},
-	}
-
-	yRow := 390
-	for _, sp := range specs {
-		drawText(dst, faceReg24, sp.label, 140, yRow, colorTextSecondary)
-		vW := measureTextWidth(faceBold24, sp.val)
-		drawText(dst, faceBold24, sp.val, 1000-vW, yRow, colorTextPrimary)
-		yRow += 68
-	}
-
-	// Right Card: Payment Required & Authoritative Price & Dynamic QR
-	rightCard := image.Rect(1080, 280, 1820, 760)
-	fillRoundedRect(dst, rightCard, 20, colorPillBlueBg)
-	strokeRoundedRect(dst, rightCard, 20, 2, colorPillBlueBorder)
-
-	// Status badge pill inside right card
-	statusBadge := image.Rect(1120, 310, 1350, 355)
-	drawPill(dst, statusBadge, colorPillGreenBg, colorPillGreenBorder)
-	drawText(dst, faceBold20, "Awaiting Payment", 1140, 323, colorSuccessGreen)
-
-	drawText(dst, faceReg22, "Authoritative Amount Due", 1120, 385, colorTextSecondary)
-
-	rupees := float64(summary.TotalPricePaise) / 100.0
-	priceStr := fmt.Sprintf("Rs. %.2f", rupees)
-	drawText(dst, faceBold56, priceStr, 1120, 435, colorPrimaryBlue)
-
-	drawText(dst, faceReg20, "Printing begins automatically once", 1120, 515, colorTextSecondary)
-	drawText(dst, faceReg20, "payment is verified by cloud engine.", 1120, 545, colorTextSecondary)
-
-	if summary.OrderID != "" {
-		orderIdStr := fmt.Sprintf("Order: %s", summary.OrderID)
-		drawText(dst, faceBold20, orderIdStr, 1120, 595, colorTextMutedDark)
-		if state.SessionID != "" {
-			sessIdStr := fmt.Sprintf("Session: %s", state.SessionID)
-			drawText(dst, faceBold20, sessIdStr, 1120, 625, colorTextMutedDark)
-		}
-	}
-
-	if state.PINError != "" {
-		drawText(dst, faceBold20, state.PINError, 1120, 675, colorErrorRed)
-	} else {
-		drawText(dst, faceReg20, "Scan UPI QR with your phone to pay", 1120, 675, colorPrimaryBlue)
-	}
-
-	// QR Code Container Box on right side of Right Card (x: 1520 to 1780, y: 330 to 590 -> 260x260)
-	qrBox := image.Rect(1520, 330, 1780, 590)
+	// Right portion: Dynamic UPI QR Code
+	qrBox := image.Rect(1475, topY+35, 1785, topY+345) // 310x310
 	fillRoundedRect(dst, qrBox, 16, colorCardBg)
 	strokeRoundedRect(dst, qrBox, 16, 1, colorBorder)
 
 	if strings.TrimSpace(state.QRContent) != "" {
 		qrImg, err := getQRCodeImage(state.QRContent)
 		if err == nil && qrImg != nil {
-			qrTarget := image.Rect(1530, 340, 1770, 580)
+			qrTarget := image.Rect(1490, topY+50, 1770, topY+330) // 280x280
 			xdraw.NearestNeighbor.Scale(dst, qrTarget, qrImg, qrImg.Bounds(), xdraw.Over, nil)
 		}
-		scanLabel := "Scan to Pay with Phone"
-		sW := measureTextWidth(faceBold20, scanLabel)
-		drawText(dst, faceBold20, scanLabel, qrBox.Min.X+(qrBox.Dx()-sW)/2, 615, colorTextPrimary)
+	} else if state.PINLoading {
+		genLabel := "Preparing Session..."
+		gW := measureTextWidth(faceBold20, genLabel)
+		drawText(dst, faceBold20, genLabel, qrBox.Min.X+(qrBox.Dx()-gW)/2, topY+160, colorPrimaryBlue)
+		waitLabel := "Please wait"
+		wW := measureTextWidth(faceReg20, waitLabel)
+		drawText(dst, faceReg20, waitLabel, qrBox.Min.X+(qrBox.Dx()-wW)/2, topY+195, colorTextSecondary)
 	} else {
 		genLabel := "Generating QR..."
 		gW := measureTextWidth(faceBold20, genLabel)
-		drawText(dst, faceBold20, genLabel, qrBox.Min.X+(qrBox.Dx()-gW)/2, 450, colorTextSecondary)
+		drawText(dst, faceBold20, genLabel, qrBox.Min.X+(qrBox.Dx()-gW)/2, topY+160, colorTextSecondary)
 		waitLabel := "Please wait"
 		wW := measureTextWidth(faceReg20, waitLabel)
-		drawText(dst, faceReg20, waitLabel, qrBox.Min.X+(qrBox.Dx()-wW)/2, 485, colorTextSecondary)
+		drawText(dst, faceReg20, waitLabel, qrBox.Min.X+(qrBox.Dx()-wW)/2, topY+195, colorTextSecondary)
 	}
 
-	// Action Bar: Confirm Demo Print & Cancel
-	cancelPill := image.Rect(100, 800, 1820, 880)
-	drawPill(dst, cancelPill, colorBgSlate, colorBorder)
-	drawText(dst, faceBold28, "[Confirm / Enter] Complete Payment        [Cancel / Esc] Cancel & Return to Home", 420, 825, colorPrimaryBlue)
+	// Matching Mint-Green UPI Pill below QR box
+	upiPill := image.Rect(1460, topY+365, 1800, topY+415)
+	pillBg := color.RGBA{R: 209, G: 250, B: 229, A: 255}    // Mint green accent #D1FAE5
+	pillBorder := color.RGBA{R: 167, G: 243, B: 208, A: 255} // Emerald border #A7F3D0
+	drawPill(dst, upiPill, pillBg, pillBorder)
+	upiText := "GPay • PhonePe • Paytm • BHIM"
+	upiW := measureTextWidth(faceBold18, upiText)
+	drawText(dst, faceBold18, upiText, upiPill.Min.X+(upiPill.Dx()-upiW)/2, topY+380, colorEmeraldGreen)
 
-	// Countdown Timer
+	// Expiry Timer inside Right Card at the bottom
 	if state.TimeoutSeconds > 0 {
-		msg := fmt.Sprintf("Transaction session expires in %d seconds", state.TimeoutSeconds)
-		mW := measureTextWidth(faceReg22, msg)
-		drawText(dst, faceReg22, msg, (ScreenWidth-mW)/2, 940, colorTextSecondary)
+		timerStr := fmt.Sprintf("Session expires in %ds", state.TimeoutSeconds)
+		timW := measureTextWidth(faceBold18, timerStr)
+		timerY := bottomY - 45
+		timerX := rightCard.Min.X + (rightCard.Dx()-timW)/2
+		drawText(dst, faceBold18, timerStr, timerX, timerY, colorErrorRed)
 	}
+
+	// Inline Error / Notice Banner if present
+	if strings.TrimSpace(state.PINError) != "" {
+		errPill := image.Rect(100, 850, 1820, 895)
+		drawPill(dst, errPill, colorPillRedBg, colorPillRedBorder)
+		errMsg := "⚠️  " + state.PINError
+		eW := measureTextWidth(faceBold20, errMsg)
+		drawText(dst, faceBold20, errMsg, errPill.Min.X+(errPill.Dx()-eW)/2, 862, colorErrorRed)
+	}
+
+	// Centered cancel instruction in gray text where buttons used to be
+	cancelText := "Press 'Esc' to Cancel order"
+	cW := measureTextWidth(faceReg22, cancelText)
+	cancelX := (ScreenWidth - cW) / 2
+	cancelY := 935
+	drawText(dst, faceReg22, cancelText, cancelX, cancelY, colorTextSecondary)
+}
+
+func renderOrderSummary(dst *image.RGBA, state ScreenState) {
+	renderReviewOrderAndPayment(dst, state)
+}
+
+func renderPaymentPending(dst *image.RGBA, state ScreenState) {
+	renderReviewOrderAndPayment(dst, state)
 }
 
 func progressBarFillWidth(innerBarWidth, current, total int) int {
