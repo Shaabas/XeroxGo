@@ -659,7 +659,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	globeRect := image.Rect(startX, globeY, startX+globeSize, globeY+globeSize)
 	drawLucideGlobe(base, globeRect)
 	textX := startX + globeSize + globeGap
-	textY := 553 // Perfectly centers faceBold20 glyphs with the 20px globe icon (both centered at Y = 568)
+	textY := 555 // Exact optical center: lowercase x-height and ascenders align symmetrically with the 20px globe equator
 	drawText(base, faceBold20, displayLink, textX, textY, colorPrimaryBlue)
 
 	// --- SECTION DIVIDER: Sleek "OR" divider (generous 36px space above & below) ---
