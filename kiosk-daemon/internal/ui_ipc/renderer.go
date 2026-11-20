@@ -178,8 +178,8 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 
 	initUIAssets()
 
-	// Fast-path: Idle mode renders directly into dst (native or scaled)
-	if state.Mode == ModeIdle {
+	// Fast-path: Idle and PIN Entry modes render directly into dst
+	if state.Mode == ModeIdle || state.Mode == ModePINEntry {
 		return renderIdle(dst, state)
 	}
 
@@ -556,32 +556,32 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	// Subtitle beside brand logo
 	drawText(base, faceReg22, "Upload, Print, Collect - It's that simple!", 480, 44, colorTextSecondary)
 
-	// 4. Right Card: QR Code + Onboarding Steps
+	// 4. Right Card: Unified QR Code + PIN Entry
 	rightCard := image.Rect(1280, 140, 1890, 1050)
 	fillRoundedRect(base, rightCard, 24, colorCardBg)
 	strokeRoundedRect(base, rightCard, 24, 2, colorBorder)
 
-	// Headline above QR code - Option A (moved slightly down closer to QR)
-	qrTitle := "Scan QR to Get Started"
+	// --- UPPER HALF: QR Code & Mobile Portal ---
+	qrTitle := "Scan to Order Online"
 	qrTitleW := measureTextWidth(faceBold28, qrTitle)
-	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 164, colorTextPrimary)
+	drawText(base, faceBold28, qrTitle, rightCard.Min.X+(rightCard.Dx()-qrTitleW)/2, 168, colorTextPrimary)
 
-	// Sub-caption below headline - Bold, slightly bigger (20px), dark gray (#334155)
-	qrSub := "Point your phone camera here, or visit website below"
-	qrSubW := measureTextWidth(faceBold20, qrSub)
-	drawText(base, faceBold20, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 198, colorTextMutedDark)
+	qrSub := "Point camera to upload files & pay"
+	qrSubW := measureTextWidth(faceReg18, qrSub)
+	drawText(base, faceReg18, qrSub, rightCard.Min.X+(rightCard.Dx()-qrSubW)/2, 202, colorTextSecondary)
 
-	// QR Code Generation (Cached for zero-lag performance)
+	// Crisp 240x240 QR Code
 	qrImg, err := getQRCodeImage(qrContent)
 	if err != nil {
 		return nil, err
 	}
 
-	qrBounds := image.Rect(1405, 236, 1765, 596)
+	qrBounds := image.Rect(1465, 235, 1705, 475)
 	draw.Draw(base, qrBounds, qrImg, image.Point{}, draw.Src)
+	strokeRoundedRect(base, image.Rect(1455, 225, 1715, 485), 12, 1, colorBorder)
 
 	// Action pill under QR with website link
-	pillRect := image.Rect(1355, 626, 1815, 682)
+	pillRect := image.Rect(1415, 502, 1755, 546)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
 	displayLink := "xeroxgo.vercel.app"
 	if strings.TrimSpace(qrContent) != "" {
@@ -594,37 +594,45 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 			displayLink = cleaned
 		}
 	}
-	pillW := measureTextWidth(faceBold24, displayLink)
-	drawText(base, faceBold24, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 642, colorPrimaryBlue)
+	pillW := measureTextWidth(faceBold20, displayLink)
+	drawText(base, faceBold20, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 513, colorPrimaryBlue)
 
-	// 3 Numbered Steps - Option A (mathematically centered with 68px left/right margins)
-	steps := []struct {
-		num    string
-		title  string
-		isLast bool
-	}{
-		{"1", "Upload your file & choose print settings", false},
-		{"2", "Pay with UPI (GPay, PhonePe, Paytm)", false},
-		{"3", "Collect your prints from the tray below", true},
-	}
-	ySteps := []int{716, 784, 852}
-	for i, s := range steps {
-		y := ySteps[i]
-		circleCol := colorPrimaryBlue
-		if s.isLast {
-			circleCol = colorSuccessGreen
-		}
-		drawCircle(base, 1366, y+18, 18, circleCol)
-		numW := measureTextWidth(faceBold20, s.num)
-		drawText(base, faceBold20, s.num, 1366-numW/2, y+9, colorTextWhite)
+	// --- SECTION DIVIDER: Sleek "OR ENTER PIN" badge ---
+	divY := 580
+	fillRect(base, image.Rect(1320, divY, 1850, divY+2), colorBorder)
 
-		drawText(base, faceBold22, s.title, 1398, y+7, colorTextPrimary)
-	}
+	badgeRect := image.Rect(1510, divY-14, 1660, divY+16)
+	drawPill(base, badgeRect, colorCardBg, colorBorderDark)
+	orText := "OR ENTER PIN"
+	orW := measureTextWidth(faceBold18, orText)
+	drawText(base, faceBold18, orText, badgeRect.Min.X+(badgeRect.Dx()-orW)/2, divY-8, colorTextSecondary)
 
-	// Security badge / footer text inside right card - Layman's terms & larger font (18px)
-	secText := "Your files are private and automatically deleted after printing"
-	secW := measureTextWidth(faceReg18, secText)
-	drawText(base, faceReg18, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 961, colorTextSecondary)
+	// --- LOWER HALF: In-Place PIN Entry Header & Static Guides ---
+	pinTitle := "Already Have a 4-Digit PIN?"
+	pinTitleW := measureTextWidth(faceBold24, pinTitle)
+	drawText(base, faceBold24, pinTitle, rightCard.Min.X+(rightCard.Dx()-pinTitleW)/2, 618, colorTextPrimary)
+
+	pinSub := "Type your retrieval code on the keypad below"
+	pinSubW := measureTextWidth(faceReg18, pinSub)
+	drawText(base, faceReg18, pinSub, rightCard.Min.X+(rightCard.Dx()-pinSubW)/2, 650, colorTextSecondary)
+
+	// Keypad Prompt Guidance Card
+	infoCard := image.Rect(1330, 856, 1840, 950)
+	fillRoundedRect(base, infoCard, 16, colorBgSlate)
+	strokeRoundedRect(base, infoCard, 16, 1, colorBorder)
+
+	drawCircle(base, 1360, 888, 14, colorPrimaryBlue)
+	drawText(base, faceBold18, "1", 1355, 878, colorTextWhite)
+	drawText(base, faceReg18, "Order from your phone to receive a 4-digit PIN", 1390, 878, colorTextPrimary)
+
+	drawCircle(base, 1360, 922, 14, colorSuccessGreen)
+	drawText(base, faceBold18, "2", 1355, 912, colorTextWhite)
+	drawText(base, faceReg18, "Type the code on the physical keypad to print", 1390, 912, colorTextPrimary)
+
+	// Trust mark / privacy badge at the bottom of the card
+	secText := "Private & Encrypted • Documents auto-deleted after pickup"
+	secW := measureTextWidth(faceReg16, secText)
+	drawText(base, faceReg16, secText, rightCard.Min.X+(rightCard.Dx()-secW)/2, 988, colorTextSecondary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
@@ -632,7 +640,11 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 }
 
 func renderIdle(dst *image.RGBA, state ScreenState) error {
-	base, err := getIdleBase(state.QRContent)
+	qrContent := state.QRContent
+	if strings.TrimSpace(qrContent) == "" {
+		qrContent = "https://xeroxgo.vercel.app"
+	}
+	base, err := getIdleBase(qrContent)
 	if err != nil {
 		return err
 	}
@@ -796,6 +808,106 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 			fillRoundedRect(dst, pill, dotR, color.RGBA{R: 255, G: 255, B: 255, A: alpha})
 			curX += w + int(14.0*sx+0.5)
 		}
+	}
+
+	// Dynamic PIN input boxes on the right card
+	const (
+		boxW    = 88
+		boxH    = 96
+		spacing = 20
+		totalW  = 4*boxW + 3*spacing
+	)
+	rightCard := image.Rect(1280, 140, 1890, 1050)
+	startX := rightCard.Min.X + (rightCard.Dx()-totalW)/2
+	boxY := 682
+
+	for i := 0; i < 4; i++ {
+		bx := startX + i*(boxW+spacing)
+		boxRect := image.Rect(bx, boxY, bx+boxW, boxY+boxH)
+		if !isNative1080p {
+			boxRect = image.Rect(
+				int(float64(boxRect.Min.X)*sx+0.5),
+				int(float64(boxRect.Min.Y)*sy+0.5),
+				int(float64(boxRect.Max.X)*sx+0.5),
+				int(float64(boxRect.Max.Y)*sy+0.5),
+			)
+		}
+
+		if i < len(state.PINDigits) {
+			fillRoundedRect(dst, boxRect, 16, colorPillBlueBg)
+			strokeRoundedRect(dst, boxRect, 16, 2, colorPrimaryBlue)
+			ch := string(state.PINDigits[i])
+			cW := measureTextWidth(faceBold44, ch)
+			drawX := boxRect.Min.X + (boxRect.Dx()-int(float64(cW)*sx+0.5))/2
+			drawY := boxRect.Min.Y + int(22.0*sy+0.5)
+			drawText(dst, faceBold44, ch, drawX, drawY, colorPrimaryBlue)
+		} else if i == len(state.PINDigits) && len(state.PINDigits) < 4 {
+			fillRoundedRect(dst, boxRect, 16, colorCardBg)
+			strokeRoundedRect(dst, boxRect, 16, 3, colorPrimaryBlue)
+			dotX := boxRect.Min.X + boxRect.Dx()/2
+			dotY := boxRect.Min.Y + boxRect.Dy()/2
+			dotR := int(5.0*sx + 0.5)
+			if dotR < 3 {
+				dotR = 3
+			}
+			drawCircle(dst, dotX, dotY, dotR, colorPrimaryBlue)
+		} else {
+			fillRoundedRect(dst, boxRect, 16, colorBgSlate)
+			strokeRoundedRect(dst, boxRect, 16, 2, colorBorderDark)
+			dotX := boxRect.Min.X + boxRect.Dx()/2
+			dotY := boxRect.Min.Y + boxRect.Dy()/2
+			dotR := int(4.0*sx + 0.5)
+			if dotR < 2 {
+				dotR = 2
+			}
+			drawCircle(dst, dotX, dotY, dotR, colorBorderDark)
+		}
+	}
+
+	// Status / Feedback message
+	if strings.TrimSpace(state.PINError) != "" {
+		errRect := image.Rect(1340, 796, 1830, 838)
+		if !isNative1080p {
+			errRect = image.Rect(
+				int(float64(errRect.Min.X)*sx+0.5),
+				int(float64(errRect.Min.Y)*sy+0.5),
+				int(float64(errRect.Max.X)*sx+0.5),
+				int(float64(errRect.Max.Y)*sy+0.5),
+			)
+		}
+		drawPill(dst, errRect, colorPillRedBg, colorPillRedBorder)
+		eW := measureTextWidth(faceBold18, state.PINError)
+		eX := errRect.Min.X + (errRect.Dx()-int(float64(eW)*sx+0.5))/2
+		eY := int(806.0*sy + 0.5)
+		drawText(dst, faceBold18, state.PINError, eX, eY, colorErrorRed)
+	} else if state.PINLoading {
+		loadRect := image.Rect(1360, 796, 1810, 838)
+		if !isNative1080p {
+			loadRect = image.Rect(
+				int(float64(loadRect.Min.X)*sx+0.5),
+				int(float64(loadRect.Min.Y)*sy+0.5),
+				int(float64(loadRect.Max.X)*sx+0.5),
+				int(float64(loadRect.Max.Y)*sy+0.5),
+			)
+		}
+		drawPill(dst, loadRect, colorPillBlueBg, colorPillBlueBorder)
+		loadMsg := "Verifying PIN with cloud..."
+		lW := measureTextWidth(faceBold18, loadMsg)
+		lX := loadRect.Min.X + (loadRect.Dx()-int(float64(lW)*sx+0.5))/2
+		lY := int(806.0*sy + 0.5)
+		drawText(dst, faceBold18, loadMsg, lX, lY, colorPrimaryBlue)
+	} else if len(state.PINDigits) > 0 {
+		activeHint := fmt.Sprintf("%d of 4 digits entered • Press [Enter] when done", len(state.PINDigits))
+		aW := measureTextWidth(faceBold18, activeHint)
+		aX := int(float64(rightCard.Min.X)*sx+0.5) + (int(float64(rightCard.Dx())*sx+0.5)-int(float64(aW)*sx+0.5))/2
+		aY := int(806.0*sy + 0.5)
+		drawText(dst, faceBold18, activeHint, aX, aY, colorPrimaryBlue)
+	} else {
+		guide := "[0-9] Type Code      [Enter] Confirm      [C] Clear"
+		gW := measureTextWidth(faceBold18, guide)
+		gX := int(float64(rightCard.Min.X)*sx+0.5) + (int(float64(rightCard.Dx())*sx+0.5)-int(float64(gW)*sx+0.5))/2
+		gY := int(806.0*sy + 0.5)
+		drawText(dst, faceBold18, guide, gX, gY, colorTextMutedDark)
 	}
 
 	return nil
@@ -973,84 +1085,10 @@ func renderError(dst *image.RGBA, state ScreenState) {
 }
 
 func renderPINEntry(dst *image.RGBA, state ScreenState) {
-	card := image.Rect(30, 140, 1890, 1050)
-	fillRoundedRect(dst, card, 24, colorCardBg)
-	strokeRoundedRect(dst, card, 24, 2, colorBorder)
-
-	// Title & Subtitle
-	drawText(dst, faceBold56, "Enter 4-Digit Order PIN", 90, 215, colorTextPrimary)
-	drawText(dst, faceReg28, "Enter the PIN generated on your phone to retrieve and confirm your order", 90, 280, colorTextSecondary)
-
-	// 4 Digit Input Boxes
-	const (
-		boxW    = 150
-		boxH    = 170
-		spacing = 36
-		totalW  = 4*boxW + 3*spacing
-	)
-	startX := (ScreenWidth - totalW) / 2
-	boxY := 350
-
-	for i := 0; i < 4; i++ {
-		bx := startX + i*(boxW+spacing)
-		boxRect := image.Rect(bx, boxY, bx+boxW, boxY+boxH)
-
-		if i < len(state.PINDigits) {
-			// Filled digit slot
-			fillRoundedRect(dst, boxRect, 16, colorPillBlueBg)
-			strokeRoundedRect(dst, boxRect, 16, 3, colorPrimaryBlue)
-			digitChar := string(state.PINDigits[i])
-			dW := measureTextWidth(faceBold56, digitChar)
-			drawText(dst, faceBold56, digitChar, boxRect.Min.X+(boxRect.Dx()-dW)/2, 405, colorPrimaryBlue)
-		} else if i == len(state.PINDigits) {
-			// Active cursor slot
-			fillRoundedRect(dst, boxRect, 16, colorCardBg)
-			strokeRoundedRect(dst, boxRect, 16, 3, colorPrimaryBlue)
-			uW := measureTextWidth(faceBold56, "_")
-			drawText(dst, faceBold56, "_", boxRect.Min.X+(boxRect.Dx()-uW)/2, 410, colorTextSecondary)
-		} else {
-			// Empty slot
-			fillRoundedRect(dst, boxRect, 16, colorBgSlate)
-			strokeRoundedRect(dst, boxRect, 16, 2, colorBorder)
-		}
+	if strings.TrimSpace(state.QRContent) == "" {
+		state.QRContent = "https://xeroxgo.vercel.app"
 	}
-
-	// Feedback & Status Banner
-	if state.PINLoading {
-		pill := image.Rect(660, 540, 1260, 606)
-		drawPill(dst, pill, colorPillBlueBg, colorPillBlueBorder)
-		loadingText := "Looking up order details..."
-		lW := measureTextWidth(faceBold28, loadingText)
-		drawText(dst, faceBold28, loadingText, pill.Min.X+(pill.Dx()-lW)/2, 560, colorPrimaryBlue)
-	} else if strings.TrimSpace(state.PINError) != "" {
-		errPill := image.Rect(540, 540, 1380, 606)
-		drawPill(dst, errPill, colorPillRedBg, colorPillRedBorder)
-		eW := measureTextWidth(faceBold24, state.PINError)
-		drawText(dst, faceBold24, state.PINError, errPill.Min.X+(errPill.Dx()-eW)/2, 560, colorErrorRed)
-	} else {
-		prompt := "Enter your 4-digit code using the keypad below"
-		pW := measureTextWidth(faceReg24, prompt)
-		drawText(dst, faceReg24, prompt, (ScreenWidth-pW)/2, 560, colorTextSecondary)
-	}
-
-	// Keypad Guide Box
-	instBox := image.Rect(90, 640, 1830, 860)
-	fillRoundedRect(dst, instBox, 20, colorBgSlate)
-	strokeRoundedRect(dst, instBox, 20, 2, colorBorder)
-
-	drawText(dst, faceBold28, "Keypad Guide:", 140, 675, colorTextPrimary)
-	drawText(dst, faceBold24, "[0 - 9]  Enter PIN digits", 140, 730, colorTextPrimary)
-	drawText(dst, faceBold24, "[Backspace]  Delete last digit", 650, 730, colorTextPrimary)
-	drawText(dst, faceBold24, "[Clear / C]  Reset all digits", 1250, 730, colorTextPrimary)
-	drawText(dst, faceBold24, "[Submit / Enter]  Submit PIN", 140, 795, colorPrimaryBlue)
-	drawText(dst, faceBold24, "[Cancel / Esc]  Cancel & return to home", 650, 795, colorErrorRed)
-
-	// Inactivity Countdown Indicator
-	if state.TimeoutSeconds > 0 {
-		tMsg := fmt.Sprintf("Screen will return to home in %d seconds of inactivity", state.TimeoutSeconds)
-		tW := measureTextWidth(faceReg22, tMsg)
-		drawText(dst, faceReg22, tMsg, (ScreenWidth-tW)/2, 920, colorTextSecondary)
-	}
+	_ = renderIdle(dst, state)
 }
 
 func renderOrderSummary(dst *image.RGBA, state ScreenState) {
