@@ -1230,6 +1230,13 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 			qrTarget := image.Rect(1490, topY+50, 1770, topY+330) // 280x280
 			xdraw.NearestNeighbor.Scale(dst, qrTarget, qrImg, qrImg.Bounds(), xdraw.Over, nil)
 		}
+	} else if strings.TrimSpace(state.PINError) != "" {
+		failLabel := "QR Unavailable"
+		fW := measureTextWidth(faceBold20, failLabel)
+		drawText(dst, faceBold20, failLabel, qrBox.Min.X+(qrBox.Dx()-fW)/2, topY+150, colorErrorRed)
+		retryLabel := "Press Confirm to retry"
+		rW := measureTextWidth(faceReg18, retryLabel)
+		drawText(dst, faceReg18, retryLabel, qrBox.Min.X+(qrBox.Dx()-rW)/2, topY+185, colorTextSecondary)
 	} else if state.PINLoading {
 		genLabel := "Preparing Session..."
 		gW := measureTextWidth(faceBold20, genLabel)

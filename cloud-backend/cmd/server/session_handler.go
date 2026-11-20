@@ -194,7 +194,7 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.db.CreateOrGetKioskSessionWithPaperCheck(r.Context(), kioskID, orderID, stock, 5*time.Minute, now)
+	sess, err := s.db.CreateOrGetKioskSessionWithPaperCheck(r.Context(), kioskID, orderID, stock, 10*time.Minute, now)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		switch {

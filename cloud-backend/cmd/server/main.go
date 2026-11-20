@@ -471,7 +471,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
+	pinExpiresAt := time.Now().UTC().Add(2 * time.Hour)
 
 	cmd := contracts.PrintJobCommand{
 		JobID:            docs[0].JobID,

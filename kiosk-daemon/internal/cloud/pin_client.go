@@ -158,7 +158,7 @@ func NewHTTPPINClient(cloudURL, kioskID, kioskSecret string, httpClient *http.Cl
 
 	if httpClient == nil {
 		httpClient = &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: 30 * time.Second,
 		}
 	}
 

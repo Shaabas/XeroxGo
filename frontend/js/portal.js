@@ -2048,19 +2048,22 @@
       }
     }
     if (!authoritativeExpiryMs) {
-      authoritativeExpiryMs = Date.now() + 15 * 60 * 1000;
+      authoritativeExpiryMs = Date.now() + 2 * 60 * 60 * 1000;
     }
 
     function tick() {
       const now = Date.now();
       const diffMs = authoritativeExpiryMs - now;
       const secondsLeft = Math.max(0, Math.ceil(diffMs / 1000));
-      const minutes = Math.floor(secondsLeft / 60);
+      const hours = Math.floor(secondsLeft / 3600);
+      const minutes = Math.floor((secondsLeft % 3600) / 60);
       const seconds = secondsLeft % 60;
       if (pinExpiryText) {
         if (secondsLeft <= 0) {
           pinExpiryText.textContent = 'PIN expired. Please create a new order.';
           if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+        } else if (hours > 0) {
+          pinExpiryText.textContent = `Expires in ${hours}h ${minutes}m`;
         } else {
           pinExpiryText.textContent = `Expires in ${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
         }

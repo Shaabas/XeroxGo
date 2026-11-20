@@ -439,7 +439,7 @@ func (c *Controller) startClaimLocked() {
 	seq := atomic.AddUint64(&c.lookupSeq, 1)
 
 	go func(targetSeq uint64, ordID string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
 		session, err := c.cfg.LookupClient.ClaimOrder(ctx, ordID)
@@ -515,18 +515,37 @@ func (c *Controller) startClaimLocked() {
 		c.renderPaymentPendingLocked(timeoutSec)
 		c.startCountdownLocked(time.Duration(timeoutSec) * time.Second)
 
-		// Asynchronously initiate payment to obtain dynamic payment QR payload
+		// Asynchronously initiate payment to obtain dynamic payment QR payload with retry
 		sessID := session.SessionID
 		go func(targetSeq uint64, sID string, tSec int) {
-			initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			attempt, pErr := c.cfg.LookupClient.InitiatePayment(initCtx, sID)
-			initCancel()
+			var attempt *cloud.PaymentAttemptDetails
+			var pErr error
 
-			if pErr != nil {
-				log.Printf("[PIN-CONTROLLER] First initiate payment attempt failed (%v); retrying...", pErr)
-				retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				attempt, pErr = c.cfg.LookupClient.InitiatePayment(retryCtx, sID)
-				retryCancel()
+			for try := 0; try < 3; try++ {
+				if try > 0 {
+					select {
+					case <-c.ctx.Done():
+						return
+					case <-time.After(2 * time.Second):
+					}
+				}
+
+				c.mu.Lock()
+				curSeq := atomic.LoadUint64(&c.lookupSeq)
+				curState := c.state
+				c.mu.Unlock()
+				if curSeq != targetSeq || curState != StatePaymentPending {
+					return
+				}
+
+				initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				attempt, pErr = c.cfg.LookupClient.InitiatePayment(initCtx, sID)
+				initCancel()
+
+				if pErr == nil && attempt != nil {
+					break
+				}
+				log.Printf("[PIN-CONTROLLER] InitiatePayment attempt %d failed: %v", try+1, pErr)
 			}
 
 			c.mu.Lock()
@@ -536,8 +555,8 @@ func (c *Controller) startClaimLocked() {
 				return
 			}
 
-			if pErr != nil {
-				log.Printf("[PIN-CONTROLLER] Failed to initiate payment for session %s: %v", sID, pErr)
+			if pErr != nil || attempt == nil {
+				log.Printf("[PIN-CONTROLLER] All initiate payment attempts failed for session %s: %v", sID, pErr)
 				c.pinError = "Failed to load payment QR. Press Confirm to retry."
 				c.renderPaymentPendingLocked(tSec)
 				return
