@@ -2694,7 +2694,9 @@ func (s *Store) getCommittedPaperSheetsTx(ctx context.Context, q queryable, kios
 	query := s.rebind(`
 SELECT COALESCE(SUM(c.committed_sheets), 0)
 FROM (
-    SELECT pc.total_sheets AS committed_sheets
+    -- print_configs describes the first document in a multi-document order.
+    -- Reserve the entire order, falling back to print_configs for legacy rows.
+    SELECT CASE WHEN o.total_sheets > 0 THEN o.total_sheets ELSE pc.total_sheets END AS committed_sheets
     FROM orders o
     JOIN print_configs pc ON o.order_id = pc.order_id
     JOIN kiosk_sessions ks ON o.order_id = ks.order_id
@@ -2703,22 +2705,31 @@ FROM (
       AND ks.status = 'PAYMENT_PENDING'
       AND ks.expires_at_ns > ?
       AND (? = '' OR o.order_id != ?)
-    GROUP BY o.order_id, pc.total_sheets
+    GROUP BY o.order_id, o.total_sheets, pc.total_sheets
 
     UNION ALL
 
-    SELECT 
-        CASE 
-            WHEN (pc.total_sheets - COALESCE(jp.sheets_printed, 0)) > 0 
-            THEN (pc.total_sheets - COALESCE(jp.sheets_printed, 0))
-            ELSE 0 
-        END AS committed_sheets
-    FROM orders o
-    JOIN print_configs pc ON o.order_id = pc.order_id
-    LEFT JOIN job_progress jp ON o.job_id = jp.job_id
-    WHERE o.kiosk_id = ?
-      AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
-      AND (? = '' OR o.order_id != ?)
+    -- Paid/in-flight orders reserve only sheets still to be printed.
+    -- Sum job progress across all child documents, not just the first job.
+    SELECT CASE WHEN paid.remaining_sheets > 0 THEN paid.remaining_sheets ELSE 0 END AS committed_sheets
+    FROM (
+        SELECT
+            (CASE WHEN o.total_sheets > 0 THEN o.total_sheets ELSE pc.total_sheets END)
+            - COALESCE(
+                (SELECT SUM(jp_doc.sheets_printed)
+                 FROM order_documents od
+                 JOIN job_progress jp_doc ON jp_doc.job_id = od.job_id
+                 WHERE od.order_id = o.order_id),
+                legacy_progress.sheets_printed,
+                0
+            ) AS remaining_sheets
+        FROM orders o
+        JOIN print_configs pc ON o.order_id = pc.order_id
+        LEFT JOIN job_progress legacy_progress ON o.job_id = legacy_progress.job_id
+        WHERE o.kiosk_id = ?
+          AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+          AND (? = '' OR o.order_id != ?)
+    ) paid
 ) c;
 `)
 
@@ -2779,13 +2790,14 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 		statusStr      string
 		pricePaise     int64
 		pinExpiresAtNS int64
+		orderTotalSheets int
 	)
 	queryOrder := s.rebind(`
-SELECT kiosk_id, status, price_paise, pin_expires_at_ns
+SELECT kiosk_id, status, price_paise, pin_expires_at_ns, COALESCE(total_sheets, 0)
 FROM orders
 WHERE order_id = ?;
 `)
-	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS)
+	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS, &orderTotalSheets)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrOrderNotFound
@@ -2865,14 +2877,18 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 
 	// 3. If paper checking is enabled (availableStock >= 0), verify sufficient available sheets
 	if availableStock >= 0 {
-		var totalSheets int
-		querySheets := s.rebind(`SELECT total_sheets FROM print_configs WHERE order_id = ?;`)
-		err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrOrderNotFound
+		// orders.total_sheets is the entire order; print_configs is only the first
+		// document for multi-file orders. Older orders may lack an order-level total.
+		totalSheets := orderTotalSheets
+		if totalSheets <= 0 {
+			querySheets := s.rebind(`SELECT total_sheets FROM print_configs WHERE order_id = ?;`)
+			err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, ErrOrderNotFound
+				}
+				return nil, fmt.Errorf("create kiosk session: query legacy print config: %w", err)
 			}
-			return nil, fmt.Errorf("create kiosk session: query print config: %w", err)
 		}
 		if totalSheets <= 0 {
 			totalSheets = 1
