@@ -42,7 +42,7 @@ export XEROXGO_KIOSK_SECRET="${KIOSK_SECRET}"
 
 KIOSK_ID="kiosk-demo"
 CLOUD_URL="ws://127.0.0.1:${PORT}/ws"
-PORTAL_URL="${PORTAL_URL:-https://xeroxgo.vercel.app/k/${KIOSK_ID}}"
+PORTAL_URL="${PORTAL_URL:-https://xeroxgo.vercel.app}"
 
 # Track background PIDs for cleanup
 CLOUD_PID=""

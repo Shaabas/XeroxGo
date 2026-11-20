@@ -61,7 +61,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --cloud-url=URL                Cloud WebSocket URL (default: $CLOUD_URL)"
       echo "  --kiosk-id=ID                  Kiosk ID (default: $KIOSK_ID)"
-      echo "  --idle-qr-content=URL          Idle screen QR URL (default: https://xeroxgo.vercel.app/k/\$KIOSK_ID)"
+      echo "  --idle-qr-content=URL          Idle screen QR URL (default: https://xeroxgo.vercel.app)"
       echo "  --cups-printer=QUEUE           CUPS printer queue name (if set, uses CUPS instead of mock)"
       echo "  --viewer-port=PORT             Port for live web viewer (default: $VIEWER_PORT)"
       echo "  --viewer-dir=DIR               Dedicated viewer directory (default: $VIEWER_DIR)"
@@ -139,7 +139,7 @@ echo " * Live Screen Monitor: http://${PRIMARY_IP}:${VIEWER_PORT}/"
 if [ -n "${IDLE_QR_CONTENT}" ]; then
 echo " * Idle Portal QR:      ${IDLE_QR_CONTENT}"
 else
-echo " * Idle Portal QR:      https://xeroxgo.vercel.app/k/${KIOSK_ID} (default)"
+echo " * Idle Portal QR:      https://xeroxgo.vercel.app (default)"
 fi
 if [ -n "${CUPS_PRINTER}" ]; then
 echo " * Printer Target:      CUPS queue ${CUPS_PRINTER}"

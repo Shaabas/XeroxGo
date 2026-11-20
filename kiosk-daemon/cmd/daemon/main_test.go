@@ -59,18 +59,18 @@ func TestResolveIdleQRContent(t *testing.T) {
 		expected      string
 	}{
 		{
-			name:          "default fallback uses vercel and kiosk id",
+			name:          "default fallback uses canonical vercel root",
 			idleQRContent: "",
 			portalURLBase: "https://xeroxgo.vercel.app",
 			kioskID:       "kiosk-demo",
-			expected:      "https://xeroxgo.vercel.app/k/kiosk-demo",
+			expected:      "https://xeroxgo.vercel.app",
 		},
 		{
 			name:          "custom portal url base",
 			idleQRContent: "",
 			portalURLBase: "https://custom.campus.org/",
 			kioskID:       "kiosk-hall-1",
-			expected:      "https://custom.campus.org/k/kiosk-hall-1",
+			expected:      "https://custom.campus.org",
 		},
 		{
 			name:          "explicit idle QR content is preserved as-is",
@@ -80,18 +80,11 @@ func TestResolveIdleQRContent(t *testing.T) {
 			expected:      "https://custom-qr.org/scan-me",
 		},
 		{
-			name:          "empty portal url defaults to vercel",
+			name:          "empty portal url defaults to vercel root",
 			idleQRContent: "",
 			portalURLBase: "   ",
 			kioskID:       "kiosk-demo",
-			expected:      "https://xeroxgo.vercel.app/k/kiosk-demo",
-		},
-		{
-			name:          "special characters in kiosk id are url-escaped",
-			idleQRContent: "",
-			portalURLBase: "https://xeroxgo.vercel.app",
-			kioskID:       "kiosk demo/01",
-			expected:      "https://xeroxgo.vercel.app/k/kiosk%20demo%2F01",
+			expected:      "https://xeroxgo.vercel.app",
 		},
 	}
 

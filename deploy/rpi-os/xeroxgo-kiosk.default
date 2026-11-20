@@ -14,7 +14,7 @@ XEROXGO_CUPS_PRINTER=HPTank
 XEROXGO_PRINTER_MODEL="HP LaserJet Tank 1020w"
 
 # URL rendered on the idle QR code
-XEROXGO_IDLE_QR_CONTENT=https://xeroxgo.vercel.app/k/kiosk-demo
+XEROXGO_IDLE_QR_CONTENT=https://xeroxgo.vercel.app
 
 # Brother HL-L5210DN printer TCP address (PJL RAW port 9100)
 # Default is direct-attach static IP 192.168.99.2:9100

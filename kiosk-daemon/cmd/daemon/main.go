@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -578,7 +577,7 @@ func resolveIdleQRContent(idleQRContent, portalURLBase, kioskID string) string {
 	}
 	base := strings.TrimRight(strings.TrimSpace(portalURLBase), "/")
 	if base == "" {
-		base = "https://xeroxgo.vercel.app"
+		return "https://xeroxgo.vercel.app"
 	}
-	return fmt.Sprintf("%s/k/%s", base, url.PathEscape(strings.TrimSpace(kioskID)))
+	return base
 }
