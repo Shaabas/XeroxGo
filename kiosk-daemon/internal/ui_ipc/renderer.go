@@ -623,7 +623,7 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	qrBounds := image.Rect(1438, 228, 1732, 522)
 	xdraw.NearestNeighbor.Scale(base, qrBounds, qrImg, qrImg.Bounds(), draw.Over, nil)
 
-	// Action pill under QR with website link
+	// Action pill under QR with website link + Lucide Globe icon
 	pillRect := image.Rect(1415, 546, 1755, 590)
 	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
 	displayLink := "xeroxgo.vercel.app"
@@ -637,8 +637,16 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 			displayLink = cleaned
 		}
 	}
-	pillW := measureTextWidth(faceBold20, displayLink)
-	drawText(base, faceBold20, displayLink, pillRect.Min.X+(pillRect.Dx()-pillW)/2, 558, colorPrimaryBlue)
+	linkW := measureTextWidth(faceBold20, displayLink)
+	globeR := 9
+	globeGap := 10
+	totalLinkW := 2*globeR + globeGap + linkW
+	startX := pillRect.Min.X + (pillRect.Dx()-totalLinkW)/2
+	globeCX := startX + globeR
+	globeCY := pillRect.Min.Y + pillRect.Dy()/2
+	drawLucideGlobeIcon(base, globeCX, globeCY, globeR, colorPrimaryBlue)
+	textX := startX + 2*globeR + globeGap
+	drawText(base, faceBold20, displayLink, textX, 558, colorPrimaryBlue)
 
 	// --- SECTION DIVIDER: Sleek "OR" divider (generous 36px space above & below) ---
 	divY := 626
@@ -648,22 +656,29 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	fillRect(base, image.Rect(1585-orW/2-14, divY-10, 1585+orW/2+14, divY+10), colorCardBg)
 	drawText(base, faceBold18, orText, 1585-orW/2, divY-8, colorTextSecondary)
 
-	// --- LOWER HALF: Enter Token Banner ---
+	// --- LOWER HALF: Enter PIN Banner ---
 	tokenCard := image.Rect(1320, 662, 1850, 734)
 	fillRoundedRect(base, tokenCard, 18, colorPillBlueBg)
 	strokeRoundedRect(base, tokenCard, 18, 1, colorPillBlueBorder)
 
-	// App-tile lock icon
-	tileRect := image.Rect(1342, 672, 1394, 724)
-	fillRoundedRect(base, tileRect, 14, colorPrimaryBlue)
-	strokeRoundedRect(base, image.Rect(1357, 682, 1379, 700), 11, 3, colorTextWhite)
-	fillRoundedRect(base, image.Rect(1352, 696, 1384, 716), 4, colorTextWhite)
-	drawCircle(base, 1368, 704, 2, colorPrimaryBlue)
-	fillRect(base, image.Rect(1367, 704, 1370, 710), colorPrimaryBlue)
+	// Centered Lock Icon + "Enter your 4-digit PIN" group
+	lockScale := 1.25
+	lockW := int(20.0 * lockScale)
+	pinMsg := "Enter your 4-digit PIN"
+	msgW := measureTextWidth(faceBold24, pinMsg)
+	lockGap := 14
+	groupW := lockW + lockGap + msgW
 
-	// Title & Subtitle beside lock icon
-	drawText(base, faceBold24, "Enter Token", 1412, 676, colorTextPrimary)
-	drawText(base, faceReg18, "If you have a 4-digit PIN", 1412, 706, colorTextSecondary)
+	groupStartX := tokenCard.Min.X + (tokenCard.Dx()-groupW)/2
+	lockCX := groupStartX + lockW/2
+	lockCY := tokenCard.Min.Y + tokenCard.Dy()/2
+
+	// Pure blue Lucide lock (transparent background, directly on card)
+	drawLucideLockIcon(base, lockCX, lockCY, lockScale, colorPrimaryBlue)
+
+	// Single clear label
+	msgX := groupStartX + lockW + lockGap
+	drawText(base, faceBold24, pinMsg, msgX, 706, colorTextPrimary)
 
 	cachedIdleBase = base
 	cachedIdleQR = qrContent
