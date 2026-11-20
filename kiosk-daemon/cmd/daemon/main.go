@@ -261,6 +261,8 @@ func main() {
 	screenBPP := flag.Int("screen-bpp", 0, "Override screen bits per pixel (e.g. 16 or 32). Defaults to auto-detect")
 	idleQRContent := flag.String("idle-qr-content", "", "URL or content rendered in idle screen QR code")
 	idleQR := flag.String("idle-qr", "", "Alias for -idle-qr-content")
+	portalURLBase := flag.String("portal-url-base", "https://xeroxgo.vercel.app", "Base URL for the frontend customer upload portal")
+	portalURL := flag.String("portal-url", "", "Alias for -portal-url-base")
 	paymentURLBase := flag.String("payment-url-base", "https://xeroxgo.vercel.app/pay", "Base URL for payment QR codes (e.g. https://xeroxgo.vercel.app/pay). If non-empty, wraps payment tokens in this URL")
 	paymentURL := flag.String("payment-url", "", "Alias for -payment-url-base")
 	bypassPayment := flag.Bool("bypass-payment", false, "In demo/test mode, auto-authorize payment and print immediately when order is confirmed on keypad without needing a phone QR scan")
@@ -284,6 +286,9 @@ func main() {
 	if *cupsPrinter == "" && *cupsQueue != "" {
 		*cupsPrinter = *cupsQueue
 	}
+	if *portalURL != "" {
+		*portalURLBase = *portalURL
+	}
 	if *idleQRContent == "" && *idleQR != "" {
 		*idleQRContent = *idleQR
 	}
@@ -295,18 +300,7 @@ func main() {
 		log.Fatalf("Fatal: --kiosk-id cannot be empty")
 	}
 
-	if *idleQRContent == "" {
-		u, err := url.Parse(*cloudURL)
-		if err == nil && u.Host != "" {
-			scheme := "http"
-			if u.Scheme == "wss" {
-				scheme = "https"
-			}
-			*idleQRContent = fmt.Sprintf("%s://%s/k/%s", scheme, u.Host, url.PathEscape(*kioskID))
-		} else {
-			*idleQRContent = "https://xeroxgo.vercel.app"
-		}
-	}
+	*idleQRContent = resolveIdleQRContent(*idleQRContent, *portalURLBase, *kioskID)
 
 	if err := os.MkdirAll(filepath.Dir(*stateDB), 0755); err != nil {
 		log.Fatalf("Fatal: failed to create state database directory: %v", err)
@@ -576,4 +570,15 @@ func main() {
 	rootWg.Wait()
 	restoreConsoleCursor()
 	log.Printf("XeroxGo kiosk daemon shut down cleanly.")
+}
+
+func resolveIdleQRContent(idleQRContent, portalURLBase, kioskID string) string {
+	if trimmed := strings.TrimSpace(idleQRContent); trimmed != "" {
+		return trimmed
+	}
+	base := strings.TrimRight(strings.TrimSpace(portalURLBase), "/")
+	if base == "" {
+		base = "https://xeroxgo.vercel.app"
+	}
+	return fmt.Sprintf("%s/k/%s", base, url.PathEscape(strings.TrimSpace(kioskID)))
 }

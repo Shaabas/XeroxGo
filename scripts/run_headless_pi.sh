@@ -27,6 +27,7 @@ ENABLE_SOUND="${ENABLE_SOUND:-true}"
 VIEWER_DIR="${VIEWER_DIR:-/tmp/xeroxgo-viewer}"
 CUPS_PRINTER="${CUPS_PRINTER:-}"
 BYPASS_PAYMENT="${BYPASS_PAYMENT:-false}"
+IDLE_QR_CONTENT="${IDLE_QR_CONTENT:-}"
 
 # Parse optional CLI flags
 while [[ $# -gt 0 ]]; do
@@ -53,11 +54,14 @@ while [[ $# -gt 0 ]]; do
     --cups-printer) CUPS_PRINTER="$2"; shift 2 ;;
     --bypass-payment=*) BYPASS_PAYMENT="${1#*=}"; shift ;;
     --bypass-payment) BYPASS_PAYMENT="true"; shift ;;
+    --idle-qr-content=*) IDLE_QR_CONTENT="${1#*=}"; shift ;;
+    --idle-qr-content) IDLE_QR_CONTENT="$2"; shift 2 ;;
     --help|-h)
       echo "Usage: $0 [options]"
       echo "Options:"
       echo "  --cloud-url=URL                Cloud WebSocket URL (default: $CLOUD_URL)"
       echo "  --kiosk-id=ID                  Kiosk ID (default: $KIOSK_ID)"
+      echo "  --idle-qr-content=URL          Idle screen QR URL (default: https://xeroxgo.vercel.app/k/\$KIOSK_ID)"
       echo "  --cups-printer=QUEUE           CUPS printer queue name (if set, uses CUPS instead of mock)"
       echo "  --viewer-port=PORT             Port for live web viewer (default: $VIEWER_PORT)"
       echo "  --viewer-dir=DIR               Dedicated viewer directory (default: $VIEWER_DIR)"
@@ -113,12 +117,30 @@ if [ -n "${CUPS_PRINTER}" ]; then
   PRINTER_ARGS=(--cups-printer="${CUPS_PRINTER}")
 fi
 
+EXTRA_ARGS=()
+if [ -n "${IDLE_QR_CONTENT}" ]; then
+  EXTRA_ARGS+=(--idle-qr-content="${IDLE_QR_CONTENT}")
+fi
+
+# Warn if another xeroxgo-kiosk daemon instance is already active
+if pgrep -f "/xeroxgo-kiosk" >/dev/null 2>&1; then
+  echo "⚠️  WARNING: Another xeroxgo-kiosk process is already running on this system!"
+  echo "   If the systemd service is active, stop it to prevent conflicting display frames:"
+  echo "   sudo systemctl stop xeroxgo-kiosk"
+  echo "------------------------------------------------------------------------------"
+fi
+
 echo "=============================================================================="
 echo " XeroxGo Headless Kiosk Active"
 echo "=============================================================================="
 echo " * Kiosk ID:            ${KIOSK_ID}"
 echo " * Cloud Target:        ${CLOUD_URL}"
 echo " * Live Screen Monitor: http://${PRIMARY_IP}:${VIEWER_PORT}/"
+if [ -n "${IDLE_QR_CONTENT}" ]; then
+echo " * Idle Portal QR:      ${IDLE_QR_CONTENT}"
+else
+echo " * Idle Portal QR:      https://xeroxgo.vercel.app/k/${KIOSK_ID} (default)"
+fi
 if [ -n "${CUPS_PRINTER}" ]; then
 echo " * Printer Target:      CUPS queue ${CUPS_PRINTER}"
 else
@@ -142,6 +164,7 @@ echo "==========================================================================
 # 6. Execute kiosk daemon
 "${KIOSK_BIN}" \
   "${PRINTER_ARGS[@]}" \
+  "${EXTRA_ARGS[@]}" \
   --enable-keypad \
   --preview-png="${PREVIEW_PNG}" \
   --viewer-addr="0.0.0.0:${VIEWER_PORT}" \

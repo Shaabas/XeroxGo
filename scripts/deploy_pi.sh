@@ -49,7 +49,7 @@ ssh -t "${PI_HOST}" "bash -c '
             --cloud-url=wss://xeroxgo-cloud.onrender.com/ws \
             --cups-printer=DCPT310 \
             --framebuffer=/dev/fb0 \
-            --idle-qr-content=https://xeroxgo.vercel.app \
+            --idle-qr-content=https://xeroxgo.vercel.app/k/kiosk-demo \
             --enable-keypad=true \
             --keypad-device=/dev/tty1 > /tmp/xeroxgo-kiosk.log 2>&1 &
         echo \"xeroxgo-kiosk launched directly on /dev/fb0.\"

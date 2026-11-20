@@ -49,3 +49,59 @@ func TestMockPrinterShutdownUnblocksListener(t *testing.T) {
 		t.Fatal("deadlock: startMockPrinter listener goroutine did not exit within 3s after cleanup")
 	}
 }
+
+func TestResolveIdleQRContent(t *testing.T) {
+	tests := []struct {
+		name          string
+		idleQRContent string
+		portalURLBase string
+		kioskID       string
+		expected      string
+	}{
+		{
+			name:          "default fallback uses vercel and kiosk id",
+			idleQRContent: "",
+			portalURLBase: "https://xeroxgo.vercel.app",
+			kioskID:       "kiosk-demo",
+			expected:      "https://xeroxgo.vercel.app/k/kiosk-demo",
+		},
+		{
+			name:          "custom portal url base",
+			idleQRContent: "",
+			portalURLBase: "https://custom.campus.org/",
+			kioskID:       "kiosk-hall-1",
+			expected:      "https://custom.campus.org/k/kiosk-hall-1",
+		},
+		{
+			name:          "explicit idle QR content is preserved as-is",
+			idleQRContent: "https://custom-qr.org/scan-me",
+			portalURLBase: "https://xeroxgo.vercel.app",
+			kioskID:       "kiosk-demo",
+			expected:      "https://custom-qr.org/scan-me",
+		},
+		{
+			name:          "empty portal url defaults to vercel",
+			idleQRContent: "",
+			portalURLBase: "   ",
+			kioskID:       "kiosk-demo",
+			expected:      "https://xeroxgo.vercel.app/k/kiosk-demo",
+		},
+		{
+			name:          "special characters in kiosk id are url-escaped",
+			idleQRContent: "",
+			portalURLBase: "https://xeroxgo.vercel.app",
+			kioskID:       "kiosk demo/01",
+			expected:      "https://xeroxgo.vercel.app/k/kiosk%20demo%2F01",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveIdleQRContent(tt.idleQRContent, tt.portalURLBase, tt.kioskID)
+			if got != tt.expected {
+				t.Errorf("resolveIdleQRContent(%q, %q, %q) = %q, want %q",
+					tt.idleQRContent, tt.portalURLBase, tt.kioskID, got, tt.expected)
+			}
+		})
+	}
+}
