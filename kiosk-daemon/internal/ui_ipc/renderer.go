@@ -1268,7 +1268,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	if strings.TrimSpace(state.PINError) != "" {
 		errPill := image.Rect(100, 850, 1820, 895)
 		drawPill(dst, errPill, colorPillRedBg, colorPillRedBorder)
-		errMsg := "⚠️  " + state.PINError
+		errMsg := strings.TrimSpace(state.PINError)
 		eW := measureTextWidth(faceBold20, errMsg)
 		drawText(dst, faceBold20, errMsg, errPill.Min.X+(errPill.Dx()-eW)/2, 862, colorErrorRed)
 	}

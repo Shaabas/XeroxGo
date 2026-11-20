@@ -10,16 +10,16 @@
       "destination": "https://xeroxgo-cloud.onrender.com/pay/:match*"
     },
     {
+      "source": "/payment/:match*",
+      "destination": "https://xeroxgo-cloud.onrender.com/pay/:match*"
+    },
+    {
       "source": "/payment",
-      "destination": "/payment.html"
+      "destination": "/"
     },
     {
       "source": "/payment/",
-      "destination": "/payment.html"
-    },
-    {
-      "source": "/payment/:match*",
-      "destination": "/payment.html"
+      "destination": "/"
     },
     {
       "source": "/admin",

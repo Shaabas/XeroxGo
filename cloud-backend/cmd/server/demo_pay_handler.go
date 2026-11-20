@@ -102,7 +102,6 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Active valid payment attempt: render mobile checkout page
 	amountRupees := float64(att.AmountPaise) / 100.0
 	var totalPages, totalSheets, copies int
 	duplexStr := "Single-sided (Simplex)"
@@ -160,100 +159,99 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>XeroxGo Demo Checkout</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>XeroxGo Demo Payment</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background: #F8FAFC;
-      color: #1E293B;
+      color: #0F172A;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 16px;
+      padding: 24px 16px 40px;
+      -webkit-font-smoothing: antialiased;
     }
     .container {
       width: 100%%;
-      max-width: 480px;
+      max-width: 440px;
       margin: 0 auto;
     }
-    .header {
+    .brand-header {
       text-align: center;
       margin-bottom: 20px;
-      padding-top: 8px;
     }
-    .logo-badge {
+    .brand-title {
+      font-size: 26px;
+      font-weight: 900;
+      letter-spacing: -0.5px;
+      color: #2563EB;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
+    }
+    .brand-title span { color: #64748B; }
+    .demo-badge {
+      display: inline-block;
+      margin-top: 6px;
       background: #EFF6FF;
-      border: 1px solid #BFDBFE;
-      padding: 6px 14px;
-      border-radius: 9999px;
-      font-size: 13px;
-      font-weight: 700;
       color: #2563EB;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 12px;
-    }
-    .demo-tag {
-      background: #FEF3C7;
-      color: #B45309;
-      border: 1px solid #FDE68A;
-      padding: 2px 8px;
-      border-radius: 6px;
+      border: 1px solid #BFDBFE;
+      padding: 3px 10px;
+      border-radius: 9999px;
       font-size: 11px;
-      font-weight: 800;
-    }
-    .title {
-      font-size: 24px;
-      font-weight: 800;
-      color: #0F172A;
-      line-height: 1.2;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
     }
     .card {
       background: #FFFFFF;
       border: 1px solid #E2E8F0;
-      border-radius: 16px;
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+      border-radius: 20px;
       padding: 24px;
+      box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.06);
       margin-bottom: 16px;
     }
-    .price-box {
+    .price-hero {
       background: #EFF6FF;
-      border: 1.5px solid #BFDBFE;
-      border-radius: 12px;
-      padding: 18px;
+      border: 1px solid #BFDBFE;
+      border-radius: 16px;
+      padding: 20px 16px;
       text-align: center;
       margin-bottom: 20px;
     }
-    .price-label {
-      font-size: 13px;
-      font-weight: 600;
-      color: #64748B;
+    .price-hero-label {
+      font-size: 12px;
+      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.05em;
+      color: #2563EB;
       margin-bottom: 4px;
     }
-    .price-val {
+    .price-hero-amount {
       font-size: 38px;
       font-weight: 900;
-      color: #2563EB;
-      letter-spacing: -0.5px;
+      color: #1E3A8A;
+      letter-spacing: -1px;
+      line-height: 1.1;
+    }
+    .price-hero-sub {
+      font-size: 12px;
+      color: #64748B;
+      margin-top: 4px;
     }
     .specs-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 12px;
+      gap: 10px;
       margin-bottom: 20px;
     }
-    .spec-item {
+    .spec-cell {
       background: #F8FAFC;
       border: 1px solid #F1F5F9;
-      border-radius: 10px;
+      border-radius: 12px;
       padding: 10px 12px;
     }
     .spec-label {
@@ -261,15 +259,16 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
       font-weight: 600;
       color: #64748B;
       text-transform: uppercase;
+      letter-spacing: 0.04em;
       margin-bottom: 2px;
     }
     .spec-val {
       font-size: 14px;
       font-weight: 700;
-      color: #1E293B;
+      color: #0F172A;
     }
     .order-meta {
-      border-top: 1px solid #E2E8F0;
+      border-top: 1px solid #F1F5F9;
       padding-top: 14px;
       margin-bottom: 20px;
       font-size: 12px;
@@ -278,114 +277,114 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
       flex-direction: column;
       gap: 4px;
     }
-    .disclaimer {
+    .order-meta strong { color: #1E293B; }
+    .demo-notice {
       background: #FFFBEB;
       border: 1px solid #FDE68A;
-      border-radius: 10px;
-      padding: 12px;
+      border-radius: 12px;
+      padding: 12px 14px;
       font-size: 12px;
+      line-height: 1.45;
       color: #92400E;
-      line-height: 1.4;
       margin-bottom: 20px;
     }
+    .demo-notice strong { color: #78350F; }
     .btn-pay {
       display: block;
       width: 100%%;
+      padding: 16px 20px;
       background: #2563EB;
       color: #FFFFFF;
-      font-size: 17px;
-      font-weight: 700;
-      padding: 16px 20px;
       border: none;
-      border-radius: 12px;
+      border-radius: 14px;
+      font-size: 16px;
+      font-weight: 700;
       cursor: pointer;
-      text-align: center;
-      transition: background 0.15s ease, transform 0.05s ease;
       box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
+      transition: background 0.15s ease, transform 0.05s ease;
+      text-align: center;
     }
     .btn-pay:hover { background: #1D4ED8; }
-    .btn-pay:active { transform: scale(0.98); }
+    .btn-pay:active { transform: scale(0.99); }
     .btn-pay:disabled {
-      background: #94A3B8;
+      opacity: 0.7;
       cursor: not-allowed;
-      box-shadow: none;
       transform: none;
+    }
+    .status-alert {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.4;
+      display: none;
+    }
+    .status-alert.success {
+      display: block;
+      background: #ECFDF5;
+      border: 1px solid #A7F3D0;
+      color: #065F46;
+    }
+    .status-alert.error {
+      display: block;
+      background: #FEF2F2;
+      border: 1px solid #FECACA;
+      color: #991B1B;
     }
     .footer {
       text-align: center;
       font-size: 12px;
       color: #94A3B8;
-      margin-top: 16px;
-    }
-    #status-msg {
-      margin-top: 14px;
-      padding: 12px;
-      border-radius: 10px;
-      font-size: 13px;
-      font-weight: 600;
-      display: none;
-      text-align: center;
-    }
-    .msg-success {
-      background: #ECFDF5;
-      color: #065F46;
-      border: 1px solid #A7F3D0;
-    }
-    .msg-error {
-      background: #FEF2F2;
-      color: #991B1B;
-      border: 1px solid #FECACA;
+      margin-top: 8px;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="header">
-      <div class="logo-badge">
-        <span>XeroxGo</span>
-        <span class="demo-tag">SIMULATED PAYMENT</span>
-      </div>
-      <h1 class="title">Complete Payment</h1>
+    <div class="brand-header">
+      <div class="brand-title"><span>Xerox</span>Go</div>
+      <div><span class="demo-badge">Demo Mode Simulation</span></div>
     </div>
 
-    <div class="card">
-      <div class="price-box">
-        <div class="price-label">Authoritative Amount Due</div>
-        <div class="price-val">₹%.2f</div>
+    <div class="card" id="checkout-card">
+      <div class="price-hero">
+        <div class="price-hero-label">Total Amount Due</div>
+        <div class="price-hero-amount">₹%.2f</div>
+        <div class="price-hero-sub">incl. of all taxes</div>
       </div>
 
       <div class="specs-grid">
-        <div class="spec-item">
+        <div class="spec-cell">
           <div class="spec-label">Document Pages</div>
           <div class="spec-val">%d pages</div>
         </div>
-        <div class="spec-item">
+        <div class="spec-cell">
           <div class="spec-label">Sheets to Print</div>
           <div class="spec-val">%d sheets</div>
         </div>
-        <div class="spec-item">
+        <div class="spec-cell">
           <div class="spec-label">Copies</div>
           <div class="spec-val">%d</div>
         </div>
-        <div class="spec-item">
+        <div class="spec-cell">
           <div class="spec-label">Sides</div>
           <div class="spec-val">%s</div>
         </div>
       </div>
 
       <div class="order-meta">
-        <div><strong>Order ID:</strong> %s</div>
-        <div><strong>Target Kiosk:</strong> %s</div>
+        <div>Order ID: <strong>%s</strong></div>
+        <div>Target Kiosk: <strong>%s</strong></div>
       </div>
 
-      <div class="disclaimer">
-        <strong>Demo Mode Notice:</strong> This is a demonstration payment flow. No real funds will be deducted. Clicking the button below simulates instant payment verification and starts printing at the kiosk.
+      <div class="demo-notice">
+        <strong>Demo Mode Notice:</strong> This is a simulation payment flow. No real funds will be deducted. Tapping below verifies payment and triggers immediate printing at the kiosk.
       </div>
 
       <form id="pay-form" method="POST" action="/pay/%s" onsubmit="handlePaySubmit(event)">
         <button type="submit" id="pay-btn" class="btn-pay">Pay ₹%.2f (Demo Mode)</button>
       </form>
-      <div id="status-msg"></div>
+      <div id="status-msg" class="status-alert"></div>
     </div>
 
     <div class="footer">
@@ -401,6 +400,7 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
 
       btn.disabled = true;
       btn.innerText = 'Processing Demo Payment...';
+      msg.className = 'status-alert';
       msg.style.display = 'none';
 
       try {
@@ -416,21 +416,21 @@ func (s *appServer) handleDemoCheckoutPage(w http.ResponseWriter, r *http.Reques
         if (resp.ok) {
           btn.innerText = 'Payment Successful!';
           btn.style.background = '#10B981';
-          msg.className = 'msg-success';
+          msg.className = 'status-alert success';
           msg.innerHTML = '<strong>Success!</strong> Payment verified. Your documents are printing at kiosk <strong>%s</strong>.';
           msg.style.display = 'block';
         } else {
           btn.disabled = false;
           btn.innerText = 'Pay ₹%.2f (Demo Mode)';
-          msg.className = 'msg-error';
-          msg.innerHTML = '<strong>Error:</strong> ' + (data.error || 'Payment failed. Please try again.');
+          msg.className = 'status-alert error';
+          msg.innerHTML = '<strong>Payment Error:</strong> ' + (data.error || 'Payment failed. Please try again.');
           msg.style.display = 'block';
         }
       } catch (err) {
         btn.disabled = false;
         btn.innerText = 'Pay ₹%.2f (Demo Mode)';
-        msg.className = 'msg-error';
-        msg.innerHTML = '<strong>Network Error:</strong> Failed to connect. Please try again.';
+        msg.className = 'status-alert error';
+        msg.innerHTML = '<strong>Network Error:</strong> Failed to connect to server. Please try again.';
         msg.style.display = 'block';
       }
     }
@@ -606,21 +606,21 @@ func (s *appServer) renderDemoSuccessPage(w http.ResponseWriter, att *store.Paym
 	w.WriteHeader(http.StatusOK)
 
 	amountRupees := float64(att.AmountPaise) / 100.0
-	headline := "Payment Verified & Printing"
-	msg := fmt.Sprintf("Your payment of <strong>₹%.2f</strong> was successfully verified. The kiosk is now printing your documents.", amountRupees)
+	headline := "Payment Successful!"
+	msg := fmt.Sprintf("Your payment of <strong>₹%.2f</strong> was verified. The kiosk is now printing your document.", amountRupees)
 	badge := "PRINTING IN PROGRESS"
-	badgeColor := "#10B981"
+	badgeColor := "#065F46"
 	badgeBg := "#ECFDF5"
 
 	if status == "paid_unprinted" {
-		headline = "Payment Captured (Session Expired)"
-		msg = fmt.Sprintf("Your payment of <strong>₹%.2f</strong> was captured, but the kiosk session expired. Please use your PIN or recovery token at Kiosk <strong>%s</strong> to release the print job.", amountRupees, html.EscapeString(att.KioskID))
+		headline = "Payment Captured"
+		msg = fmt.Sprintf("Your payment of <strong>₹%.2f</strong> was captured, but the kiosk session timed out. Please enter your PIN at Kiosk <strong>%s</strong> to release the print job.", amountRupees, html.EscapeString(att.KioskID))
 		badge = "PAID - AWAITING KIOSK CLAIM"
-		badgeColor = "#D97706"
+		badgeColor = "#92400E"
 		badgeBg = "#FEF3C7"
 	} else if status == "already_processed" {
 		headline = "Payment Already Received"
-		msg = fmt.Sprintf("This order has already been paid (<strong>₹%.2f</strong>) and sent for printing.", amountRupees)
+		msg = fmt.Sprintf("This order has already been paid (<strong>₹%.2f</strong>) and sent to the kiosk for printing.", amountRupees)
 		badge = "COMPLETED"
 	}
 
@@ -628,39 +628,41 @@ func (s *appServer) renderDemoSuccessPage(w http.ResponseWriter, att *store.Paym
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Payment Success - XeroxGo</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background: #F8FAFC;
-      color: #1E293B;
+      color: #0F172A;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 24px 16px;
+      padding: 32px 16px;
+      -webkit-font-smoothing: antialiased;
     }
-    .container { width: 100%%; max-width: 480px; margin: 0 auto; }
+    .container { width: 100%%; max-width: 440px; margin: 0 auto; }
     .card {
       background: #FFFFFF;
       border: 1px solid #E2E8F0;
       border-radius: 20px;
-      padding: 32px 24px;
+      padding: 36px 24px;
       text-align: center;
-      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+      box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.06);
     }
     .icon {
       width: 64px;
       height: 64px;
-      background: %s;
-      color: %s;
+      background: #ECFDF5;
+      color: #10B981;
       border-radius: 50%%;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 32px;
+      font-weight: 900;
       margin: 0 auto 16px auto;
     }
     .badge {
@@ -673,7 +675,7 @@ func (s *appServer) renderDemoSuccessPage(w http.ResponseWriter, att *store.Paym
       border-radius: 9999px;
       margin-bottom: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.05em;
     }
     .title { font-size: 22px; font-weight: 800; color: #0F172A; margin-bottom: 12px; }
     .desc { font-size: 14px; color: #475569; line-height: 1.5; margin-bottom: 24px; }
@@ -685,7 +687,6 @@ func (s *appServer) renderDemoSuccessPage(w http.ResponseWriter, att *store.Paym
       text-align: left;
       font-size: 13px;
       color: #64748B;
-      margin-bottom: 20px;
     }
     .details div { margin-bottom: 4px; }
     .details strong { color: #1E293B; }
@@ -694,21 +695,20 @@ func (s *appServer) renderDemoSuccessPage(w http.ResponseWriter, att *store.Paym
 <body>
   <div class="container">
     <div class="card">
-      <div class="icon">✓</div>
+      <div class="icon">&#10003;</div>
       <div class="badge">%s</div>
       <h1 class="title">%s</h1>
       <p class="desc">%s</p>
 
       <div class="details">
-        <div><strong>Order ID:</strong> %s</div>
-        <div><strong>Kiosk ID:</strong> %s</div>
-        <div><strong>Amount:</strong> ₹%.2f</div>
+        <div>Order ID: <strong>%s</strong></div>
+        <div>Target Kiosk: <strong>%s</strong></div>
+        <div>Amount Paid: <strong>₹%.2f</strong></div>
       </div>
     </div>
   </div>
 </body>
 </html>`,
-		badgeBg, badgeColor,
 		badgeBg, badgeColor,
 		badge,
 		headline,
@@ -729,28 +729,29 @@ func (s *appServer) renderDemoErrorPage(w http.ResponseWriter, code int, title, 
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>%s - XeroxGo</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background: #F8FAFC;
-      color: #1E293B;
+      color: #0F172A;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 24px 16px;
+      padding: 32px 16px;
+      -webkit-font-smoothing: antialiased;
     }
-    .container { width: 100%%; max-width: 480px; margin: 0 auto; }
+    .container { width: 100%%; max-width: 440px; margin: 0 auto; }
     .card {
       background: #FFFFFF;
       border: 1px solid #FECACA;
       border-radius: 20px;
-      padding: 32px 24px;
+      padding: 36px 24px;
       text-align: center;
-      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+      box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.06);
     }
     .icon {
       width: 64px;
@@ -761,10 +762,11 @@ func (s *appServer) renderDemoErrorPage(w http.ResponseWriter, code int, title, 
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 32px;
+      font-size: 28px;
+      font-weight: 900;
       margin: 0 auto 16px auto;
     }
-    .title { font-size: 22px; font-weight: 800; color: #991B1B; margin-bottom: 12px; }
+    .title { font-size: 20px; font-weight: 800; color: #991B1B; margin-bottom: 12px; }
     .desc { font-size: 14px; color: #475569; line-height: 1.5; }
   </style>
 </head>

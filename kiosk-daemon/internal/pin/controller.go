@@ -354,7 +354,7 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 			seq := atomic.AddUint64(&c.lookupSeq, 1)
 			sID := c.currentSession.SessionID
 			go func(targetSeq uint64, sessionID string) {
-				initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer initCancel()
 				attempt, pErr := c.cfg.LookupClient.InitiatePayment(initCtx, sessionID)
 				c.mu.Lock()
@@ -374,9 +374,6 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 
 				token := attempt.DemoToken
-				if token == "" && c.currentOrder != nil {
-					token = c.currentOrder.OrderID
-				}
 				if c.cfg.BypassPayment && token != "" {
 					log.Printf("[PIN-CONTROLLER] BypassPayment enabled: auto-authorizing demo payment for %s", token)
 					c.authorizeDemoPaymentLocked(token)
@@ -386,8 +383,6 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 			token := ""
 			if c.currentAttempt != nil && c.currentAttempt.DemoToken != "" {
 				token = c.currentAttempt.DemoToken
-			} else if c.currentOrder != nil && c.currentOrder.OrderID != "" {
-				token = c.currentOrder.OrderID
 			}
 			if token != "" {
 				log.Printf("[PIN-CONTROLLER] Keypad Confirm: authorizing demo payment for %s", token)
@@ -523,10 +518,17 @@ func (c *Controller) startClaimLocked() {
 		// Asynchronously initiate payment to obtain dynamic payment QR payload
 		sessID := session.SessionID
 		go func(targetSeq uint64, sID string, tSec int) {
-			initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer initCancel()
-
+			initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
 			attempt, pErr := c.cfg.LookupClient.InitiatePayment(initCtx, sID)
+			initCancel()
+
+			if pErr != nil {
+				log.Printf("[PIN-CONTROLLER] First initiate payment attempt failed (%v); retrying...", pErr)
+				retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				attempt, pErr = c.cfg.LookupClient.InitiatePayment(retryCtx, sID)
+				retryCancel()
+			}
+
 			c.mu.Lock()
 			defer c.mu.Unlock()
 
@@ -548,9 +550,6 @@ func (c *Controller) startClaimLocked() {
 			c.renderPaymentPendingLocked(tSec)
 
 			token := attempt.DemoToken
-			if token == "" && c.currentOrder != nil {
-				token = c.currentOrder.OrderID
-			}
 			if c.cfg.BypassPayment && token != "" {
 				log.Printf("[PIN-CONTROLLER] BypassPayment enabled: auto-authorizing demo payment for %s", token)
 				c.authorizeDemoPaymentLocked(token)
@@ -665,16 +664,10 @@ func (c *Controller) renderOrderSummaryLocked(remainingSeconds int) {
 }
 
 func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetails) string {
-	urlBase := strings.TrimRight(strings.TrimSpace(c.cfg.PaymentURLBase), "/")
 	if attempt == nil {
-		if urlBase != "" {
-			if c.currentOrder != nil && c.currentOrder.OrderID != "" {
-				return fmt.Sprintf("%s/%s", urlBase, c.currentOrder.OrderID)
-			}
-			return urlBase
-		}
 		return ""
 	}
+	urlBase := strings.TrimRight(strings.TrimSpace(c.cfg.PaymentURLBase), "/")
 	if urlBase != "" {
 		token := strings.TrimSpace(attempt.DemoToken)
 		if token == "" && strings.HasPrefix(attempt.QRPayload, "http") {
@@ -691,9 +684,6 @@ func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetail
 		}
 		if token == "" {
 			token = strings.TrimSpace(attempt.AttemptID)
-		}
-		if token == "" && c.currentOrder != nil {
-			token = strings.TrimSpace(c.currentOrder.OrderID)
 		}
 		if token != "" {
 			return fmt.Sprintf("%s/%s", urlBase, token)
