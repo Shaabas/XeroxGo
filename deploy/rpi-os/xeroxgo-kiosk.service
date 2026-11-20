@@ -6,8 +6,8 @@
 [Unit]
 Description=XeroxGo Kiosk Spooler & HDMI Display Daemon
 Documentation=https://github.com/Shaabas/XeroxGo
-After=network-online.target
-Wants=network-online.target
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 Conflicts=getty@tty1.service
 
 [Service]

@@ -385,8 +385,8 @@ func drawFloatingHeader(dst *image.RGBA) {
 	sloganX := 40 + logoW + 28
 	drawText(dst, faceReg22, "Upload, Print, Collect - It's that simple!", sloganX, 47, colorTextSecondary)
 
-	// Live network clock in top right corner
-	drawClockWidget(dst, 1880, 47, NetworkNow())
+	// Live clock in top right corner
+	drawClockWidget(dst, 1880, 47, time.Now())
 }
 
 // initScaledAdSlides pre-scales all promotional slides into memory buffers once for the target resolution.
@@ -918,7 +918,7 @@ func renderIdle(dst *image.RGBA, state ScreenState) error {
 	}
 
 	// Dynamic live clock refresh in top-right header
-	drawClockWidget(dst, int(float64(1880)*sx+0.5), int(float64(47)*sy+0.5), NetworkNow())
+	drawClockWidget(dst, int(float64(1880)*sx+0.5), int(float64(47)*sy+0.5), time.Now())
 
 	return nil
 }

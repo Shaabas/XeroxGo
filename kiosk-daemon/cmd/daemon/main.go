@@ -394,9 +394,6 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Initialize background network clock synchronization (handles Raspberry Pi CMOS-less boot)
-	ui_ipc.StartNetworkClockLoop(ctx)
-
 	actualPrinterAddr := *printerAddr
 	var mockHealthPoller func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	var cleanupMock func()
