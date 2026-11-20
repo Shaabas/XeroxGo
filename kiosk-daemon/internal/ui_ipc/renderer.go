@@ -9,7 +9,6 @@ import (
 	_ "image/jpeg"
 	"image/png"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -624,23 +623,37 @@ func getIdleBase(qrContent string) (*image.RGBA, error) {
 	xdraw.NearestNeighbor.Scale(base, qrBounds, qrImg, qrImg.Bounds(), draw.Over, nil)
 
 	// Action pill under QR with website link + Lucide Globe icon
-	pillRect := image.Rect(1415, 546, 1755, 590)
-	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
-	displayLink := "xeroxgo.vercel.app"
+	displayLink := "https://xeroxgo.vercel.app/"
 	if strings.TrimSpace(qrContent) != "" {
 		cleaned := strings.TrimSpace(qrContent)
 		if strings.HasPrefix(cleaned, "http://") || strings.HasPrefix(cleaned, "https://") {
-			if u, err := url.Parse(cleaned); err == nil && u.Host != "" {
-				displayLink = u.Host
-			}
-		} else if strings.Contains(cleaned, ".") && !strings.Contains(cleaned, " ") {
 			displayLink = cleaned
+		} else if strings.Contains(cleaned, ".") && !strings.Contains(cleaned, " ") {
+			displayLink = "https://" + cleaned
+		} else {
+			displayLink = cleaned
+		}
+	}
+	if (strings.HasPrefix(displayLink, "http://") || strings.HasPrefix(displayLink, "https://")) && !strings.HasSuffix(displayLink, "/") {
+		if !strings.Contains(displayLink, "?") && !strings.Contains(displayLink, "#") {
+			displayLink += "/"
 		}
 	}
 	linkW := measureTextWidth(faceBold20, displayLink)
 	globeSize := 20
 	globeGap := 10
 	totalLinkW := globeSize + globeGap + linkW
+	pillW := totalLinkW + 64 // 32px horizontal padding on left & right
+	if pillW < 340 {
+		pillW = 340
+	}
+	if pillW > 530 {
+		pillW = 530
+	}
+	pillStartX := 1585 - pillW/2
+	pillRect := image.Rect(pillStartX, 546, pillStartX+pillW, 590)
+	drawPill(base, pillRect, colorPillBlueBg, colorPillBlueBorder)
+
 	startX := pillRect.Min.X + (pillRect.Dx()-totalLinkW)/2
 	globeY := pillRect.Min.Y + (pillRect.Dy()-globeSize)/2
 	globeRect := image.Rect(startX, globeY, startX+globeSize, globeY+globeSize)
