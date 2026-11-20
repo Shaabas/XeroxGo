@@ -214,7 +214,7 @@ var transparent1x1PNG = []byte{
 }
 
 // viewerHTML is the self-contained, responsive live kiosk screen monitor page.
-// It renders the real kiosk image stream and does NOT duplicate kiosk UI logic.
+// It renders the real kiosk image stream full-screen without extraneous chrome or debug overlays.
 const viewerHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -224,169 +224,53 @@ const viewerHTML = `<!DOCTYPE html>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
-      background-color: #0b0f19;
-      color: #e2e8f0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #000000;
       width: 100vw;
       height: 100vh;
       overflow: hidden;
       display: flex;
-      flex-direction: column;
-    }
-    header {
-      background: #111827;
-      border-bottom: 1px solid #1f2937;
-      padding: 8px 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 13px;
-      user-select: none;
-      z-index: 10;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: #064e3b;
-      color: #34d399;
-      padding: 3px 10px;
-      border-radius: 9999px;
-      font-weight: 600;
-      font-size: 12px;
-      letter-spacing: 0.05em;
-    }
-    .badge-dot {
-      width: 8px;
-      height: 8px;
-      background-color: #10b981;
-      border-radius: 50%;
-      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.85); }
-    }
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .hint {
-      color: #94a3b8;
-      font-size: 12px;
-    }
-    .btn-audio {
-      background: #1e293b;
-      border: 1px solid #334155;
-      color: #cbd5e1;
-      padding: 4px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 12px;
-      display: flex;
-      align-items: center;
-      gap: 5px;
-    }
-    .btn-audio:hover { background: #334155; color: #fff; }
-    .stage {
-      flex: 1;
-      display: flex;
       align-items: center;
       justify-content: center;
-      background: #000000;
-      position: relative;
     }
     #screen {
-      max-width: 100vw;
-      max-height: calc(100vh - 42px);
-      width: auto;
-      height: auto;
-      aspect-ratio: 16 / 9;
+      width: 100vw;
+      height: 100vh;
       object-fit: contain;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
-    }
-    #ssh-hint-banner {
-      position: absolute;
-      bottom: 12px;
-      background: rgba(15, 23, 42, 0.85);
-      backdrop-filter: blur(4px);
-      border: 1px solid rgba(51, 65, 85, 0.6);
-      padding: 6px 16px;
-      border-radius: 8px;
-      font-size: 12px;
-      color: #94a3b8;
-      pointer-events: none;
-    }
-    #ssh-hint-banner kbd {
-      background: #334155;
-      color: #f8fafc;
-      padding: 1px 6px;
-      border-radius: 4px;
-      font-family: monospace;
-      font-size: 11px;
+      display: block;
     }
   </style>
 </head>
 <body>
-  <header>
-    <div style="display:flex; align-items:center; gap:12px;">
-      <span class="badge"><span class="badge-dot"></span> LIVE MONITOR</span>
-      <span style="font-weight:600; color:#f1f5f9;">XeroxGo Headless Kiosk</span>
-    </div>
-    <div class="controls">
-      <span id="latency" class="hint">Refreshing...</span>
-      <button id="audio-toggle" class="btn-audio" onclick="toggleAudio()">🔇 Audio: Click to Enable</button>
-    </div>
-  </header>
-
-  <main class="stage">
-    <img id="screen" src="/screen.png" alt="XeroxGo Live Kiosk Screen">
-    <div id="ssh-hint-banner">
-      Control over SSH: Type <kbd>PIN</kbd> then <kbd>Enter</kbd> to confirm &bull; <kbd>c</kbd> to clear &bull; <kbd>q</kbd> to cancel
-    </div>
-  </main>
-
+  <img id="screen" src="/screen.png" alt="XeroxGo Live Kiosk Screen">
   <audio id="chime" src="/chime.wav" preload="auto"></audio>
 
   <script>
-    let audioUnlocked = false;
     let isFetching = false;
     const playedCompletedJobs = new Set();
     const img = document.getElementById('screen');
     const chime = document.getElementById('chime');
-    const latencyEl = document.getElementById('latency');
-    const audioBtn = document.getElementById('audio-toggle');
 
-    function toggleAudio() {
-      audioUnlocked = !audioUnlocked;
-      audioBtn.textContent = audioUnlocked ? '🔔 Audio: Enabled' : '🔇 Audio: Click to Enable';
-      if (audioUnlocked) {
-        // Unlock browser audio context via explicit user gesture
-        chime.play().then(() => {
-          chime.pause();
-          chime.currentTime = 0;
-        }).catch(() => {});
-      }
-    }
+    // Unlock browser audio seamlessly on first click anywhere on screen
+    window.addEventListener('click', function() {
+      chime.play().then(() => {
+        chime.pause();
+        chime.currentTime = 0;
+      }).catch(() => {});
+    }, { once: true });
 
     // High performance buffer refresh loop without flicker
     function updateFrame() {
       if (isFetching) return;
       isFetching = true;
-      const t0 = performance.now();
       const nextImg = new Image();
       const targetSrc = '/screen.png?t=' + Date.now();
 
       nextImg.onload = function() {
         img.src = targetSrc;
-        const dt = Math.round(performance.now() - t0);
-        latencyEl.textContent = 'Sync: ' + dt + 'ms';
         isFetching = false;
       };
 
       nextImg.onerror = function() {
-        latencyEl.textContent = 'Reconnecting...';
         isFetching = false;
       };
 
@@ -402,12 +286,8 @@ const viewerHTML = `<!DOCTYPE html>
             const jobID = data.last_completed_job_id;
             if (!playedCompletedJobs.has(jobID)) {
               playedCompletedJobs.add(jobID);
-              if (audioUnlocked) {
-                chime.currentTime = 0;
-                chime.play().catch(function(e) {
-                  console.log('Audio playback prevented:', e);
-                });
-              }
+              chime.currentTime = 0;
+              chime.play().catch(function() {});
             }
           }
         })
