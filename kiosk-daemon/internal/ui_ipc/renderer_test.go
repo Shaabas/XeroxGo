@@ -307,12 +307,44 @@ func TestClockWidget_NoGhosting(t *testing.T) {
 
 	// The clock region must be pixel-identical between the reused buffer and the clean buffer
 	clockRegion := image.Rect(1880-400, 47-26, 1890, 47+13)
+	// Test midnight date rollover: Fri, Nov 20 -> Sat, Nov 21
+	tMidnight1 := time.Date(2026, 11, 20, 23, 59, 59, 0, time.Local)
+	tMidnight2 := time.Date(2026, 11, 21, 0, 0, 0, 0, time.Local)
+
+	drawClockWidget(buf, 1880, 47, tMidnight1)
+	drawClockWidget(buf, 1880, 47, tMidnight2)
+
+	cleanBufMidnight := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	fillRect(cleanBufMidnight, cleanBufMidnight.Bounds(), colorBgSlate)
+	drawClockWidget(cleanBufMidnight, 1880, 47, tMidnight2)
+
 	for y := clockRegion.Min.Y; y < clockRegion.Max.Y; y++ {
 		for x := clockRegion.Min.X; x < clockRegion.Max.X; x++ {
 			c1 := buf.RGBAAt(x, y)
-			c2 := cleanBuf.RGBAAt(x, y)
+			c2 := cleanBufMidnight.RGBAAt(x, y)
 			if c1 != c2 {
-				t.Fatalf("mismatch at (%d, %d): reused buffer has %v, clean buffer has %v (indicates ghosting)", x, y, c1, c2)
+				t.Fatalf("midnight rollover mismatch at (%d, %d): reused buffer has %v, clean buffer has %v", x, y, c1, c2)
+			}
+		}
+	}
+
+	// Test month rollover with wide date to narrow date: Wed, Sep 30 -> Thu, Oct 1
+	tMonth1 := time.Date(2026, 9, 30, 23, 59, 59, 0, time.Local)
+	tMonth2 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)
+
+	drawClockWidget(buf, 1880, 47, tMonth1)
+	drawClockWidget(buf, 1880, 47, tMonth2)
+
+	cleanBufMonth := image.NewRGBA(image.Rect(0, 0, ScreenWidth, ScreenHeight))
+	fillRect(cleanBufMonth, cleanBufMonth.Bounds(), colorBgSlate)
+	drawClockWidget(cleanBufMonth, 1880, 47, tMonth2)
+
+	for y := clockRegion.Min.Y; y < clockRegion.Max.Y; y++ {
+		for x := clockRegion.Min.X; x < clockRegion.Max.X; x++ {
+			c1 := buf.RGBAAt(x, y)
+			c2 := cleanBufMonth.RGBAAt(x, y)
+			if c1 != c2 {
+				t.Fatalf("month rollover mismatch at (%d, %d): reused buffer has %v, clean buffer has %v", x, y, c1, c2)
 			}
 		}
 	}
