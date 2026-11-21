@@ -25,7 +25,7 @@ is necessary for the refund worker to run.
 2. Cloud durably latches `kiosk_service_flags.out_of_service`. All mobile
    stock checks and new checkout sessions are rejected, even after telemetry
    returns healthy, until an authenticated operator explicitly restores service.
-3. Cloud creates a single **full refund obligation** from the captured payment
+3. Cloud creates a **full refund obligation for the funding payment**
    (`refund_requests.REQUIRED`). This is not the same as a processed refund.
 4. Pi stops queued sibling jobs and tries to cancel **every** CUPS child job.
    Only confirmed `canceled`/`aborted` or never-submitted jobs count as safe.
@@ -45,11 +45,31 @@ is necessary for the refund worker to run.
 9. The operator restores the kiosk only after fresh healthy printer telemetry,
    verified safe-stop obligations and both kiosk and operator authentication.
 
+## Payment-level capture and refund accounting
+
+- Exactly one verified captured payment may fund an order and authorize printing.
+  The binding is serialized per order and persisted in `order_funding_payments`.
+- Every additional distinct captured payment is persisted atomically with a
+  separate `payment_refund_requests` obligation, even if the order has already
+  completed. Repeated callbacks for the same payment ID do not duplicate money.
+- `EXCESS_CAPTURE` refunds are actionable independently; they do **not** stop
+  the legitimate order, require CUPS cancellation, or release its paid PIN.
+- `FULFILLMENT_FAILED` refunds apply only to the funding payment and still
+  require verified physical safe-stop before submission.
+- Each payment's refund carries a unique stable Razorpay idempotency key,
+  provider refund ID, status and retry history.
+- The old `refund_requests` table is retained as a legacy archive. Startup
+  migrates its existing obligations into the payment-scoped table, preserving
+  in-flight state and provider identifiers, and backfills previously unrecorded
+  surplus captured payments. Repeat startup must not reset these records.
+- Orders with unresolved refund obligations are protected from normal artifact
+  cleanup; completed legitimate orders may still have excess refunds pending.
+
 ## Refund states
 
 `REQUIRED → REQUESTING → PENDING → PROCESSED`; a failed attempt can be
 retried using the identical provider idempotency key. A processed refund is
-terminal for printing. The DB stores provider IDs and paid/refund amounts.
+terminal for printing. The DB stores provider IDs and paid/refund amounts per captured payment.
 
 ## Required runtime configuration
 
