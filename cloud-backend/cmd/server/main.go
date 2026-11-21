@@ -1284,7 +1284,14 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		pagesPrinted = progress.PagesPrinted
 		sheetsPrinted = progress.SheetsPrinted
 		errorReason = progress.ErrorReason
-		if order.Status == contracts.JobStatusCompleted && documentsCompleted != documentsTotal {
+		// Child faults must outrank a completed earlier document; the parent
+		// aggregation currently propagates FAILED_REFUNDABLE but not every
+		// PAUSED_ERROR, so fail closed for either before showing print progress.
+		if progress.DocumentsFailed > 0 {
+			currentStatus = string(contracts.JobStatusFailedRefundable)
+		} else if progress.DocumentsPaused > 0 {
+			currentStatus = string(contracts.JobStatusPausedError)
+		} else if order.Status == contracts.JobStatusCompleted && documentsCompleted != documentsTotal {
 			// Fail closed on corrupt/inconsistent order state; do not tell a
 			// customer to collect papers before every child is complete.
 			log.Printf("[ORDER] Completion invariant violated for %s: %d/%d child documents", orderID, documentsCompleted, documentsTotal)
