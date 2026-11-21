@@ -119,11 +119,15 @@ type AlertState struct {
 	Time        uint32 `json:"time"`
 }
 
+func uint32Ptr(v uint32) *uint32 {
+	return &v
+}
+
 // SNMPState encapsulates the simulated printer telemetry state.
 type SNMPState struct {
 	SysDescr        string        `json:"sys_descr"`
 	SysObjectID     string        `json:"sys_object_id,omitempty"`
-	SysUpTime       uint32        `json:"sys_uptime,omitempty"`
+	SysUpTime       *uint32       `json:"sys_uptime,omitempty"`
 	PrinterName     string        `json:"printer_name,omitempty"`
 	PrinterIndex    string        `json:"printer_index,omitempty"`
 	HrPrinterStatus int           `json:"hr_printer_status"`
@@ -143,12 +147,42 @@ type SNMPState struct {
 	Offline         bool          `json:"offline,omitempty"`
 }
 
+// Clone creates an independent deep copy of the state without shared slice references.
+func (s SNMPState) Clone() SNMPState {
+	c := s
+	if s.SysUpTime != nil {
+		up := *s.SysUpTime
+		c.SysUpTime = &up
+	}
+	if s.Markers != nil {
+		c.Markers = make([]MarkerState, len(s.Markers))
+		copy(c.Markers, s.Markers)
+	}
+	if s.Supplies != nil {
+		c.Supplies = make([]SupplyState, len(s.Supplies))
+		copy(c.Supplies, s.Supplies)
+	}
+	if s.Covers != nil {
+		c.Covers = make([]CoverState, len(s.Covers))
+		copy(c.Covers, s.Covers)
+	}
+	if s.Alerts != nil {
+		c.Alerts = make([]AlertState, len(s.Alerts))
+		copy(c.Alerts, s.Alerts)
+	}
+	if s.OmittedOIDs != nil {
+		c.OmittedOIDs = make([]string, len(s.OmittedOIDs))
+		copy(c.OmittedOIDs, s.OmittedOIDs)
+	}
+	return c
+}
+
 // DefaultState returns healthy/idle default state.
 func DefaultState() SNMPState {
 	return SNMPState{
 		SysDescr:        "Xerox WorkCentre 3025 (Local Emulator)",
 		SysObjectID:     "1.3.6.1.4.1.2699.1",
-		SysUpTime:       360000, // 3600 seconds in 10ms ticks
+		SysUpTime:       uint32Ptr(360000), // 3600 seconds in 10ms ticks
 		PrinterName:     "Xerox WorkCentre 3025 (Local Emulator)",
 		PrinterIndex:    "1",
 		HrPrinterStatus: 3, // idle
@@ -271,8 +305,8 @@ func (s *SNMPState) Sync() {
 	if s.SysObjectID == "" {
 		s.SysObjectID = "1.3.6.1.4.1.2699.1"
 	}
-	if s.SysUpTime == 0 {
-		s.SysUpTime = 360000
+	if s.SysUpTime == nil {
+		s.SysUpTime = uint32Ptr(360000)
 	}
 	if s.PrinterName == "" {
 		s.PrinterName = s.SysDescr
@@ -359,30 +393,36 @@ func (s *SNMPState) Sync() {
 }
 
 // buildActiveMIB compiles all scalar and RFC table variable bindings into a numerically sorted PDU slice.
-func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
-	s.Sync()
+func (s SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
+	snapshot := s.Clone()
+	snapshot.Sync()
 	var pdus []gosnmp.SnmpPDU
+
+	uptimeVal := uint32(0)
+	if snapshot.SysUpTime != nil {
+		uptimeVal = *snapshot.SysUpTime
+	}
 
 	// RFC 1213 / SNMPv2-MIB scalars
 	pdus = append(pdus,
 		gosnmp.SnmpPDU{
 			Name:  "." + normalizeOID(oidSysDescr),
 			Type:  gosnmp.OctetString,
-			Value: []byte(s.SysDescr),
+			Value: []byte(snapshot.SysDescr),
 		},
 		gosnmp.SnmpPDU{
 			Name:  "." + normalizeOID(oidSysObjectID),
 			Type:  gosnmp.ObjectIdentifier,
-			Value: "." + normalizeOID(s.SysObjectID),
+			Value: "." + normalizeOID(snapshot.SysObjectID),
 		},
 		gosnmp.SnmpPDU{
 			Name:  "." + normalizeOID(oidSysUpTime),
 			Type:  gosnmp.TimeTicks,
-			Value: s.SysUpTime,
+			Value: uptimeVal,
 		},
 	)
 
-	pIdx := s.PrinterIndex
+	pIdx := snapshot.PrinterIndex
 	if pIdx == "" {
 		pIdx = "1"
 	}
@@ -392,20 +432,20 @@ func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
 	pdus = append(pdus, gosnmp.SnmpPDU{
 		Name:  fmt.Sprintf(".1.3.6.1.2.1.25.3.5.1.1.%s", pIdx),
 		Type:  gosnmp.Integer,
-		Value: s.HrPrinterStatus,
+		Value: snapshot.HrPrinterStatus,
 	})
 	// Col 2: hrPrinterDetectedErrorState
 	pdus = append(pdus, gosnmp.SnmpPDU{
 		Name:  fmt.Sprintf(".1.3.6.1.2.1.25.3.5.1.2.%s", pIdx),
 		Type:  gosnmp.OctetString,
-		Value: []byte{s.ErrorByte0, s.ErrorByte1},
+		Value: []byte{snapshot.ErrorByte0, snapshot.ErrorByte1},
 	})
 
 	// RFC 3805 prtGeneralTable: 1.3.6.1.2.1.43.5.1.1
 	// Col 16: prtGeneralPrinterName
-	prtName := s.PrinterName
+	prtName := snapshot.PrinterName
 	if prtName == "" {
-		prtName = s.SysDescr
+		prtName = snapshot.SysDescr
 	}
 	pdus = append(pdus, gosnmp.SnmpPDU{
 		Name:  fmt.Sprintf(".1.3.6.1.2.1.43.5.1.1.16.%s", pIdx),
@@ -416,7 +456,7 @@ func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
 	// RFC 3805 prtCoverTable: 1.3.6.1.2.1.43.6.1.1
 	// Col 2: prtCoverDescription
 	// Col 3: prtCoverStatus
-	for _, cov := range s.Covers {
+	for _, cov := range snapshot.Covers {
 		pdus = append(pdus,
 			gosnmp.SnmpPDU{
 				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.6.1.1.2.%s", cov.Index),
@@ -435,7 +475,7 @@ func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
 	// Col 3: prtMarkerCounterUnit
 	// Col 4: prtMarkerLifeCount
 	// Col 5: prtMarkerPowerOnCount
-	for _, m := range s.Markers {
+	for _, m := range snapshot.Markers {
 		pdus = append(pdus, gosnmp.SnmpPDU{
 			Name:  fmt.Sprintf(".1.3.6.1.2.1.43.10.2.1.3.%s", m.Index),
 			Type:  gosnmp.Integer,
@@ -464,7 +504,7 @@ func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
 	// Col 7: prtMarkerSuppliesSupplyUnit
 	// Col 8: prtMarkerSuppliesMaxCapacity
 	// Col 9: prtMarkerSuppliesLevel
-	for _, sup := range s.Supplies {
+	for _, sup := range snapshot.Supplies {
 		pdus = append(pdus,
 			gosnmp.SnmpPDU{
 				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.4.%s", sup.Index),
@@ -500,7 +540,7 @@ func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
 	}
 
 	// RFC 3805 prtAlertTable: 1.3.6.1.2.1.43.18.1.1
-	for _, alt := range s.Alerts {
+	for _, alt := range snapshot.Alerts {
 		pdus = append(pdus,
 			gosnmp.SnmpPDU{
 				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.2.%s", alt.Index),
@@ -537,7 +577,7 @@ func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
 
 	// Filter out OmittedOIDs
 	omittedSet := make(map[string]bool)
-	for _, o := range s.OmittedOIDs {
+	for _, o := range snapshot.OmittedOIDs {
 		omittedSet[normalizeOID(o)] = true
 	}
 
@@ -631,7 +671,7 @@ func (s *StateStore) ReloadIfChanged() {
 func (s *StateStore) GetState() SNMPState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.state
+	return s.state.Clone()
 }
 
 func (s *StateStore) UpdateState(fn func(*SNMPState)) error {
@@ -868,13 +908,14 @@ func (srv *Server) listenLoop() {
 			}
 
 		case gosnmp.GetBulkRequest:
+			const (
+				maxBulkRepetitions       = 50
+				maxBulkResponseVariables = 128
+			)
+
 			nonRepeaters := int(packet.NonRepeaters)
 			if nonRepeaters < 0 {
 				nonRepeaters = 0
-			}
-			maxRepetitions := int(packet.MaxRepetitions)
-			if maxRepetitions < 0 {
-				maxRepetitions = 0
 			}
 			numVars := len(packet.Variables)
 			nr := nonRepeaters
@@ -882,8 +923,19 @@ func (srv *Server) listenLoop() {
 				nr = numVars
 			}
 
+			maxRepetitions := int(packet.MaxRepetitions)
+			if maxRepetitions < 0 {
+				maxRepetitions = 0
+			}
+			if maxRepetitions > maxBulkRepetitions {
+				maxRepetitions = maxBulkRepetitions
+			}
+
 			// Handle non-repeaters (1 successor each)
 			for i := 0; i < nr; i++ {
+				if len(resp.Variables) >= maxBulkResponseVariables {
+					break
+				}
 				pdu := packet.Variables[i]
 				normReqOID := normalizeOID(pdu.Name)
 				var successor *gosnmp.SnmpPDU
@@ -917,7 +969,14 @@ func (srv *Server) listenLoop() {
 				}
 
 				for r := 0; r < maxRepetitions; r++ {
+					if len(resp.Variables) >= maxBulkResponseVariables {
+						break
+					}
+					allEndOfMib := true
 					for i := 0; i < repeatersCount; i++ {
+						if len(resp.Variables) >= maxBulkResponseVariables {
+							break
+						}
 						currentOID := lastOIDs[i]
 						var successor *gosnmp.SnmpPDU
 						for j := range activeMIB {
@@ -927,6 +986,7 @@ func (srv *Server) listenLoop() {
 							}
 						}
 						if successor != nil {
+							allEndOfMib = false
 							resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
 								Name:  successor.Name,
 								Type:  successor.Type,
@@ -940,6 +1000,9 @@ func (srv *Server) listenLoop() {
 								Value: nil,
 							})
 						}
+					}
+					if allEndOfMib {
+						break
 					}
 				}
 			}
@@ -1059,7 +1122,11 @@ func printState(state SNMPState, w io.Writer) {
 	fmt.Fprintf(w, "SNMP Emulator State (Synthetic Test Fixture - Not Real Hardware Measurement):\n")
 	fmt.Fprintf(w, "  sysDescr:              %s\n", state.SysDescr)
 	fmt.Fprintf(w, "  sysObjectID:           %s\n", state.SysObjectID)
-	fmt.Fprintf(w, "  sysUpTime:             %d (10ms ticks)\n", state.SysUpTime)
+	uptimeVal := uint32(0)
+	if state.SysUpTime != nil {
+		uptimeVal = *state.SysUpTime
+	}
+	fmt.Fprintf(w, "  sysUpTime:             %d (10ms ticks)\n", uptimeVal)
 	fmt.Fprintf(w, "  prtGeneralPrinterName: %s\n", state.PrinterName)
 	fmt.Fprintf(w, "  printerIndex:          %s\n", state.PrinterIndex)
 
@@ -1490,10 +1557,14 @@ func cmdSet(args []string) {
 			}
 		}
 		if *uptime >= 0 {
-			s.SysUpTime = uint32(*uptime)
+			val := uint32(*uptime)
+			s.SysUpTime = &val
 		}
 		if *restart {
-			s.SysUpTime = 100 // 1 second
+			if *uptime < 0 {
+				val := uint32(0)
+				s.SysUpTime = &val
+			}
 		}
 		if *offline != "" {
 			s.Offline = strings.EqualFold(*offline, "true") || *offline == "1"

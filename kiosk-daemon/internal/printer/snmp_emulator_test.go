@@ -18,6 +18,11 @@ import (
 	"github.com/gosnmp/gosnmp"
 )
 
+const (
+	oidSysObjectID = "1.3.6.1.2.1.1.2.0"
+	oidSysUpTime   = "1.3.6.1.2.1.1.3.0"
+)
+
 // emulatedSNMPState holds the mutable telemetry state for the in-process test responder.
 type emulatedSNMPState struct {
 	SysDescr        string   `json:"sys_descr"`
@@ -1574,5 +1579,155 @@ func TestSNMPEmulator_SyntheticLabeling_NoEjectionProof(t *testing.T) {
 	}
 	if !strings.Contains(human, "TELEMETRY EVALUATION") {
 		t.Errorf("human output missing telemetry evaluation section")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 16: GETBULK handling over real UDP
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_GetBulk_RealUDP(t *testing.T) {
+	_, port, _, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	client := &gosnmp.GoSNMP{
+		Target:    "127.0.0.1",
+		Port:      uint16(port),
+		Community: "public",
+		Version:   gosnmp.Version2c,
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	if err := client.Connect(); err != nil {
+		t.Fatalf("client failed to connect: %v", err)
+	}
+	defer client.Conn.Close()
+
+	// 1. Non-repeaters and repeaters
+	// Non-repeater: sysDescr -> returns sysObjectID
+	// Repeater: prtMarkerTable -> returns up to 3 successors
+	resp, err := client.GetBulk([]string{oidSysDescr, oidSubtreePrtMarker}, 1, 3)
+	if err != nil {
+		t.Fatalf("client.GetBulk failed: %v", err)
+	}
+	if len(resp.Variables) < 2 {
+		t.Fatalf("expected at least 2 variables, got %d", len(resp.Variables))
+	}
+	if strings.TrimPrefix(resp.Variables[0].Name, ".") != normalizeOID(oidSysObjectID) {
+		t.Errorf("expected first variable to be sysObjectID, got %s", resp.Variables[0].Name)
+	}
+
+	// 2. Repeaters only (nonRepeaters=0, maxRepetitions=2)
+	respRepeaters, err := client.GetBulk([]string{oidSubtreeHRPrinter}, 0, 2)
+	if err != nil {
+		t.Fatalf("GetBulk repeaters failed: %v", err)
+	}
+	if len(respRepeaters.Variables) != 2 {
+		t.Errorf("expected exactly 2 variables for maxRepetitions=2, got %d", len(respRepeaters.Variables))
+	}
+
+	// 3. End-of-MIB
+	respEnd, err := client.GetBulk([]string{"1.3.6.1.4.1.99999"}, 0, 5)
+	if err != nil {
+		t.Fatalf("GetBulk end-of-MIB failed: %v", err)
+	}
+	if len(respEnd.Variables) == 0 || respEnd.Variables[0].Type != gosnmp.EndOfMibView {
+		t.Errorf("expected EndOfMibView at end of MIB, got %+v", respEnd.Variables)
+	}
+
+	// 4. Excessive MaxRepetitions (e.g. 50000) - bounded response
+	respExcessive, err := client.GetBulk([]string{oidSubtreePrtMarker}, 0, 50000)
+	if err != nil {
+		t.Fatalf("GetBulk with excessive MaxRepetitions failed: %v", err)
+	}
+	if len(respExcessive.Variables) > 128 {
+		t.Errorf("response exceeded bounded limit: got %d, max 128", len(respExcessive.Variables))
+	}
+	if len(respExcessive.Variables) == 0 {
+		t.Errorf("expected non-empty response for excessive maxRepetitions query")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 17: Explicit Zero Uptime Preservation & Simulated Restart
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_ZeroUptimeAndRestart(t *testing.T) {
+	binPath, port, stateFile, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	ctx := context.Background()
+
+	// 1. Explicitly configure sysUpTime=0
+	setCmd := exec.Command(binPath, "set", "-state", stateFile, "-uptime", "0")
+	if out, err := setCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to set uptime 0: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	session, err := NewRealDynamicSNMPSession(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// Direct GET query for sysUpTime (1.3.6.1.2.1.1.3.0)
+	resp, err := session.Get([]string{oidSysUpTime})
+	if err != nil {
+		t.Fatalf("session.Get(oidSysUpTime) failed: %v", err)
+	}
+	if len(resp.Variables) != 1 {
+		t.Fatalf("expected 1 PDU for sysUpTime, got %d", len(resp.Variables))
+	}
+	pdu := resp.Variables[0]
+	if pdu.Type != gosnmp.TimeTicks {
+		t.Errorf("expected TimeTicks type, got %v", pdu.Type)
+	}
+	if pdu.Value.(uint32) != 0 {
+		t.Errorf("expected sysUpTime=0 to be preserved, got %v", pdu.Value)
+	}
+
+	// Verify DiscoverSNMPDynamic reports "0s"
+	res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+	}
+	if res.SysUpTime != "0s" {
+		t.Errorf("expected DiscoverSNMPDynamic SysUpTime='0s', got %q", res.SysUpTime)
+	}
+
+	// 2. Simulate printer restart without explicit uptime flag -> defaults to uptime 0
+	restartCmd := exec.Command(binPath, "set", "-state", stateFile, "-restart")
+	if out, err := restartCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to simulate restart: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	resp2, err := session.Get([]string{oidSysUpTime})
+	if err != nil {
+		t.Fatalf("session.Get(oidSysUpTime) after restart failed: %v", err)
+	}
+	if resp2.Variables[0].Value.(uint32) != 0 {
+		t.Errorf("expected sysUpTime=0 on restart, got %v", resp2.Variables[0].Value)
+	}
+
+	// 3. Set non-zero uptime and verify update
+	setNonZero := exec.Command(binPath, "set", "-state", stateFile, "-uptime", "12345")
+	if out, err := setNonZero.CombinedOutput(); err != nil {
+		t.Fatalf("failed to set non-zero uptime: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	resp3, err := session.Get([]string{oidSysUpTime})
+	if err != nil {
+		t.Fatalf("session.Get(oidSysUpTime) after non-zero set failed: %v", err)
+	}
+	if resp3.Variables[0].Value.(uint32) != 12345 {
+		t.Errorf("expected sysUpTime=12345, got %v", resp3.Variables[0].Value)
 	}
 }

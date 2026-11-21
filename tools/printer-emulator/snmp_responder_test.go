@@ -149,3 +149,157 @@ func TestServer_RealUDPWalk(t *testing.T) {
 		t.Fatalf("expected multiple PDUs from full MIB walk, got %d", len(allWalked))
 	}
 }
+
+func TestStateStore_DeepCopyAndImmutability(t *testing.T) {
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "state.json")
+	store, err := NewStateStore(stateFile)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+
+	st1 := store.GetState()
+	// Mutate slices in st1
+	st1.Markers[0].LifeCount = 99999
+	st1.Supplies[0].Level = 1
+	st1.OmittedOIDs = append(st1.OmittedOIDs, "1.2.3.4")
+	zero := uint32(0)
+	st1.SysUpTime = &zero
+
+	// st2 must remain unaffected
+	st2 := store.GetState()
+	if st2.Markers[0].LifeCount == 99999 {
+		t.Errorf("GetState() leaked mutable Markers slice reference")
+	}
+	if st2.Supplies[0].Level == 1 {
+		t.Errorf("GetState() leaked mutable Supplies slice reference")
+	}
+	if len(st2.OmittedOIDs) > 0 {
+		t.Errorf("GetState() leaked mutable OmittedOIDs slice reference")
+	}
+	if st2.SysUpTime != nil && *st2.SysUpTime == 0 {
+		t.Errorf("GetState() leaked mutable SysUpTime pointer reference")
+	}
+
+	// buildActiveMIB() must not mutate store state
+	_ = st2.buildActiveMIB()
+	st3 := store.GetState()
+	if st3.Markers[0].LifeCount != 1000 {
+		t.Errorf("buildActiveMIB() mutated underlying store state")
+	}
+}
+
+func TestServer_RealUDP_GetBulk(t *testing.T) {
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "state.json")
+	pidFile := filepath.Join(tempDir, "server.pid")
+
+	store, err := NewStateStore(stateFile)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+
+	srv, err := NewServer("127.0.0.1", 0, "public", store, pidFile)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Stop()
+
+	client := &gosnmp.GoSNMP{
+		Target:    "127.0.0.1",
+		Port:      uint16(srv.Port()),
+		Community: "public",
+		Version:   gosnmp.Version2c,
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	if err := client.Connect(); err != nil {
+		t.Fatalf("client failed to connect: %v", err)
+	}
+	defer client.Conn.Close()
+
+	// 1. Non-repeaters and repeaters
+	// Variable 0 is scalar sysDescr (1 non-repeater), Variable 1 is prtMarkerTable root (repeater, maxRepetitions=3)
+	resp, err := client.GetBulk([]string{oidSysDescr, oidSubtreePrtMarker}, 1, 3)
+	if err != nil {
+		t.Fatalf("client.GetBulk failed: %v", err)
+	}
+	if len(resp.Variables) < 2 {
+		t.Fatalf("expected at least 2 variables, got %d", len(resp.Variables))
+	}
+	if normalizeOID(resp.Variables[0].Name) != normalizeOID(oidSysObjectID) {
+		t.Errorf("expected first variable to be sysObjectID (1.3.6.1.2.1.1.2.0), got %s", resp.Variables[0].Name)
+	}
+
+	// 2. Repeaters only (nonRepeaters=0, maxRepetitions=2)
+	respRepeaters, err := client.GetBulk([]string{oidSubtreeHRPrinter}, 0, 2)
+	if err != nil {
+		t.Fatalf("GetBulk repeaters failed: %v", err)
+	}
+	if len(respRepeaters.Variables) != 2 {
+		t.Errorf("expected exactly 2 variables for maxRepetitions=2, got %d", len(respRepeaters.Variables))
+	}
+
+	// 3. End-of-MIB
+	respEnd, err := client.GetBulk([]string{"1.3.6.1.4.1.99999"}, 0, 5)
+	if err != nil {
+		t.Fatalf("GetBulk end-of-MIB failed: %v", err)
+	}
+	if len(respEnd.Variables) == 0 || respEnd.Variables[0].Type != gosnmp.EndOfMibView {
+		t.Errorf("expected EndOfMibView at end of MIB, got %+v", respEnd.Variables)
+	}
+
+	// 4. Excessive MaxRepetitions (e.g. 50000)
+	respExcessive, err := client.GetBulk([]string{oidSubtreePrtMarker}, 0, 50000)
+	if err != nil {
+		t.Fatalf("GetBulk with excessive MaxRepetitions failed: %v", err)
+	}
+	if len(respExcessive.Variables) > 128 {
+		t.Errorf("response exceeded maxBulkResponseVariables limit: got %d, max 128", len(respExcessive.Variables))
+	}
+	if len(respExcessive.Variables) == 0 {
+		t.Errorf("expected non-empty response for excessive maxRepetitions query")
+	}
+}
+
+func TestServer_ZeroUptimeAndRestart(t *testing.T) {
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "state.json")
+	store, err := NewStateStore(stateFile)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+
+	// 1. Explicitly set uptime to 0
+	err = store.UpdateState(func(s *SNMPState) {
+		zero := uint32(0)
+		s.SysUpTime = &zero
+	})
+	if err != nil {
+		t.Fatalf("failed to set uptime 0: %v", err)
+	}
+
+	// Verify uptime 0 is preserved across GetState() and Sync()
+	st := store.GetState()
+	if st.SysUpTime == nil || *st.SysUpTime != 0 {
+		t.Fatalf("expected SysUpTime to be preserved as 0, got %v", st.SysUpTime)
+	}
+
+	pdus := st.buildActiveMIB()
+	var uptimePDU *gosnmp.SnmpPDU
+	for i := range pdus {
+		if normalizeOID(pdus[i].Name) == normalizeOID(oidSysUpTime) {
+			uptimePDU = &pdus[i]
+			break
+		}
+	}
+	if uptimePDU == nil {
+		t.Fatalf("sysUpTime PDU not found in active MIB")
+	}
+	if uptimePDU.Value.(uint32) != 0 {
+		t.Errorf("expected sysUpTime PDU value 0, got %v", uptimePDU.Value)
+	}
+}
