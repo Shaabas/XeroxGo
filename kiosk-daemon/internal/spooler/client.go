@@ -3370,6 +3370,13 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 
 	isFault := c.isHardwareFaultActive()
 
+	// Printer health polling and the CUPS worker may discover the same
+	// interruption independently. Keep one stable error screen until the
+	// operator clears the fault rather than re-rendering it twice.
+	if state.Mode == ui_ipc.ModeError && currentMode == ui_ipc.ModeError {
+		return nil
+	}
+
 	// Prevent printing/downloading progress updates from overwriting an active hardware fault screen or existing error
 	if (state.Mode == ui_ipc.ModePrinting || state.Mode == ui_ipc.ModeDownloading) && (isFault || currentMode == ui_ipc.ModeError) {
 		log.Printf("[SPOOLER] Suppressing %s render: hardware fault active or screen already in ModeError (%s)", state.Mode, c.getFaultReason())
