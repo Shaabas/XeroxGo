@@ -620,8 +620,16 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 	}
 	var simResp map[string]interface{}
 	_ = json.Unmarshal(simRec.Body.Bytes(), &simResp)
-	if simResp["status"] != "DISPATCHED" {
-		t.Errorf("expected status DISPATCHED, got %v", simResp["status"])
+	if simResp["status"] != "DISPATCH_PENDING" {
+		t.Errorf("simulated paid multi-doc order without a hub must retain pending delivery, got %v", simResp["status"])
+	}
+	ord, err := app.db.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusDispatched {
+		t.Fatalf("multi-document payment authorization was lost: %+v %v",ord,err)
+	}
+	pending, err := app.db.GetPendingDispatchOrders(context.Background(),"kiosk-pay-guard")
+	if err != nil || len(pending) != len(ord.Documents) {
+		t.Fatalf("every paid child must have a reconnectable dispatch intent: %+v %v",pending,err)
 	}
 }
 
