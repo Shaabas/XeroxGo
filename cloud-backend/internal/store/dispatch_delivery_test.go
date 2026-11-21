@@ -114,3 +114,41 @@ func TestDispatchDelivery_UseFundingPaymentDespiteLaterSurplusCapture(t *testing
 		t.Fatalf("excess payment refund incorrectly blocked fulfillment: %+v %v",refund,err)
 	}
 }
+
+func TestDispatchDelivery_LateSessionCancelCannotErasePaidDispatchIntents(t *testing.T) {
+	s,err:=Open(filepath.Join(t.TempDir(),"paid_session_cancel.db"))
+	if err!=nil{t.Fatal(err)}
+	defer s.Close()
+	ctx:=context.Background()
+	now:=time.Now().UTC()
+	const orderID,kioskID="ord_stale_cancel","kiosk_stale_cancel"
+	createTestOrderWithSheets(t,s,ctx,orderID,kioskID,"1937",2,contracts.JobStatusPendingPayment,now)
+	session,err:=s.CreateOrGetKioskSession(ctx,kioskID,orderID,5*time.Minute,now)
+	if err!=nil{t.Fatal(err)}
+	paid,err:=s.CapturePaymentAndCheckDispatch(ctx,PaymentRecord{
+		PaymentID:"pay_stale_cancel",OrderID:orderID,KioskID:kioskID,
+		SessionID:session.SessionID,AmountPaise:400,Provider:"mock",Status:"captured",
+	},now)
+	if err!=nil||!paid.DispatchEligible{t.Fatalf("paid order not authorized: %+v %v",paid,err)}
+	// A delayed cancel from a prior kiosk UI timer must not cancel a session
+	// already consumed by verified successful payment.
+	if err:=s.CancelKioskSession(ctx,session.SessionID,kioskID,now.Add(time.Second));err!=nil{
+		t.Fatalf("stale cancel failed: %v",err)
+	}
+	got,err:=s.GetOrder(ctx,orderID)
+	if err!=nil||got.Status!=contracts.JobStatusDispatched{
+		t.Fatalf("stale cancel rolled back paid authorization: %+v %v",got,err)
+	}
+	intents,err:=s.GetDispatchIntentsByOrder(ctx,orderID)
+	if err!=nil||len(intents)!=1||intents[0].Status!="PENDING"{
+		t.Fatalf("stale cancel erased pending physical job: %+v %v",intents,err)
+	}
+	sess,err:=s.GetKioskSession(ctx,session.SessionID,now.Add(time.Second))
+	if err!=nil||sess.Status!=KioskSessionCompleted{
+		t.Fatalf("paid kiosk session was canceled after completion: %+v %v",sess,err)
+	}
+	pending,err:=s.GetPendingDispatchOrders(ctx,kioskID)
+	if err!=nil||len(pending)!=1{
+		t.Fatalf("paid dispatch lost its reconnect path: %+v %v",pending,err)
+	}
+}
