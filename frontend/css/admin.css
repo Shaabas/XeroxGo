@@ -893,6 +893,17 @@ input:checked + .slider:before {
 }
 
 /* Cost Estimator Scoped Styles */
+.estimator-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.estimator-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
 .estimator-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -913,7 +924,7 @@ select.form-input {
 }
 
 .estimator-summary {
-  margin-top: 0.5rem;
+  margin-top: auto;
   padding: 1.15rem 1.25rem;
   background: var(--bg-slate);
   border: 1px solid var(--border);
