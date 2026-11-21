@@ -75,9 +75,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200 CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000 CHECK (color_price_per_sheet_paise > 0),
     bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200 CHECK (bw_simplex_price_paise > 0),
     bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150 CHECK (bw_duplex_price_paise > 0),
     color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000 CHECK (color_simplex_price_paise > 0),

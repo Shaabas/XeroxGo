@@ -32,18 +32,23 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	var legacyPrice, bwPrice, colorPrice, bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
+	var bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
 	var colorEnabledInt int
 	var updatedNS int64
-	query := "SELECT price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise, bw_simplex_price_paise, bw_duplex_price_paise, color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns FROM pricing WHERE id = 1;"
-	err := s.db.QueryRowContext(ctx, query).Scan(
-		&legacyPrice, &bwPrice, &colorPrice,
-		&bwSimplex, &bwDuplex,
-		&colorSimplex, &colorDuplex,
+	err := s.db.QueryRowContext(ctx, `SELECT bw_simplex_price_paise, bw_duplex_price_paise,
+		color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns
+		FROM pricing WHERE id = 1;`).Scan(
+		&bwSimplex, &bwDuplex, &colorSimplex, &colorDuplex,
 		&colorEnabledInt, &updatedNS,
 	)
 	if err == sql.ErrNoRows {
 		return PricingConfig{}, fmt.Errorf("get pricing: pricing has not been configured")
+	}
+	if err != nil {
+		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
+	}
+
+	return PricingConfig{}, fmt.Errorf("get pricing: pricing has not been configured")
 	}
 	if err != nil {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
@@ -78,10 +83,6 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		ColorSimplexPricePaise: colorSimplex,
 		ColorDuplexPricePaise:  colorDuplex,
 		ColorEnabled:           colorEnabledInt == 1,
-		BWPricePerSheetPaise:    bwSimplex,
-		ColorPricePerSheetPaise: colorSimplex,
-		BWPricePerSidePaise:    bwSimplex,
-		ColorPricePerSidePaise: colorSimplex,
 		UpdatedAt:               time.Unix(0, updatedNS).UTC(),
 	}, nil
 }
@@ -117,15 +118,10 @@ func (s *Store) SetDetailedPricing(ctx context.Context, bwSimplex, bwDuplex, col
 
 	updatedNS := time.Now().UTC().UnixNano()
 	query := `
-INSERT INTO pricing (id, price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise,
-                     bw_simplex_price_paise, bw_duplex_price_paise,
-                     color_simplex_price_paise, color_duplex_price_paise,
-                     color_enabled, updated_at_ns)
-VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO pricing (id, bw_simplex_price_paise, bw_duplex_price_paise,
+                     color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns)
+VALUES (1, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-    price_per_sheet_paise = excluded.price_per_sheet_paise,
-    bw_price_per_sheet_paise = excluded.bw_price_per_sheet_paise,
-    color_price_per_sheet_paise = excluded.color_price_per_sheet_paise,
     bw_simplex_price_paise = excluded.bw_simplex_price_paise,
     bw_duplex_price_paise = excluded.bw_duplex_price_paise,
     color_simplex_price_paise = excluded.color_simplex_price_paise,
@@ -134,21 +130,12 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at_ns = excluded.updated_at_ns;
 `
 	_, err := s.db.ExecContext(ctx, s.rebind(query),
-		bwSimplex, bwSimplex, colorSimplex,
-		bwSimplex, bwDuplex,
-		colorSimplex, colorDuplex,
+		bwSimplex, bwDuplex, colorSimplex, colorDuplex,
 		colorEnabledInt, updatedNS)
 	if err != nil {
 		return fmt.Errorf("set pricing: %w", err)
 	}
 	return nil
-}
-
-// SetPricing updates or inserts the dual pricing configuration (backward compatible).
-func (s *Store) SetPricing(ctx context.Context, bwPrice, colorPrice int64) error {
-	bwDuplex := pricing.ComputeDuplexDiscount(bwPrice, pricing.DefaultBWDuplexPaise)
-	colorDuplex := pricing.ComputeDuplexDiscount(colorPrice, pricing.DefaultColorDuplexPaise)
-	return s.SetDetailedPricing(ctx, bwPrice, bwDuplex, colorPrice, colorDuplex, false)
 }
 
 // DailyTrendItem represents volume and revenue aggregated by calendar day.

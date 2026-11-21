@@ -28,10 +28,6 @@ type TariffConfig struct {
 	ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
 	ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
 	ColorEnabled           bool      `json:"color_enabled"`
-	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
-	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
-	BWPricePerSidePaise    int64     `json:"bw_price_per_side_paise,omitempty"`
-	ColorPricePerSidePaise int64     `json:"color_price_per_side_paise,omitempty"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 

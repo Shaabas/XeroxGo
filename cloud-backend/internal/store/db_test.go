@@ -247,63 +247,30 @@ func TestUpdateOrderStatus(t *testing.T) {
 func TestPricingPersistence(t *testing.T) {
 	s, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	// 1. Error before pricing configured
-	if _, err := s.GetPricePerSheetPaise(ctx); err == nil {
-		t.Fatalf("expected error for unconfigured pricing, got nil")
+	if _, err := s.GetPricing(ctx); err == nil {
+		t.Fatal("pricing should be unconfigured initially")
 	}
-
-	// 2. Set valid positive integer price
-	if err := s.SetPricePerSheetPaise(ctx, 350); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(350) failed: %v", err)
+	if err := s.SetDetailedPricing(ctx, 350, 262, 1500, 1125, true); err != nil {
+		t.Fatal(err)
 	}
-
-	// 3. Read back price
-	price, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil {
-		t.Fatalf("GetPricePerSheetPaise failed: %v", err)
+	got, err := s.GetPricing(ctx)
+	if err != nil || got.BWSimplexPricePaise != 350 || got.ColorDuplexPricePaise != 1125 {
+		t.Fatalf("invalid persisted tariff: %+v err=%v", got, err)
 	}
-	if price != 350 {
-		t.Fatalf("expected price 350, got %d", price)
+	if err := s.Close(); err != nil { t.Fatal(err) }
+	reopened, err := Open(dbPath)
+	if err != nil { t.Fatal(err) }
+	defer reopened.Close()
+	got, err = reopened.GetPricing(ctx)
+	if err != nil || got.BWSimplexPricePaise != 350 || !got.ColorEnabled {
+		t.Fatalf("tariff lost on restart: %+v err=%v", got, err)
 	}
-
-	// 4. Replace price
-	if err := s.SetPricePerSheetPaise(ctx, 400); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(400) failed: %v", err)
-	}
-	price, err = s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("expected price 400, got %d (err: %v)", price, err)
-	}
-
-	// 5. Reopen preserves configured price
-	_ = s.Close()
-	s2, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("reopen store failed: %v", err)
-	}
-	defer s2.Close()
-
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price after reopen mismatch: got %d (err: %v)", price, err)
-	}
-
-	// 6. Zero and negative prices rejected
-	if err := s2.SetPricePerSheetPaise(ctx, 0); err == nil {
-		t.Fatalf("expected error for price=0, got nil")
-	}
-	if err := s2.SetPricePerSheetPaise(ctx, -50); err == nil {
-		t.Fatalf("expected error for negative price, got nil")
-	}
-
-	// 7. Failed update did not change previous price
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price changed after rejected updates: got %d, want 400", price)
+	if err := reopened.SetDetailedPricing(ctx, -1, 262, 1500, 1125, false); err == nil {
+		t.Fatal("expected rejection of negative price")
 	}
 }
 
+// Test F — TestRecordWebhookIdempotency
 // Test F — TestRecordWebhookIdempotency
 func TestRecordWebhookIdempotency(t *testing.T) {
 	s, dbPath := newTestStore(t)

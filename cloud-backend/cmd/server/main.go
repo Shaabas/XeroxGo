@@ -961,20 +961,23 @@ func main() {
 		if err != nil || p <= 0 {
 			log.Fatalf("invalid XEROXGO_PRICE_PER_SHEET_PAISE: %s", priceEnv)
 		}
-		if err := storeDB.SetPricePerSheetPaise(ctx, p); err != nil {
-			log.Fatalf("failed to persist price per sheet: %v", err)
+		tariff := store.DefaultPricingConfig()
+		if err := storeDB.SetDetailedPricing(ctx, p, pricing.ComputeDuplexDiscount(p, tariff.BWDuplexPricePaise),
+			tariff.ColorSimplexPricePaise, tariff.ColorDuplexPricePaise, false); err != nil {
+			log.Fatalf("failed to save configured 4-tier pricing: %v", err)
 		}
 		pricePaise = p
-	} else {
-		p, err := storeDB.GetPricePerSheetPaise(ctx)
-		if err == nil && p > 0 {
-			pricePaise = p
-		} else if devMode {
-			pricePaise = 500
-			_ = storeDB.SetPricePerSheetPaise(ctx, pricePaise)
-		} else {
-			log.Fatalf("pricing unconfigured in production mode")
+	} else if tariff, err := storeDB.GetPricing(ctx); err == nil {
+		pricePaise = tariff.BWSimplexPricePaise
+	} else if devMode {
+		tariff := store.DefaultPricingConfig()
+		if err := storeDB.SetDetailedPricing(ctx, tariff.BWSimplexPricePaise, tariff.BWDuplexPricePaise,
+			tariff.ColorSimplexPricePaise, tariff.ColorDuplexPricePaise, tariff.ColorEnabled); err != nil {
+			log.Fatalf("failed to initialize demo pricing: %v", err)
 		}
+		pricePaise = tariff.BWSimplexPricePaise
+	} else {
+		log.Fatalf("pricing unconfigured")
 	}
 
 	// Initialize default promo ads & bootstrap admin user

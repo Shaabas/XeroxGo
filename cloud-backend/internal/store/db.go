@@ -2209,25 +2209,6 @@ WHERE order_id = ?;
 	return nil
 }
 
-// SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.
-func (s *Store) SetPricePerSheetPaise(ctx context.Context, pricePaise int64) error {
-	cfg, _ := s.GetPricing(ctx)
-	colorPrice := cfg.ColorPricePerSheetPaise
-	if colorPrice <= 0 {
-		colorPrice = 1000
-	}
-	return s.SetPricing(ctx, pricePaise, colorPrice)
-}
-
-// GetPricePerSheetPaise retrieves the configured per-sheet pricing.
-func (s *Store) GetPricePerSheetPaise(ctx context.Context) (int64, error) {
-	cfg, err := s.GetPricing(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return cfg.BWPricePerSheetPaise, nil
-}
-
 // RecordWebhook atomically attempts to record a webhook ID.
 // Returns (true, nil) if inserted for the first time, (false, nil) if already existed.
 func (s *Store) RecordWebhook(ctx context.Context, webhookID string) (bool, error) {
