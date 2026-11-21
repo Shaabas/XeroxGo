@@ -74,6 +74,19 @@ func (e *printerConditionError) Error() string {
 }
 
 func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditionError) {
+	// Faults remain sticky until an authenticated operator restores service.
+	// Hardware returning to healthy does not automatically re-enable payments.
+	if s.db != nil {
+		blocked, reason, err := s.db.GetKioskBlock(context.Background(), kioskID)
+		if err != nil {
+			return 0, &printerConditionError{StatusCode: http.StatusServiceUnavailable,
+				Code: "SERVICE_STATE_UNAVAILABLE", Message: "cannot verify kiosk service state"}
+		}
+		if blocked {
+			return 0, &printerConditionError{StatusCode: http.StatusConflict,
+				Code: "KIOSK_OUT_OF_SERVICE", Message: "kiosk out of service: " + reason}
+		}
+	}
 	if s.hub == nil {
 		if s.cfg != nil && s.cfg.devMode {
 			return 250, nil
