@@ -11,8 +11,8 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-// seedMultiDocumentPaperOrder deliberately creates an order whose legacy
-// print_configs row describes only the first document.
+// seedMultiDocumentPaperOrder creates an order where the print-config snapshot
+// describes the first document but orders.total_sheets covers every document.
 func seedMultiDocumentPaperOrder(t *testing.T, s *Store, orderID, kioskID string, sheets []int, now time.Time) []string {
 	t.Helper()
 	var docs []OrderDocument
@@ -149,28 +149,31 @@ UPDATE job_progress SET sheets_printed = 2, pages_printed = 2 WHERE job_id = ?`)
 	checkCommitment(0)
 }
 
-func TestStore_LegacyPaperTotalFallback(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "legacy-stock.db"))
+func TestStore_ClaimRejectsInvalidOrderSheetTotal(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "invalid-total.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	ctx := context.Background()
 	now := time.Now().UTC()
-	kioskID := "kiosk-legacy-stock"
-	orderID := "ord_legacy_stock"
+	kioskID := "kiosk-invalid-total"
+	orderID := "ord_invalid_total"
 	createTestOrderWithSheets(t, s, ctx, orderID, kioskID, "8181", 4, contracts.JobStatusPendingPayment, now)
-	// Legacy rows may have no populated order-level total.
+
+	// An invalid order total must never be silently replaced with first-document
+	// totals, even when the printer reports enough paper.
 	if _, err := s.db.ExecContext(ctx, s.rebind("UPDATE orders SET total_sheets = 0 WHERE order_id = ?"), orderID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 3, 5*time.Minute, now); !errors.Is(err, ErrInsufficientPaper) {
-		t.Fatalf("legacy fallback must reject three sheets for four-sheet config: %v", err)
+	if _, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 100, 5*time.Minute, now); err == nil {
+		t.Fatal("claim must fail closed when orders.total_sheets is not positive")
 	}
-	if _, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 4, 5*time.Minute, now); err != nil {
-		t.Fatalf("legacy fallback should permit sufficient stock: %v", err)
+	var count int
+	if err := s.db.QueryRowContext(ctx, s.rebind("SELECT COUNT(*) FROM kiosk_sessions WHERE order_id = ?"), orderID).Scan(&count); err != nil {
+		t.Fatal(err)
 	}
-	if got, err := s.GetCommittedPaperSheets(ctx, kioskID, "", now); err != nil || got != 4 {
-		t.Fatalf("legacy committed = %d err=%v; want 4", got, err)
+	if count != 0 {
+		t.Fatalf("invalid order created %d payment sessions; want 0", count)
 	}
 }
