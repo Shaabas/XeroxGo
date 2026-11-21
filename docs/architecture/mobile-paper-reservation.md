@@ -12,6 +12,7 @@
 
 ## Accounting invariants
 
+- Kiosk PIN lookup reports aggregate `orders.total_pages` and `orders.total_sheets`, never the first child document's figures.
 - `orders.total_sheets` is the **only** physical sheet total used for allocation. `print_configs.total_sheets` refers to the first print job and is not an order-level stock count.
 - At time `now`, committed stock is:
   - the full sheet total of every `PENDING_PAYMENT` order whose `pin_expires_at_ns` is still in the future, **whether or not the user has visited the kiosk**;
@@ -22,9 +23,10 @@
 
 ## Expiration and cancellation
 
-- Unpaid PINs issued by mobile upload currently expire after **15 minutes**; their stock commitment ends at that timestamp.
+- Unpaid PINs issued by mobile upload currently expire after **5 minutes**; their stock commitment ends at that timestamp.
 - Kiosk checkout/session cancellation, inactivity, or session expiration does **not** abandon the still-valid mobile reservation. The customer may re-enter their PIN until it expires.
 - Paid/queued/printing jobs remain committed until their outstanding sheet requirement has been consumed or they reach an appropriate terminal state.
+- Recovery PINs for paid, unprinted orders also expire after **5 minutes**; that timeout does not release their paid-order paper commitment.
 - Kiosk "Esc" exits the checkout session; it is not a command to delete the customer's pending mobile order.
 - There is no legacy paper-count fallback or automatic migration of historic development records with missing totals.
 
