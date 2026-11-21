@@ -302,3 +302,35 @@ func TestHTTPPINClient_InitiatePayment(t *testing.T) {
 	}
 }
 
+
+func TestHTTPPINClient_ReleaseOrderAcceptsDurableDispatchPending(t *testing.T) {
+	for _, tc := range []struct{
+		name string
+		status int
+		wantError bool
+	}{
+		{name:"delivered",status:http.StatusOK},
+		{name:"durably_queued",status:http.StatusAccepted},
+		{name:"genuine_unavailable",status:http.StatusServiceUnavailable,wantError:true},
+	} {
+		t.Run(tc.name,func(t *testing.T){
+			srv:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+				if r.Method!=http.MethodPost || r.URL.Path!="/api/k/kiosk-released/orders/ord-paid/release" {
+					t.Errorf("invalid request: %s %s",r.Method,r.URL.Path)
+				}
+				if r.Header.Get("Authorization")!="Bearer release-secret"{
+					t.Errorf("kiosk release missing authentication")
+				}
+				w.Header().Set("Content-Type","application/json")
+				w.WriteHeader(tc.status)
+				_,_=w.Write([]byte(`{"status":"DISPATCH_PENDING","code":"PRINTER_OFFLINE"}`))
+			}))
+			defer srv.Close()
+			client,err:=NewHTTPPINClient(srv.URL,"kiosk-released","release-secret",nil)
+			if err!=nil{t.Fatal(err)}
+			err=client.ReleaseOrder(context.Background(),"ord-paid")
+			if tc.wantError && err==nil {t.Fatal("genuine HTTP error must not be treated as accepted")}
+			if !tc.wantError && err!=nil {t.Fatalf("durably accepted release unexpectedly failed: %v",err)}
+		})
+	}
+}
