@@ -26,24 +26,33 @@ is necessary for the refund worker to run.
    stock checks and new checkout sessions are rejected, even after telemetry
    returns healthy, until an authenticated operator explicitly restores service.
 3. Cloud creates a **full refund obligation for the funding payment**
-   (`refund_requests.REQUIRED`). This is not the same as a processed refund.
+   (`payment_refund_requests.REQUIRED`). This is not the same as a processed refund.
 4. Pi stops queued sibling jobs and tries to cancel **every** CUPS child job.
    Only confirmed `canceled`/`aborted` or never-submitted jobs count as safe.
    A held, processing, unknown, or ambiguous job is **not** safe.
 5. Pi sends an authenticated `safe_stop` attestation to cloud. Cloud verifies
    kiosk/order identity and persists `safe_stop_verified=1`.
-6. Only then may the worker submit a full refund with the order's durable
-   idempotency key. Retries reuse the same key; pending refunds are polled for
+6. Only then may the worker submit a full refund with the funding payment's
+   durable idempotency key. Retries reuse the same key; pending refunds are polled for
    provider completion. The UI differentiates required, pending, retrying and
    processed. No bank-settlement timeline is promised.
-7. A paid `PAID_WAITING` order with **no dispatch intent at all** and no
-   active kiosk session is auto-marked `PAUSED_ERROR` after two minutes,
-   and a refund is safe without Pi evidence because no print was ever dispatched.
-8. Failed/ambiguous CUPS cancellation must remain visibly unresolved pending
-   operator reconciliation. **Never** tell the customer refund is completed
-   until the provider reports it.
-9. The operator restores the kiosk only after fresh healthy printer telemetry,
-   verified safe-stop obligations and both kiosk and operator authentication.
+7. A captured `PAID_WAITING` order remains a durable fulfillment entitlement
+   even if no dispatch intent exists, the kiosk goes offline, or its checkout
+   session expires. **Elapsed time alone must never produce `PAUSED_ERROR` or a
+   `FULFILLMENT_FAILED` refund obligation.** The two-minute auto-refund worker
+   path and its unsafe database helpers have been removed.
+8. On return, an unprinted customer may claim their still-valid paid PIN, or
+   securely rotate an expired/recycled PIN using their original recovery
+   credential. A new session authorizes a first dispatch without recharging.
+9. A genuine terminal fulfillment failure still creates a funding-payment
+   refund obligation through an explicit failure path. Its safe-stop requirement
+   remains in force. Preexisting refund obligations are not silently canceled,
+   reversed, or reclassified by this policy change.
+10. Failed/ambiguous CUPS cancellation must remain visibly unresolved pending
+    operator reconciliation. **Never** tell the customer refund is completed
+    until the provider reports it.
+11. The operator restores the kiosk only after fresh healthy printer telemetry,
+    verified safe-stop obligations and both kiosk and operator authentication.
 
 ## Payment-level capture and refund accounting
 
