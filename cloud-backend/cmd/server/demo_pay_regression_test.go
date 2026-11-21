@@ -16,7 +16,6 @@ func TestDemoPay_UsesDurableDispatchAndDoesNotFundExcessPayment(t *testing.T) {
 	const orderID,kioskID="ord_demo_financial","kiosk_demo_financial"
 	app,_,_,_,st:=setupSafetyTestApp(t,kioskID,orderID,"8574",
 		contracts.JobStatusPendingPayment,400,time.Now().UTC().Add(5*time.Minute))
-	app.cfg.demoMode=true
 	ctx:=context.Background()
 	now:=time.Now().UTC()
 	sess,err:=st.CreateOrGetKioskSession(ctx,kioskID,orderID,5*time.Minute,now)
@@ -26,7 +25,7 @@ func TestDemoPay_UsesDurableDispatchAndDoesNotFundExcessPayment(t *testing.T) {
 		if err:=st.CreatePaymentAttempt(ctx,store.PaymentAttempt{
 			AttemptID:id,DemoToken:token,
 			OrderID:orderID,KioskID:kioskID,SessionID:sess.SessionID,
-			Provider:"mock_demo",ProviderOrderID:"mock_provider_"+id,
+			Provider:"mock",ProviderOrderID:"mock_provider_"+id,
 			AmountPaise:400,Currency:"INR",Status:"CREATED",
 			ExpiresAt:now.Add(5*time.Minute),
 		});err!=nil{t.Fatal(err)}
