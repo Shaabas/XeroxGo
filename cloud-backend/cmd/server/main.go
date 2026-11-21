@@ -1354,6 +1354,17 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		(documentsTotal == 0 || documentsCompleted == documentsTotal) {
 		currentStatus = "COMPLETED"
 	}
+	// Dispatch intents describe transport, not physical printing. Keep that
+	// separate from the parent order lifecycle so a captured-but-offline
+	// order is not represented to the customer as already printing.
+	dispatch, dispatchErr := s.db.GetOrderDispatchSummary(r.Context(), orderID)
+	if dispatchErr != nil {
+		log.Printf("[ORDER] Cannot read dispatch summary for %s: %v", orderID, dispatchErr)
+		http.Error(w, "order dispatch temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	awaitingDelivery := dispatch.PendingCount + dispatch.SentCount
+
 	// Additional captured payments have independent refunds. Do not reveal
 	// payment IDs in this public order status response.
 	excessSummary, extraErr := s.db.GetExcessRefundSummary(r.Context(), orderID)
@@ -1374,6 +1385,8 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"sheets_printed":    sheetsPrinted,
 		"documents_total":  documentsTotal,
 		"documents_completed": documentsCompleted,
+		"documents_awaiting_delivery": awaitingDelivery,
+		"dispatch_pending": awaitingDelivery > 0,
 		"error_reason":      errorReason,
 		"price_paise":       order.PricePaise,
 		"pin_expires_at":    pinExpiry,
