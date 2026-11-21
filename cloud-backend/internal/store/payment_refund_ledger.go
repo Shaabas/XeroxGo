@@ -62,10 +62,12 @@ ON CONFLICT(order_id) DO NOTHING;`)
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO order_funding_payments(order_id,payment_id,created_at_ns)
 SELECT p.order_id,p.payment_id,p.created_at_ns FROM payments p
+JOIN orders o ON o.order_id=p.order_id
 WHERE LOWER(p.status) IN ('captured','paid')
+AND p.amount_paise=o.price_paise
 AND NOT EXISTS (
 	SELECT 1 FROM payments x WHERE x.order_id=p.order_id
-	AND LOWER(x.status) IN ('captured','paid')
+	AND LOWER(x.status) IN ('captured','paid') AND x.amount_paise=o.price_paise
 	AND (x.created_at_ns < p.created_at_ns OR
 	(x.created_at_ns=p.created_at_ns AND x.payment_id < p.payment_id))
 )
@@ -82,8 +84,9 @@ ON CONFLICT(payment_id) DO NOTHING;`)
 	if err != nil { return fmt.Errorf("refund migration legacy obligations: %w", err) }
 	rows, err := tx.QueryContext(ctx, `
 SELECT p.payment_id,p.order_id,p.provider,p.amount_paise,p.created_at_ns
-FROM payments p JOIN order_funding_payments f ON f.order_id=p.order_id
-WHERE LOWER(p.status) IN ('captured','paid') AND p.payment_id <> f.payment_id;`)
+FROM payments p LEFT JOIN order_funding_payments f ON f.order_id=p.order_id
+WHERE LOWER(p.status) IN ('captured','paid')
+AND (f.payment_id IS NULL OR p.payment_id <> f.payment_id);`)
 	if err != nil { return err }
 	type item struct { id, orderID, provider string; amount, at int64 }
 	var extra []item
