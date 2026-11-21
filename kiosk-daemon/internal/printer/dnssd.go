@@ -20,11 +20,12 @@ type DNSSDServiceInfo struct {
 
 // ResolvedEndpoint contains discovered network endpoint parameters from DNS-SD.
 type ResolvedEndpoint struct {
-	Scheme   string `json:"scheme"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Path     string `json:"path,omitempty"` // empty if unverified by discovery query
-	ExactURI string `json:"exact_uri,omitempty"`
+	Scheme       string `json:"scheme"`
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	Path         string `json:"path,omitempty"` // empty if unverified by discovery query
+	ExactURI     string `json:"exact_uri,omitempty"`
+	PathVerified bool   `json:"path_verified"`
 }
 
 // ParseDNSSDURI parses a CUPS driverless device URI with the dnssd:// scheme.
@@ -125,11 +126,12 @@ func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string
 				scheme = defaultScheme
 			}
 			return ResolvedEndpoint{
-				Scheme:   scheme,
-				Host:     resolvedURI.Hostname(),
-				Port:     parsePortOrDefault(resolvedURI.Port(), defaultPort),
-				Path:     resolvedURI.RequestURI(),
-				ExactURI: resolvedURI.String(),
+				Scheme:       scheme,
+				Host:         resolvedURI.Hostname(),
+				Port:         parsePortOrDefault(resolvedURI.Port(), defaultPort),
+				Path:         resolvedURI.RequestURI(),
+				ExactURI:     resolvedURI.String(),
+				PathVerified: true,
 			}, nil
 		}
 	}
@@ -149,11 +151,12 @@ func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string
 						scheme = defaultScheme
 					}
 					return ResolvedEndpoint{
-						Scheme:   scheme,
-						Host:     resolvedURI.Hostname(),
-						Port:     parsePortOrDefault(resolvedURI.Port(), defaultPort),
-						Path:     resolvedURI.RequestURI(),
-						ExactURI: resolvedURI.String(),
+						Scheme:       scheme,
+						Host:         resolvedURI.Hostname(),
+						Port:         parsePortOrDefault(resolvedURI.Port(), defaultPort),
+						Path:         resolvedURI.RequestURI(),
+						ExactURI:     resolvedURI.String(),
+						PathVerified: true,
 					}, nil
 				}
 			}
@@ -171,13 +174,15 @@ func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string
 			ip := parts[1]
 			if ip != "" {
 				// NOTE: avahi-resolve resolves only the host/IP.
-				// Do NOT manufacture a resource path like "/ipp/print" without evidence.
+				// Hostname resolution alone does NOT imply a verified IPP endpoint.
+				// Unverified resource path is left empty and PathVerified is false.
 				return ResolvedEndpoint{
-					Scheme:   defaultScheme,
-					Host:     ip,
-					Port:     defaultPort,
-					Path:     "", // unverified resource path left empty
-					ExactURI: fmt.Sprintf("%s://%s:%d", defaultScheme, ip, defaultPort),
+					Scheme:       defaultScheme,
+					Host:         ip,
+					Port:         defaultPort,
+					Path:         "", // unverified resource path left empty
+					ExactURI:     "", // no verified exact URI
+					PathVerified: false,
 				}, nil
 			}
 		}

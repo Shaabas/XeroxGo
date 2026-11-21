@@ -3,6 +3,7 @@ package printer
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -110,6 +111,7 @@ type SNMPMarker struct {
 	CounterUnit      int64  `json:"counter_unit"`
 	CounterUnitName  string `json:"counter_unit_name"`
 	IsPageCounter    bool   `json:"is_page_counter"`
+	HasLifeCount     bool   `json:"has_life_count"`
 	LifeCount        int64  `json:"life_count"`
 	PowerOnCount     int64  `json:"power_on_count"`
 	HasPowerOnCount  bool   `json:"has_power_on_count"`
@@ -319,7 +321,7 @@ func walkHRPrinterTable(session DynamicSNMPSession) ([]SNMPPrinterDevice, error)
 		seen[idx] = true
 	}
 
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		st := statusMap[idx]
 		errBytes := errorMap[idx]
 		devices = append(devices, SNMPPrinterDevice{
@@ -389,7 +391,7 @@ func walkPrtCoverTable(session DynamicSNMPSession) ([]SNMPCover, error) {
 	for idx := range descMap {
 		seen[idx] = true
 	}
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		st := statusMap[idx]
 		covers = append(covers, SNMPCover{
 			Index:       idx,
@@ -443,17 +445,30 @@ func walkPrtMarkerTable(session DynamicSNMPSession) ([]SNMPMarker, error) {
 	for idx := range unitMap {
 		seen[idx] = true
 	}
+	for idx := range powerMap {
+		seen[idx] = true
+	}
 
-	for idx := range seen {
-		unit := unitMap[idx]
+	for _, idx := range sortedKeys(seen) {
+		unit, hasUnit := unitMap[idx]
+		if !hasUnit {
+			unit = -1
+		}
 		unitName, isPage := FormatMarkerCounterUnit(unit)
-		life := lifeMap[idx]
+		life, hasLife := lifeMap[idx]
+		if !hasLife {
+			life = -1
+		}
 		pCount, hasP := powerMap[idx]
+		if !hasP {
+			pCount = -1
+		}
 		markers = append(markers, SNMPMarker{
 			Index:           idx,
 			CounterUnit:     unit,
 			CounterUnitName: unitName,
 			IsPageCounter:   isPage,
+			HasLifeCount:    hasLife,
 			LifeCount:       life,
 			PowerOnCount:    pCount,
 			HasPowerOnCount: hasP,
@@ -526,7 +541,7 @@ func walkPrtMarkerSuppliesTable(session DynamicSNMPSession) ([]SNMPSupply, error
 		seen[idx] = true
 	}
 
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		cls := classMap[idx]
 		typ := typeMap[idx]
 		unit := unitMap[idx]
@@ -620,7 +635,7 @@ func walkPrtAlertTable(session DynamicSNMPSession) ([]SNMPAlert, error) {
 		seen[idx] = true
 	}
 
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		sev := sevMap[idx]
 		trn := trnMap[idx]
 		grp := grpMap[idx]
@@ -724,6 +739,7 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 				CounterUnit:     markerUnit,
 				CounterUnitName: unitName,
 				IsPageCounter:   isPage,
+				HasLifeCount:    true,
 				LifeCount:       v,
 			})
 		}
@@ -1262,4 +1278,13 @@ func pduToBytes(pdu gosnmp.SnmpPDU) ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
