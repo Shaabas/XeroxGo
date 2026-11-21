@@ -268,7 +268,7 @@ func TestTransactionSession_CancellationFlow(t *testing.T) {
 	canResp.Body.Close()
 
 	// Payment initiation must now fail because session was cancelled!
-	payURL := ts.URL + "/api/k/kiosk-can-01/orders/ord_can_01/initiate-payment"
+	payURL := ts.URL + "/api/k/kiosk-can-01/sessions/" + sess.SessionID + "/initiate-payment"
 	payReq, _ := http.NewRequest(http.MethodPost, payURL, nil)
 	payReq.Header.Set("Authorization", "Bearer "+secret)
 	payResp, _ := http.DefaultClient.Do(payReq)
