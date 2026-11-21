@@ -507,7 +507,12 @@ SELECT COUNT(1) FROM (
 			}
 		}
 
-		return &Store{db: db, dialect: "postgres"}, nil
+		store := &Store{db: db, dialect: "postgres"}
+		if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open store: fulfillment schema: %w", err)
+		}
+		return store, nil
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -724,7 +729,12 @@ CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns)
 		return nil, fmt.Errorf("open store: sqlite migration: %w", err)
 	}
 
-	return &Store{db: db, dialect: "sqlite"}, nil
+	store := &Store{db: db, dialect: "sqlite"}
+	if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: fulfillment schema: %w", err)
+	}
+	return store, nil
 }
 
 func migrateSQLiteSchema(db *sql.DB) error {
