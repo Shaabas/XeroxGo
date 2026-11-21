@@ -3133,7 +3133,8 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 	if err != nil {
 		return fmt.Errorf("cancel kiosk session: %w", err)
 	}
-	rows, _ := res.RowsAffected()
+	rows, err := res.RowsAffected()
+	if err != nil { return fmt.Errorf("cancel kiosk session: rows affected: %w", err) }
 	if rows == 0 {
 		var currentStatus string
 		err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM kiosk_sessions WHERE session_id = ? AND kiosk_id = ?;`), sessionID, kioskID).Scan(&currentStatus)
@@ -3143,8 +3144,15 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 			}
 			return err
 		}
+		// After payment capture, the session is COMPLETED. A stale kiosk
+		// cancellation/timer must not revoke durable paid dispatch intents.
+		// A repeat cancel of an already-terminal session is idempotent.
+		return tx.Commit()
 	}
 
+	// Only a successfully canceled PAYMENT_PENDING session may revoke its
+	// still-unacknowledged dispatch intents. Capture completion and cancel
+	// serialize on the session row; whichever wins determines authorization.
 	// Cancel any pending or unacknowledged dispatch intents for this session
 	_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
