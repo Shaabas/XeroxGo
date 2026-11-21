@@ -48,33 +48,8 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	return PricingConfig{}, fmt.Errorf("get pricing: pricing has not been configured")
-	}
-	if err != nil {
-		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
-	}
-
-	if bwSimplex <= 0 {
-		if bwPrice > 0 {
-			bwSimplex = bwPrice
-		} else if legacyPrice > 0 {
-			bwSimplex = legacyPrice
-		} else {
-			bwSimplex = pricing.DefaultBWSimplexPaise
-		}
-	}
-	if bwDuplex <= 0 {
-		bwDuplex = pricing.ComputeDuplexDiscount(bwSimplex, pricing.DefaultBWDuplexPaise)
-	}
-	if colorSimplex <= 0 {
-		if colorPrice > 0 {
-			colorSimplex = colorPrice
-		} else {
-			colorSimplex = pricing.DefaultColorSimplexPaise
-		}
-	}
-	if colorDuplex <= 0 {
-		colorDuplex = pricing.ComputeDuplexDiscount(colorSimplex, pricing.DefaultColorDuplexPaise)
+	if bwSimplex <= 0 || bwDuplex <= 0 || colorSimplex <= 0 || colorDuplex <= 0 {
+		return PricingConfig{}, fmt.Errorf("get pricing: configured tariffs must be greater than zero")
 	}
 
 	return PricingConfig{
