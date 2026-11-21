@@ -33,19 +33,12 @@ func (s *appServer) processRefundsOnce(ctx context.Context) error {
 	refunder, ok := provider.(payments.RefundProvider)
 	if !ok { return fmt.Errorf("payment provider %s does not support refunds", provider.Name()) }
 
-	// A captured payment with no dispatch intent cannot leave a customer
-	// stranded forever. After a short grace period, atomically close its
-	// fulfillment path and create a safely executable full-refund obligation.
-	now := time.Now().UTC()
-	unfulfilled, err := s.db.ListPaidWithoutDispatch(ctx, now.Add(-2*time.Minute), now)
-	if err != nil { return err }
-	for _, orderID := range unfulfilled {
-		if _, err := s.db.FailNeverDispatchedPaidOrder(ctx, orderID, now); err != nil {
-			log.Printf("[REFUND] could not finalize never-dispatched order %s: %v", orderID, err)
-		}
-	}
-
-	retryCutoff := now.Add(-60 * time.Second)
+	// A captured payment establishes a durable fulfillment entitlement.
+	// An expired/missing kiosk session or absent dispatch intent is NOT proof
+	// of failure. Do not expire PAID_WAITING orders or auto-refund based on age.
+	// This worker acts only on obligations recorded by an explicit failure
+	// path (which requires verified safe-stop) or by an excess capture.
+	retryCutoff := time.Now().UTC().Add(-60 * time.Second)
 	pending, err := s.db.ListPendingRefunds(ctx, retryCutoff)
 	if err != nil { return err }
 	for _, item := range pending {
