@@ -218,41 +218,14 @@ func (s *Store) HasUnsafeRefundStops(ctx context.Context,kioskID string)(bool,er
 	err:=s.db.QueryRowContext(ctx,s.rebind("\nSELECT COUNT(*) FROM payment_refund_requests rr\nJOIN orders o ON o.order_id=rr.order_id\nWHERE o.kiosk_id=? AND rr.reason='FULFILLMENT_FAILED'\nAND rr.safe_stop_verified=0 AND rr.status <> 'PROCESSED';"),kioskID).Scan(&n)
 	return n>0,err
 }
-// ListPaidWithoutDispatch returns captured orders with no active kiosk checkout,
-// no durable CUPS dispatch intent and no refund obligation. These are provably
-// never dispatched by XeroxGo, unlike jobs with an uncertain SENT intent.
-func (s *Store) ListPaidWithoutDispatch(ctx context.Context,cutoff time.Time,now time.Time)([]string,error){
-	rows,err:=s.db.QueryContext(ctx,s.rebind("\nSELECT o.order_id FROM orders o WHERE o.status='PAID_WAITING'\nAND EXISTS(SELECT 1 FROM payments p WHERE p.order_id=o.order_id\nAND LOWER(p.status) IN ('captured','paid') AND p.created_at_ns < ?)\nAND NOT EXISTS(SELECT 1 FROM dispatch_intents di WHERE di.order_id=o.order_id)\nAND NOT EXISTS(SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id=o.order_id\nAND ks.status='PAYMENT_PENDING' AND ks.expires_at_ns > ?)\nAND NOT EXISTS(SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id=o.order_id\nAND rr.reason='FULFILLMENT_FAILED')\nORDER BY o.created_at_ns ASC LIMIT 30;"),cutoff.UnixNano(),now.UnixNano())
-	if err!=nil{return nil,err}
-	defer rows.Close()
-	var out []string
-	for rows.Next(){var id string;if err:=rows.Scan(&id);err!=nil{return nil,err};out=append(out,id)}
-	return out,rows.Err()
-}
-// FailNeverDispatchedPaidOrder atomically transitions a paid order to a refund
-// obligation only if no job was ever scheduled for physical dispatch. This is
-// safe to auto-refund even if the Pi is offline, since no dispatch intent exists.
-func (s *Store) FailNeverDispatchedPaidOrder(ctx context.Context,orderID string,now time.Time)(bool,error){
-	tx,err:=s.db.BeginTx(ctx,nil)
-	if err!=nil{return false,err}
-	defer tx.Rollback()
-	nowNS:=now.UTC().UnixNano()
-	res,err:=tx.ExecContext(ctx,s.rebind("\nUPDATE orders SET status='PAUSED_ERROR',updated_at_ns=?\nWHERE order_id=? AND status='PAID_WAITING'\nAND NOT EXISTS(SELECT 1 FROM dispatch_intents di WHERE di.order_id=orders.order_id)\nAND NOT EXISTS(SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id=orders.order_id\nAND ks.status='PAYMENT_PENDING' AND ks.expires_at_ns > ?)\nAND EXISTS(SELECT 1 FROM payments p WHERE p.order_id=orders.order_id\nAND LOWER(p.status) IN ('captured','paid'))\nAND NOT EXISTS(SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id=orders.order_id\nAND rr.reason='FULFILLMENT_FAILED');"),nowNS,orderID,nowNS)
-	if err!=nil{return false,err}
-	n,err:=res.RowsAffected()
-	if err!=nil{return false,err}
-	if n==0{return false,nil}
-	// This branch is unchanged in policy (Problem 2); only its ledger key and
-	// funding-payment selection are made correct.
-	var paymentID,provider string
-	var amount int64
-	err=tx.QueryRowContext(ctx,s.rebind("\nSELECT p.payment_id,p.provider,p.amount_paise FROM payments p\nLEFT JOIN order_funding_payments f ON f.order_id=p.order_id\nWHERE p.order_id=? AND LOWER(p.status) IN ('captured','paid')\nAND (p.payment_id=f.payment_id OR (f.payment_id IS NULL AND NOT EXISTS(\n SELECT 1 FROM payments older WHERE older.order_id=p.order_id\n AND LOWER(older.status) IN ('captured','paid')\n AND (older.created_at_ns<p.created_at_ns OR\n (older.created_at_ns=p.created_at_ns AND older.payment_id<p.payment_id))\n)))\nLIMIT 1;"),orderID).Scan(&paymentID,&provider,&amount)
-	if err!=nil{return false,err}
-	_,err=tx.ExecContext(ctx,s.rebind("\nINSERT INTO payment_refund_requests(payment_id,order_id,provider,amount_paise,reason,\n status,idempotency_key,safe_stop_verified,created_at_ns,updated_at_ns)\nVALUES(?,?,?,?,'FULFILLMENT_FAILED','REQUIRED',?,1,?,?)\nON CONFLICT(payment_id) DO NOTHING;"),paymentID,orderID,provider,amount,refundIdempotencyKey(paymentID),nowNS,nowNS)
-	if err!=nil{return false,err}
-	if err:=tx.Commit();err!=nil{return false,err}
-	return true,nil
-}
+// Paid PAID_WAITING orders must never be failed or refunded solely because
+// their kiosk session expired or physical dispatch has not yet started.
+// Terminal refund obligations are created by explicit failure paths using
+// RecordRefundRequired (and verified safe-stop), not elapsed time.
+//
+// The former ListPaidWithoutDispatch and FailNeverDispatchedPaidOrder helpers
+// were removed to prevent any caller from silently reintroducing that policy.
+
 type KioskServiceFlag struct {
 	KioskID      string `json:"kiosk_id"`
 	Reason       string `json:"reason"`
