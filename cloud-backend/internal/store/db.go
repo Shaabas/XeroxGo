@@ -3457,8 +3457,9 @@ WHERE order_id = ?;
 			var earlierID string
 			err = tx.QueryRowContext(ctx, s.rebind(`
 SELECT payment_id FROM payments WHERE order_id = ?
-AND LOWER(status) IN ('captured','paid') ORDER BY created_at_ns ASC, payment_id ASC LIMIT 1;`),
-				p.OrderID).Scan(&earlierID)
+AND LOWER(status) IN ('captured','paid') AND amount_paise = ?
+ORDER BY created_at_ns ASC, payment_id ASC LIMIT 1;`),
+				p.OrderID, pricePaise).Scan(&earlierID)
 			if errors.Is(err, sql.ErrNoRows) {
 				earlierID = p.PaymentID
 			} else if err != nil {
