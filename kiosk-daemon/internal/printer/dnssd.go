@@ -18,6 +18,15 @@ type DNSSDServiceInfo struct {
 	UUID        string `json:"uuid,omitempty"`
 }
 
+// ResolvedEndpoint contains discovered network endpoint parameters from DNS-SD.
+type ResolvedEndpoint struct {
+	Scheme   string `json:"scheme"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Path     string `json:"path,omitempty"` // empty if unverified by discovery query
+	ExactURI string `json:"exact_uri,omitempty"`
+}
+
 // ParseDNSSDURI parses a CUPS driverless device URI with the dnssd:// scheme.
 // Format example: dnssd://HP%20LaserJet%20Tank%201020w._ipp._tcp.local/?uuid=381v6a
 func ParseDNSSDURI(rawURI string) (*DNSSDServiceInfo, error) {
@@ -86,11 +95,11 @@ func ParseDNSSDURI(rawURI string) (*DNSSDServiceInfo, error) {
 // ResolveDNSSDTarget attempts best-effort resolution of a dnssd:// device URI
 // to a concrete host/IP, port, and IPP resource path.
 // It uses CUPS ippfind or standard mDNS resolution commands without ever guessing an address.
-// If resolution fails or commands are absent, it returns an error and empty host.
-func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string) (string, int, string, error) {
+// It preserves secure ipps:// schemes and NEVER manufactures resource paths without evidence.
+func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string) (ResolvedEndpoint, error) {
 	info, err := ParseDNSSDURI(rawURI)
 	if err != nil {
-		return "", 0, "", err
+		return ResolvedEndpoint{}, err
 	}
 
 	if runner == nil {
@@ -100,11 +109,28 @@ func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string
 		ctx = context.Background()
 	}
 
+	defaultScheme := "ipp"
+	defaultPort := 631
+	if strings.Contains(strings.ToLower(info.RegType), "_ipps.") {
+		defaultScheme = "ipps"
+		defaultPort = 443
+	}
+
 	// Attempt 1: Use CUPS ippfind
-	// ippfind searches and resolves DNS-SD registered IPP printers directly into ipp:// URIs
+	// ippfind searches and resolves DNS-SD registered IPP printers directly into ipp:// or ipps:// URIs
 	if out, err := runner(ctx, "ippfind", "-T", "2", info.ServiceName); err == nil {
 		if resolvedURI := parseResolvedIPPURI(string(out)); resolvedURI != nil {
-			return resolvedURI.Hostname(), parsePortOrDefault(resolvedURI.Port(), 631), resolvedURI.RequestURI(), nil
+			scheme := strings.ToLower(resolvedURI.Scheme)
+			if scheme == "" {
+				scheme = defaultScheme
+			}
+			return ResolvedEndpoint{
+				Scheme:   scheme,
+				Host:     resolvedURI.Hostname(),
+				Port:     parsePortOrDefault(resolvedURI.Port(), defaultPort),
+				Path:     resolvedURI.RequestURI(),
+				ExactURI: resolvedURI.String(),
+			}, nil
 		}
 	}
 
@@ -117,9 +143,18 @@ func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string
 				continue
 			}
 			if resolvedURI := parseResolvedIPPURI(l); resolvedURI != nil {
-				// Check if service name or host matches
 				if strings.Contains(strings.ToLower(l), strings.ToLower(info.ServiceName)) {
-					return resolvedURI.Hostname(), parsePortOrDefault(resolvedURI.Port(), 631), resolvedURI.RequestURI(), nil
+					scheme := strings.ToLower(resolvedURI.Scheme)
+					if scheme == "" {
+						scheme = defaultScheme
+					}
+					return ResolvedEndpoint{
+						Scheme:   scheme,
+						Host:     resolvedURI.Hostname(),
+						Port:     parsePortOrDefault(resolvedURI.Port(), defaultPort),
+						Path:     resolvedURI.RequestURI(),
+						ExactURI: resolvedURI.String(),
+					}, nil
 				}
 			}
 		}
@@ -135,13 +170,21 @@ func ResolveDNSSDTarget(ctx context.Context, runner CommandRunner, rawURI string
 		if len(parts) >= 2 {
 			ip := parts[1]
 			if ip != "" {
-				return ip, 631, "/ipp/print", nil
+				// NOTE: avahi-resolve resolves only the host/IP.
+				// Do NOT manufacture a resource path like "/ipp/print" without evidence.
+				return ResolvedEndpoint{
+					Scheme:   defaultScheme,
+					Host:     ip,
+					Port:     defaultPort,
+					Path:     "", // unverified resource path left empty
+					ExactURI: fmt.Sprintf("%s://%s:%d", defaultScheme, ip, defaultPort),
+				}, nil
 			}
 		}
 	}
 
 	// Unresolved: do not guess!
-	return "", 0, "", fmt.Errorf("DNS-SD target %q (service %q) could not be resolved automatically. Provide explicit --ipp-uri or --snmp-host override", rawURI, info.ServiceName)
+	return ResolvedEndpoint{}, fmt.Errorf("DNS-SD target %q (service %q) could not be resolved automatically. Provide explicit --ipp-uri or --snmp-host override", rawURI, info.ServiceName)
 }
 
 func parseResolvedIPPURI(raw string) *url.URL {

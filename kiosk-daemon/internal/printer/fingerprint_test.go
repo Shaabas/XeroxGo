@@ -12,10 +12,11 @@ import (
 )
 
 func TestRunFingerprint_EndToEndWithDiscrepancyAndRedaction(t *testing.T) {
+	// Synthetic test fixtures - not real hardware measurements
 	cupsRawOutput := `"/usr/share/cups/ipptool/get-printer-attributes.test":
     status-code = successful-ok
     printer-name (nameWithoutLanguage) = HPTank
-    printer-make-and-model (textWithoutLanguage) = HP LaserJet Tank 1020w
+    printer-make-and-model (textWithoutLanguage) = HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)
     printer-state (enum) = idle
     printer-is-accepting-jobs (boolean) = true
     document-format-supported (1setOf mimeMediaType) = application/pdf,application/postscript
@@ -27,8 +28,8 @@ func TestRunFingerprint_EndToEndWithDiscrepancyAndRedaction(t *testing.T) {
 
 	remoteIPPRawOutput := `"/usr/share/cups/ipptool/get-printer-attributes.test":
     status-code = successful-ok
-    printer-name (nameWithoutLanguage) = HP LaserJet Tank 1020w (Serial: VNC3K89123)
-    printer-make-and-model (textWithoutLanguage) = HP LaserJet Tank 1020w
+    printer-name (nameWithoutLanguage) = HP LaserJet Tank 1020w (Synthetic Test Fixture Serial: VNC3K89123)
+    printer-make-and-model (textWithoutLanguage) = HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)
     printer-info (textWithoutLanguage) = Hardware MAC 00:1A:2B:3C:4D:5E on 192.168.1.50
     printer-state (enum) = idle
     printer-is-accepting-jobs (boolean) = true
@@ -72,7 +73,7 @@ func TestRunFingerprint_EndToEndWithDiscrepancyAndRedaction(t *testing.T) {
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return &gosnmp.SnmpPacket{
 					Variables: []gosnmp.SnmpPDU{
-						{Name: "1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("HP LaserJet Tank 1020w SNMP Agent SN:VNC3K89123")},
+						{Name: "1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("HP LaserJet Tank 1020w Synthetic Test SNMP Agent SN:VNC3K89123")},
 					},
 				}, nil
 			},
@@ -136,12 +137,15 @@ func TestRunFingerprint_EndToEndWithDiscrepancyAndRedaction(t *testing.T) {
 		t.Errorf("expected CUPS SUPPORTED and Remote UNSUPPORTED, got CUPS=%s, Remote=%s", duplexComp.CUPSQueue, duplexComp.RemoteIPP)
 	}
 
-	// 3. Verify Telemetry Summary
-	if rep.Telemetry.Rating != TelemetryRatingVerifiedOdometer {
-		t.Errorf("expected rating VERIFIED_ODOMETER_ONLY, got %s", rep.Telemetry.Rating)
+	// 3. Verify Telemetry Summary (read-only capability discovery never claims physical ejection is verified or safe)
+	if rep.Telemetry.Rating != TelemetryRatingOdometerAvailable {
+		t.Errorf("expected rating %s, got %s", TelemetryRatingOdometerAvailable, rep.Telemetry.Rating)
 	}
-	if !rep.Telemetry.SafeForPhysicalCompletion {
-		t.Errorf("expected SafeForPhysicalCompletion = true due to verified SNMP sheet counter")
+	if rep.Telemetry.SafeForPhysicalCompletion {
+		t.Errorf("expected SafeForPhysicalCompletion = false in read-only capability discovery")
+	}
+	if rep.Telemetry.PhysicalEjectionVerified {
+		t.Errorf("expected PhysicalEjectionVerified = false in read-only capability discovery")
 	}
 	if rep.Telemetry.SNMPMarkerLifeCount != 1042 || rep.Telemetry.SNMPMarkerCounterUnit != "sheets" {
 		t.Errorf("unexpected marker counter: %d %s", rep.Telemetry.SNMPMarkerLifeCount, rep.Telemetry.SNMPMarkerCounterUnit)
@@ -182,7 +186,7 @@ func TestRunFingerprint_EndToEndWithDiscrepancyAndRedaction(t *testing.T) {
 	if !strings.Contains(humanOutput, "CAPABILITY CONSENSUS & DISCREPANCIES") {
 		t.Errorf("human output missing consensus section")
 	}
-	if !strings.Contains(humanOutput, "VERIFIED_ODOMETER_ONLY") {
+	if !strings.Contains(humanOutput, string(TelemetryRatingOdometerAvailable)) {
 		t.Errorf("human output missing telemetry rating")
 	}
 	if !strings.Contains(humanOutput, "SUPPLIES (DYNAMIC SNMP DISCOVERY)") {

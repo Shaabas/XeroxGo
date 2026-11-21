@@ -24,11 +24,16 @@ const (
 type TelemetryRating string
 
 const (
-	TelemetryRatingVerifiedFull         TelemetryRating = "VERIFIED_FULL"
-	TelemetryRatingVerifiedOdometer     TelemetryRating = "VERIFIED_ODOMETER_ONLY"
-	TelemetryRatingVerifiedOdometerOnly TelemetryRating = "VERIFIED_ODOMETER_ONLY"
-	TelemetryRatingQueueOnly            TelemetryRating = "QUEUE_ONLY_UNCERTAIN_EJECTION"
-	TelemetryRatingAbsent               TelemetryRating = "ABSENT"
+	TelemetryRatingOdometerAndIPPSheetsAvailable TelemetryRating = "ODOMETER_AND_IPP_SHEETS_AVAILABLE_UNVERIFIED_EJECTION"
+	TelemetryRatingOdometerAvailable            TelemetryRating = "ODOMETER_AVAILABLE_UNVERIFIED_EJECTION"
+	TelemetryRatingQueueOnly                    TelemetryRating = "QUEUE_ONLY_UNCERTAIN_EJECTION"
+	TelemetryRatingAbsent                       TelemetryRating = "ABSENT"
+
+	// Deprecated aliases maintained for backward compatibility; read-only capability discovery
+	// never establishes physical ejection correctness or post-jam recovery.
+	TelemetryRatingVerifiedFull         = TelemetryRatingOdometerAndIPPSheetsAvailable
+	TelemetryRatingVerifiedOdometer     = TelemetryRatingOdometerAvailable
+	TelemetryRatingVerifiedOdometerOnly = TelemetryRatingOdometerAvailable
 )
 
 // TargetConfig specifies the endpoints and queues targeted for fingerprinting.
@@ -124,6 +129,7 @@ type TelemetrySummary struct {
 	SNMPMarkerLifeCount       int64           `json:"snmp_marker_life_count,omitempty"`
 	IPPJobProgressSupported   bool            `json:"ipp_job_progress_supported"`
 	IPPMediaSheetsSupported   bool            `json:"ipp_media_sheets_supported"`
+	PhysicalEjectionVerified  bool            `json:"physical_ejection_verified"`
 	SafeForPhysicalCompletion bool            `json:"safe_for_physical_completion"`
 	Warnings                  []string        `json:"warnings,omitempty"`
 }
@@ -163,6 +169,11 @@ func RunFingerprint(ctx context.Context, runner CommandRunner, snmpSessionFactor
 		ctx = context.Background()
 	}
 
+	commReport := ""
+	if cfg.SNMPCommunity != "" {
+		commReport = "[REDACTED_COMMUNITY]"
+	}
+
 	report := &FingerprintReport{
 		Timestamp:   time.Now().UTC(),
 		Redacted:    cfg.Redact,
@@ -172,7 +183,7 @@ func RunFingerprint(ctx context.Context, runner CommandRunner, snmpSessionFactor
 			RemoteIPPURI:  cfg.RemoteIPPURI,
 			SNMPHost:      cfg.SNMPHost,
 			SNMPPort:      cfg.SNMPPort,
-			SNMPCommunity: cfg.SNMPCommunity,
+			SNMPCommunity: commReport, // NEVER serialize plain community credentials even when redact=false
 		},
 	}
 
@@ -202,13 +213,18 @@ func RunFingerprint(ctx context.Context, runner CommandRunner, snmpSessionFactor
 			if err == nil && dnssdInfo != nil {
 				report.Targets.DNSSDService = dnssdInfo.ServiceName
 			}
-			host, port, path, rErr := ResolveDNSSDTarget(ctx, runner, cupsDeviceURI)
-			if rErr == nil && host != "" {
+			endpoint, rErr := ResolveDNSSDTarget(ctx, runner, cupsDeviceURI)
+			if rErr == nil && endpoint.Host != "" {
 				report.Targets.DNSSDResolved = true
-				if path == "" {
-					path = "/ipp/print"
+				// Preserve discovered scheme (ipp:// or ipps://) and exact URI if resolved.
+				// NEVER manufacture a resource path like "/ipp/print" without evidence.
+				if endpoint.ExactURI != "" && endpoint.Path != "" {
+					remoteIPPURI = endpoint.ExactURI
+				} else if endpoint.Path != "" {
+					remoteIPPURI = fmt.Sprintf("%s://%s:%d%s", endpoint.Scheme, endpoint.Host, endpoint.Port, endpoint.Path)
+				} else {
+					remoteIPPURI = fmt.Sprintf("%s://%s:%d", endpoint.Scheme, endpoint.Host, endpoint.Port)
 				}
-				remoteIPPURI = fmt.Sprintf("ipp://%s:%d%s", host, port, path)
 			} else {
 				report.Targets.DNSSDResolved = false
 			}
@@ -510,33 +526,29 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 		supportedJobAttrs = append(supportedJobAttrs, attrs...)
 	}
 
-	// Also check whether job-impressions-completed or media-sheets are reported in raw attributes
-	if len(supportedJobAttrs) > 0 {
-		if containsCaseInsensitive(supportedJobAttrs, "job-impressions-completed") {
-			res.JobProgressSupport.JobImpressionsCompleted = CapabilitySupported
-		} else {
-			res.JobProgressSupport.JobImpressionsCompleted = CapabilityUnsupported
-		}
-		if containsCaseInsensitive(supportedJobAttrs, "job-media-sheets-completed") {
-			res.JobProgressSupport.JobMediaSheetsCompleted = CapabilitySupported
-		} else {
-			res.JobProgressSupport.JobMediaSheetsCompleted = CapabilityUnsupported
-		}
-		if containsCaseInsensitive(supportedJobAttrs, "job-impressions") {
-			res.JobProgressSupport.JobImpressions = CapabilitySupported
-		} else {
-			res.JobProgressSupport.JobImpressions = CapabilityUnsupported
-		}
-		if containsCaseInsensitive(supportedJobAttrs, "job-media-sheets") {
-			res.JobProgressSupport.JobMediaSheets = CapabilitySupported
-		} else {
-			res.JobProgressSupport.JobMediaSheets = CapabilityUnsupported
-		}
-		if containsCaseInsensitive(supportedJobAttrs, "job-pages-completed") {
-			res.JobProgressSupport.JobPagesCompleted = CapabilitySupported
-		} else {
-			res.JobProgressSupport.JobPagesCompleted = CapabilityUnsupported
-		}
+	// Missing entries in attribute lists do NOT imply UNSUPPORTED.
+	// IPP Everywhere requires Get-Job-Attributes to report progress, but printers do not
+	// list job-impressions-completed in job-creation-attributes-supported.
+	// Only set CapabilitySupported on positive evidence; leave as CapabilityUnknown otherwise.
+	if containsCaseInsensitive(supportedJobAttrs, "job-impressions-completed") ||
+		containsCaseInsensitive(res.RawAttributes["job-impressions-completed-supported"], "true") {
+		res.JobProgressSupport.JobImpressionsCompleted = CapabilitySupported
+	}
+	if containsCaseInsensitive(supportedJobAttrs, "job-media-sheets-completed") ||
+		containsCaseInsensitive(res.RawAttributes["job-media-sheets-completed-supported"], "true") {
+		res.JobProgressSupport.JobMediaSheetsCompleted = CapabilitySupported
+	}
+	if containsCaseInsensitive(supportedJobAttrs, "job-impressions") ||
+		containsCaseInsensitive(res.RawAttributes["job-impressions-supported"], "true") {
+		res.JobProgressSupport.JobImpressions = CapabilitySupported
+	}
+	if containsCaseInsensitive(supportedJobAttrs, "job-media-sheets") ||
+		containsCaseInsensitive(res.RawAttributes["job-media-sheets-supported"], "true") {
+		res.JobProgressSupport.JobMediaSheets = CapabilitySupported
+	}
+	if containsCaseInsensitive(supportedJobAttrs, "job-pages-completed") ||
+		containsCaseInsensitive(res.RawAttributes["job-pages-completed-supported"], "true") {
+		res.JobProgressSupport.JobPagesCompleted = CapabilitySupported
 	}
 
 	// Markers / Supplies from IPP
@@ -669,7 +681,9 @@ func buildComparisons(cups *QueueProbeResult, remote *IPPProbeResult) []FeatureC
 
 func evaluateTelemetry(cups *QueueProbeResult, remote *IPPProbeResult, snmp *SNMPProbeResult) TelemetrySummary {
 	summary := TelemetrySummary{
-		Rating: TelemetryRatingAbsent,
+		Rating:                    TelemetryRatingAbsent,
+		PhysicalEjectionVerified:  false, // Read-only capability discovery cannot establish actual ejection correctness
+		SafeForPhysicalCompletion: false, // Read-only discovery cannot prove safe completion or verify post-jam recovery
 	}
 
 	// 1. Check SNMP Marker Odometer and Counter Unit
@@ -695,21 +709,18 @@ func evaluateTelemetry(cups *QueueProbeResult, remote *IPPProbeResult, snmp *SNM
 		}
 	}
 
-	// 3. Rate Telemetry Feasibility
+	// 3. Rate Telemetry Feasibility using explicit available/unverified terminology
 	if summary.IPPMediaSheetsSupported && summary.SNMPMarkerUnitValid {
-		summary.Rating = TelemetryRatingVerifiedFull
-		summary.SafeForPhysicalCompletion = true
+		summary.Rating = TelemetryRatingOdometerAndIPPSheetsAvailable
+		summary.Warnings = append(summary.Warnings, "SNMP marker counter and IPP media sheets are available for active polling; read-only capability discovery cannot establish actual ejection correctness or verify post-jam recovery.")
 	} else if summary.SNMPMarkerUnitValid {
-		summary.Rating = TelemetryRatingVerifiedOdometerOnly
-		summary.SafeForPhysicalCompletion = true
-		summary.Warnings = append(summary.Warnings, "Physical completion verified via SNMP marker counter delta (odometer); IPP job-media-sheets-completed is unavailable.")
+		summary.Rating = TelemetryRatingOdometerAvailable
+		summary.Warnings = append(summary.Warnings, "SNMP marker counter odometer is available for polling, but physical page ejection cannot be verified by read-only discovery; IPP job-media-sheets-completed is unavailable.")
 	} else if cups != nil && cups.QueueStatus != "" {
 		summary.Rating = TelemetryRatingQueueOnly
-		summary.SafeForPhysicalCompletion = false
 		summary.Warnings = append(summary.Warnings, "CUPS queue completed status does NOT verify physical page delivery; marker counter is absent or has unvalidated units.")
 	} else {
 		summary.Rating = TelemetryRatingAbsent
-		summary.SafeForPhysicalCompletion = false
 		summary.Warnings = append(summary.Warnings, "No telemetry or printer monitoring channels are available.")
 	}
 
@@ -726,7 +737,7 @@ func SanitizeReport(rep *FingerprintReport) {
 		return
 	}
 
-	// Redact community string
+	// Community string is NEVER exposed
 	if rep.Targets.SNMPCommunity != "" {
 		rep.Targets.SNMPCommunity = "[REDACTED_COMMUNITY]"
 	}
@@ -740,7 +751,13 @@ func SanitizeReport(rep *FingerprintReport) {
 	if rep.RemoteIPP != nil {
 		rep.RemoteIPP.TargetURI = sanitizeURI(rep.RemoteIPP.TargetURI)
 		rep.RemoteIPP.PrinterName = sanitizeString(rep.RemoteIPP.PrinterName)
+		rep.RemoteIPP.PrinterMakeAndModel = sanitizeString(rep.RemoteIPP.PrinterMakeAndModel)
 		rep.RemoteIPP.PrinterInfo = sanitizeString(rep.RemoteIPP.PrinterInfo)
+		rep.RemoteIPP.StatusCode = sanitizeString(rep.RemoteIPP.StatusCode)
+		rep.RemoteIPP.ProbeError = sanitizeString(rep.RemoteIPP.ProbeError)
+		for i := range rep.RemoteIPP.Alerts {
+			rep.RemoteIPP.Alerts[i] = sanitizeString(rep.RemoteIPP.Alerts[i])
+		}
 		for k, vals := range rep.RemoteIPP.RawAttributes {
 			for i, v := range vals {
 				rep.RemoteIPP.RawAttributes[k][i] = sanitizeString(v)
@@ -751,6 +768,10 @@ func SanitizeReport(rep *FingerprintReport) {
 	// Redact CUPS Queue
 	if rep.CUPSQueue != nil {
 		rep.CUPSQueue.DeviceURI = sanitizeURI(rep.CUPSQueue.DeviceURI)
+		rep.CUPSQueue.QueueStatus = sanitizeString(rep.CUPSQueue.QueueStatus)
+		rep.CUPSQueue.ProbeError = sanitizeString(rep.CUPSQueue.ProbeError)
+		rep.CUPSQueue.Capabilities.PrinterName = sanitizeString(rep.CUPSQueue.Capabilities.PrinterName)
+		rep.CUPSQueue.Capabilities.PrinterMakeAndModel = sanitizeString(rep.CUPSQueue.Capabilities.PrinterMakeAndModel)
 		for k, vals := range rep.CUPSQueue.Capabilities.RawAttributes {
 			for i, v := range vals {
 				rep.CUPSQueue.Capabilities.RawAttributes[k][i] = sanitizeString(v)
@@ -763,6 +784,7 @@ func SanitizeReport(rep *FingerprintReport) {
 		rep.SNMP.TargetHost = sanitizeHostOrIP(rep.SNMP.TargetHost)
 		rep.SNMP.SysDescr = sanitizeString(rep.SNMP.SysDescr)
 		rep.SNMP.PrinterName = sanitizeString(rep.SNMP.PrinterName)
+		rep.SNMP.ProbeError = sanitizeString(rep.SNMP.ProbeError)
 		for i := range rep.SNMP.Covers {
 			rep.SNMP.Covers[i].Description = sanitizeString(rep.SNMP.Covers[i].Description)
 		}
@@ -774,6 +796,11 @@ func SanitizeReport(rep *FingerprintReport) {
 		}
 	}
 
+	// Redact Telemetry Warnings
+	for i := range rep.Telemetry.Warnings {
+		rep.Telemetry.Warnings[i] = sanitizeString(rep.Telemetry.Warnings[i])
+	}
+
 	// Redact Raw Evidence
 	if rep.RawEvidence != nil {
 		sanitizeRawEvidence(rep.RawEvidence)
@@ -781,9 +808,10 @@ func SanitizeReport(rep *FingerprintReport) {
 }
 
 var (
-	macRegex    = regexp.MustCompile(`(?i)\b([0-9a-f]{2}[:-]){5}([0-9a-f]{2})\b`)
-	serialRegex = regexp.MustCompile(`(?i)\b(?:sn|serial|s/n|serialno|vnc)[:= ]*([a-z0-9\-_]{5,})\b`)
-	ipv4Regex   = regexp.MustCompile(`\b(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)\b`)
+	macRegex        = regexp.MustCompile(`(?i)\b([0-9a-f]{2}[:-]){5}([0-9a-f]{2})\b`)
+	serialRegex     = regexp.MustCompile(`(?i)\b(?:sn|serial|s/n|serialno|vnc)[:= ]*([a-z0-9\-_]{5,})\b`)
+	ipv4Regex       = regexp.MustCompile(`\b(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)\b`)
+	credentialRegex = regexp.MustCompile(`(?i)\b(?:community|pass|passwd|password|secret|token)[:= ]*(\S+)\b`)
 )
 
 func sanitizeString(s string) string {
@@ -793,6 +821,7 @@ func sanitizeString(s string) string {
 	s = macRegex.ReplaceAllString(s, "[REDACTED_MAC]")
 	s = serialRegex.ReplaceAllString(s, "SN:[REDACTED_SERIAL]")
 	s = ipv4Regex.ReplaceAllString(s, "[REDACTED_IP]")
+	s = credentialRegex.ReplaceAllString(s, "[REDACTED_CREDENTIAL]")
 	return s
 }
 
@@ -816,8 +845,12 @@ func sanitizeURI(rawURI string) string {
 	if err != nil || u.Host == "" {
 		return sanitizeString(rawURI)
 	}
+	// Always strip credentials from URL userinfo
+	if u.User != nil {
+		u.User = nil
+	}
 	if IsLoopbackHost(u.Hostname()) {
-		return rawURI
+		return u.String()
 	}
 	port := u.Port()
 	if port != "" {
@@ -849,6 +882,8 @@ func sanitizeRawEvidence(evidence map[string]any) {
 				sanitizedMap[subK] = sanitizedSub
 			}
 			evidence[k] = sanitizedMap
+		case map[string]any:
+			sanitizeRawEvidence(val)
 		}
 	}
 }
@@ -937,8 +972,9 @@ func FormatHumanReadable(rep *FingerprintReport) string {
 
 	// Job Progress & Telemetry
 	fmt.Fprintln(&b, "[JOB PROGRESS & PHYSICAL TELEMETRY EVALUATION]")
-	fmt.Fprintf(&b, "  Telemetry Feasibility:       %s\n", rep.Telemetry.Rating)
-	fmt.Fprintf(&b, "  Safe For Physical Delivery:  %v\n", rep.Telemetry.SafeForPhysicalCompletion)
+	fmt.Fprintf(&b, "  Telemetry Rating:            %s\n", rep.Telemetry.Rating)
+	fmt.Fprintf(&b, "  Physical Ejection Verified:  %v (Discovery is read-only; requires active lifecycle validation)\n", rep.Telemetry.PhysicalEjectionVerified)
+	fmt.Fprintf(&b, "  Safe For Physical Delivery:  %v (Discovery is read-only; physical completion unverified)\n", rep.Telemetry.SafeForPhysicalCompletion)
 	fmt.Fprintf(&b, "  IPP impressions-completed:   %s\n", progressCapStr(rep.RemoteIPP, "impressions"))
 	fmt.Fprintf(&b, "  IPP media-sheets-completed:  %s\n", progressCapStr(rep.RemoteIPP, "sheets"))
 	if rep.Telemetry.HasSNMPMarkerCounter {
