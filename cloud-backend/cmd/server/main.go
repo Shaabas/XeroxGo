@@ -480,7 +480,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pinExpiresAt := time.Now().UTC().Add(2 * time.Hour)
+	// Unpaid paper must not be held for hours when a customer abandons checkout.
+	// The mobile checkout already communicates a 15-minute PIN lifetime.
+	pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
 
 	cmd := contracts.PrintJobCommand{
 		JobID:            docs[0].JobID,
