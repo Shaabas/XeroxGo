@@ -121,3 +121,84 @@ func TestPaymentWebhook_KnownAttemptWrongAmountCreatesRefundOnly(t *testing.T) {
 		t.Fatalf("wrong amount missing from financial ledger: %+v %v",ready,err)
 	}
 }
+
+func TestRefundWorker_PaidWaitingNeverExpiresByAgeOrSession(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "paid_no_timeout.db")
+	st, err := store.Open(dbPath)
+	if err != nil { t.Fatal(err) }
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().UTC()
+	const orderID, kioskID = "ord_paid_no_timeout", "kiosk_paid_no_timeout"
+	order := store.Order{
+		OrderID: orderID,
+		Status: contracts.JobStatusPendingPayment,
+		PricePaise: 400,
+		PINExpiresAt: now.Add(5 * time.Minute),
+		Command: contracts.PrintJobCommand{
+			JobID: "job_paid_no_timeout", OrderID: orderID, KioskID: kioskID,
+			DisplayCode: "5139", TotalPages: 2, TotalSheets: 2,
+			Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+		},
+	}
+	if err := st.CreateOrder(ctx, order); err != nil { t.Fatal(err) }
+
+	// Record a genuine captured payment from long before the worker runs.
+	// There is no active kiosk session or dispatch intent. The old worker
+	// would classify this otherwise healthy order as PAUSED_ERROR and refund it.
+	past := now.Add(-15 * time.Minute)
+	capture, err := st.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID: "pay_paid_no_timeout", OrderID: orderID, KioskID: kioskID,
+		AmountPaise: 400, Provider: "mock", Status: "captured",
+	}, past)
+	if err != nil { t.Fatal(err) }
+	if capture.DispatchEligible || capture.OrderStatus != contracts.JobStatusPaidWaiting {
+		t.Fatalf("late waiting capture unexpectedly dispatched: %+v", capture)
+	}
+	mock := payments.NewMockProvider("paid_no_timeout")
+	app := &appServer{
+		cfg: &serverConfig{webhookSecret: []byte("paid_no_timeout")},
+		db: st, paymentProvider: mock,
+	}
+	for i := 0; i < 3; i++ {
+		if err := app.processRefundsOnce(ctx); err != nil { t.Fatalf("worker pass %d: %v",i,err) }
+	}
+	if mock.RefundedCount != 0 {
+		t.Fatalf("worker refunded healthy paid order solely because of elapsed time: %d", mock.RefundedCount)
+	}
+	refund, err := st.GetRefundRequest(ctx, orderID)
+	if err != nil || refund != nil {
+		t.Fatalf("healthy paid waiting has an unexpected refund obligation: %+v %v", refund, err)
+	}
+	stored, err := st.GetOrder(ctx, orderID)
+	if err != nil || stored.Status != contracts.JobStatusPaidWaiting || stored.PINExpiresAt.Year() != 2100 {
+		t.Fatalf("worker revoked paid fulfillment/PIN: %+v %v", stored, err)
+	}
+	committed, err := st.GetCommittedPaperSheets(ctx, kioskID, "", now)
+	if err != nil || committed != 2 {
+		t.Fatalf("worker released paid paper commitment: %d %v",committed,err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/orders/"+orderID+"/status",nil)
+	w := httptest.NewRecorder()
+	app.handleOrderStatus(w,req)
+	if w.Code != http.StatusOK { t.Fatalf("status request failed: %d",w.Code) }
+	var state map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(),&state);err!=nil{t.Fatal(err)}
+	if state["status"] != string(contracts.JobStatusPaidWaiting) {
+		t.Fatalf("customer status hides recoverable paid order: %+v", state)
+	}
+
+	// Explicit failure does still enter the normal safe-stop-gated refund
+	// lifecycle; a mere elapsed deadline never manufactures the obligation.
+	if err := st.RecordRefundRequired(ctx,orderID); err != nil { t.Fatal(err) }
+	if err := app.processRefundsOnce(ctx); err != nil { t.Fatal(err) }
+	if mock.RefundedCount != 0 {
+		t.Fatal("unsafe terminal refund was sent without physical safe-stop")
+	}
+	if err := st.ConfirmRefundSafeStop(ctx,orderID); err != nil { t.Fatal(err) }
+	if err := app.processRefundsOnce(ctx); err != nil { t.Fatal(err) }
+	if mock.RefundedCount != 1 {
+		t.Fatalf("explicit safely stopped failure did not refund exactly once: %d",mock.RefundedCount)
+	}
+}
