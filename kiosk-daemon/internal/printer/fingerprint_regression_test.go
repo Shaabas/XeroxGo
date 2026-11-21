@@ -174,9 +174,33 @@ func TestRegression_SNMPMarker_DeterministicCounterSelection(t *testing.T) {
 // Strengthen credential and identifier sanitization: public/private IPv4, IPv6, DNS-SD UUIDs, URI query secrets,
 // raw evidence and errors. Never serialize URL credentials, even with -redact=false.
 func TestRegression_Credentials_NeverSerializedAndSanitization(t *testing.T) {
-	// Case 3A: With Redact = false, URL userinfo and SNMP community MUST NEVER be serialized
+	// Case 3A: Direct test of stripURLCredentials
+	// Must remove sensitive URL query parameters as well as userinfo, regardless of -redact.
+	// Must preserve harmless query parameters.
+	testRawURI := "ipp://admin:secretpass123@192.168.1.50:631/ipp/print?version=2.0&token=tok_secret456&format=pdf&auth_token=super_auth_token&wait=false"
+	strippedURI := stripURLCredentials(testRawURI)
+	if strings.Contains(strippedURI, "secretpass123") || strings.Contains(strippedURI, "admin:") {
+		t.Fatalf("stripURLCredentials leaked userinfo: %s", strippedURI)
+	}
+	if strings.Contains(strippedURI, "tok_secret456") || strings.Contains(strippedURI, "token=") {
+		t.Fatalf("stripURLCredentials leaked token query param: %s", strippedURI)
+	}
+	if strings.Contains(strippedURI, "super_auth_token") || strings.Contains(strippedURI, "auth_token=") {
+		t.Fatalf("stripURLCredentials leaked auth_token query param: %s", strippedURI)
+	}
+	if !strings.Contains(strippedURI, "version=2.0") {
+		t.Fatalf("stripURLCredentials dropped harmless query parameter version=2.0: %s", strippedURI)
+	}
+	if !strings.Contains(strippedURI, "format=pdf") {
+		t.Fatalf("stripURLCredentials dropped harmless query parameter format=pdf: %s", strippedURI)
+	}
+	if !strings.Contains(strippedURI, "wait=false") {
+		t.Fatalf("stripURLCredentials dropped harmless query parameter wait=false: %s", strippedURI)
+	}
+
+	// Case 3B: With Redact = false, URL userinfo and ?token=... MUST NEVER be serialized
 	cfgUnredacted := FingerprintConfig{
-		RemoteIPPURI:  "ipp://admin:secretpass123@8.8.8.8:631/ipp/print",
+		RemoteIPPURI:  "ipp://admin:secretpass123@8.8.8.8:631/ipp/print?version=2.0&token=tok_secret456&format=pdf",
 		SNMPHost:      "8.8.8.8",
 		SNMPPort:      161,
 		SNMPCommunity: "my_secret_snmp_community",
@@ -205,6 +229,12 @@ func TestRegression_Credentials_NeverSerializedAndSanitization(t *testing.T) {
 	if strings.Contains(repUnredacted.Targets.RemoteIPPURI, "secretpass123") || strings.Contains(repUnredacted.Targets.RemoteIPPURI, "admin:") {
 		t.Fatalf("CRITICAL SECURITY DEFECT: URL credentials leaked into Targets.RemoteIPPURI with Redact=false: %s", repUnredacted.Targets.RemoteIPPURI)
 	}
+	if strings.Contains(repUnredacted.Targets.RemoteIPPURI, "tok_secret456") || strings.Contains(repUnredacted.Targets.RemoteIPPURI, "token=") {
+		t.Fatalf("CRITICAL SECURITY DEFECT: URL ?token=... leaked into Targets.RemoteIPPURI with Redact=false: %s", repUnredacted.Targets.RemoteIPPURI)
+	}
+	if !strings.Contains(repUnredacted.Targets.RemoteIPPURI, "version=2.0") || !strings.Contains(repUnredacted.Targets.RemoteIPPURI, "format=pdf") {
+		t.Fatalf("Targets.RemoteIPPURI must preserve harmless query parameters: %s", repUnredacted.Targets.RemoteIPPURI)
+	}
 	if repUnredacted.Targets.SNMPCommunity != "[REDACTED_COMMUNITY]" {
 		t.Fatalf("Targets.SNMPCommunity must be '[REDACTED_COMMUNITY]' even when Redact=false, got %q", repUnredacted.Targets.SNMPCommunity)
 	}
@@ -217,11 +247,48 @@ func TestRegression_Credentials_NeverSerializedAndSanitization(t *testing.T) {
 	if strings.Contains(jsonStr, "secretpass123") {
 		t.Fatalf("CRITICAL SECURITY DEFECT: URL password leaked into JSON output with Redact=false!")
 	}
+	if strings.Contains(jsonStr, "tok_secret456") {
+		t.Fatalf("CRITICAL SECURITY DEFECT: URL token leaked into JSON output with Redact=false!")
+	}
 	if strings.Contains(jsonStr, "my_secret_snmp_community") {
 		t.Fatalf("CRITICAL SECURITY DEFECT: SNMP community leaked into JSON output with Redact=false!")
 	}
 
-	// Case 3B: With Redact = true, test comprehensive sanitization:
+	// Case 3C: CUPS device URI containing credentials with Redact = false
+	mockRunnerCUPSCreds := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" && len(args) >= 2 && args[0] == "-v" {
+			return []byte("device for HPTank: ipp://cups_admin:cups_pass999@10.0.1.50:631/printers/hp?auth_token=super_cups_token&wait=false\n"), nil
+		}
+		return nil, errors.New("mock runner fallback")
+	}
+
+	cfgCUPSCreds := FingerprintConfig{
+		QueueName: "HPTank",
+		Redact:    false,
+	}
+
+	repCUPSCreds, err := RunFingerprint(context.Background(), mockRunnerCUPSCreds, mockSNMPFact, cfgCUPSCreds)
+	if err != nil {
+		t.Fatalf("RunFingerprint error: %v", err)
+	}
+	if repCUPSCreds.CUPSQueue == nil {
+		t.Fatalf("expected CUPSQueue in report")
+	}
+	if strings.Contains(repCUPSCreds.CUPSQueue.DeviceURI, "cups_admin") ||
+		strings.Contains(repCUPSCreds.CUPSQueue.DeviceURI, "cups_pass999") ||
+		strings.Contains(repCUPSCreds.CUPSQueue.DeviceURI, "auth_token") ||
+		strings.Contains(repCUPSCreds.CUPSQueue.DeviceURI, "super_cups_token") {
+		t.Fatalf("CRITICAL SECURITY DEFECT: QueueProbeResult.DeviceURI exposed credentials with Redact=false: %s", repCUPSCreds.CUPSQueue.DeviceURI)
+	}
+	if !strings.Contains(repCUPSCreds.CUPSQueue.DeviceURI, "wait=false") {
+		t.Fatalf("QueueProbeResult.DeviceURI must preserve harmless query parameter wait=false, got: %s", repCUPSCreds.CUPSQueue.DeviceURI)
+	}
+	if strings.Contains(repCUPSCreds.Targets.QueueDeviceURI, "cups_pass999") ||
+		strings.Contains(repCUPSCreds.Targets.QueueDeviceURI, "super_cups_token") {
+		t.Fatalf("Targets.QueueDeviceURI exposed credentials with Redact=false: %s", repCUPSCreds.Targets.QueueDeviceURI)
+	}
+
+	// Case 3D: With Redact = true, test comprehensive sanitization:
 	// Public IPv4 (8.8.8.8), private IPv4 (10.0.1.25), IPv6 (2001:db8::1), UUIDs, query secrets, nested evidence, errors
 	repToSanitize := &FingerprintReport{
 		Targets: TargetConfig{
@@ -523,7 +590,61 @@ func TestRegression_IPP_FailedObservationsNeverYieldUnsupportedOrVerifiedProgres
 		t.Errorf("expected rating ABSENT, got %s", telemFailed.Rating)
 	}
 
-	// Case 6B: IPP returns client-error status (e.g. client-error-not-found)
+	// Case 6B: Failed ipptool query with nonempty partial attributes
+	// Must NOT derive supported/unsupported capabilities from partial output when ipptool returns an error.
+	// Failure details and sanitized raw evidence must be preserved, but unverified capabilities must remain UNKNOWN.
+	partialRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		partialOut := []byte(`"/usr/share/cups/ipptool/get-printer-attributes.test":
+    status-code = successful-ok
+    printer-name = "PartialPrinter"
+    printer-make-and-model = "Partial HP Device"
+    document-format-supported = "application/postscript"
+    media-supported = "iso_a4_210x297mm"
+    sides-supported = "one-sided"
+    print-color-mode-supported = "monochrome"
+    job-creation-attributes-supported = "job-impressions-completed"
+`)
+		return partialOut, errors.New("connection reset by peer: ipptool command exited with status 1")
+	}
+
+	resPartial := probeRemoteIPP(context.Background(), partialRunner, "ipp://192.168.1.50:631/ipp/print")
+	if !strings.Contains(resPartial.ProbeError, "connection reset by peer") {
+		t.Errorf("expected failure details in ProbeError, got: %s", resPartial.ProbeError)
+	}
+	// Raw evidence MUST be preserved
+	if len(resPartial.RawAttributes["document-format-supported"]) == 0 {
+		t.Errorf("expected raw attributes to be preserved in RawAttributes on partial failure")
+	}
+	if resPartial.PrinterName != "PartialPrinter" {
+		t.Errorf("expected printer name 'PartialPrinter' from partial output, got %q", resPartial.PrinterName)
+	}
+	// Capabilities MUST remain UNKNOWN, NOT supported or unsupported!
+	if resPartial.PDFSupport != CapabilityUnknown {
+		t.Errorf("expected PDFSupport = CapabilityUnknown on partial error, got %s", resPartial.PDFSupport)
+	}
+	if resPartial.PWGRasterSupport != CapabilityUnknown {
+		t.Errorf("expected PWGRasterSupport = CapabilityUnknown on partial error, got %s", resPartial.PWGRasterSupport)
+	}
+	if resPartial.A4Support != CapabilityUnknown {
+		t.Errorf("expected A4Support = CapabilityUnknown on partial error, got %s", resPartial.A4Support)
+	}
+	if resPartial.ColorSupport != CapabilityUnknown {
+		t.Errorf("expected ColorSupport = CapabilityUnknown on partial error, got %s", resPartial.ColorSupport)
+	}
+	if resPartial.MonochromeSupport != CapabilityUnknown {
+		t.Errorf("expected MonochromeSupport = CapabilityUnknown on partial error, got %s", resPartial.MonochromeSupport)
+	}
+	if resPartial.SimplexSupport != CapabilityUnknown {
+		t.Errorf("expected SimplexSupport = CapabilityUnknown on partial error, got %s", resPartial.SimplexSupport)
+	}
+	if resPartial.DuplexLongEdge != CapabilityUnknown {
+		t.Errorf("expected DuplexLongEdge = CapabilityUnknown on partial error, got %s", resPartial.DuplexLongEdge)
+	}
+	if resPartial.JobProgressSupport.JobImpressionsCompleted != CapabilityUnknown {
+		t.Errorf("expected JobImpressionsCompleted = CapabilityUnknown on partial error, got %s", resPartial.JobProgressSupport.JobImpressionsCompleted)
+	}
+
+	// Case 6C: IPP returns client-error status (e.g. client-error-not-found)
 	errorStatusRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		return []byte(`"/usr/share/cups/ipptool/get-printer-attributes.test":
     status-code = client-error-not-found
@@ -541,7 +662,7 @@ func TestRegression_IPP_FailedObservationsNeverYieldUnsupportedOrVerifiedProgres
 		t.Errorf("job progress must remain UNKNOWN on error status response")
 	}
 
-	// Case 6C: IPP response is successful-ok, but document-format-supported is omitted entirely
+	// Case 6D: IPP response is successful-ok, but document-format-supported is omitted entirely
 	missingFormatsRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		return []byte(`"/usr/share/cups/ipptool/get-printer-attributes.test":
     status-code = successful-ok
@@ -558,5 +679,56 @@ func TestRegression_IPP_FailedObservationsNeverYieldUnsupportedOrVerifiedProgres
 	// Media was provided, so A4 is CapabilitySupported
 	if resMissing.A4Support != CapabilitySupported {
 		t.Errorf("A4Support must be CapabilitySupported, got %s", resMissing.A4Support)
+	}
+
+	// Case 6E: Successful IPP response still produces valid capabilities
+	successRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return []byte(`"/usr/share/cups/ipptool/get-printer-attributes.test":
+    status-code = successful-ok
+    printer-name = "HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)"
+    printer-make-and-model = "HP LaserJet Tank 1020w"
+    printer-state = 3
+    printer-is-accepting-jobs = true
+    document-format-supported = "application/pdf,image/pwg-raster,image/urf"
+    media-supported = "iso_a4_210x297mm,na_letter_8.5x11in"
+    sides-supported = "one-sided"
+    print-color-mode-supported = "monochrome"
+    job-creation-attributes-supported = "job-impressions-completed,job-media-sheets-completed"
+`), nil
+	}
+
+	resSuccess := probeRemoteIPP(context.Background(), successRunner, "ipp://192.168.1.50:631/ipp/print")
+	if resSuccess.ProbeError != "" {
+		t.Errorf("unexpected ProbeError on successful response: %s", resSuccess.ProbeError)
+	}
+	if resSuccess.PDFSupport != CapabilitySupported {
+		t.Errorf("expected PDFSupport = CapabilitySupported, got %s", resSuccess.PDFSupport)
+	}
+	if resSuccess.PWGRasterSupport != CapabilitySupported {
+		t.Errorf("expected PWGRasterSupport = CapabilitySupported, got %s", resSuccess.PWGRasterSupport)
+	}
+	if resSuccess.URFSupport != CapabilitySupported {
+		t.Errorf("expected URFSupport = CapabilitySupported, got %s", resSuccess.URFSupport)
+	}
+	if resSuccess.A4Support != CapabilitySupported {
+		t.Errorf("expected A4Support = CapabilitySupported, got %s", resSuccess.A4Support)
+	}
+	if resSuccess.ColorSupport != CapabilityUnsupported {
+		t.Errorf("expected ColorSupport = CapabilityUnsupported, got %s", resSuccess.ColorSupport)
+	}
+	if resSuccess.MonochromeSupport != CapabilitySupported {
+		t.Errorf("expected MonochromeSupport = CapabilitySupported, got %s", resSuccess.MonochromeSupport)
+	}
+	if resSuccess.SimplexSupport != CapabilitySupported {
+		t.Errorf("expected SimplexSupport = CapabilitySupported, got %s", resSuccess.SimplexSupport)
+	}
+	if resSuccess.DuplexLongEdge != CapabilityUnsupported {
+		t.Errorf("expected DuplexLongEdge = CapabilityUnsupported, got %s", resSuccess.DuplexLongEdge)
+	}
+	if resSuccess.JobProgressSupport.JobImpressionsCompleted != CapabilitySupported {
+		t.Errorf("expected JobImpressionsCompleted = CapabilitySupported, got %s", resSuccess.JobProgressSupport.JobImpressionsCompleted)
+	}
+	if resSuccess.JobProgressSupport.JobMediaSheetsCompleted != CapabilitySupported {
+		t.Errorf("expected JobMediaSheetsCompleted = CapabilitySupported, got %s", resSuccess.JobProgressSupport.JobMediaSheetsCompleted)
 	}
 }

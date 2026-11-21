@@ -344,9 +344,9 @@ func probeCUPSQueue(ctx context.Context, runner CommandRunner, queue string) *Qu
 	if out, err := runner(ctx, "lpstat", "-v", queue); err == nil {
 		line := strings.TrimSpace(string(out))
 		if idx := strings.Index(line, ":"); idx != -1 {
-			res.DeviceURI = strings.TrimSpace(line[idx+1:])
+			res.DeviceURI = stripURLCredentials(strings.TrimSpace(line[idx+1:]))
 		} else {
-			res.DeviceURI = line
+			res.DeviceURI = stripURLCredentials(line)
 		}
 	}
 
@@ -425,9 +425,6 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 	out, err := runner(ctx, "ipptool", "-tv", remoteURI, "get-printer-attributes.test")
 	if err != nil {
 		res.ProbeError = fmt.Sprintf("ipptool query failed for remote IPP URI: %v", err)
-		if len(out) == 0 {
-			return res
-		}
 	}
 
 	// Parse raw attributes
@@ -459,8 +456,24 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 		}
 	}
 
-	// Identity
-	res.StatusCode = singleAttrs["status-code"]
+	// Capture identity and status metadata if available in output
+	res.StatusCode = strings.Trim(strings.TrimSpace(singleAttrs["status-code"]), `"`)
+	if v, ok := singleAttrs["printer-name"]; ok {
+		res.PrinterName = strings.Trim(strings.TrimSpace(v), `"`)
+	}
+	if v, ok := singleAttrs["printer-make-and-model"]; ok {
+		res.PrinterMakeAndModel = strings.Trim(strings.TrimSpace(v), `"`)
+	}
+	if v, ok := singleAttrs["printer-info"]; ok {
+		res.PrinterInfo = strings.Trim(strings.TrimSpace(v), `"`)
+	}
+
+	// When ipptool execution fails (err != nil), do not derive supported/unsupported capabilities from partial output.
+	// Failure details and sanitized raw evidence are preserved, but all unverified capabilities remain UNKNOWN.
+	if err != nil {
+		return res
+	}
+
 	scLower := strings.ToLower(res.StatusCode)
 	if strings.HasPrefix(scLower, "client-error") || strings.HasPrefix(scLower, "server-error") {
 		if res.ProbeError == "" {
@@ -472,10 +485,6 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 	if len(singleAttrs) == 0 && res.ProbeError != "" {
 		return res
 	}
-
-	res.PrinterName = singleAttrs["printer-name"]
-	res.PrinterMakeAndModel = singleAttrs["printer-make-and-model"]
-	res.PrinterInfo = singleAttrs["printer-info"]
 
 	// State & reasons
 	if v, ok := singleAttrs["printer-state"]; ok {
@@ -900,18 +909,66 @@ var (
 	credentialRegex  = regexp.MustCompile(`(?i)\b(?:community|pass|passwd|password|secret|token)[:= ]*(\S+)\b`)
 )
 
+func isSensitiveQueryKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if k == "" {
+		return false
+	}
+	if k == "token" || k == "secret" || k == "password" || k == "passwd" || k == "pass" || k == "pwd" ||
+		k == "auth" || k == "key" || k == "apikey" || k == "api_key" || k == "credential" || k == "credentials" ||
+		k == "signature" || k == "sig" {
+		return true
+	}
+	parts := strings.FieldsFunc(k, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	})
+	for _, p := range parts {
+		if p == "token" || p == "secret" || p == "password" || p == "passwd" || p == "pass" || p == "pwd" ||
+			p == "auth" || p == "key" || p == "apikey" || p == "cred" || p == "credential" || p == "credentials" {
+			return true
+		}
+	}
+	if strings.Contains(k, "token") || strings.Contains(k, "secret") || strings.Contains(k, "password") ||
+		strings.Contains(k, "passwd") || strings.Contains(k, "auth") || strings.Contains(k, "apikey") ||
+		strings.Contains(k, "api_key") || strings.Contains(k, "credential") {
+		return true
+	}
+	return false
+}
+
 func stripURLCredentials(rawURI string) string {
 	rawURI = strings.TrimSpace(rawURI)
 	if rawURI == "" {
 		return ""
 	}
-	u, err := url.Parse(rawURI)
-	if err == nil && u.Host != "" {
-		u.User = nil
-		return u.String()
-	}
 	credRegex := regexp.MustCompile(`(?i)(://)(?:[^:/@\s]+(?::[^/@\s]*)?@)`)
-	return credRegex.ReplaceAllString(rawURI, "$1")
+	rawURI = credRegex.ReplaceAllString(rawURI, "$1")
+
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	u.User = nil
+
+	if u.RawQuery != "" {
+		var keptParams []string
+		pairs := strings.FieldsFunc(u.RawQuery, func(r rune) bool {
+			return r == '&' || r == ';'
+		})
+		for _, pair := range pairs {
+			if pair == "" {
+				continue
+			}
+			parts := strings.SplitN(pair, "=", 2)
+			paramKey := parts[0]
+			if !isSensitiveQueryKey(paramKey) {
+				keptParams = append(keptParams, pair)
+			}
+		}
+		u.RawQuery = strings.Join(keptParams, "&")
+	}
+
+	return u.String()
 }
 
 func sanitizeString(s string) string {
