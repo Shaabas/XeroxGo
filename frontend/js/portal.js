@@ -2185,7 +2185,14 @@
     }
 
     if (checkoutStatusMsg) {
-      if (st === 'PRINTING') {
+      if (st === 'DISPATCHED' && statusData.dispatch_pending) {
+        const waiting = Math.max(0, Number(statusData.documents_awaiting_delivery) || 0);
+        checkoutStatusMsg.textContent = waiting > 1
+          ? `Payment confirmed. Waiting for kiosk delivery of ${waiting} document commands...`
+          : 'Payment confirmed. Your print job is queued for kiosk delivery.';
+      } else if (st === 'DISPATCHED') {
+        checkoutStatusMsg.textContent = 'Payment confirmed. The kiosk is preparing your print order.';
+      } else if (st === 'PRINTING') {
         const docProgress = totalDocs > 1 ? ` (${completedDocs}/${totalDocs} documents finished)` : '';
         checkoutStatusMsg.textContent = `Printing: ${statusData.pages_printed || 0} of ${statusData.total_pages || 1} pages${docProgress}...`;
       } else if (st === 'COMPLETED') {
