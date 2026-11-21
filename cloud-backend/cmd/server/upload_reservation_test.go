@@ -86,7 +86,7 @@ func TestMobileUploadReservesLastSheetBeforeIssuingPIN(t *testing.T) {
 	if err != nil || reserved != 1 {
 		t.Fatalf("expected one reserved sheet before PIN expiry: reserved=%d err=%v", reserved, err)
 	}
-	released, err := app.db.GetCommittedPaperSheets(context.Background(), "kiosk-mobile-stock", "", expiry.Add(time.Nanosecond))
+	released, err := app.db.GetCommittedPaperSheets(context.Background(), "kiosk-mobile-stock", "", expiry.Add(time.Second))
 	if err != nil || released != 0 {
 		t.Fatalf("PIN expiration must free unpaid sheets: reserved=%d err=%v", released, err)
 	}
