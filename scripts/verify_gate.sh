@@ -169,9 +169,13 @@ if ! node --check frontend/js/portal.js; then
     echo "ERROR: node --check frontend/js/portal.js failed."
     gate6_passed=false
 fi
+if ! node --check frontend/js/estimator_test.js; then
+    echo "ERROR: node --check frontend/js/estimator_test.js failed."
+    gate6_passed=false
+fi
 
 echo "Running frontend test suite..."
-if ! node --test frontend/js/conversion_test.js frontend/js/pricing_test.js; then
+if ! node --test frontend/js/conversion_test.js frontend/js/pricing_test.js frontend/js/estimator_test.js; then
     echo "ERROR: Frontend tests failed."
     gate6_passed=false
 fi

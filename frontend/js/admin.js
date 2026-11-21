@@ -3,7 +3,152 @@
   'use strict';
 
   // --- Session & Auth State ---
-  let authToken = localStorage.getItem('xeroxgo_admin_token') || '';
+  let authToken = '';
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      authToken = window.localStorage.getItem('xeroxgo_admin_token') || '';
+    } catch (_) {
+      authToken = '';
+    }
+  }
+
+  // --- Estimator Math & Parsing Helpers ---
+  function parsePositiveInteger(val) {
+    if (val === null || val === undefined) return null;
+    if (typeof val === 'number') {
+      return (Number.isSafeInteger(val) && val > 0) ? val : null;
+    }
+    const str = String(val).trim();
+    if (!/^\d+$/.test(str)) return null;
+    const n = parseInt(str, 10);
+    if (!Number.isSafeInteger(n) || n <= 0) return null;
+    const normalizedStr = str.replace(/^0+/, '') || '0';
+    if (String(n) !== normalizedStr) return null;
+    return n;
+  }
+
+  function parseRupeesToPaise(valStr) {
+    if (valStr === null || valStr === undefined) return null;
+    const trimmed = String(valStr).trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
+      return null;
+    }
+    const parts = trimmed.split('.');
+    const r = parseInt(parts[0], 10);
+    if (!Number.isSafeInteger(r) || r < 0) return null;
+    const p = parts.length > 1 ? parseInt(parts[1].padEnd(2, '0'), 10) : 0;
+    if (!Number.isSafeInteger(p) || p < 0 || p > 99) return null;
+
+    const totalPaise = (r * 100) + p;
+    if (!Number.isSafeInteger(totalPaise) || totalPaise <= 0) {
+      return null;
+    }
+    return totalPaise;
+  }
+
+  function calculateEstimate(opts) {
+    const failClosed = {
+      valid: false,
+      printedSidesPerCopy: null,
+      totalSheets: null,
+      totalCostPaise: null,
+      printedSidesDisplay: '--',
+      sheetsDisplay: '--',
+      totalCostDisplay: '--'
+    };
+
+    if (!opts) {
+      return failClosed;
+    }
+
+    const pages = parsePositiveInteger(opts.pages);
+    const copies = parsePositiveInteger(opts.copies);
+    const nUp = (opts.nUp === 2 || opts.nUp === '2') ? 2 : 1;
+    const isDuplex = (opts.sides === 'double' || opts.sides === 'duplex');
+    const isColor = (opts.mode === 'color');
+
+    if (pages === null || copies === null) {
+      return failClosed;
+    }
+
+    // Intermediate 1: Imposed printed sides per copy
+    const imposedSidesPerCopy = Math.ceil(pages / nUp);
+    if (!Number.isSafeInteger(imposedSidesPerCopy) || imposedSidesPerCopy <= 0) {
+      return failClosed;
+    }
+
+    // Intermediate 2: Sheets per copy
+    const sheetsPerCopy = isDuplex ? Math.ceil(imposedSidesPerCopy / 2) : imposedSidesPerCopy;
+    if (!Number.isSafeInteger(sheetsPerCopy) || sheetsPerCopy <= 0) {
+      return failClosed;
+    }
+
+    // Intermediate 3: Sheets × copies
+    const totalSheets = sheetsPerCopy * copies;
+    if (!Number.isSafeInteger(totalSheets) || totalSheets <= 0) {
+      return failClosed;
+    }
+
+    // Physical calculations are valid: prepare response with valid sheet counts
+    const rates = opts.rates || {};
+    const simplexRate = isColor ? rates.colorSimplex : rates.bwSimplex;
+    const duplexRate = isColor ? rates.colorDuplex : rates.bwDuplex;
+
+    let totalCostPaise = null;
+    let totalCostDisplay = '--';
+
+    const isSafePositivePaise = (r) => (typeof r === 'number' && Number.isSafeInteger(r) && r > 0);
+    const validSimplex = isSafePositivePaise(simplexRate);
+    const validDuplex = isSafePositivePaise(duplexRate);
+
+    if (!isDuplex) {
+      if (validSimplex) {
+        // Intermediate 4: Cost per copy for simplex
+        const costPerCopyPaise = imposedSidesPerCopy * simplexRate;
+        if (Number.isSafeInteger(costPerCopyPaise) && costPerCopyPaise > 0) {
+          // Final: Total cost × copies
+          const total = costPerCopyPaise * copies;
+          if (Number.isSafeInteger(total) && total > 0) {
+            totalCostPaise = total;
+            totalCostDisplay = '₹' + (totalCostPaise / 100).toFixed(2);
+          }
+        }
+      }
+    } else {
+      if (validSimplex && validDuplex) {
+        // Intermediate 4: Full duplex sheets × duplex rate
+        const fullSheets = Math.floor(imposedSidesPerCopy / 2);
+        const fullSheetsCost = fullSheets * duplexRate;
+        // Intermediate 5: Odd simplex side × simplex rate
+        const oddSides = imposedSidesPerCopy % 2;
+        const oddSidesCost = oddSides * simplexRate;
+
+        if (Number.isSafeInteger(fullSheetsCost) && fullSheetsCost >= 0 &&
+            Number.isSafeInteger(oddSidesCost) && oddSidesCost >= 0) {
+          // Intermediate 6: Cost per copy
+          const costPerCopyPaise = fullSheetsCost + oddSidesCost;
+          if (Number.isSafeInteger(costPerCopyPaise) && costPerCopyPaise > 0) {
+            // Final: Total cost × copies
+            const total = costPerCopyPaise * copies;
+            if (Number.isSafeInteger(total) && total > 0) {
+              totalCostPaise = total;
+              totalCostDisplay = '₹' + (totalCostPaise / 100).toFixed(2);
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      valid: true,
+      printedSidesPerCopy: imposedSidesPerCopy,
+      totalSheets: totalSheets,
+      totalCostPaise: totalCostPaise,
+      printedSidesDisplay: String(imposedSidesPerCopy),
+      sheetsDisplay: String(totalSheets),
+      totalCostDisplay: totalCostDisplay
+    };
+  }
 
   // --- API Request Helper ---
   async function apiRequest(endpoint, options = {}) {
@@ -30,6 +175,14 @@
 
   // Helper to safely parse JSON responses
   async function parseResponseJSON(response) {
+    if (!response) return {};
+    if (typeof response.json === 'function' && typeof response.text !== 'function') {
+      try {
+        return await response.json();
+      } catch (_) {
+        return {};
+      }
+    }
     const text = await response.text();
     if (!text || text.trim() === '') {
       return {};
@@ -39,6 +192,267 @@
     } catch (_) {
       return { error: text.trim() };
     }
+  }
+
+  // --- Pricing Controller & Estimator Initialization ---
+  function initPricingController(context = {}) {
+    const doc = context.document || (typeof document !== 'undefined' ? document : null);
+    const api = context.apiRequest || (typeof apiRequest !== 'undefined' ? apiRequest : fetch);
+    const toast = context.showToast || (typeof showToast !== 'undefined' ? showToast : () => {});
+    const alertFn = context.alert || (typeof alert !== 'undefined' ? alert : () => {});
+
+    if (!doc) return null;
+
+    const pricingForm = doc.getElementById('pricing-form');
+    const priceBwSimplexInput = doc.getElementById('price-bw-simplex-input');
+    const priceBwDuplexInput = doc.getElementById('price-bw-duplex-input');
+    const priceColorSimplexInput = doc.getElementById('price-color-simplex-input');
+    const priceColorDuplexInput = doc.getElementById('price-color-duplex-input');
+    const pricingColorEnabledToggle = doc.getElementById('pricing-color-enabled-toggle');
+    const pricingSaveBtn = doc.getElementById('pricing-save-btn');
+
+    const calcPagesInput = doc.getElementById('calc-pages-input');
+    const calcCopiesInput = doc.getElementById('calc-copies-input');
+    const calcNupSelect = doc.getElementById('calc-nup-select');
+    const calcSidesSelect = doc.getElementById('calc-sides-select');
+    const calcModeSelect = doc.getElementById('calc-mode-select');
+
+    const calcResultSides = doc.getElementById('calc-result-sides');
+    const calcResultSheets = doc.getElementById('calc-result-sheets');
+    const calcResultTotal = doc.getElementById('calc-result-total');
+
+    let currentBWSimplexPaise = null;
+    let currentBWDuplexPaise = null;
+    let currentColorSimplexPaise = null;
+    let currentColorDuplexPaise = null;
+    let currentColorEnabled = false;
+
+    function getEffectiveRatePaise(inputEl, fallbackPaise) {
+      if (inputEl) {
+        const str = inputEl.value !== undefined && inputEl.value !== null ? String(inputEl.value).trim() : '';
+        if (str === '') {
+          return null;
+        }
+        return parseRupeesToPaise(str);
+      }
+      return fallbackPaise;
+    }
+
+    function syncColorInputsState() {
+      const isColorEnabled = pricingColorEnabledToggle ? Boolean(pricingColorEnabledToggle.checked) : false;
+      if (priceColorSimplexInput) {
+        priceColorSimplexInput.disabled = !isColorEnabled;
+      }
+      if (priceColorDuplexInput) {
+        priceColorDuplexInput.disabled = !isColorEnabled;
+      }
+    }
+
+    function updateCostEstimator() {
+      if (!calcPagesInput) return;
+
+      const bwSimplexPaise = getEffectiveRatePaise(priceBwSimplexInput, currentBWSimplexPaise);
+      const bwDuplexPaise = getEffectiveRatePaise(priceBwDuplexInput, currentBWDuplexPaise);
+      const colorSimplexPaise = getEffectiveRatePaise(priceColorSimplexInput, currentColorSimplexPaise);
+      const colorDuplexPaise = getEffectiveRatePaise(priceColorDuplexInput, currentColorDuplexPaise);
+
+      const res = calculateEstimate({
+        pages: calcPagesInput.value,
+        copies: calcCopiesInput ? calcCopiesInput.value : 1,
+        nUp: calcNupSelect ? calcNupSelect.value : 1,
+        sides: calcSidesSelect ? calcSidesSelect.value : 'single',
+        mode: calcModeSelect ? calcModeSelect.value : 'bw',
+        rates: {
+          bwSimplex: bwSimplexPaise,
+          bwDuplex: bwDuplexPaise,
+          colorSimplex: colorSimplexPaise,
+          colorDuplex: colorDuplexPaise
+        }
+      });
+
+      if (calcResultSides) calcResultSides.textContent = res.printedSidesDisplay;
+      if (calcResultSheets) calcResultSheets.textContent = res.sheetsDisplay;
+      if (calcResultTotal) calcResultTotal.textContent = res.totalCostDisplay;
+    }
+
+    async function loadPricing() {
+      try {
+        const res = await api('/api/admin/pricing');
+        if (!res.ok) throw new Error('Failed to load pricing');
+        const data = await parseResponseJSON(res);
+
+        if (
+          !data ||
+          typeof data.bw_simplex_price_paise !== 'number' || !Number.isSafeInteger(data.bw_simplex_price_paise) || data.bw_simplex_price_paise <= 0 ||
+          typeof data.bw_duplex_price_paise !== 'number' || !Number.isSafeInteger(data.bw_duplex_price_paise) || data.bw_duplex_price_paise <= 0 ||
+          typeof data.color_simplex_price_paise !== 'number' || !Number.isSafeInteger(data.color_simplex_price_paise) || data.color_simplex_price_paise <= 0 ||
+          typeof data.color_duplex_price_paise !== 'number' || !Number.isSafeInteger(data.color_duplex_price_paise) || data.color_duplex_price_paise <= 0
+        ) {
+          throw new Error('Invalid or incomplete pricing configuration received from server');
+        }
+
+        currentBWSimplexPaise = data.bw_simplex_price_paise;
+        currentBWDuplexPaise = data.bw_duplex_price_paise;
+        currentColorSimplexPaise = data.color_simplex_price_paise;
+        currentColorDuplexPaise = data.color_duplex_price_paise;
+        currentColorEnabled = Boolean(data.color_enabled);
+
+        if (priceBwSimplexInput) {
+          priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
+          priceBwSimplexInput.disabled = false;
+        }
+        if (priceBwDuplexInput) {
+          priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
+          priceBwDuplexInput.disabled = false;
+        }
+        if (priceColorSimplexInput) {
+          priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
+        }
+        if (priceColorDuplexInput) {
+          priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
+        }
+        if (pricingColorEnabledToggle) {
+          pricingColorEnabledToggle.checked = currentColorEnabled;
+          pricingColorEnabledToggle.disabled = false;
+        }
+        syncColorInputsState();
+        if (pricingSaveBtn) {
+          pricingSaveBtn.disabled = false;
+          pricingSaveBtn.textContent = 'Save Rates';
+        }
+
+        updateCostEstimator();
+      } catch (err) {
+        currentBWSimplexPaise = null;
+        currentBWDuplexPaise = null;
+        currentColorSimplexPaise = null;
+        currentColorDuplexPaise = null;
+        currentColorEnabled = false;
+
+        if (priceBwSimplexInput) {
+          priceBwSimplexInput.value = '';
+          priceBwSimplexInput.placeholder = '--';
+          priceBwSimplexInput.disabled = true;
+        }
+        if (priceBwDuplexInput) {
+          priceBwDuplexInput.value = '';
+          priceBwDuplexInput.placeholder = '--';
+          priceBwDuplexInput.disabled = true;
+        }
+        if (priceColorSimplexInput) {
+          priceColorSimplexInput.value = '';
+          priceColorSimplexInput.placeholder = '--';
+          priceColorSimplexInput.disabled = true;
+        }
+        if (priceColorDuplexInput) {
+          priceColorDuplexInput.value = '';
+          priceColorDuplexInput.placeholder = '--';
+          priceColorDuplexInput.disabled = true;
+        }
+        if (pricingColorEnabledToggle) {
+          pricingColorEnabledToggle.disabled = true;
+        }
+        if (pricingSaveBtn) {
+          pricingSaveBtn.disabled = true;
+          pricingSaveBtn.textContent = 'Pricing Unavailable';
+        }
+
+        updateCostEstimator();
+        toast('Pricing load error: ' + err.message);
+      }
+    }
+
+    // Register UI event handlers
+    ['input', 'change'].forEach(evt => {
+      if (calcPagesInput) calcPagesInput.addEventListener(evt, updateCostEstimator);
+      if (calcCopiesInput) calcCopiesInput.addEventListener(evt, updateCostEstimator);
+      if (priceBwSimplexInput) priceBwSimplexInput.addEventListener(evt, updateCostEstimator);
+      if (priceBwDuplexInput) priceBwDuplexInput.addEventListener(evt, updateCostEstimator);
+      if (priceColorSimplexInput) priceColorSimplexInput.addEventListener(evt, updateCostEstimator);
+      if (priceColorDuplexInput) priceColorDuplexInput.addEventListener(evt, updateCostEstimator);
+    });
+    if (calcNupSelect) calcNupSelect.addEventListener('change', updateCostEstimator);
+    if (calcSidesSelect) calcSidesSelect.addEventListener('change', updateCostEstimator);
+    if (calcModeSelect) calcModeSelect.addEventListener('change', updateCostEstimator);
+    if (pricingColorEnabledToggle) {
+      pricingColorEnabledToggle.addEventListener('change', () => {
+        syncColorInputsState();
+        updateCostEstimator();
+      });
+    }
+
+    if (pricingForm) {
+      pricingForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (pricingSaveBtn && pricingSaveBtn.disabled) {
+          return;
+        }
+        const bwSimplexPaise = parseRupeesToPaise(priceBwSimplexInput ? priceBwSimplexInput.value : '');
+        const bwDuplexPaise = parseRupeesToPaise(priceBwDuplexInput ? priceBwDuplexInput.value : '');
+        const colorSimplexPaise = parseRupeesToPaise(priceColorSimplexInput ? priceColorSimplexInput.value : '');
+        const colorDuplexPaise = parseRupeesToPaise(priceColorDuplexInput ? priceColorDuplexInput.value : '');
+        const colorEnabled = pricingColorEnabledToggle ? Boolean(pricingColorEnabledToggle.checked) : false;
+
+        if (bwSimplexPaise === null || bwDuplexPaise === null || colorSimplexPaise === null || colorDuplexPaise === null) {
+          alertFn('All prices must be valid positive numbers with at most two decimal places.');
+          return;
+        }
+
+        pricingSaveBtn.disabled = true;
+        pricingSaveBtn.textContent = 'Saving...';
+
+        try {
+          const res = await api('/api/admin/pricing', {
+            method: 'PUT',
+            body: {
+              bw_simplex_price_paise: bwSimplexPaise,
+              bw_duplex_price_paise: bwDuplexPaise,
+              color_simplex_price_paise: colorSimplexPaise,
+              color_duplex_price_paise: colorDuplexPaise,
+              color_enabled: colorEnabled
+            }
+          });
+
+          if (!res.ok) {
+            const data = await parseResponseJSON(res);
+            throw new Error(data.error || 'Failed to save');
+          }
+
+          currentBWSimplexPaise = bwSimplexPaise;
+          currentBWDuplexPaise = bwDuplexPaise;
+          currentColorSimplexPaise = colorSimplexPaise;
+          currentColorDuplexPaise = colorDuplexPaise;
+          currentColorEnabled = colorEnabled;
+
+          syncColorInputsState();
+          updateCostEstimator();
+          toast('Print rates saved');
+        } catch (err) {
+          alertFn('Save error: ' + err.message);
+        } finally {
+          if (pricingSaveBtn) {
+            pricingSaveBtn.disabled = false;
+            pricingSaveBtn.textContent = 'Save Rates';
+          }
+        }
+      });
+    }
+
+    // Perform initial calculation on mount
+    updateCostEstimator();
+
+    return {
+      loadPricing,
+      updateCostEstimator,
+      syncColorInputsState,
+      getCurrentRates: () => ({
+        bwSimplex: currentBWSimplexPaise,
+        bwDuplex: currentBWDuplexPaise,
+        colorSimplex: currentColorSimplexPaise,
+        colorDuplex: currentColorDuplexPaise,
+        colorEnabled: currentColorEnabled
+      })
+    };
   }
 
   function removeAppLoader() {
@@ -158,10 +572,6 @@
 
     // DOM Elements - Navigation & User
     const logoutBtn = document.getElementById('logout-btn');
-    const userNameEl = document.getElementById('user-name');
-    if (userNameEl && userData && userData.username) {
-      userNameEl.textContent = userData.username;
-    }
 
     const tabNavOverview = document.getElementById('tab-nav-overview');
     const tabNavOrders = document.getElementById('tab-nav-orders');
@@ -196,105 +606,8 @@
       window.location.reload();
     });
 
-    // --- Change Password Modal Controller ---
-    const changePasswordNavBtn = document.getElementById('change-password-nav-btn');
-    const passwordModal = document.getElementById('password-modal');
-    const passwordModalCloseBtn = document.getElementById('password-modal-close-btn');
-    const passwordModalCancelBtn = document.getElementById('password-modal-cancel-btn');
-    const passwordForm = document.getElementById('password-form');
-    const pwdCurrentInput = document.getElementById('pwd-current');
-    const pwdNewInput = document.getElementById('pwd-new');
-    const pwdConfirmInput = document.getElementById('pwd-confirm');
-    const passwordModalError = document.getElementById('password-modal-error');
-    const passwordModalSubmitBtn = document.getElementById('password-modal-submit-btn');
 
-    function closePasswordModal() {
-      if (!passwordModal) return;
-      passwordModal.classList.add('hidden');
-      if (passwordForm) passwordForm.reset();
-      if (passwordModalError) {
-        passwordModalError.classList.add('hidden');
-        passwordModalError.textContent = '';
-      }
-    }
-
-    if (changePasswordNavBtn && passwordModal) {
-      changePasswordNavBtn.addEventListener('click', () => {
-        closePasswordModal();
-        passwordModal.classList.remove('hidden');
-        if (pwdCurrentInput) pwdCurrentInput.focus();
-      });
-    }
-
-    if (passwordModalCloseBtn) {
-      passwordModalCloseBtn.addEventListener('click', closePasswordModal);
-    }
-    if (passwordModalCancelBtn) {
-      passwordModalCancelBtn.addEventListener('click', closePasswordModal);
-    }
-    if (passwordModal) {
-      passwordModal.addEventListener('click', (e) => {
-        if (e.target === passwordModal) closePasswordModal();
-      });
-    }
-
-    if (passwordForm) {
-      passwordForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        passwordModalError.classList.add('hidden');
-        passwordModalError.textContent = '';
-
-        const currentPassword = pwdCurrentInput.value;
-        const newPassword = pwdNewInput.value;
-        const confirmPassword = pwdConfirmInput.value;
-
-        if (newPassword.length < 8) {
-          passwordModalError.textContent = 'New password must be at least 8 characters long.';
-          passwordModalError.classList.remove('hidden');
-          pwdNewInput.focus();
-          return;
-        }
-
-        if (newPassword !== confirmPassword) {
-          passwordModalError.textContent = 'New passwords do not match.';
-          passwordModalError.classList.remove('hidden');
-          pwdConfirmInput.focus();
-          return;
-        }
-
-        passwordModalSubmitBtn.disabled = true;
-        passwordModalSubmitBtn.textContent = 'Updating...';
-
-        try {
-          const res = await apiRequest('/api/admin/password', {
-            method: 'POST',
-            body: {
-              current_password: currentPassword,
-              new_password: newPassword
-            }
-          });
-          const data = await parseResponseJSON(res);
-          if (res.ok && data.ok) {
-            closePasswordModal();
-            showToast('Password changed successfully. Please sign in again.');
-            localStorage.removeItem('xeroxgo_admin_token');
-            authToken = '';
-            setTimeout(() => {
-              window.location.reload();
-            }, 1200);
-          } else {
-            passwordModalError.textContent = data.error || 'Failed to update password.';
-            passwordModalError.classList.remove('hidden');
-          }
-        } catch (err) {
-          passwordModalError.textContent = 'Error: ' + err.message;
-          passwordModalError.classList.remove('hidden');
-        } finally {
-          passwordModalSubmitBtn.disabled = false;
-          passwordModalSubmitBtn.textContent = 'Update Password';
-        }
-      });
-    }
+    let pricingController = null;
 
     // --- Tab Navigation ---
     function switchNavTab(tabName) {
@@ -317,7 +630,7 @@
       } else if (tabName === 'pricing') {
         if (tabNavPricing) tabNavPricing.classList.add('active');
         if (viewPricing) viewPricing.classList.remove('hidden');
-        loadPricing();
+        if (pricingController) pricingController.loadPricing();
       } else if (tabName === 'ads') {
         if (tabNavAds) tabNavAds.classList.add('active');
         if (viewAds) viewAds.classList.remove('hidden');
@@ -688,242 +1001,12 @@
     // ==========================================
     // 3. PRICING CONTROLLER & COST ESTIMATOR
     // ==========================================
-    const pricingForm = document.getElementById('pricing-form');
-    const priceBwSimplexInput = document.getElementById('price-bw-simplex-input');
-    const priceBwDuplexInput = document.getElementById('price-bw-duplex-input');
-    const priceColorSimplexInput = document.getElementById('price-color-simplex-input');
-    const priceColorDuplexInput = document.getElementById('price-color-duplex-input');
-    const pricingColorEnabledToggle = document.getElementById('pricing-color-enabled-toggle');
-    const pricingSaveBtn = document.getElementById('pricing-save-btn');
-
-    const calcPagesInput = document.getElementById('calc-pages-input');
-    const calcResultSheets = document.getElementById('calc-result-sheets');
-    const calcResultBw = document.getElementById('calc-result-bw');
-    const calcResultColor = document.getElementById('calc-result-color');
-
-    let currentBWSimplexPaise = null;
-    let currentBWDuplexPaise = null;
-    let currentColorSimplexPaise = null;
-    let currentColorDuplexPaise = null;
-    let currentColorEnabled = false;
-
-    async function loadPricing() {
-      try {
-        const res = await apiRequest('/api/admin/pricing');
-        if (!res.ok) throw new Error('Failed to load pricing');
-        const data = await parseResponseJSON(res);
-
-        if (
-          !data ||
-          typeof data.bw_simplex_price_paise !== 'number' || data.bw_simplex_price_paise <= 0 ||
-          typeof data.bw_duplex_price_paise !== 'number' || data.bw_duplex_price_paise <= 0 ||
-          typeof data.color_simplex_price_paise !== 'number' || data.color_simplex_price_paise <= 0 ||
-          typeof data.color_duplex_price_paise !== 'number' || data.color_duplex_price_paise <= 0
-        ) {
-          throw new Error('Invalid or incomplete pricing configuration received from server');
-        }
-
-        currentBWSimplexPaise = data.bw_simplex_price_paise;
-        currentBWDuplexPaise = data.bw_duplex_price_paise;
-        currentColorSimplexPaise = data.color_simplex_price_paise;
-        currentColorDuplexPaise = data.color_duplex_price_paise;
-        currentColorEnabled = Boolean(data.color_enabled);
-
-        if (priceBwSimplexInput) {
-          priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
-          priceBwSimplexInput.disabled = false;
-        }
-        if (priceBwDuplexInput) {
-          priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
-          priceBwDuplexInput.disabled = false;
-        }
-        if (priceColorSimplexInput) {
-          priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
-          priceColorSimplexInput.disabled = false;
-        }
-        if (priceColorDuplexInput) {
-          priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
-          priceColorDuplexInput.disabled = false;
-        }
-        if (pricingColorEnabledToggle) {
-          pricingColorEnabledToggle.checked = currentColorEnabled;
-          pricingColorEnabledToggle.disabled = false;
-        }
-        if (pricingSaveBtn) {
-          pricingSaveBtn.disabled = false;
-          pricingSaveBtn.textContent = 'Save Changes';
-        }
-
-        updateCostEstimator();
-      } catch (err) {
-        currentBWSimplexPaise = null;
-        currentBWDuplexPaise = null;
-        currentColorSimplexPaise = null;
-        currentColorDuplexPaise = null;
-        currentColorEnabled = false;
-
-        if (priceBwSimplexInput) {
-          priceBwSimplexInput.value = '';
-          priceBwSimplexInput.placeholder = '--';
-          priceBwSimplexInput.disabled = true;
-        }
-        if (priceBwDuplexInput) {
-          priceBwDuplexInput.value = '';
-          priceBwDuplexInput.placeholder = '--';
-          priceBwDuplexInput.disabled = true;
-        }
-        if (priceColorSimplexInput) {
-          priceColorSimplexInput.value = '';
-          priceColorSimplexInput.placeholder = '--';
-          priceColorSimplexInput.disabled = true;
-        }
-        if (priceColorDuplexInput) {
-          priceColorDuplexInput.value = '';
-          priceColorDuplexInput.placeholder = '--';
-          priceColorDuplexInput.disabled = true;
-        }
-        if (pricingColorEnabledToggle) {
-          pricingColorEnabledToggle.disabled = true;
-        }
-        if (pricingSaveBtn) {
-          pricingSaveBtn.disabled = true;
-          pricingSaveBtn.textContent = 'Pricing Unavailable';
-        }
-
-        updateCostEstimator();
-        showToast('Pricing load error: ' + err.message);
-      }
-    }
-
-    function updateCostEstimator() {
-      if (!calcPagesInput) return;
-      const pages = Math.max(1, parseInt(calcPagesInput.value, 10) || 1);
-      const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
-      const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
-
-      const bwSimplex = (priceBwSimplexInput && priceBwSimplexInput.value && !isNaN(parseFloat(priceBwSimplexInput.value)))
-        ? parseFloat(priceBwSimplexInput.value)
-        : (currentBWSimplexPaise !== null ? currentBWSimplexPaise / 100 : null);
-      const bwDuplex = (priceBwDuplexInput && priceBwDuplexInput.value && !isNaN(parseFloat(priceBwDuplexInput.value)))
-        ? parseFloat(priceBwDuplexInput.value)
-        : (currentBWDuplexPaise !== null ? currentBWDuplexPaise / 100 : null);
-      const colorSimplex = (priceColorSimplexInput && priceColorSimplexInput.value && !isNaN(parseFloat(priceColorSimplexInput.value)))
-        ? parseFloat(priceColorSimplexInput.value)
-        : (currentColorSimplexPaise !== null ? currentColorSimplexPaise / 100 : null);
-      const colorDuplex = (priceColorDuplexInput && priceColorDuplexInput.value && !isNaN(parseFloat(priceColorDuplexInput.value)))
-        ? parseFloat(priceColorDuplexInput.value)
-        : (currentColorDuplexPaise !== null ? currentColorDuplexPaise / 100 : null);
-
-      if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
-
-      if (bwSimplex !== null && bwDuplex !== null) {
-        let bwCost = 0;
-        if (isDuplex) {
-          const fullSheets = Math.floor(pages / 2);
-          const hasOddPage = (pages % 2 !== 0);
-          bwCost = (fullSheets * bwDuplex) + (hasOddPage ? bwSimplex : 0);
-        } else {
-          bwCost = pages * bwSimplex;
-        }
-        if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
-      } else {
-        if (calcResultBw) calcResultBw.textContent = '--';
-      }
-
-      if (colorSimplex !== null && colorDuplex !== null) {
-        let colorCost = 0;
-        if (isDuplex) {
-          const fullSheets = Math.floor(pages / 2);
-          const hasOddPage = (pages % 2 !== 0);
-          colorCost = (fullSheets * colorDuplex) + (hasOddPage ? colorSimplex : 0);
-        } else {
-          colorCost = pages * colorSimplex;
-        }
-        if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
-      } else {
-        if (calcResultColor) calcResultColor.textContent = '--';
-      }
-    }
-
-    if (calcPagesInput) calcPagesInput.addEventListener('input', updateCostEstimator);
-    document.querySelectorAll('input[name="calc-duplex"]').forEach(r => {
-      r.addEventListener('change', updateCostEstimator);
+    pricingController = initPricingController({
+      document,
+      apiRequest,
+      showToast,
+      alert: (typeof alert !== 'undefined' ? alert : () => {})
     });
-    if (priceBwSimplexInput) priceBwSimplexInput.addEventListener('input', updateCostEstimator);
-    if (priceBwDuplexInput) priceBwDuplexInput.addEventListener('input', updateCostEstimator);
-    if (priceColorSimplexInput) priceColorSimplexInput.addEventListener('input', updateCostEstimator);
-    if (priceColorDuplexInput) priceColorDuplexInput.addEventListener('input', updateCostEstimator);
-    if (pricingColorEnabledToggle) pricingColorEnabledToggle.addEventListener('change', updateCostEstimator);
-
-    function parseRupeesToPaise(valStr) {
-      const trimmed = valStr ? String(valStr).trim() : '';
-      if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
-        return null;
-      }
-      const num = parseFloat(trimmed);
-      if (isNaN(num) || num <= 0) {
-        return null;
-      }
-      const paise = Math.round(num * 100);
-      if (paise <= 0) {
-        return null;
-      }
-      return paise;
-    }
-
-    if (pricingForm) {
-      pricingForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        if (pricingSaveBtn && pricingSaveBtn.disabled) {
-          return;
-        }
-        const bwSimplexPaise = parseRupeesToPaise(priceBwSimplexInput.value);
-        const bwDuplexPaise = parseRupeesToPaise(priceBwDuplexInput.value);
-        const colorSimplexPaise = parseRupeesToPaise(priceColorSimplexInput.value);
-        const colorDuplexPaise = parseRupeesToPaise(priceColorDuplexInput.value);
-        const colorEnabled = pricingColorEnabledToggle ? pricingColorEnabledToggle.checked : false;
-
-        if (bwSimplexPaise === null || bwDuplexPaise === null || colorSimplexPaise === null || colorDuplexPaise === null) {
-          alert('All prices must be valid positive numbers with at most two decimal places.');
-          return;
-        }
-
-        pricingSaveBtn.disabled = true;
-        pricingSaveBtn.textContent = 'Saving...';
-
-        try {
-          const res = await apiRequest('/api/admin/pricing', {
-            method: 'PUT',
-            body: {
-              bw_simplex_price_paise: bwSimplexPaise,
-              bw_duplex_price_paise: bwDuplexPaise,
-              color_simplex_price_paise: colorSimplexPaise,
-              color_duplex_price_paise: colorDuplexPaise,
-              color_enabled: colorEnabled
-            }
-          });
-
-          if (!res.ok) {
-            const data = await parseResponseJSON(res);
-            throw new Error(data.error || 'Failed to save');
-          }
-
-          currentBWSimplexPaise = bwSimplexPaise;
-          currentBWDuplexPaise = bwDuplexPaise;
-          currentColorSimplexPaise = colorSimplexPaise;
-          currentColorDuplexPaise = colorDuplexPaise;
-          currentColorEnabled = colorEnabled;
-
-          updateCostEstimator();
-          showToast('Print rates saved');
-        } catch (err) {
-          alert('Save error: ' + err.message);
-        } finally {
-          pricingSaveBtn.disabled = false;
-          pricingSaveBtn.textContent = 'Save Rates';
-        }
-      });
-    }
 
     // ==========================================
     // 4. PROMOTIONAL ADS & SIMULATOR
@@ -1495,7 +1578,27 @@
       .replace(/'/g, '&#039;');
   }
 
+  // --- Exports for Testing & Window Access ---
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      parsePositiveInteger,
+      parseRupeesToPaise,
+      calculateEstimate,
+      initPricingController
+    };
+  }
+  if (typeof window !== 'undefined') {
+    window.__adminEstimator = {
+      parsePositiveInteger,
+      parseRupeesToPaise,
+      calculateEstimate,
+      initPricingController
+    };
+  }
+
   // Initial session check
-  document.addEventListener('DOMContentLoaded', checkSession);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', checkSession);
+  }
 
 })();

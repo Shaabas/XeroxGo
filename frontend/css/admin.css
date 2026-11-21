@@ -540,6 +540,18 @@ input:checked + .slider:before {
   border-color: var(--border-focus);
 }
 
+.form-input:disabled {
+  background-color: #F1F5F9;
+  color: var(--text-muted);
+  border-color: #CBD5E1;
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+
+.form-group:has(.form-input:disabled) span {
+  opacity: 0.6;
+}
+
 .color-presets-row {
   display: flex;
   gap: 0.6rem;
@@ -890,5 +902,88 @@ input:checked + .slider:before {
   .pricing-grid {
     grid-template-columns: 1fr;
   }
+}
+
+/* Cost Estimator Scoped Styles */
+.estimator-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.estimator-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+.estimator-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 640px) {
+  .estimator-row {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}
+
+select.form-input {
+  background-color: var(--card-bg);
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.estimator-summary {
+  margin-top: auto;
+  padding: 1.15rem 1.25rem;
+  background: var(--bg-slate);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.estimator-summary-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.65rem;
+}
+
+.estimator-summary-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.estimator-summary-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.estimator-divider {
+  border-top: 1px solid var(--border);
+  margin: 0.75rem 0 0.85rem 0;
+}
+
+.estimator-total-row {
+  margin-bottom: 0;
+  align-items: baseline;
+}
+
+.estimator-total-label {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.estimator-total-value {
+  font-size: 1.75rem;
+  font-weight: 800;
+  color: var(--primary);
+  line-height: 1.1;
+  text-align: right;
+  letter-spacing: -0.02em;
 }
 
