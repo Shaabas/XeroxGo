@@ -2494,6 +2494,7 @@ WHERE job_id = ?;
 			totalDocs     int
 			completedDocs int
 			failedDocs    int
+			pausedDocs    int
 			printingDocs  int
 			spoolingDocs  int
 		)
@@ -2502,13 +2503,14 @@ SELECT
     COUNT(1),
     COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'FAILED_REFUNDABLE' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'PAUSED_ERROR' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'PRINTING' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'SPOOLING' THEN 1 ELSE 0 END), 0)
 FROM order_documents
 WHERE order_id = ?;
 `
 		err = tx.QueryRowContext(ctx, s.rebind(queryCounts), orderID).Scan(
-			&totalDocs, &completedDocs, &failedDocs, &printingDocs, &spoolingDocs,
+			&totalDocs, &completedDocs, &failedDocs, &pausedDocs, &printingDocs, &spoolingDocs,
 		)
 		if err != nil {
 			return fmt.Errorf("update job progress: query order document counts: %w", err)
@@ -2530,17 +2532,25 @@ UPDATE orders
 SET status = 'FAILED_REFUNDABLE', updated_at_ns = ?
 WHERE order_id = ?;
 `), eventNS, orderID)
+		} else if pausedDocs > 0 {
+			// Any paused child freezes the entire physical order. No later
+			// progress from a different child may make it printable again.
+			_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders SET status = 'PAUSED_ERROR', updated_at_ns = ?
+WHERE order_id = ? AND status NOT IN ('FAILED_REFUNDABLE', 'COMPLETED');
+`), eventNS, orderID)
+			if err != nil { return fmt.Errorf("update job progress: pause order: %w", err) }
 		} else if printingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'PRINTING', updated_at_ns = ?
-WHERE order_id = ? AND status NOT IN ('COMPLETED');
+WHERE order_id = ? AND status NOT IN ('COMPLETED','FAILED_REFUNDABLE','PAUSED_ERROR');
 `), eventNS, orderID)
 		} else if spoolingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'SPOOLING', updated_at_ns = ?
-WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED');
+WHERE order_id = ? AND status NOT IN ('PRINTING','COMPLETED','FAILED_REFUNDABLE','PAUSED_ERROR');
 `), eventNS, orderID)
 		}
 	} else {
