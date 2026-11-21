@@ -540,6 +540,18 @@ input:checked + .slider:before {
   border-color: var(--border-focus);
 }
 
+.form-input:disabled {
+  background-color: #F1F5F9;
+  color: var(--text-muted);
+  border-color: #CBD5E1;
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+
+.form-group:has(.form-input:disabled) span {
+  opacity: 0.6;
+}
+
 .color-presets-row {
   display: flex;
   gap: 0.6rem;

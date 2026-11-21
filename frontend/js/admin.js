@@ -849,16 +849,15 @@
         }
         if (priceColorSimplexInput) {
           priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
-          priceColorSimplexInput.disabled = false;
         }
         if (priceColorDuplexInput) {
           priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
-          priceColorDuplexInput.disabled = false;
         }
         if (pricingColorEnabledToggle) {
           pricingColorEnabledToggle.checked = currentColorEnabled;
           pricingColorEnabledToggle.disabled = false;
         }
+        syncColorInputsState();
         if (pricingSaveBtn) {
           pricingSaveBtn.disabled = false;
           pricingSaveBtn.textContent = 'Save Rates';
@@ -916,6 +915,16 @@
       return fallbackPaise;
     }
 
+    function syncColorInputsState() {
+      const isColorEnabled = pricingColorEnabledToggle ? pricingColorEnabledToggle.checked : false;
+      if (priceColorSimplexInput) {
+        priceColorSimplexInput.disabled = !isColorEnabled;
+      }
+      if (priceColorDuplexInput) {
+        priceColorDuplexInput.disabled = !isColorEnabled;
+      }
+    }
+
     function updateCostEstimator() {
       if (!calcPagesInput) return;
 
@@ -954,7 +963,12 @@
     if (calcNupSelect) calcNupSelect.addEventListener('change', updateCostEstimator);
     if (calcSidesSelect) calcSidesSelect.addEventListener('change', updateCostEstimator);
     if (calcModeSelect) calcModeSelect.addEventListener('change', updateCostEstimator);
-    if (pricingColorEnabledToggle) pricingColorEnabledToggle.addEventListener('change', updateCostEstimator);
+    if (pricingColorEnabledToggle) {
+      pricingColorEnabledToggle.addEventListener('change', () => {
+        syncColorInputsState();
+        updateCostEstimator();
+      });
+    }
 
     if (pricingForm) {
       pricingForm.addEventListener('submit', async (e) => {
@@ -999,6 +1013,7 @@
           currentColorDuplexPaise = colorDuplexPaise;
           currentColorEnabled = colorEnabled;
 
+          syncColorInputsState();
           updateCostEstimator();
           showToast('Print rates saved');
         } catch (err) {
