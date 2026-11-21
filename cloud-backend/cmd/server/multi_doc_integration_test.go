@@ -76,7 +76,13 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 		convWake: make(chan struct{}, 10),
 	}
 
-	var handler http.Handler = app.routes()
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/test/capture" {
+			app.handleFixtureCapture(w, r)
+			return
+		}
+		app.routes().ServeHTTP(w, r)
+	})
 	if wrapHandler != nil {
 		handler = wrapHandler(handler)
 	}
@@ -533,9 +539,9 @@ func TestMultiDoc_Cloud_ConcurrentDuplicateWebhooks(t *testing.T) {
 			mac.Write(rawB)
 			sig := hex.EncodeToString(mac.Sum(nil))
 
-			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawB))
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawB))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Razorpay-Signature", sig)
+			req.Header.Set("X-Fixture-Signature", sig)
 			resp, err := http.DefaultClient.Do(req)
 			if err == nil {
 				results[idx] = resp.StatusCode
@@ -743,7 +749,7 @@ func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 	defer wsConn.CloseNow()
 
 	// 3. Simulate-payment: must succeed with HTTP 200 and transition order to DISPATCHED
-	simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/simulate-payment?session_id=%s&force=1", ts.URL, orderID, sess.SessionID), nil)
+	simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/test/simulate-payment?session_id=%s&force=1", ts.URL, orderID, sess.SessionID), nil)
 	simResp, err := http.DefaultClient.Do(simReq)
 	if err != nil || simResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK for simulate-payment, got %d (err=%v)", simResp.StatusCode, err)

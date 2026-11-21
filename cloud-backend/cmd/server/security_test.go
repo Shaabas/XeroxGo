@@ -103,25 +103,25 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 		}
 	})
 
-	t.Run("Production mode exempts healthz probe without secret", func(t *testing.T) {
+	t.Run("Retired capture endpoint does not bypass proxy auth", func(t *testing.T) {
 		h := createIngressHandler(dummyMux, secret, false)
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for /healthz, got %d", rec.Code)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for /healthz, got %d", rec.Code)
 		}
 	})
 
-	t.Run("Production mode exempts razorpay webhook without secret", func(t *testing.T) {
+	t.Run("Production mode requires secret for retired capture route", func(t *testing.T) {
 		h := createIngressHandler(dummyMux, secret, false)
-		req := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/test/capture", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for /api/webhooks/razorpay, got %d", rec.Code)
+			t.Fatalf("expected 200 OK for /api/test/capture, got %d", rec.Code)
 		}
 	})
 

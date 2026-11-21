@@ -556,8 +556,8 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 		app.handleUpload(w, r)
 	})
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/simulate-payment") {
-			app.handleSimulatePayment(w, r)
+		if strings.HasSuffix(r.URL.Path, "/test/simulate-payment") {
+			app.handleFixtureSimulatePayment(w, r)
 			return
 		}
 		http.NotFound(w, r)
@@ -611,9 +611,9 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 		t.Errorf("expected non-empty attempt_id in payment response, got %v", payResp)
 	}
 
-	// 3. Attempt handleSimulatePayment on multi-doc order in devMode
+	// 3. Attempt handleFixtureSimulatePayment on multi-doc order in devMode
 	app.cfg.devMode = true
-	simReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/simulate-payment?force=1", orderID), nil)
+	simReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/test/simulate-payment?force=1", orderID), nil)
 	simRec := httptest.NewRecorder()
 	mux.ServeHTTP(simRec, simReq)
 

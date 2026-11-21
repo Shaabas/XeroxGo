@@ -100,10 +100,10 @@ func TestPaymentWebhook_KnownAttemptWrongAmountCreatesRefundOnly(t *testing.T) {
 	raw := []byte(`{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_webhook_wrong_amount","order_id":"mock_order_wrong_amount","amount":100,"currency":"INR","status":"captured"}}}}`)
 	mac := hmac.New(sha256.New, app.cfg.webhookSecret)
 	_, _ = mac.Write(raw)
-	req := httptest.NewRequest(http.MethodPost,"/api/webhooks/razorpay",bytes.NewReader(raw))
-	req.Header.Set("X-Razorpay-Signature",hex.EncodeToString(mac.Sum(nil)))
+	req := httptest.NewRequest(http.MethodPost,"/api/test/capture",bytes.NewReader(raw))
+	req.Header.Set("X-Fixture-Signature",hex.EncodeToString(mac.Sum(nil)))
 	w := httptest.NewRecorder()
-	app.handleRazorpayWebhook(w,req)
+	app.handleFixtureCapture(w,req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("signed amount mismatch should be accounted and refunded, got %d: %s",w.Code,w.Body.String())
 	}
@@ -129,10 +129,10 @@ func TestPaymentWebhook_KnownAttemptWrongAmountCreatesRefundOnly(t *testing.T) {
 	correct:=[]byte(`{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_webhook_correct_amount","order_id":"mock_order_wrong_amount","amount":400,"currency":"INR","status":"captured"}}}}`)
 	mac=hmac.New(sha256.New,app.cfg.webhookSecret)
 	_,_=mac.Write(correct)
-	req2:=httptest.NewRequest(http.MethodPost,"/api/webhooks/razorpay",bytes.NewReader(correct))
-	req2.Header.Set("X-Razorpay-Signature",hex.EncodeToString(mac.Sum(nil)))
+	req2:=httptest.NewRequest(http.MethodPost,"/api/test/capture",bytes.NewReader(correct))
+	req2.Header.Set("X-Fixture-Signature",hex.EncodeToString(mac.Sum(nil)))
 	w2:=httptest.NewRecorder()
-	app.handleRazorpayWebhook(w2,req2)
+	app.handleFixtureCapture(w2,req2)
 	if w2.Code!=http.StatusOK || !bytes.Contains(w2.Body.Bytes(),[]byte("dispatch_pending")){
 		t.Fatalf("second correctly funded payment not queued: HTTP %d %s",w2.Code,w2.Body.String())
 	}
