@@ -179,8 +179,10 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 
 	// Submit PIN
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", pinCtrl.GetState())
+	if !waitCondition(5*time.Second, func() bool {
+		return pinCtrl.GetState() == "PAYMENT_PENDING" && pinCtrl.GetCurrentSession() != nil
+	}) {
+		t.Fatalf("expected active payment after PIN, got %s", pinCtrl.GetState())
 	}
 
 	history := client.RenderHistory()
@@ -190,7 +192,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 	lastState := history[len(history)-1]
 
 	if lastState.Mode != ui_ipc.ModePaymentPending {
-		t.Errorf("expected mode ORDER_SUMMARY, got %s", lastState.Mode)
+		t.Errorf("expected mode PAYMENT_PENDING, got %s", lastState.Mode)
 	}
 	if lastState.OrderSummary == nil {
 		t.Fatalf("expected non-nil OrderSummary")
@@ -477,18 +479,17 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 1. Enter PIN & lookup -> ORDER_SUMMARY
+	// 1. Enter PIN -> payment screen automatically
 	simInput.EmitDigits("9876")
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "9876" }) {
 		t.Fatalf("expected buffer 9876, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected direct payment after PIN, got %s", client.PINController().GetState())
-	}
-
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool {
+		sess := client.PINController().GetCurrentSession()
+		return sess != nil && client.PINController().GetState() == "PAYMENT_PENDING"
+	}) {
+		t.Fatalf("expected active payment session directly after PIN, got %s", client.PINController().GetState())
 	}
 
 	// Verify Payment Pending screen state
@@ -629,18 +630,17 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 1. Enter PIN & lookup -> ORDER_SUMMARY
+	// 1. Enter PIN -> payment screen automatically
 	simInput.EmitDigits("1122")
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "1122" }) {
 		t.Fatalf("expected buffer 1122, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected direct payment after PIN, got %s", client.PINController().GetState())
-	}
-
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool {
+		sess := client.PINController().GetCurrentSession()
+		return sess != nil && client.PINController().GetState() == "PAYMENT_PENDING"
+	}) {
+		t.Fatalf("expected active payment session directly after PIN, got %s", client.PINController().GetState())
 	}
 
 	// 3. Verify that InitiatePayment was called via HTTPPINClient
@@ -893,12 +893,10 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 		t.Fatalf("expected buffer 5555, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected direct payment after PIN, got %s", client.PINController().GetState())
-	}
-	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool {
+		return client.PINController().GetCurrentSession() != nil
+	}) {
+		t.Fatalf("expected direct payment session after PIN, got %s", client.PINController().GetState())
 	}
 
 	// 5. Unrelated job arrives FIRST while customer is looking at QR payment screen
