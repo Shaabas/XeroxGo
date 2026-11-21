@@ -1128,8 +1128,9 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if entity.Amount != attempt.AmountPaise {
-			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", attempt.AmountPaise, entity.Amount), http.StatusBadRequest)
-			return
+			// Payment was captured by the provider for a known attempt.
+			// Never discard actual money: persist as refund-only, never print.
+			log.Printf("[PAYMENT] Captured payment %s has unexpected amount for attempt %s; refund-only accounting required", entity.ID, attempt.AttemptID)
 		}
 		if entity.Currency != "" && attempt.Currency != "" && !strings.EqualFold(entity.Currency, attempt.Currency) {
 			http.Error(w, "payment currency mismatch with stored attempt", http.StatusBadRequest)
@@ -1138,7 +1139,7 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		orderID = attempt.OrderID
 		kioskID = attempt.KioskID
 		sessionID = attempt.SessionID
-		amount = attempt.AmountPaise
+		amount = entity.Amount
 		providerName = attempt.Provider
 	} else {
 		// Fallback for orders without an explicit attempt:
