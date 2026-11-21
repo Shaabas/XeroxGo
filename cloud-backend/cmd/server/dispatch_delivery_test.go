@@ -82,7 +82,10 @@ func TestDispatchDelivery_OfflinePaymentReconnectsWithoutRefundOrDoublePrint(t *
 	defer conn.CloseNow()
 
 	var received wireMsg
-	if err := wsjson.Read(ctx,conn,&received);err!=nil{t.Fatalf("reconnect delivery not received: %v",err)}
+	for {
+		if err := wsjson.Read(ctx,conn,&received);err!=nil{t.Fatalf("reconnect delivery not received: %v",err)}
+		if received.Type!="sync_ads"{break}
+	}
 	if received.Type!="job" || received.Job==nil ||
 		received.Job.JobID!="job_"+orderID || received.Job.OrderID!=orderID{
 		t.Fatalf("reconnect must deliver same immutable job: %+v",received)
