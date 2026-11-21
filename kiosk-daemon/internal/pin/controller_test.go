@@ -276,7 +276,7 @@ func TestController_SubmitLessThan4Digits(t *testing.T) {
 	}
 }
 
-func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
+func TestController_SuccessfulPINOpensPayment(t *testing.T) {
 	sim := input.NewSimulatedSource(32)
 	defer sim.Close()
 
@@ -324,13 +324,13 @@ func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
 	sim.EmitSubmit()
 	time.Sleep(50 * time.Millisecond)
 
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
 	}
 
 	last := rnd.LastState()
-	if last.Mode != ui_ipc.ModeOrderSummary {
-		t.Errorf("expected mode %s, got %s", ui_ipc.ModeOrderSummary, last.Mode)
+	if last.Mode != ui_ipc.ModePaymentPending {
+		t.Errorf("expected mode %s, got %s", ui_ipc.ModePaymentPending, last.Mode)
 	}
 	if last.OrderSummary == nil {
 		t.Fatalf("expected non-nil OrderSummary")
@@ -342,16 +342,16 @@ func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
 		t.Errorf("expected price 1800 paise, got %d", last.OrderSummary.TotalPricePaise)
 	}
 
-	// Cancel on Order Summary returns to Idle
+	// Cancel on payment screen returns to idle
 	sim.EmitCancel()
 	time.Sleep(20 * time.Millisecond)
 
 	if ctrl.GetState() != StateIdle {
-		t.Errorf("state after cancel on summary = %s, want %s", ctrl.GetState(), StateIdle)
+		t.Errorf("state after cancel on payment = %s, want %s", ctrl.GetState(), StateIdle)
 	}
 }
 
-func TestController_OrderConfirmationAndPaymentPending(t *testing.T) {
+func TestController_PINAutomaticallyClaimsAndOpensPayment(t *testing.T) {
 	sim := input.NewSimulatedSource(32)
 	defer sim.Close()
 
@@ -400,19 +400,11 @@ func TestController_OrderConfirmationAndPaymentPending(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN & Submit -> Order Summary
+	// One PIN submission must automatically claim and display the payment screen.
 	sim.EmitDigits("1234")
 	time.Sleep(20 * time.Millisecond)
 	sim.EmitSubmit()
-	time.Sleep(50 * time.Millisecond)
-
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// 2. Submit on Order Summary -> Claim Order & Transition to PAYMENT_PENDING
-	sim.EmitSubmit()
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(110 * time.Millisecond)
 
 	if ctrl.GetState() != StatePaymentPending {
 		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
@@ -686,45 +678,28 @@ func TestController_PaperShortageAndRetryAfterRefill(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN
+	// First PIN submission fails because the printer stock changed.
 	sim.EmitDigits("4567")
 	sim.EmitSubmit()
-
-	// Wait for lookup to complete and reach StateOrderSummary
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePINEntry || ctrl.GetPINError() == "") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("state = %s, want %s", ctrl.GetState(), StateOrderSummary)
+	if ctrl.GetState() != StatePINEntry || !strings.Contains(ctrl.GetPINError(), "refill") {
+		t.Fatalf("expected PIN_ENTRY with paper shortage explanation, got state=%s err=%q", ctrl.GetState(), ctrl.GetPINError())
 	}
 
-	// 2. Customer confirms order
-	sim.EmitSubmit()
-	time.Sleep(50 * time.Millisecond)
-
-	// Claim failed with ErrInsufficientPaper -> State should STILL be StateOrderSummary!
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state to remain %s on shortage, got %s", StateOrderSummary, ctrl.GetState())
-	}
-	if !strings.Contains(ctrl.GetPINError(), "refill paper") {
-		t.Errorf("expected refill paper message in pinError, got %q", ctrl.GetPINError())
-	}
-
-	// 3. Attendant refills paper; customer presses confirm AGAIN without retyping PIN!
+	// After refill, entering the same valid PIN immediately opens payment.
+	sim.EmitDigits("4567")
 	sim.EmitSubmit()
 	deadline = time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-
-	// State should now be StatePaymentPending!
 	if ctrl.GetState() != StatePaymentPending {
-		t.Fatalf("state after refill retry = %s, want %s", ctrl.GetState(), StatePaymentPending)
+		t.Fatalf("expected PAYMENT_PENDING after retry, got %s", ctrl.GetState())
 	}
-	if ctrl.GetPINError() != "" {
-		t.Errorf("pinError after success = %q, want empty", ctrl.GetPINError())
-	}
+
 }
 
 func TestController_InitiatePayment_DynamicQR(t *testing.T) {
@@ -794,22 +769,11 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// 2. Confirm order to transition to StatePaymentPending and initiate payment
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
-		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
+		t.Fatalf("PIN should directly open payment, got %s", ctrl.GetState())
 	}
 
 	// Wait for async InitiatePayment to deliver QRContent
@@ -902,31 +866,18 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 		_, _ = pw.Write([]byte("4281\n"))
 	}()
 
-	// Wait for transition to StateOrderSummary
+	// A single newline submits the PIN; another Enter must not be required.
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s after typing 4281\\n, got %s", StateOrderSummary, ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected direct PAYMENT_PENDING after PIN, got %s", ctrl.GetState())
 	}
 	if ctrl.ActiveOrderID() != "ord_ssh_4281" {
 		t.Errorf("ActiveOrderID = %q, want ord_ssh_4281", ctrl.ActiveOrderID())
 	}
 
-	// 2. Simulate user pressing Enter (\n) to confirm order summary
-	go func() {
-		_, _ = pw.Write([]byte("\n"))
-	}()
-
-	// Wait for transition to StatePaymentPending
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StatePaymentPending {
-		t.Fatalf("expected state %s after Enter confirmation, got %s", StatePaymentPending, ctrl.GetState())
-	}
 }
 
 func TestController_PaymentURLBase_Wrapping(t *testing.T) {
@@ -1000,22 +951,11 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// 2. Confirm order to transition to PaymentPending
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
-		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
+		t.Fatalf("expected direct payment after PIN, got %s", ctrl.GetState())
 	}
 
 	// 3. Wait for InitiatePayment to deliver wrapped QR content
@@ -1041,7 +981,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 	}
 }
 
-func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
+func TestController_KeypadCannotAuthorizeDemoPayment(t *testing.T) {
 	sim := input.NewSimulatedSource(32)
 	defer sim.Close()
 
@@ -1109,10 +1049,6 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
 
 	// Wait for PaymentPending and QRContent arrival in rendered state
 	deadline = time.Now().Add(2 * time.Second)
@@ -1127,25 +1063,18 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
 	}
 
-	// Press Submit (Confirm/Enter) on keypad to demo pay
+	// Pressing Enter on the QR screen must NOT authorize mock payment.
 	sim.EmitSubmit()
-
+	time.Sleep(80 * time.Millisecond)
 	select {
 	case tok := <-authChan:
-		if tok != "dmo_keypad_confirm_token_999" {
-			t.Errorf("expected authorized token %q, got %q", "dmo_keypad_confirm_token_999", tok)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("expected AuthorizeDemoPayment to be called on keypad confirm")
+		t.Fatalf("keypad unexpectedly authorized payment token %q", tok)
+	default:
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("keypad Enter must not leave checkout screen, got %s", ctrl.GetState())
 	}
 
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateIdle {
-		t.Errorf("expected controller to reset to IDLE after demo payment, got %s", ctrl.GetState())
-	}
 }
 
 func TestController_BypassPayment_AutoAuthorize(t *testing.T) {
@@ -1216,11 +1145,6 @@ func TestController_BypassPayment_AutoAuthorize(t *testing.T) {
 	sim.EmitDigit('8')
 	sim.EmitSubmit()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit() // Confirm order summary
 
 	// Without any more user input, bypass payment should automatically authorize and return to IDLE
 	select {
@@ -1232,7 +1156,7 @@ func TestController_BypassPayment_AutoAuthorize(t *testing.T) {
 		t.Fatalf("expected AuthorizeDemoPayment to be automatically called with BypassPayment=true")
 	}
 
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
