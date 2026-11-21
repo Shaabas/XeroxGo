@@ -1110,7 +1110,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 						ErrorReason:   inc.ErrorReason,
 						Timestamp:     time.Now().UTC(),
 					}
-					c.sendProgress(connCtx, evt)
+					_ = c.sendWire(connCtx, conn, wireMessage{Type: "progress", Progress: &evt})
 				}
 			}
 		}
