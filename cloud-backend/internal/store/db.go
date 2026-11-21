@@ -1117,7 +1117,22 @@ func (s *Store) Close() error {
 }
 
 // CreateOrder persists an order and its associated print configuration and child documents atomically.
+// CreateOrder persists an order without a stock check. Internal/test callers can
+// use this; the public mobile finalization path must use CreateOrderWithPaperCheck.
 func (s *Store) CreateOrder(ctx context.Context, order Order) error {
+	return s.createOrder(ctx, order, -1)
+}
+
+// CreateOrderWithPaperCheck atomically reserves the full order's sheets before
+// publishing a PIN. availableStock is the latest kiosk-reported physical stock.
+func (s *Store) CreateOrderWithPaperCheck(ctx context.Context, order Order, availableStock int) error {
+	if availableStock < 0 {
+		return fmt.Errorf("create order: available stock must be nonnegative")
+	}
+	return s.createOrder(ctx, order, availableStock)
+}
+
+func (s *Store) createOrder(ctx context.Context, order Order, availableStock int) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("create order: store is closed or nil")
 	}
@@ -1307,6 +1322,23 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("create order: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Serialize competing mobile reservations and kiosk session claims per kiosk.
+	// The stock check and order/PIN insert share this transaction.
+	if availableStock >= 0 {
+		if s.dialect == "postgres" {
+			if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", order.Command.KioskID); err != nil {
+				return fmt.Errorf("create order: acquire kiosk paper lock: %w", err)
+			}
+		}
+		committed, err := s.getCommittedPaperSheetsTx(ctx, tx, order.Command.KioskID, "", createdNS)
+		if err != nil {
+			return fmt.Errorf("create order: calculate paper commitments: %w", err)
+		}
+		if availableStock-committed < order.TotalSheets {
+			return ErrInsufficientPaper
+		}
+	}
 
 	// 1. Prune expired PIN reservations on this kiosk atomically
 	_, err = tx.ExecContext(ctx, s.rebind(`
@@ -2672,7 +2704,7 @@ func generateSessionID() (string, error) {
 }
 
 // GetCommittedPaperSheets returns the total number of physical paper sheets currently committed
-// on the given kiosk by active unexpired unpaid sessions and active/in-flight paid orders,
+// on the given kiosk by unexpired unpaid PIN orders and active/in-flight paid orders,
 // optionally excluding a specific orderID (e.g. the order currently being checked).
 func (s *Store) GetCommittedPaperSheets(ctx context.Context, kioskID, excludeOrderID string, now time.Time) (int, error) {
 	if s == nil || s.db == nil {
@@ -2691,16 +2723,14 @@ func (s *Store) getCommittedPaperSheetsTx(ctx context.Context, q queryable, kios
 	query := s.rebind(`
 SELECT COALESCE(SUM(c.committed_sheets), 0)
 FROM (
-    -- Reserve all sheets in each pending order, not just its first document.
+    -- Every pending order with an unexpired PIN already owns its paper.
+    -- Session creation does not reserve additional sheets.
     SELECT o.total_sheets AS committed_sheets
     FROM orders o
-    JOIN kiosk_sessions ks ON o.order_id = ks.order_id
     WHERE o.kiosk_id = ?
       AND o.status = 'PENDING_PAYMENT'
-      AND ks.status = 'PAYMENT_PENDING'
-      AND ks.expires_at_ns > ?
+      AND o.pin_expires_at_ns > ?
       AND (? = '' OR o.order_id != ?)
-    GROUP BY o.order_id, o.total_sheets
 
     UNION ALL
 
