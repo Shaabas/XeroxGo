@@ -151,6 +151,24 @@ func TestOrderStatus_MultiDocumentFaultReportsLaterChildNotFirst(t *testing.T) {
 	}
 }
 
+func TestOrderStatus_PausedSecondDocumentOverridesFirstCompletion(t *testing.T) {
+	st,err:=store.Open(filepath.Join(t.TempDir(),"order_status_paused.db"))
+	if err!=nil{t.Fatal(err)}
+	defer st.Close()
+	const orderID="ord_status_second_paused"
+	docs,kioskID:=seedMultiDocStatusOrder(t,st,orderID)
+	app:=&appServer{db:st}
+	now:=time.Now().UTC()
+	recordDocumentStatus(t,st,docs[0].JobID,kioskID,contracts.JobStatusCompleted,2,1,"",now)
+	recordDocumentStatus(t,st,docs[1].JobID,kioskID,contracts.JobStatusPausedError,1,1,
+		"paper jam during second document",now.Add(time.Second))
+	status:=statusForOrder(t,app,orderID)
+	if status.Status!="PAUSED_ERROR" || status.ErrorReason!="paper jam during second document" ||
+		status.DocumentsCompleted!=1 || status.PagesPrinted!=3 || status.SheetsPrinted!=2 {
+		t.Fatalf("later document pause hidden by first child's completion: %+v",status)
+	}
+}
+
 func TestOrderStatus_CorruptCompletedParentFailsClosed(t *testing.T) {
 	st,err:=store.Open(filepath.Join(t.TempDir(),"order_status_invariant.db"))
 	if err!=nil{t.Fatal(err)}
