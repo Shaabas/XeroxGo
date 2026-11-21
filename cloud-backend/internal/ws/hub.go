@@ -126,9 +126,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 		close(sess.closed)
 		log.Printf("[HUB] Kiosk disconnected: %q", kioskID)
-		if h.db != nil {
-			_ = h.db.ResetUnacknowledgedDispatchIntents(context.Background(), kioskID)
-		}
+		// Leave SENT intact until the next connection performs reconciliation.
+		// Resetting from the old connection's defer can race a replacement
+		// connection and downgrade intents it has just delivered.
 		_ = conn.Close(websocket.StatusNormalClosure, "session ended")
 	}()
 
@@ -138,11 +138,18 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Proactively sync active ads to newly connected kiosk
 	if h.db != nil {
 		if activeAds, err := h.db.GetActiveAds(ctx); err == nil && len(activeAds) > 0 {
+			sess.sendMu.Lock()
 			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: activeAds})
+			sess.sendMu.Unlock()
 		}
-		// Reconcile pending dispatch intents for this kiosk (crash/disconnect recovery)
-		_ = h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID)
-		if pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID); err == nil && len(pendingJobs) > 0 {
+		// Only a new authenticated Pi connection may initiate replay.
+		// ACKNOWLEDGED and COMPLETED jobs stay terminal; the Pi uses its
+		// persisted JobID state to deduplicate a previously delivered command.
+		if err := h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID); err != nil {
+			log.Printf("[HUB] Failed to reset unacknowledged intents for kiosk %s: %v", kioskID, err)
+		} else if pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID); err != nil {
+			log.Printf("[HUB] Failed to reconcile pending intents for kiosk %s: %v", kioskID, err)
+		} else if len(pendingJobs) > 0 {
 			log.Printf("[HUB] Reconciling %d pending dispatch orders for kiosk %s", len(pendingJobs), kioskID)
 			for _, jobCmd := range pendingJobs {
 				if err := h.SendJob(ctx, jobCmd); err != nil {
@@ -301,6 +308,9 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 	defer sess.sendMu.Unlock()
 
 	if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
+		// Force the broken session to exit its receive loop and reconnect.
+		// Do not retry this possibly delivered frame on the same connection.
+		_ = sess.conn.CloseNow()
 		return fmt.Errorf("send job: write to kiosk %q: %w", cmd.KioskID, err)
 	}
 
