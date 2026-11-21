@@ -93,6 +93,28 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 			return
 		}
 
+		// The kiosk now claims a reserved order automatically after PIN entry.
+		if r.URL.Path == "/api/k/kiosk-e2e/orders/ord_e2e_valid/claim" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"session_id": "sess_e2e_valid", "order_id": "ord_e2e_valid",
+				"kiosk_id": "kiosk-e2e", "status": "PAYMENT_PENDING",
+				"total_price_paise": 2400, "seconds_remaining": 300,
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/sessions/") && strings.HasSuffix(r.URL.Path, "/initiate-payment") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"session_id": "sess_e2e_valid", "qr_payload": "https://example.test/pay/dmo_e2e",
+				"amount_paise": 2400, "attempt_status": "CREATED",
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		// 2. Mock ads endpoint
 		if r.URL.Path == "/api/ads" {
 			w.Header().Set("Content-Type", "application/json")
@@ -157,7 +179,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 
 	// Submit PIN
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "ORDER_SUMMARY" }) {
+	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "PAYMENT_PENDING" }) {
 		t.Fatalf("expected state ORDER_SUMMARY, got %s", pinCtrl.GetState())
 	}
 
@@ -167,7 +189,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 	}
 	lastState := history[len(history)-1]
 
-	if lastState.Mode != ui_ipc.ModeOrderSummary {
+	if lastState.Mode != ui_ipc.ModePaymentPending {
 		t.Errorf("expected mode ORDER_SUMMARY, got %s", lastState.Mode)
 	}
 	if lastState.OrderSummary == nil {
@@ -186,7 +208,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 		t.Errorf("expected total sheets 4, got %d", lastState.OrderSummary.TotalSheets)
 	}
 
-	// Step 2: Cancel from order summary returns to idle
+	// Step 2: Cancel from payment screen returns to idle
 	simInput.EmitCancel()
 	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "IDLE" }) {
 		t.Errorf("expected state IDLE after cancel, got %s", pinCtrl.GetState())
@@ -365,12 +387,9 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 	}
 	simInput.EmitSubmit()
 
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected direct payment screen, got %s", client.PINController().GetState())
 	}
-
-	// User submits on order summary
-	simInput.EmitSubmit()
 	time.Sleep(50 * time.Millisecond)
 
 	// CUPS print function must NEVER have been called!
@@ -464,12 +483,10 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 		t.Fatalf("expected buffer 9876, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected direct payment after PIN, got %s", client.PINController().GetState())
 	}
 
-	// 2. Confirm order -> PAYMENT_PENDING
-	simInput.EmitSubmit()
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
 		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
 	}
@@ -618,12 +635,10 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 		t.Fatalf("expected buffer 1122, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected direct payment after PIN, got %s", client.PINController().GetState())
 	}
 
-	// 2. Confirm order -> PAYMENT_PENDING with dynamic QR
-	simInput.EmitSubmit()
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
 		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
 	}
@@ -878,8 +893,8 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 		t.Fatalf("expected buffer 5555, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected direct payment after PIN, got %s", client.PINController().GetState())
 	}
 	simInput.EmitSubmit()
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
