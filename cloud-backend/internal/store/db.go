@@ -1521,9 +1521,6 @@ WHERE o.order_id = ?;
 	if ordTotalPages <= 0 {
 		ordTotalPages = totalPages
 	}
-	if ordTotalSheets <= 0 {
-		ordTotalSheets = totalSheets
-	}
 
 	result := &Order{
 		OrderID: resOrderID,
@@ -2779,8 +2776,8 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 	var (
 		orderKioskID   string
 		statusStr      string
-		pricePaise      int64
-		pinExpiresAtNS  int64
+		pricePaise       int64
+		pinExpiresAtNS   int64
 		orderTotalSheets int
 	)
 	queryOrder := s.rebind(`
