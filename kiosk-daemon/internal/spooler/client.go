@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -62,47 +63,52 @@ type StateStore interface {
 
 // ClientConfig holds the runtime dependencies and parameters for the kiosk spooler client.
 type ClientConfig struct {
-	CloudURL                 string
-	KioskID                  string
-	KioskSecret              string
-	StateStore               StateStore
-	PrinterAddr              string
-	SNMPTarget               string
-	SNMPCommunity            string
-	SNMPPort                 int
-	CUPSQueue                string
-	PrinterModel             string
-	DownloadDir              string
-	IdleQRContent            string
-	AdsCachePath             string
-	IdleCarouselInterval     time.Duration
-	CompletedDisplayDuration time.Duration
-	ErrorDisplayDuration     time.Duration
+	CloudURL                     string
+	KioskID                      string
+	KioskSecret                  string
+	StateStore                   StateStore
+	PrinterAddr                  string
+	SNMPTarget                   string
+	SNMPCommunity                string
+	SNMPPort                     int
+	CUPSQueue                    string
+	PrinterModel                 string
+	DownloadDir                  string
+	IdleQRContent                string
+	AdsCachePath                 string
+	IdleCarouselInterval         time.Duration
+	CompletedDisplayDuration     time.Duration
+	ErrorDisplayDuration         time.Duration
 	HealthPollInterval           time.Duration
 	RequiredRecoveryHealthyCount int
 	ScreenSink                   ui_ipc.Sink
-	HTTPClient               *http.Client
-	MockHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
-	MockCUPSPrint            func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
-	SNMPPoller               func(ctx context.Context) printer.HardwareTelemetry
-	CUPSRunner               printer.CommandRunner
-	EnableCloudRecovery      bool
-	InputSource              input.Source
-	InactivityTimeout        time.Duration
-	SummaryTimeout           time.Duration
-	PaymentTimeout           time.Duration
-	PaymentURLBase           string
-	BypassPayment            bool
-	SoundPlayer              audio.Player
-	OnJobCompleted           func(jobID string)
-	TrustedOrigins           []string
-	EnableShadowHealth       bool
-	ShadowHealthInterval     time.Duration
-	MockCUPSHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
-	MockCUPSHealthDiag       func(ctx context.Context, estimatedSheets int) (contracts.PrinterHealth, error)
-	MockSNMPHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
-	MockIPPState             func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error)
-	JobQueueCapacity         int
+	HTTPClient                   *http.Client
+	MockHealth                   func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockCUPSPrint                func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
+	SNMPPoller                   func(ctx context.Context) printer.HardwareTelemetry
+	CUPSRunner                   printer.CommandRunner
+	EnableCloudRecovery          bool
+	InputSource                  input.Source
+	InactivityTimeout            time.Duration
+	SummaryTimeout               time.Duration
+	PaymentTimeout               time.Duration
+	PaymentURLBase               string
+	BypassPayment                bool
+	SoundPlayer                  audio.Player
+	OnJobCompleted               func(jobID string)
+	TrustedOrigins               []string
+	EnableShadowHealth           bool
+	ShadowHealthInterval         time.Duration
+	MockCUPSHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockCUPSHealthDiag           func(ctx context.Context, estimatedSheets int) (contracts.PrinterHealth, error)
+	MockSNMPHealth               func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
+	MockIPPState                 func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error)
+	JobQueueCapacity             int
+	PingInterval                 time.Duration
+	PingTimeout                  time.Duration
+	HeartbeatInterval            time.Duration
+	MinBackoff                   time.Duration
+	MaxBackoff                   time.Duration
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -110,6 +116,7 @@ type ClientConfig struct {
 type Client struct {
 	cfg           ClientConfig
 	normalizedURL string
+	safeURL       string
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -134,6 +141,8 @@ type Client struct {
 	minBackoff        time.Duration
 	maxBackoff        time.Duration
 	heartbeatInterval time.Duration
+	pingInterval      time.Duration
+	pingTimeout       time.Duration
 	maxDownloadBytes  int64
 
 	lastRenderErrMu sync.Mutex
@@ -150,7 +159,7 @@ type Client struct {
 	hardwareFault         bool
 	faultReason           string
 	faultCustomerMsg      string
-	consecutiveHealthy   int
+	consecutiveHealthy    int
 	requiredRecoveryCount int
 
 	renderMu sync.Mutex
@@ -220,6 +229,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	u.RawQuery = q.Encode()
 	normalizedURL := u.String()
 
+	// Remove credentials, query strings and fragments from every logged URL.
+	safeU := *u
+	safeU.User = nil
+	safeU.RawQuery = ""
+	safeU.Fragment = ""
+	safeURL := safeU.String()
+
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
@@ -272,21 +288,21 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				snmpCfg.Community = cfg.SNMPCommunity
 			}
 
-		cupsQ := strings.TrimSpace(cfg.CUPSQueue)
-		runner := cfg.CUPSRunner
-		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-			if strings.TrimSpace(cupsQ) == "" && strings.TrimSpace(snmpCfg.Target) == "" {
-				return contracts.PrinterHealth{
-					Online:          true,
-					State:           "READY",
-					PaperTrayStatus: "OK",
-					EstimatedSheets: estimatedSheets,
-					UpdatedAt:       time.Now().UTC(),
+			cupsQ := strings.TrimSpace(cfg.CUPSQueue)
+			runner := cfg.CUPSRunner
+			poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+				if strings.TrimSpace(cupsQ) == "" && strings.TrimSpace(snmpCfg.Target) == "" {
+					return contracts.PrinterHealth{
+						Online:          true,
+						State:           "READY",
+						PaperTrayStatus: "OK",
+						EstimatedSheets: estimatedSheets,
+						UpdatedAt:       time.Now().UTC(),
+					}
 				}
+				return printer.PollCombinedHealth(ctx, runner, cupsQ, snmpCfg, estimatedSheets)
 			}
-			return printer.PollCombinedHealth(ctx, runner, cupsQ, snmpCfg, estimatedSheets)
 		}
-	}
 	}
 
 	if cfg.CompletedDisplayDuration <= 0 {
@@ -343,19 +359,43 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		queueCap = 16
 	}
 
+	minBackoff := cfg.MinBackoff
+	if minBackoff <= 0 {
+		minBackoff = 1 * time.Second
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+	hbInterval := cfg.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = 15 * time.Second
+	}
+	pingInterval := cfg.PingInterval
+	if pingInterval <= 0 {
+		pingInterval = 30 * time.Second
+	}
+	pingTimeout := cfg.PingTimeout
+	if pingTimeout <= 0 {
+		pingTimeout = 10 * time.Second
+	}
+
 	runCtx, runCancel := context.WithCancel(context.Background())
 	client := &Client{
 		cfg:                   cfg,
 		normalizedURL:         normalizedURL,
+		safeURL:               safeURL,
 		jobQueue:              make(chan contracts.PrintJobCommand, queueCap),
 		activeJobs:            make(map[string]bool),
 		deferredJobs:          make([]contracts.PrintJobCommand, 0),
 		pendingQueue:          make([]contracts.PrintJobCommand, 0),
 		runCtx:                runCtx,
 		runCancel:             runCancel,
-		minBackoff:            1 * time.Second,
-		maxBackoff:            30 * time.Second,
-		heartbeatInterval:     15 * time.Second,
+		minBackoff:            minBackoff,
+		maxBackoff:            maxBackoff,
+		heartbeatInterval:     hbInterval,
+		pingInterval:          pingInterval,
+		pingTimeout:           pingTimeout,
 		maxDownloadBytes:      250 * 1024 * 1024,
 		healthPoller:          poller,
 		snmpPoller:            cfg.SNMPPoller,
@@ -401,6 +441,41 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 // PINController returns the active PIN controller instance, or nil if keypad input is not configured.
 func (c *Client) PINController() *pin.Controller {
 	return c.pinController
+}
+
+var (
+	bearerAuthRegex  = regexp.MustCompile(`(?i)(bearer\s+)[^\s"',;]+`)
+	urlUserInfoRegex = regexp.MustCompile(`(?i)(wss?://|https?://)[^/\s@]+@`)
+	urlQueryRegex    = regexp.MustCompile(`\?[^\s"',;` + "`" + `]+`)
+)
+
+// SafeURL returns the cloud WebSocket URL without any query parameters or authentication credentials.
+func (c *Client) SafeURL() string {
+	return c.safeURL
+}
+
+func sanitizeErrorMessage(msg string, secret string, rawURL string, safeURL string) string {
+	if msg == "" {
+		return ""
+	}
+	if rawURL != "" && safeURL != "" {
+		msg = strings.ReplaceAll(msg, rawURL, safeURL)
+	}
+	trimmedSecret := strings.TrimSpace(secret)
+	if trimmedSecret != "" {
+		msg = strings.ReplaceAll(msg, trimmedSecret, "[REDACTED]")
+	}
+	msg = bearerAuthRegex.ReplaceAllString(msg, "${1}[REDACTED]")
+	msg = urlUserInfoRegex.ReplaceAllString(msg, "${1}")
+	msg = urlQueryRegex.ReplaceAllString(msg, "")
+	return msg
+}
+
+func (c *Client) sanitizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sanitizeErrorMessage(err.Error(), c.cfg.KioskSecret, c.normalizedURL, c.safeURL)
 }
 
 // RenderHistory returns a copy of the screen states recorded during client execution.
@@ -962,7 +1037,7 @@ func (c *Client) Run(ctx context.Context) error {
 
 		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
-			log.Printf("[SPOOLER] WebSocket connection to cloud failed (%v); retrying in %v...", err, delay)
+			log.Printf("[SPOOLER] WebSocket connection to cloud failed (%s); retrying in %v...", c.sanitizeError(err), delay)
 			select {
 			case <-ctx.Done():
 				wg.Wait()
@@ -976,7 +1051,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 		}
 
-		log.Printf("[SPOOLER] Connected to cloud WebSocket hub at %s", c.normalizedURL)
+		log.Printf("[SPOOLER] Connected to cloud WebSocket hub at %s", c.safeURL)
 		// Connected successfully: reset backoff delay
 		delay = c.minBackoff
 		c.handleConnection(ctx, conn)
@@ -1000,19 +1075,28 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 			c.conn = nil
 		}
 		c.connMu.Unlock()
-		_ = conn.Close(websocket.StatusNormalClosure, "disconnecting")
 	}()
 
+	var connWg sync.WaitGroup
+
 	// Start heartbeat and telemetry loop
-	var hbWg sync.WaitGroup
-	hbWg.Add(1)
+	connWg.Add(1)
 	go func() {
-		defer hbWg.Done()
-		c.heartbeatLoop(connCtx, conn)
+		defer connWg.Done()
+		c.heartbeatLoop(connCtx, cancel, conn)
+	}()
+
+	// Start independent ping watchdog loop
+	connWg.Add(1)
+	go func() {
+		defer connWg.Done()
+		c.pingWatchdog(connCtx, cancel, conn)
 	}()
 
 	// Synchronize any paused/error job states with the cloud upon connection
+	connWg.Add(1)
 	go func() {
+		defer connWg.Done()
 		incList, err := c.cfg.StateStore.GetIncompleteJobs(connCtx)
 		if err == nil {
 			for _, inc := range incList {
@@ -1026,7 +1110,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 						ErrorReason:   inc.ErrorReason,
 						Timestamp:     time.Now().UTC(),
 					}
-					c.sendProgress(connCtx, evt)
+					_ = c.sendWire(connCtx, conn, wireMessage{Type: "progress", Progress: &evt})
 				}
 			}
 		}
@@ -1061,10 +1145,11 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 	}
 
 	cancel()
-	hbWg.Wait()
+	_ = conn.CloseNow()
+	connWg.Wait()
 }
 
-func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
+func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
 
@@ -1074,7 +1159,15 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			return
 		case <-ticker.C:
 			// Send heartbeat
-			_ = c.sendWire(ctx, conn, wireMessage{Type: "heartbeat"})
+			if err := c.sendWire(ctx, conn, wireMessage{Type: "heartbeat"}); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[SPOOLER] Heartbeat write failed (%s); terminating connection", c.sanitizeError(err))
+				cancel()
+				_ = conn.CloseNow()
+				return
+			}
 
 			// Relay printer health
 			sheets, isCalibrated, err := c.cfg.StateStore.GetPaperSupply(ctx)
@@ -1086,13 +1179,73 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			if !isCalibrated {
 				h.PaperTrayStatus = "UNKNOWN"
 			}
-			_ = c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h})
+			if err := c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h}); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[SPOOLER] Health telemetry write failed (%s); terminating connection", c.sanitizeError(err))
+				cancel()
+				_ = conn.CloseNow()
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) pingWatchdog(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, pingCancel := context.WithTimeout(ctx, c.pingTimeout)
+			err := conn.Ping(pingCtx)
+			pingCancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[SPOOLER] WebSocket ping watchdog failed (%s); terminating connection", c.sanitizeError(err))
+				cancel()
+				_ = conn.CloseNow()
+				return
+			}
 		}
 	}
 }
 
 func (c *Client) sendWire(ctx context.Context, conn *websocket.Conn, msg wireMessage) error {
-	c.sendMu.Lock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if !c.sendMu.TryLock() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+
+		acquired := false
+		for !acquired {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if c.sendMu.TryLock() {
+					acquired = true
+				}
+			}
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		c.sendMu.Unlock()
+		return err
+	}
 	defer c.sendMu.Unlock()
 
 	c.connMu.Lock()
@@ -3687,4 +3840,3 @@ func (c *Client) cloudKeepAliveLoop(ctx context.Context, healthURL string) {
 		}
 	}
 }
-
