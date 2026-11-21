@@ -135,7 +135,7 @@ flowchart TD
 - **Primary Responsibility:** Calculation and enforcement of authoritative printing tariffs in fixed integer paise. Supports matrix tariffs (B&W Simplex, B&W Duplex, Color Simplex, Color Duplex) and volume discounts.
 - **Source Paths:**
   - Authoritative Pricing Engine: [`cloud-backend/internal/pricing/pricing.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/pricing/pricing.go) (`CalculatePricePaise`, `ResolveUnitPrice`, `ComputeDuplexDiscount`)
-  - Legacy Price Calculation Delegation: [`cloud-backend/internal/payments/razorpay.go:16-20`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/razorpay.go#L16-L20) (`CalculatePricePaise`)
+  - Canonical Price Calculation: [`cloud-backend/internal/pricing/pricing.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/pricing.go#L16-L20) (`CalculatePricePaise`)
   - Tariff Resolution Delegation: [`cloud-backend/cmd/server/main.go:210-212`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L210-L212) (`resolveUnitPrice`)
   - Tariff Persistence: [`cloud-backend/internal/store/analytics.go:120-170`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/analytics.go#L120-L170) (`SetDetailedPricing`, `GetPricing`)
   - Admin Tariff Handler: [`cloud-backend/cmd/server/admin_handlers.go:35-95`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/admin_handlers.go#L35-L95) (`handleAdminPricing`)
@@ -207,38 +207,38 @@ flowchart TD
 
 ### 2.5 Payments Module
 
-- **Primary Responsibility:** Dynamic UPI payment generation, payment gateway integration (Razorpay production and Mock dev provider), webhook verification, payment attempt tracking, and authorization gating for print dispatch.
+- **Primary Responsibility:** Dynamic UPI payment generation, payment gateway integration (Demo production and Mock dev provider), demo capture verification, payment attempt tracking, and authorization gating for print dispatch.
 - **Source Paths:**
-  - Payment Gateways: [`cloud-backend/internal/payments/razorpay.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/razorpay.go), [`mock.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/mock.go)
-  - Webhook Handler: [`cloud-backend/cmd/server/main.go:1417-1550`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1417-L1550) (`handleRazorpayWebhook`)
+  - Payment Gateways: [`cloud-backend/internal/payments/pricing.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/pricing.go), [`mock.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/mock.go)
+  - Webhook Handler: [`cloud-backend/cmd/server/main.go:1417-1550`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1417-L1550) (`handleDemoWebhook`)
   - Payment Initiation: [`cloud-backend/cmd/server/session_handler.go:363-440`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/session_handler.go#L363-L440) (`handleInitiatePayment`)
   - Persistence & Deduplication: [`cloud-backend/internal/store/db.go:1733-1765`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L1733-L1765) (`RecordWebhook`), [`db.go:2537-2680`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L2537-L2680) (`CapturePaymentAndCheckDispatch`)
 - **Inputs:**
   - Payment initiation requests from kiosk session (`POST /api/k/{id}/sessions/{id}/initiate-payment`).
-  - Signed webhook payloads from Razorpay (`POST /api/webhooks/razorpay`).
+  - Signed demo capture payloads from Demo (`POST /api/demo captures/razorpay`).
 - **Outputs:**
   - Dynamic UPI QR payload (`upi://pay?pa=...&am=...&tr=...`).
   - Captured payment audit records in `payments` and `payment_attempts`.
   - Authorized `PrintJobCommand` sent to Dispatch Module.
 - **Owned State:**
-  - Tables: `payment_attempts`, `payments`, `payment_webhooks`.
+  - Tables: `payment_attempts`, `payments`, `payment_demo captures`.
 - **Dependencies:**
-  - Razorpay REST API, Cloud Database Store.
+  - Demo REST API, Cloud Database Store.
 - **Permitted Side Effects:**
   - External HTTP requests to payment gateway.
   - Transitioning orders to `PAID_WAITING` or `DISPATCHED`.
 - **Minimum Required Functionality:**
   - Generate dynamic UPI QR payload tied to order ID and session ID.
-  - Verify webhook HMAC-SHA256 signature using constant-time comparison.
-  - Deduplicate incoming webhooks by gateway event ID.
+  - Verify demo capture HMAC-SHA256 signature using constant-time comparison.
+  - Deduplicate incoming demo captures by gateway event ID.
   - Verify payment amount matches order amount in paise.
 - **Explicit Invariants:**
-  1. **Webhook Deduplication Invariant:** Duplicate webhook deliveries for the same event ID are discarded as idempotent no-ops via primary key constraint on `payment_webhooks.webhook_id`.
+  1. **Webhook Deduplication Invariant:** Duplicate demo capture deliveries for the same event ID are discarded as idempotent no-ops via primary key constraint on `payment_demo captures.demo capture_id`.
   2. **Presence-Gated Dispatch Invariant:** Captured payments authorize print dispatch **if and only if** the customer's transaction session is active and in `PAYMENT_PENDING`. If the session expired or was canceled, the order transitions to `PAID_WAITING` and dispatch is withheld until physical re-claiming ([`db.go:2537`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L2537)).
   3. **Exact Amount Invariant:** Webhooks with paid amounts differing from `orders.price_paise` are rejected with HTTP 400.
 - **Failure & Lifecycle Behavior:**
   - Gateway network failures allow retrying payment initiation within session TTL.
-  - Invalid webhook signatures return HTTP 400 and are dropped immediately.
+  - Invalid demo capture signatures return HTTP 400 and are dropped immediately.
 
 ---
 
