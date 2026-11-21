@@ -4501,6 +4501,10 @@ func TestClient_PingWatchdog_UnresponsivePeer_TriggersReconnect(t *testing.T) {
 	conn2Established := make(chan struct{})
 
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		count := connCount.Add(1)
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -4603,46 +4607,40 @@ func (c *failWriterConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
-	var connCount atomic.Int32
-	conn2Established := make(chan struct{})
+type pingTrackingConn struct {
+	net.Conn
+	pingCount atomic.Int32
+}
 
+func (c *pingTrackingConn) Write(b []byte) (int, error) {
+	if len(b) > 0 && (b[0]&0x0f) == 0x9 {
+		c.pingCount.Add(1)
+	}
+	return c.Conn.Write(b)
+}
+
+func TestClient_Heartbeat_WriteError_TerminatesConnection(t *testing.T) {
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := connCount.Add(1)
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
+		defer c.CloseNow()
 
-		if count == 1 {
-			// First connection: accept and read normally without closing.
-			// The server keeps the socket open so the client's reader does NOT detect EOF.
-			go func() {
-				for {
-					var msg wireMessage
-					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
-						return
-					}
+		// Server keeps the socket open so the client's reader does NOT detect EOF
+		go func() {
+			for {
+				var msg wireMessage
+				if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+					return
 				}
-			}()
-			<-r.Context().Done()
-		} else {
-			// Second connection (recovery): read normally and signal establishment
-			select {
-			case <-conn2Established:
-			default:
-				close(conn2Established)
 			}
-			go func() {
-				for {
-					var msg wireMessage
-					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
-						return
-					}
-				}
-			}()
-			<-r.Context().Done()
-		}
+		}()
+		<-r.Context().Done()
 	}))
 	defer wsServer.Close()
 
@@ -4726,36 +4724,14 @@ func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
 	if !strings.Contains(logOutput, "[SPOOLER] Heartbeat write failed") {
 		t.Fatalf("expected '[SPOOLER] Heartbeat write failed' in log, got:\n%s", logOutput)
 	}
-
-	// Now verify recovery: client connects connection 2 and runs healthy
-	conn2Ctx, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-
-	conn2, _, err := websocket.Dial(conn2Ctx, client.normalizedURL, nil)
-	if err != nil {
-		t.Fatalf("Dial connection 2 failed: %v", err)
-	}
-	defer conn2.CloseNow()
-
-	conn2Done := make(chan struct{})
-	go func() {
-		client.handleConnection(conn2Ctx, conn2)
-		close(conn2Done)
-	}()
-
-	select {
-	case <-conn2Established:
-		// Reconnection / recovery succeeded!
-	case <-time.After(1 * time.Second):
-		t.Fatal("recovery connection 2 was not established")
-	}
-
-	cancel2()
-	<-conn2Done
 }
 
 func TestClient_PingWatchdog_CleanShutdown(t *testing.T) {
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -4819,6 +4795,10 @@ func TestClient_PingWatchdog_CleanShutdown(t *testing.T) {
 
 func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -4856,7 +4836,24 @@ func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 	connCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+	var ptc *pingTrackingConn
+	dialer := &net.Dialer{}
+	dialClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				rawConn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				ptc = &pingTrackingConn{Conn: rawConn}
+				return ptc, nil
+			},
+		},
+	}
+
+	conn, _, err := websocket.Dial(connCtx, client.normalizedURL, &websocket.DialOptions{
+		HTTPClient: dialClient,
+	})
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
@@ -4897,6 +4894,11 @@ func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("pingWatchdog hung or was blocked while sendMu was locked")
 	}
+
+	// Positive observable assertion that the watchdog actually executed pings
+	if pings := ptc.pingCount.Load(); pings < 2 {
+		t.Fatalf("expected ping watchdog to execute multiple pings while sendMu was locked, got %d", pings)
+	}
 }
 
 func TestClient_SafeURL_RemovesEmbeddedUserInfoAndFragment(t *testing.T) {
@@ -4926,5 +4928,120 @@ func TestClient_SafeURL_RemovesEmbeddedUserInfoAndFragment(t *testing.T) {
 		if strings.Contains(got, secret) {
 			t.Fatalf("error still contains %q: %s", secret, got)
 		}
+	}
+}
+
+func TestClient_PingWatchdog_ReconnectWhileSendMuLocked(t *testing.T) {
+	var connCount atomic.Int32
+	conn1Established := make(chan struct{})
+	conn2Established := make(chan struct{})
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		count := connCount.Add(1)
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+
+		if count == 1 {
+			// First connection: accept WebSocket upgrade, but do NOT read.
+			// Incoming pings will not receive pongs, triggering the ping watchdog.
+			select {
+			case <-conn1Established:
+			default:
+				close(conn1Established)
+			}
+			select {
+			case <-r.Context().Done():
+			case <-time.After(3 * time.Second):
+			}
+		} else {
+			// Second connection (reconnect): signal establishment and read normally.
+			select {
+			case <-conn2Established:
+			default:
+				close(conn2Established)
+			}
+			_ = c.CloseRead(r.Context())
+			select {
+			case <-r.Context().Done():
+			case <-time.After(3 * time.Second):
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "test_watchdog_sendmu_reconnect.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	cfg := ClientConfig{
+		CloudURL:          wsURL,
+		KioskID:           "kiosk-watchdog-sendmu-test",
+		KioskSecret:       "watchdog-sendmu-token",
+		StateStore:        store,
+		PrinterAddr:       "127.0.0.1:9100",
+		DownloadDir:       t.TempDir(),
+		IdleQRContent:     "https://example.com/qr",
+		ScreenSink:        noopSink,
+		PingInterval:      30 * time.Millisecond,
+		PingTimeout:       30 * time.Millisecond,
+		HeartbeatInterval: 10 * time.Millisecond,
+		MinBackoff:        10 * time.Millisecond,
+		MaxBackoff:        50 * time.Millisecond,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- client.Run(ctx)
+	}()
+
+	select {
+	case <-conn1Established:
+	case <-time.After(1 * time.Second):
+		t.Fatal("connection 1 was not established")
+	}
+
+	// Hold sendMu to simulate a stalled print job or slow writer
+	client.sendMu.Lock()
+
+	// Prove client reconnects while sendMu is STILL held
+	select {
+	case <-conn2Established:
+		// Reconnection succeeded while sendMu was locked
+	case <-time.After(1500 * time.Millisecond):
+		client.sendMu.Unlock()
+		t.Fatal("client failed to reconnect while sendMu was locked (connection teardown deadlock)")
+	}
+
+	// Release mutex safely
+	client.sendMu.Unlock()
+
+	// Prove clean shutdown
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("client.Run returned unexpected error on clean shutdown: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("client.Run did not terminate promptly after context cancel")
 	}
 }

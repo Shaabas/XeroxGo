@@ -1176,7 +1176,6 @@ func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, c
 				isCalibrated = true
 			}
 			h := c.healthPoller(ctx, sheets)
-			h.EstimatedSheets = sheets
 			if !isCalibrated {
 				h.PaperTrayStatus = "UNKNOWN"
 			}
@@ -1219,7 +1218,34 @@ func (c *Client) pingWatchdog(ctx context.Context, cancel context.CancelFunc, co
 }
 
 func (c *Client) sendWire(ctx context.Context, conn *websocket.Conn, msg wireMessage) error {
-	c.sendMu.Lock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if !c.sendMu.TryLock() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+
+		acquired := false
+		for !acquired {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if c.sendMu.TryLock() {
+					acquired = true
+				}
+			}
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		c.sendMu.Unlock()
+		return err
+	}
 	defer c.sendMu.Unlock()
 
 	c.connMu.Lock()
