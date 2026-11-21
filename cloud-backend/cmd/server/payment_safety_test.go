@@ -1660,14 +1660,25 @@ func TestPaymentPhase1_Webhook_MismatchedAmount_Rejected(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request for mismatched amount, got %d", resp.StatusCode)
+	// A verified captured transaction represents real money, even if its
+	// amount cannot fund printing. The signed webhook is acknowledged only
+	// after the independent refund obligation has committed.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("captured wrong-amount money must be accounted, got HTTP %d", resp.StatusCode)
 	}
-
-	// Verify order status unchanged
+	var response map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil { t.Fatal(err) }
+	if response["status"] != "excess_payment_refund_required" {
+		t.Fatalf("wrong amount did not create refund-only obligation: %+v",response)
+	}
 	ord, _ := st.GetOrder(context.Background(), orderID)
 	if ord.Status != contracts.JobStatusPendingPayment {
-		t.Fatalf("expected order status PENDING_PAYMENT, got %s", ord.Status)
+		t.Fatalf("underpaid capture authorized printing: %s", ord.Status)
+	}
+	refunds, err := st.ListActionableRefunds(context.Background(), time.Now().Add(time.Hour))
+	if err != nil || len(refunds) != 1 || refunds[0].AmountPaise != 500 ||
+		refunds[0].Reason != store.RefundReasonExcess || !refunds[0].SafeStopVerified {
+		t.Fatalf("wrong-amount capture lost its independent refund: %+v %v", refunds, err)
 	}
 }
 
