@@ -2157,7 +2157,8 @@
         pct = Math.min(95, Math.max(60, Math.round((pagesPrinted / totalPages) * 100)));
       } else if (st === 'COMPLETED') {
         pct = 100;
-        if (orderPollTimer) clearInterval(orderPollTimer);
+        // A completed print can still have an additional payment refund in progress.
+        if (!statusData.excess_refunds_unresolved && orderPollTimer) clearInterval(orderPollTimer);
       }
       checkoutProgressBar.style.width = pct + '%';
     }
@@ -2179,6 +2180,14 @@
         checkoutStatusMsg.textContent = 'Printing interrupted. Please leave the kiosk to the attendant; your order will be reviewed for a refund.';
       } else {
         checkoutStatusMsg.textContent = '';
+      }
+      const extraTotal = Number(statusData.excess_refunds_total) || 0;
+      const extraUnresolved = Number(statusData.excess_refunds_unresolved) || 0;
+      if (extraTotal > 0) {
+        const extraMessage = extraUnresolved > 0
+          ? 'An additional payment was detected; its refund is being processed separately.'
+          : 'An additional payment was refunded by the payment provider.';
+        checkoutStatusMsg.textContent += (checkoutStatusMsg.textContent ? ' ' : '') + extraMessage;
       }
     }
   }
