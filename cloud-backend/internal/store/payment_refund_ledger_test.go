@@ -201,6 +201,11 @@ func TestPaymentLedger_LegacyPendingRefundMigration(t *testing.T) {
 		"pay_legacy_1").Scan(&status); err != nil || status != "RECONCILIATION_REQUIRED" {
 		t.Fatalf("historic surplus lost safe manual reconciliation state: %q %v", status, err)
 	}
+	reviews, err := s.ListHistoricalCaptureReviews(ctx)
+	if err != nil || len(reviews) != 1 ||
+		reviews[0].PaymentID != "pay_legacy_1" || reviews[0].AmountPaise != 400 {
+		t.Fatalf("historic surplus not visible for operator reconciliation: %+v %v", reviews, err)
+	}
 }
 
 func TestPaymentLedger_WrongAmountCaptureRefundedNotApplied(t *testing.T) {
