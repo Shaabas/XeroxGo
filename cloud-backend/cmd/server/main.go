@@ -976,36 +976,19 @@ func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request
 	}
 
 	if captureRes.DispatchEligible {
-		if s.hub != nil {
-			if len(captureRes.Commands) > 0 {
-				for _, cmd := range captureRes.Commands {
-					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusServiceUnavailable)
-						_ = json.NewEncoder(w).Encode(map[string]interface{}{
-							"order_id": orderID,
-							"status":   string(contracts.JobStatusPaidWaiting),
-							"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
-						})
-						return
-					}
-					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
-				}
-			} else if captureRes.Command != nil {
-				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusServiceUnavailable)
-					_ = json.NewEncoder(w).Encode(map[string]interface{}{
-						"order_id": orderID,
-						"status":   string(contracts.JobStatusPaidWaiting),
-						"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
-					})
-					return
-				}
-				_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
-			}
+		commands := captureRes.Commands
+		if len(commands) == 0 && captureRes.Command != nil {
+			commands = []contracts.PrintJobCommand{*captureRes.Command}
 		}
-
+		if err := s.deliverAuthorizedJobs(r.Context(), orderID, commands); err != nil {
+			log.Printf("[SIMULATION] Order %s paid but delivery unresolved: %v", orderID, err)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"order_id": orderID,
+				"status":   "DISPATCH_PENDING",
+			})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"order_id": orderID,
