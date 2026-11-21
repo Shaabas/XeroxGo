@@ -194,3 +194,34 @@ func TestPaymentLedger_LegacyPendingRefundMigration(t *testing.T) {
 		t.Fatalf("migration did not recover excess capture: %+v %v", ready, err)
 	}
 }
+
+func TestPaymentLedger_WrongAmountCaptureRefundedNotApplied(t *testing.T) {
+	s := openPaymentLedgerTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	id, kiosk := "ord_wrong_amount", "kiosk_wrong_amount"
+	createTestOrderWithSheets(t, s, ctx, id, kiosk, "6583", 2, contracts.JobStatusPendingPayment, now)
+	wrong, err := s.CapturePaymentAndCheckDispatch(ctx, PaymentRecord{
+		PaymentID: "pay_wrong_amount", OrderID: id, KioskID: kiosk,
+		AmountPaise: 100, Provider: "mock", Status: "captured",
+	}, now)
+	if err != nil || wrong == nil || !wrong.ExcessCapture || wrong.DispatchEligible {
+		t.Fatalf("wrong captured amount must be refund-only: %+v %v",wrong,err)
+	}
+	var funded int
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM order_funding_payments WHERE order_id=?",id).Scan(&funded); err != nil || funded!=0 {
+		t.Fatalf("wrong amount claimed funding: %d %v",funded,err)
+	}
+	correct, err := s.CapturePaymentAndCheckDispatch(ctx, PaymentRecord{
+		PaymentID: "pay_correct_amount", OrderID: id, KioskID: kiosk,
+		AmountPaise: 400, Provider: "mock", Status: "captured",
+	}, now.Add(time.Second))
+	if err != nil || correct == nil || correct.ExcessCapture {
+		t.Fatalf("later exact payment must be legitimate funding: %+v %v",correct,err)
+	}
+	ready, err := s.ListActionableRefunds(ctx,now.Add(time.Hour))
+	if err != nil || len(ready)!=1 || ready[0].PaymentID!="pay_wrong_amount" || ready[0].AmountPaise!=100 {
+		t.Fatalf("wrong amount should be independently refunded in full: %+v %v",ready,err)
+	}
+}
