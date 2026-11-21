@@ -249,7 +249,7 @@
               </div>
 
               <div style="margin-top:1.5rem;">
-                <button id="pricing-save-btn" class="btn-primary" type="submit" style="width:100%;">
+                <button id="pricing-save-btn" class="btn-primary" type="submit">
                   Save Rates
                 </button>
               </div>
@@ -264,38 +264,60 @@
               </div>
             </div>
 
-            <div style="display:flex; flex-direction:column; gap:1rem;">
-              <div class="form-group">
-                <label class="form-label" for="calc-pages-input">Document Pages</label>
-                <input id="calc-pages-input" class="form-input" type="number" min="1" max="500" value="10" />
-              </div>
-
-              <div class="form-group">
-                <label class="form-label">Sides</label>
-                <div style="display:flex; gap:0.75rem;">
-                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
-                    <input type="radio" name="calc-duplex" value="simplex" checked />
-                    <span style="font-weight:600; font-size:0.875rem;">Single Side</span>
-                  </label>
-                  <label style="flex:1; display:flex; align-items:center; gap:0.5rem; padding:0.65rem 0.85rem; border:1px solid var(--border); border-radius:var(--radius-sm); cursor:pointer;">
-                    <input type="radio" name="calc-duplex" value="duplex" />
-                    <span style="font-weight:600; font-size:0.875rem;">Double Side</span>
-                  </label>
+            <div>
+              <!-- First row — two equal columns -->
+              <div class="estimator-row">
+                <div class="form-group">
+                  <label class="form-label" for="calc-pages-input">Document Pages</label>
+                  <input id="calc-pages-input" class="form-input" type="number" min="1" step="1" value="10" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="calc-copies-input">Copies</label>
+                  <input id="calc-copies-input" class="form-input" type="number" min="1" step="1" value="1" />
                 </div>
               </div>
 
-              <div style="margin-top:1rem; padding:1.25rem; background:#F8FAFC; border:1px solid var(--border); border-radius:var(--radius-sm);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Physical Sheets:</span>
-                  <span id="calc-result-sheets" style="font-weight:700;">10 sheets</span>
+              <!-- Second row — two equal columns -->
+              <div class="estimator-row">
+                <div class="form-group">
+                  <label class="form-label" for="calc-nup-select">Pages per side (N-Up)</label>
+                  <select id="calc-nup-select" class="form-input">
+                    <option value="1" selected>1-up</option>
+                    <option value="2">2-up</option>
+                  </select>
                 </div>
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Monochrome:</span>
-                  <span id="calc-result-bw" style="font-weight:800; font-size:1.15rem; color:var(--text-main);">₹30.00</span>
+                <div class="form-group">
+                  <label class="form-label" for="calc-sides-select">Printing sides</label>
+                  <select id="calc-sides-select" class="form-input">
+                    <option value="single" selected>Single-sided</option>
+                    <option value="double">Double-sided</option>
+                  </select>
                 </div>
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                  <span style="font-weight:600; color:var(--text-muted); font-size:0.875rem;">Color:</span>
-                  <span id="calc-result-color" style="font-weight:800; font-size:1.15rem; color:var(--primary);">₹80.00</span>
+              </div>
+
+              <!-- Third row — full width -->
+              <div class="form-group">
+                <label class="form-label" for="calc-mode-select">Print Mode</label>
+                <select id="calc-mode-select" class="form-input">
+                  <option value="bw" selected>Black &amp; white</option>
+                  <option value="color">Color</option>
+                </select>
+              </div>
+
+              <!-- Bottom — full-width summary box -->
+              <div class="estimator-summary">
+                <div class="estimator-summary-row">
+                  <span class="estimator-summary-label">Printed sides per copy</span>
+                  <span id="calc-result-sides" class="estimator-summary-value">10</span>
+                </div>
+                <div class="estimator-summary-row">
+                  <span class="estimator-summary-label">Sheets (all copies)</span>
+                  <span id="calc-result-sheets" class="estimator-summary-value">10</span>
+                </div>
+                <div class="estimator-divider"></div>
+                <div class="estimator-summary-row estimator-total-row">
+                  <span class="estimator-total-label">Calculated total</span>
+                  <span id="calc-result-total" class="estimator-total-value">₹30.00</span>
                 </div>
               </div>
             </div>

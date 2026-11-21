@@ -3,7 +3,112 @@
   'use strict';
 
   // --- Session & Auth State ---
-  let authToken = localStorage.getItem('xeroxgo_admin_token') || '';
+  let authToken = '';
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      authToken = window.localStorage.getItem('xeroxgo_admin_token') || '';
+    } catch (_) {
+      authToken = '';
+    }
+  }
+
+  // --- Estimator Math & Parsing Helpers ---
+  function parsePositiveInteger(val) {
+    if (val === null || val === undefined) return null;
+    const str = String(val).trim();
+    if (!/^\d+$/.test(str)) return null;
+    const n = parseInt(str, 10);
+    if (!Number.isSafeInteger(n) || n <= 0) return null;
+    return n;
+  }
+
+  function parseRupeesToPaise(valStr) {
+    const trimmed = valStr ? String(valStr).trim() : '';
+    if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
+      return null;
+    }
+    const num = parseFloat(trimmed);
+    if (isNaN(num) || num <= 0) {
+      return null;
+    }
+    const paise = Math.round(num * 100);
+    if (paise <= 0) {
+      return null;
+    }
+    return paise;
+  }
+
+  function calculateEstimate(opts) {
+    if (!opts) {
+      return {
+        valid: false,
+        printedSidesPerCopy: null,
+        totalSheets: null,
+        totalCostPaise: null,
+        printedSidesDisplay: '--',
+        sheetsDisplay: '--',
+        totalCostDisplay: '--'
+      };
+    }
+
+    const pages = parsePositiveInteger(opts.pages);
+    const copies = parsePositiveInteger(opts.copies);
+    const nUp = (opts.nUp === 2 || opts.nUp === '2') ? 2 : 1;
+    const isDuplex = (opts.sides === 'double' || opts.sides === 'duplex');
+    const isColor = (opts.mode === 'color');
+
+    if (pages === null || copies === null) {
+      return {
+        valid: false,
+        printedSidesPerCopy: null,
+        totalSheets: null,
+        totalCostPaise: null,
+        printedSidesDisplay: '--',
+        sheetsDisplay: '--',
+        totalCostDisplay: '--'
+      };
+    }
+
+    const imposedSidesPerCopy = Math.ceil(pages / nUp);
+    const sheetsPerCopy = isDuplex ? Math.ceil(imposedSidesPerCopy / 2) : imposedSidesPerCopy;
+    const totalSheets = sheetsPerCopy * copies;
+
+    const rates = opts.rates || {};
+    const simplexRate = isColor ? rates.colorSimplex : rates.bwSimplex;
+    const duplexRate = isColor ? rates.colorDuplex : rates.bwDuplex;
+
+    let totalCostPaise = null;
+    let totalCostDisplay = '--';
+
+    const validSimplex = (typeof simplexRate === 'number' && Number.isInteger(simplexRate) && simplexRate > 0);
+    const validDuplex = (typeof duplexRate === 'number' && Number.isInteger(duplexRate) && duplexRate > 0);
+
+    if (!isDuplex) {
+      if (validSimplex) {
+        const costPerCopyPaise = imposedSidesPerCopy * simplexRate;
+        totalCostPaise = costPerCopyPaise * copies;
+        totalCostDisplay = '₹' + (totalCostPaise / 100).toFixed(2);
+      }
+    } else {
+      if (validSimplex && validDuplex) {
+        const fullSheets = Math.floor(imposedSidesPerCopy / 2);
+        const oddSides = imposedSidesPerCopy % 2;
+        const costPerCopyPaise = (fullSheets * duplexRate) + (oddSides * simplexRate);
+        totalCostPaise = costPerCopyPaise * copies;
+        totalCostDisplay = '₹' + (totalCostPaise / 100).toFixed(2);
+      }
+    }
+
+    return {
+      valid: true,
+      printedSidesPerCopy: imposedSidesPerCopy,
+      totalSheets: totalSheets,
+      totalCostPaise: totalCostPaise,
+      printedSidesDisplay: String(imposedSidesPerCopy),
+      sheetsDisplay: String(totalSheets),
+      totalCostDisplay: totalCostDisplay
+    };
+  }
 
   // --- API Request Helper ---
   async function apiRequest(endpoint, options = {}) {
@@ -697,9 +802,14 @@
     const pricingSaveBtn = document.getElementById('pricing-save-btn');
 
     const calcPagesInput = document.getElementById('calc-pages-input');
+    const calcCopiesInput = document.getElementById('calc-copies-input');
+    const calcNupSelect = document.getElementById('calc-nup-select');
+    const calcSidesSelect = document.getElementById('calc-sides-select');
+    const calcModeSelect = document.getElementById('calc-mode-select');
+
+    const calcResultSides = document.getElementById('calc-result-sides');
     const calcResultSheets = document.getElementById('calc-result-sheets');
-    const calcResultBw = document.getElementById('calc-result-bw');
-    const calcResultColor = document.getElementById('calc-result-color');
+    const calcResultTotal = document.getElementById('calc-result-total');
 
     let currentBWSimplexPaise = null;
     let currentBWDuplexPaise = null;
@@ -751,7 +861,7 @@
         }
         if (pricingSaveBtn) {
           pricingSaveBtn.disabled = false;
-          pricingSaveBtn.textContent = 'Save Changes';
+          pricingSaveBtn.textContent = 'Save Rates';
         }
 
         updateCostEstimator();
@@ -795,81 +905,56 @@
       }
     }
 
+    function getEffectiveRatePaise(inputEl, fallbackPaise) {
+      if (inputEl) {
+        const str = inputEl.value ? String(inputEl.value).trim() : '';
+        if (str === '') {
+          return null;
+        }
+        return parseRupeesToPaise(str);
+      }
+      return fallbackPaise;
+    }
+
     function updateCostEstimator() {
       if (!calcPagesInput) return;
-      const pages = Math.max(1, parseInt(calcPagesInput.value, 10) || 1);
-      const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
-      const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
 
-      const bwSimplex = (priceBwSimplexInput && priceBwSimplexInput.value && !isNaN(parseFloat(priceBwSimplexInput.value)))
-        ? parseFloat(priceBwSimplexInput.value)
-        : (currentBWSimplexPaise !== null ? currentBWSimplexPaise / 100 : null);
-      const bwDuplex = (priceBwDuplexInput && priceBwDuplexInput.value && !isNaN(parseFloat(priceBwDuplexInput.value)))
-        ? parseFloat(priceBwDuplexInput.value)
-        : (currentBWDuplexPaise !== null ? currentBWDuplexPaise / 100 : null);
-      const colorSimplex = (priceColorSimplexInput && priceColorSimplexInput.value && !isNaN(parseFloat(priceColorSimplexInput.value)))
-        ? parseFloat(priceColorSimplexInput.value)
-        : (currentColorSimplexPaise !== null ? currentColorSimplexPaise / 100 : null);
-      const colorDuplex = (priceColorDuplexInput && priceColorDuplexInput.value && !isNaN(parseFloat(priceColorDuplexInput.value)))
-        ? parseFloat(priceColorDuplexInput.value)
-        : (currentColorDuplexPaise !== null ? currentColorDuplexPaise / 100 : null);
+      const bwSimplexPaise = getEffectiveRatePaise(priceBwSimplexInput, currentBWSimplexPaise);
+      const bwDuplexPaise = getEffectiveRatePaise(priceBwDuplexInput, currentBWDuplexPaise);
+      const colorSimplexPaise = getEffectiveRatePaise(priceColorSimplexInput, currentColorSimplexPaise);
+      const colorDuplexPaise = getEffectiveRatePaise(priceColorDuplexInput, currentColorDuplexPaise);
 
-      if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
-
-      if (bwSimplex !== null && bwDuplex !== null) {
-        let bwCost = 0;
-        if (isDuplex) {
-          const fullSheets = Math.floor(pages / 2);
-          const hasOddPage = (pages % 2 !== 0);
-          bwCost = (fullSheets * bwDuplex) + (hasOddPage ? bwSimplex : 0);
-        } else {
-          bwCost = pages * bwSimplex;
+      const res = calculateEstimate({
+        pages: calcPagesInput.value,
+        copies: calcCopiesInput ? calcCopiesInput.value : 1,
+        nUp: calcNupSelect ? calcNupSelect.value : 1,
+        sides: calcSidesSelect ? calcSidesSelect.value : 'single',
+        mode: calcModeSelect ? calcModeSelect.value : 'bw',
+        rates: {
+          bwSimplex: bwSimplexPaise,
+          bwDuplex: bwDuplexPaise,
+          colorSimplex: colorSimplexPaise,
+          colorDuplex: colorDuplexPaise
         }
-        if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
-      } else {
-        if (calcResultBw) calcResultBw.textContent = '--';
-      }
+      });
 
-      if (colorSimplex !== null && colorDuplex !== null) {
-        let colorCost = 0;
-        if (isDuplex) {
-          const fullSheets = Math.floor(pages / 2);
-          const hasOddPage = (pages % 2 !== 0);
-          colorCost = (fullSheets * colorDuplex) + (hasOddPage ? colorSimplex : 0);
-        } else {
-          colorCost = pages * colorSimplex;
-        }
-        if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
-      } else {
-        if (calcResultColor) calcResultColor.textContent = '--';
-      }
+      if (calcResultSides) calcResultSides.textContent = res.printedSidesDisplay;
+      if (calcResultSheets) calcResultSheets.textContent = res.sheetsDisplay;
+      if (calcResultTotal) calcResultTotal.textContent = res.totalCostDisplay;
     }
 
-    if (calcPagesInput) calcPagesInput.addEventListener('input', updateCostEstimator);
-    document.querySelectorAll('input[name="calc-duplex"]').forEach(r => {
-      r.addEventListener('change', updateCostEstimator);
+    ['input', 'change'].forEach(evt => {
+      if (calcPagesInput) calcPagesInput.addEventListener(evt, updateCostEstimator);
+      if (calcCopiesInput) calcCopiesInput.addEventListener(evt, updateCostEstimator);
+      if (priceBwSimplexInput) priceBwSimplexInput.addEventListener(evt, updateCostEstimator);
+      if (priceBwDuplexInput) priceBwDuplexInput.addEventListener(evt, updateCostEstimator);
+      if (priceColorSimplexInput) priceColorSimplexInput.addEventListener(evt, updateCostEstimator);
+      if (priceColorDuplexInput) priceColorDuplexInput.addEventListener(evt, updateCostEstimator);
     });
-    if (priceBwSimplexInput) priceBwSimplexInput.addEventListener('input', updateCostEstimator);
-    if (priceBwDuplexInput) priceBwDuplexInput.addEventListener('input', updateCostEstimator);
-    if (priceColorSimplexInput) priceColorSimplexInput.addEventListener('input', updateCostEstimator);
-    if (priceColorDuplexInput) priceColorDuplexInput.addEventListener('input', updateCostEstimator);
+    if (calcNupSelect) calcNupSelect.addEventListener('change', updateCostEstimator);
+    if (calcSidesSelect) calcSidesSelect.addEventListener('change', updateCostEstimator);
+    if (calcModeSelect) calcModeSelect.addEventListener('change', updateCostEstimator);
     if (pricingColorEnabledToggle) pricingColorEnabledToggle.addEventListener('change', updateCostEstimator);
-
-    function parseRupeesToPaise(valStr) {
-      const trimmed = valStr ? String(valStr).trim() : '';
-      if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
-        return null;
-      }
-      const num = parseFloat(trimmed);
-      if (isNaN(num) || num <= 0) {
-        return null;
-      }
-      const paise = Math.round(num * 100);
-      if (paise <= 0) {
-        return null;
-      }
-      return paise;
-    }
 
     if (pricingForm) {
       pricingForm.addEventListener('submit', async (e) => {
@@ -1495,7 +1580,25 @@
       .replace(/'/g, '&#039;');
   }
 
+  // --- Exports for Testing & Window Access ---
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      parsePositiveInteger,
+      parseRupeesToPaise,
+      calculateEstimate
+    };
+  }
+  if (typeof window !== 'undefined') {
+    window.__adminEstimator = {
+      parsePositiveInteger,
+      parseRupeesToPaise,
+      calculateEstimate
+    };
+  }
+
   // Initial session check
-  document.addEventListener('DOMContentLoaded', checkSession);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', checkSession);
+  }
 
 })();

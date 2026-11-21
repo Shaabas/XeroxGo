@@ -892,3 +892,75 @@ input:checked + .slider:before {
   }
 }
 
+/* Cost Estimator Scoped Styles */
+.estimator-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 640px) {
+  .estimator-row {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}
+
+select.form-input {
+  background-color: var(--card-bg);
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.estimator-summary {
+  margin-top: 0.5rem;
+  padding: 1.15rem 1.25rem;
+  background: var(--bg-slate);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.estimator-summary-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.65rem;
+}
+
+.estimator-summary-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.estimator-summary-value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.estimator-divider {
+  border-top: 1px solid var(--border);
+  margin: 0.75rem 0 0.85rem 0;
+}
+
+.estimator-total-row {
+  margin-bottom: 0;
+  align-items: baseline;
+}
+
+.estimator-total-label {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.estimator-total-value {
+  font-size: 1.75rem;
+  font-weight: 800;
+  color: var(--primary);
+  line-height: 1.1;
+  text-align: right;
+  letter-spacing: -0.02em;
+}
+
