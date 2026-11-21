@@ -40,6 +40,7 @@ type wireMessage struct {
 	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
 	Sheets   int                         `json:"sheets,omitempty"`
 	Error    string                      `json:"error,omitempty"`
+	OrderID  string                      `json:"order_id,omitempty"`
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 }
 
@@ -1108,17 +1109,19 @@ func (c *Client) sendWire(ctx context.Context, conn *websocket.Conn, msg wireMes
 
 func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEvent) {
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-
 	c.connMu.Lock()
 	conn := c.conn
 	c.connMu.Unlock()
-
-	if conn == nil {
-		return
+	if conn != nil {
+		_ = wsjson.Write(ctx, conn, wireMessage{Type: "progress", Progress: &event})
 	}
+	c.sendMu.Unlock()
 
-	_ = wsjson.Write(ctx, conn, wireMessage{Type: "progress", Progress: &event})
+	// An error alone cannot release money: cancel every queued CUPS child
+	// and prove it is safe before attesting the stop to the cloud.
+	if event.Status == contracts.JobStatusPausedError || event.Status == contracts.JobStatusFailedRefundable {
+		go c.tryConfirmRefundSafeStop(event.JobID)
+	}
 }
 
 func (c *Client) sendJobAck(ctx context.Context, event contracts.JobProgressEvent) {
@@ -3688,3 +3691,62 @@ func (c *Client) cloudKeepAliveLoop(ctx context.Context, healthURL string) {
 	}
 }
 
+
+// tryConfirmRefundSafeStop must run outside sendMu. It is deliberately
+// conservative: ambiguous submission/CUPS state never unlocks a refund.
+// The attendant may then investigate and resolve the uncertainty manually.
+func (c *Client) tryConfirmRefundSafeStop(failedJobID string) {
+	if c.cfg.StateStore == nil { return }
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	job, err := c.cfg.StateStore.GetJob(ctx, failedJobID)
+	if err != nil || job == nil || strings.TrimSpace(job.Command.OrderID) == "" { return }
+	orderID := job.Command.OrderID
+	jobs, err := c.cfg.StateStore.GetJobsByOrderID(ctx, orderID)
+	if err != nil || len(jobs) == 0 { return }
+	expected := jobs[0].Command.TotalDocuments
+	if expected > 0 && len(jobs) != expected {
+		log.Printf("[REFUND] Holding refund safe-stop: order %s missing child jobs", orderID)
+		return
+	}
+	for _, child := range jobs {
+		// Wait for the currently executing worker to finish its fault path;
+		// otherwise it could still submit another print job.
+		for tries := 0; tries < 10; tries++ {
+			c.activeMu.Lock()
+			active := c.activeJobs[child.Command.JobID]
+			c.activeMu.Unlock()
+			if !active { break }
+			select {
+			case <-ctx.Done(): return
+			case <-time.After(250*time.Millisecond):
+			}
+		}
+		c.activeMu.Lock()
+		stillActive := c.activeJobs[child.Command.JobID]
+		c.activeMu.Unlock()
+		if stillActive { return }
+
+		if child.Status == contracts.JobStatusCompleted {
+			continue
+		}
+		if child.CUPSJobID == "" {
+			if child.SubmittedToPrinter {
+				log.Printf("[REFUND] Order %s has ambiguous CUPS submission for %s", orderID, child.Command.JobID)
+				return
+			}
+			continue // Persisted pre-submission state; no printer job exists.
+		}
+		if err := printer.CancelAndVerifyCUPSJob(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, child.CUPSJobID); err != nil {
+			log.Printf("[REFUND] Safe cancellation not confirmed for %s: %v", child.CUPSJobID, err)
+			return
+		}
+	}
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn == nil { return }
+	if err := c.sendWire(ctx, conn, wireMessage{Type:"safe_stop", OrderID:orderID}); err != nil {
+		log.Printf("[REFUND] Could not report safe stop for %s: %v", orderID, err)
+	}
+}
