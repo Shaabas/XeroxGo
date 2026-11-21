@@ -1266,19 +1266,50 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	sheetsPrinted := 0
 	currentStatus := string(order.Status)
 	errorReason := ""
+	documentsTotal := 0
+	documentsCompleted := 0
 
-	progress, err := s.db.GetJobProgress(r.Context(), order.Command.JobID)
-	if err == nil && progress != nil {
+	// The parent order, not its first child, owns completion and refund state.
+	// Read every child document in one aggregate query so the mobile client
+	// sees cumulative progress and never completes after document 1 of N.
+	progress, err := s.db.GetOrderPrintProgress(r.Context(), orderID)
+	if err != nil {
+		log.Printf("[ORDER] Cannot read order-wide progress for %s: %v", orderID, err)
+		http.Error(w, "order progress temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	documentsTotal = progress.DocumentsTotal
+	documentsCompleted = progress.DocumentsCompleted
+	if documentsTotal > 0 {
 		pagesPrinted = progress.PagesPrinted
 		sheetsPrinted = progress.SheetsPrinted
 		errorReason = progress.ErrorReason
-		switch progress.Status {
-		case contracts.JobStatusSpooling,
-			contracts.JobStatusPrinting,
-			contracts.JobStatusCompleted,
-			contracts.JobStatusPausedError,
-			contracts.JobStatusFailedRefundable:
-			currentStatus = string(progress.Status)
+		if order.Status == contracts.JobStatusCompleted && documentsCompleted != documentsTotal {
+			// Fail closed on corrupt/inconsistent order state; do not tell a
+			// customer to collect papers before every child is complete.
+			log.Printf("[ORDER] Completion invariant violated for %s: %d/%d child documents", orderID, documentsCompleted, documentsTotal)
+			currentStatus = string(contracts.JobStatusDispatched)
+		} else if order.Status == contracts.JobStatusDispatched {
+			if progress.DocumentsPrinting > 0 || documentsCompleted > 0 {
+				currentStatus = string(contracts.JobStatusPrinting)
+			} else if progress.DocumentsSpooling > 0 {
+				currentStatus = string(contracts.JobStatusSpooling)
+			}
+		}
+	} else {
+		// Historical single-job orders have no order_documents rows.
+		// Preserve their progress counters, but not a potentially stale
+		// child status override; the parent order is authoritative.
+		legacy, err := s.db.GetJobProgress(r.Context(), order.Command.JobID)
+		if err != nil {
+			log.Printf("[ORDER] Cannot read legacy job progress for %s: %v", orderID, err)
+			http.Error(w, "order progress temporarily unavailable", http.StatusInternalServerError)
+			return
+		}
+		if legacy != nil {
+			pagesPrinted = legacy.PagesPrinted
+			sheetsPrinted = legacy.SheetsPrinted
+			errorReason = legacy.ErrorReason
 		}
 	}
 
@@ -1312,7 +1343,8 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 			currentStatus = "REFUND_REQUIRED"
 		}
 	}
-	if order.Status == contracts.JobStatusCompleted && refundStatus == "" {
+	if order.Status == contracts.JobStatusCompleted && refundStatus == "" &&
+		(documentsTotal == 0 || documentsCompleted == documentsTotal) {
 		currentStatus = "COMPLETED"
 	}
 	// Additional captured payments have independent refunds. Do not reveal
@@ -1333,6 +1365,8 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"duplex":            string(order.Command.Duplex),
 		"pages_printed":     pagesPrinted,
 		"sheets_printed":    sheetsPrinted,
+		"documents_total":  documentsTotal,
+		"documents_completed": documentsCompleted,
 		"error_reason":      errorReason,
 		"price_paise":       order.PricePaise,
 		"pin_expires_at":    pinExpiry,
