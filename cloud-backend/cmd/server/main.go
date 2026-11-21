@@ -1351,6 +1351,12 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	if order.Status == contracts.JobStatusCompleted && refundStatus == "" {
 		currentStatus = "COMPLETED"
 	}
+	// Additional captured payments have independent refunds. Do not reveal
+	// payment IDs in this public order status response.
+	excessSummary, extraErr := s.db.GetExcessRefundSummary(r.Context(), orderID)
+	if extraErr != nil {
+		log.Printf("[PAYMENT] Excess refund summary unavailable for %s: %v", orderID, extraErr)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1369,6 +1375,9 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"seconds_remaining": secondsRemaining,
 		"refund_status":     refundStatus,
 		"refund_stop_verified": refundStopVerified,
+		"excess_refunds_total": excessSummary.Total,
+		"excess_refunds_processed": excessSummary.Processed,
+		"excess_refunds_unresolved": excessSummary.Unresolved,
 	})
 }
 
