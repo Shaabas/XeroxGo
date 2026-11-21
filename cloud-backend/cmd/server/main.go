@@ -1205,6 +1205,14 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		_ = s.db.MarkPaymentAttemptPaid(r.Context(), attempt.AttemptID, eventID)
 	}
 
+	if captureRes.ExcessCapture {
+		// A second distinct captured payment never authorizes additional printing.
+		// Its independent refund obligation committed with the payment record.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"excess_payment_refund_required"}`))
+		return
+	}
 	if captureRes.AlreadyProcessed {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"already_processed"}`))
