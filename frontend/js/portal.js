@@ -10,11 +10,27 @@
 (function () {
   'use strict';
 
+  // Keep completion validation independent of the DOM so it can be tested
+  // without a browser. A child completion must never stop order polling.
+  function deriveCustomerOrderStatus(statusData) {
+    const totalDocs = Math.max(0, Number(statusData.documents_total) || 0);
+    const completedDocs = Math.max(0, Number(statusData.documents_completed) || 0);
+    const reportedStatus = statusData.status || '';
+    const status = reportedStatus === 'COMPLETED' &&
+      totalDocs > 0 && completedDocs !== totalDocs ? 'PRINTING' : reportedStatus;
+    return { status, totalDocs, completedDocs };
+  }
+
+  function shouldStopOrderPolling(statusData) {
+    return deriveCustomerOrderStatus(statusData).status === 'COMPLETED' &&
+      !statusData.excess_refunds_unresolved;
+  }
+
   // --- Configuration from DOM ---
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
-      module.exports = { convertDocumentOnServer };
+      module.exports = { convertDocumentOnServer, deriveCustomerOrderStatus, shouldStopOrderPolling };
     }
     return;
   }
@@ -2103,14 +2119,9 @@
 
   function updateCheckoutStatus(statusData) {
     if (!statusData || !checkoutLiveStatusBox) return;
-    // A child job finishing is not a completed multi-document order.
-    // Fail closed even against a stale/incorrect API response: do not
-    // show 100% or stop polling unless every child is completed.
-    const totalDocs = Math.max(0, Number(statusData.documents_total) || 0);
-    const completedDocs = Math.max(0, Number(statusData.documents_completed) || 0);
-    const reportedStatus = statusData.status || '';
-    const st = reportedStatus === 'COMPLETED' &&
-      totalDocs > 0 && completedDocs !== totalDocs ? 'PRINTING' : reportedStatus;
+    // Fail closed if the API or a stale cache reports a completed parent
+    // before every child has finished.
+    const { status: st, totalDocs, completedDocs } = deriveCustomerOrderStatus(statusData);
     const originalPINExpired = authoritativeExpiryMs > 0 && Date.now() >= authoritativeExpiryMs;
 
     // The five-minute clock is for UNPAID orders only. Verified payment
@@ -2165,7 +2176,7 @@
       } else if (st === 'COMPLETED') {
         pct = 100;
         // A completed print can still have an additional payment refund in progress.
-        if (!statusData.excess_refunds_unresolved && orderPollTimer) {
+        if (shouldStopOrderPolling(statusData) && orderPollTimer) {
           clearInterval(orderPollTimer);
           orderPollTimer = null;
         }
