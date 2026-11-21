@@ -24,6 +24,7 @@ type wireMessage struct {
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 	Sheets   int                         `json:"sheets,omitempty"`
 	Error    string                      `json:"error,omitempty"`
+	OrderID  string                      `json:"order_id,omitempty"`
 }
 
 type kioskSession struct {
@@ -175,7 +176,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if jobID != "" && h.db != nil {
 				_ = h.db.MarkDispatchIntentAcknowledged(ctx, jobID)
 				if msg.Progress != nil && msg.Progress.KioskID == kioskID && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
-					_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+					if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err == nil {
+						h.onProgressFault(ctx, kioskID, *msg.Progress)
+					}
 				}
 			}
 		case "progress":
@@ -190,7 +193,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if h.db != nil {
-				_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+				if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err == nil {
+					h.onProgressFault(ctx, kioskID, *msg.Progress)
+				}
 			}
 		case "health":
 			if msg.Health == nil {
@@ -206,6 +211,22 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.healthMu.Lock()
 			h.health[kioskID] = *msg.Health
 			h.healthMu.Unlock()
+			if h.db != nil && (msg.Health.PaperJam || msg.Health.CoverOpen || msg.Health.State == "ERROR" || msg.Health.OutputBinFull) {
+				if err := h.db.BlockKiosk(ctx, kioskID, "printer hardware fault requires attendant clearance"); err != nil {
+					log.Printf("[KIOSK] Failed to latch outage for %s: %v", kioskID, err)
+				}
+			}
+		case "safe_stop":
+			// Authenticated Pi attests that every CUPS job in this order has
+			// reached a cancel/abort state or was never submitted.
+			if h.db != nil && strings.TrimSpace(msg.OrderID) != "" {
+				order, err := h.db.GetOrder(ctx, msg.OrderID)
+				if err == nil && order != nil && order.Command.KioskID == kioskID {
+					if err := h.db.ConfirmRefundSafeStop(ctx, msg.OrderID); err != nil {
+						log.Printf("[REFUND] safe-stop persistence failed for %s: %v", msg.OrderID, err)
+					}
+				}
+			}
 		case "error":
 			// Operational error
 		default:
@@ -385,4 +406,21 @@ func (h *Hub) ConnectedKiosksCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.sessions)
+}
+
+// onProgressFault is intentionally fail-closed: a fault records the refund
+// obligation and blocks new orders, but DOES NOT submit a monetary refund.
+// Only a later authenticated safe_stop attestation unlocks provider processing.
+func (h *Hub) onProgressFault(ctx context.Context, kioskID string, event contracts.JobProgressEvent) {
+	if event.Status != contracts.JobStatusPausedError && event.Status != contracts.JobStatusFailedRefundable {
+		return
+	}
+	order, err := h.db.GetOrderByJobID(ctx, event.JobID)
+	if err != nil || order == nil { return }
+	if err := h.db.BlockKiosk(ctx, kioskID, event.ErrorReason); err != nil {
+		log.Printf("[KIOSK] could not latch outage for %s: %v", kioskID, err)
+	}
+	if err := h.db.RecordRefundRequired(ctx, order.OrderID); err != nil {
+		log.Printf("[REFUND] could not record obligation for %s: %v", order.OrderID, err)
+	}
 }
