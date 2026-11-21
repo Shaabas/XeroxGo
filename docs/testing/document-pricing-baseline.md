@@ -134,7 +134,7 @@ During baseline test construction, three API field naming inconsistencies were u
 * **`POST /api/k/{id}/orders/lookup`:** Returns `"total_price_paise"`.
 * **`POST /api/k/{id}/orders/{id}/claim`:** Returns `"total_price_paise"`.
 * **`GET /api/orders/{id}/status`:** Returns `"price_paise"`.
-* **Recommendation:** Retain `"total_price_paise"` as canonical; alias `"price_paise"` in status responses for backward compatibility.
+* **Recommendation:** Retain `"total_price_paise"` as canonical; use a single canonical pricing field without a compatibility alias.
 
 ### Discrepancy 3: User-Password Encrypted PDFs vs `qpdf --is-encrypted`
 * **Intended Logic:** `normalizer.go:381` runs `qpdf --is-encrypted` to detect and reject password-protected PDFs.

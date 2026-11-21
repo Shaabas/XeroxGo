@@ -81,7 +81,7 @@ flowchart TD
 - **Primary Responsibility:** User-facing mobile and desktop web portal, PWA install prompts, document preview, client-side print customization (color, duplex, copies, page range), dynamic pricing estimation, and admin management UI.
 - **Components & Files:**
   - Customer Portal: [`frontend/index.html`](file:///home/shabas/Projects/XeroxGo/frontend/index.html), [`frontend/css/portal.css`](file:///home/shabas/Projects/XeroxGo/frontend/css/portal.css), [`frontend/js/portal.js`](file:///home/shabas/Projects/XeroxGo/frontend/js/portal.js)
-  - Mobile Payment Checkout: [`frontend/payment.html`](file:///home/shabas/Projects/XeroxGo/frontend/payment.html)
+  - Demo Payment Checkout: `cloud-backend/cmd/server/demo_pay_handler.go` (served directly by cloud at `/pay/{token}`)
   - Admin Portal: [`frontend/admin.html`](file:///home/shabas/Projects/XeroxGo/frontend/admin.html), [`frontend/css/admin.css`](file:///home/shabas/Projects/XeroxGo/frontend/css/admin.css), [`frontend/js/admin.js`](file:///home/shabas/Projects/XeroxGo/frontend/js/admin.js)
   - Static Assets & Vendor Libraries: [`frontend/vendor/pdf.min.mjs`](file:///home/shabas/Projects/XeroxGo/frontend/vendor/pdf.min.mjs), [`frontend/vendor/pdf-lib.min.js`](file:///home/shabas/Projects/XeroxGo/frontend/vendor/pdf-lib.min.js), [`frontend/manifest.webmanifest`](file:///home/shabas/Projects/XeroxGo/frontend/manifest.webmanifest), [`frontend/vercel.json`](file:///home/shabas/Projects/XeroxGo/frontend/vercel.json)
 - **External Dependencies:** Mozilla PDF.js, PDF-Lib.

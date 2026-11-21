@@ -33,13 +33,13 @@ The documentation suite is structured into the following navigable references:
   - Concurrency throttle (`libreOfficeSem`), thread blocking, proxy gateway timeout risks, token security, and crash recovery analysis.
   - Completed 3-phase migration plan: frontend made async-only in Task 3.6A, legacy synchronous endpoint retired and removed in Task 3.6B, with Gate 6 verification.
 
-- 🔍 **[Legacy Orders & Sessions Endpoint Review](file:///home/shabas/Projects/XeroxGo/docs/cleanup/orders-sessions-endpoints.md)**
+- 🔍 **[Canonical Orders & Sessions Endpoints](file:///home/shabas/Projects/XeroxGo/docs/cleanup/orders-sessions-endpoints.md)**
   - Forensic mapping of all Order, PIN, Kiosk Session, and Payment Simulation endpoints across `cloud-backend`, `kiosk-daemon`, `frontend`, and operational scripts.
-  - Comparative analysis of canonical REST routes vs legacy aliases (`/pin/lookup`, `/confirm`, `/cancel-session`, and order-scoped `/initiate-payment`).
+  - Current canonical routes only; aliases intentionally removed.
   - Analysis of unreachable dead code in `session_handler.go:277-285` blocked by the HTTP router.
-  - Assessment of `handleSimulatePayment` vs demo checkout (`/pay/{token}`); retention justified as a developer-only test harness for `run_local_demo.sh` and security isolation checks.
+  - Only the XeroxGo-hosted demo checkout is exposed; synthetic events live in test-only fixtures.
   - Verification of physical presence safety gates (`/release`) and distinct dual trust domains for customer vs kiosk recovery PIN generation.
-  - 18-endpoint classification matrix and smallest safe cleanup proposal with regression test specifications.
+  - Current canonical HTTP endpoint reference.
 
 - 🔀 **[Branch Integration Assessment & Plan](file:///home/shabas/Projects/XeroxGo/docs/cleanup/branch-integration-plan.md)**
   - Topological analysis and lineage verification for `main`, `bibin`, and `integration/agent-simplification`.
@@ -59,7 +59,7 @@ The documentation suite is structured into the following navigable references:
 - 🛡️ **[Minimum Core Dependency Classification](file:///home/shabas/Projects/XeroxGo/docs/architecture/minimum-core.md)**
   - Direct and transitive dependency mapping across startup, config, database, cloud, and edge hardware.
   - 6-tier component classification: `CORE`, `SAFETY-CRITICAL`, `SUPPORT`, `OPTIONAL`, `LEGACY`, and `UNVERIFIED`.
-  - Non-negotiable safety invariant deep-dive (webhook deduplication, mutual exclusion, paper reservation, SHA256 verification, restart re-attachment).
+  - Non-negotiable safety invariant deep-dive (demo capture idempotency, mutual exclusion, paper reservation, SHA256 verification, restart re-attachment).
   - Overlapping implementation analysis (CUPS vs PJL, async vs sync conversions, cloud vs Pi slicing, pricing endpoints).
   - Crash window failure analysis, technical debt documentation, and minimal target architecture.
 
@@ -85,7 +85,7 @@ The documentation suite is structured into the following navigable references:
 - 🔍 **[Orders & Sessions Architecture Audit](file:///home/shabas/Projects/XeroxGo/docs/architecture/orders-sessions-audit.md)**
   - Comprehensive architectural audit of Order, PIN, Kiosk Session, Paper Reservation, Payment Authorization, and Expiration logic.
   - End-to-end lifecycle sequence and state transition matrix across 9 distinct order statuses.
-  - Verification of 6 non-negotiable safety invariants (atomic PIN collision retry, paper tray overcommitment gating, anti-ghost-print physical presence gate, webhook deduplication, local spooler re-print prevention, and unacknowledged intent reconciliation).
+  - Verification of 6 non-negotiable safety invariants (atomic PIN collision retry, paper tray overcommitment gating, anti-ghost-print physical presence gate, demo capture idempotency, local spooler re-print prevention, and unacknowledged intent reconciliation).
   - Forensic analysis of duplicate API routing aliases, legacy simulation code vs demo checkout, PostgreSQL phantom read risks, and missing background expiration pruning.
   - Proposed smallest reliable architecture and prioritized 4-phase consolidation roadmap.
 

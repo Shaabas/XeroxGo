@@ -112,7 +112,7 @@ sequenceDiagram
     Cloud->>Kiosk: Send PrintJobCommand over WebSocket
 
     Note over Kiosk,Hardware: 4. Spooling, Printing & Completion
-    Kiosk->>Cloud: GET /api/orders/{id}/pdf (Signed URL)
+    Kiosk->>Cloud: GET /api/orders/{id}/jobs/{job_id}/pdf (Signed URL)
     Kiosk->>Kiosk: Verify SHA256 Checksum
     Kiosk->>Hardware: lp -d Queue -n Copies -o sides=Duplex (CUPS / PJL)
     Kiosk->>Kiosk: Render PRINTING Mode
@@ -163,7 +163,7 @@ sequenceDiagram
 2. **Safe Order Synchronization:** If kiosk screen is currently occupied by an active customer session for a *different* order, the incoming job is queued into `deferredJobs` until the active session completes or times out ([`client.go:616-628`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/spooler/client.go#L616-L628)).
 3. **Download & Checksum Verification:**
    - Kiosk switches screen mode to `DOWNLOADING` ([`client.go:1484`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/spooler/client.go#L1484)).
-   - Downloads PDF from cloud backend signed URL (`/api/orders/{id}/pdf?expires=...&sig=...`).
+   - Downloads PDF from cloud backend signed URL (`/api/orders/{id}/jobs/{job_id}/pdf?expires=...&sig=...`).
    - Computes SHA256 stream digest and verifies against `PrintJobCommand.SHA256Checksum` ([`client.go:1400-1430`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/spooler/client.go#L1400-L1430)).
 4. **Paper Stock Deduction:** Deducts `TotalSheets` from local SQLite paper stock ([`kiosk-daemon/internal/state/store.go:665-703`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/state/store.go#L665-L703)).
 5. **CUPS Submission:**
