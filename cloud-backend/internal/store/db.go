@@ -1560,10 +1560,6 @@ WHERE o.order_id = ?;
 		return nil, fmt.Errorf("get order: scan: %w", err)
 	}
 
-	if ordTotalPages <= 0 {
-		ordTotalPages = totalPages
-	}
-
 	result := &Order{
 		OrderID: resOrderID,
 		Command: contracts.PrintJobCommand{
@@ -1650,16 +1646,7 @@ func (s *Store) GetOrderByJobID(ctx context.Context, jobID string) (*Order, erro
 		return nil, fmt.Errorf("get order by job id: query order_documents: %w", err)
 	}
 
-	queryOrder := `SELECT order_id FROM orders WHERE job_id = ?;`
-	err = s.db.QueryRowContext(ctx, s.rebind(queryOrder), targetJobID).Scan(&orderID)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get order by job id: query orders: %w", err)
-	}
-
-	return s.GetOrder(ctx, orderID)
+	return nil, nil
 }
 
 // GetOrderDocuments retrieves all child documents for an order, ordered by document_index.
@@ -2317,7 +2304,7 @@ func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgre
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Check if job is a child document in order_documents, or directly on orders, or recovery
+	// 1. Resolve the canonical child document, including active recovery jobs.
 	var (
 		orderID            string
 		orderKioskID       string
@@ -2343,42 +2330,35 @@ WHERE d.job_id = ?;
 	if err == nil {
 		isDocJob = true
 	} else if errors.Is(err, sql.ErrNoRows) {
-		// Fallback to legacy orders / recovery
-		queryOrder := `
-SELECT o.order_id, o.kiosk_id, p.total_pages, p.total_sheets
-FROM orders o
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE o.job_id = ?;
-`
-		err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderID, &orderKioskID, &totalPages, &totalSheets)
-		if err == sql.ErrNoRows {
-			if idx := strings.LastIndex(event.JobID, "-rec"); idx != -1 {
-				pJobID := event.JobID[:idx]
-				seqStr := event.JobID[idx+4:]
-				if seqID, parseErr := strconv.Atoi(seqStr); parseErr == nil && pJobID != "" {
-					queryRec := `
-SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed, r.remaining_pages, r.remaining_sheets, p.total_pages, p.total_sheets, o.order_id
-FROM recovery_records r
-JOIN orders o ON r.job_id = o.job_id
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE r.job_id = ? AND r.sequence_id = ?;
-`
-					recErr := tx.QueryRowContext(ctx, s.rebind(queryRec), pJobID, seqID).Scan(
-						&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets, &recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets, &orderID,
-					)
-					if recErr == nil {
-						isRecovery = true
-					}
-				}
-			}
-			if !isRecovery {
-				return fmt.Errorf("update job progress: job %q not found in orders or order_documents", event.JobID)
-			}
-		} else if err != nil {
-			return fmt.Errorf("update job progress: query order: %w", err)
+		// Only recovery jobs associated with a canonical child document exist.
+		idx := strings.LastIndex(event.JobID, "-rec")
+		if idx < 1 {
+			return fmt.Errorf("update job progress: unknown child document %q", event.JobID)
 		}
+		parentJob := event.JobID[:idx]
+		seqID, parseErr := strconv.Atoi(event.JobID[idx+4:])
+		if parseErr != nil {
+			return fmt.Errorf("update job progress: invalid recovery id %q", event.JobID)
+		}
+		err = tx.QueryRowContext(ctx, s.rebind(`
+SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed,
+       r.remaining_pages, r.remaining_sheets, d.total_pages, d.total_sheets, d.order_id
+FROM recovery_records r
+JOIN order_documents d ON d.job_id = r.job_id
+WHERE r.job_id = ? AND r.sequence_id = ?;`), parentJob, seqID).Scan(
+			&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets,
+			&recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets, &orderID,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("update job progress: unknown recovery job %q", event.JobID)
+		}
+		if err != nil {
+			return fmt.Errorf("update job progress: lookup recovery document: %w", err)
+		}
+		isRecovery = true
+		isDocJob = true
 	} else {
-		return fmt.Errorf("update job progress: query order_documents: %w", err)
+		return fmt.Errorf("update job progress: lookup child document: %w", err)
 	}
 
 	// 2. Verify kiosk ID matches
@@ -2483,7 +2463,7 @@ WHERE recovery_id = ?;
 UPDATE order_documents
 SET status = ?, updated_at_ns = ?
 WHERE job_id = ?;
-`), string(event.Status), eventNS, event.JobID)
+`), string(event.Status), eventNS, targetJobID)
 		if err != nil {
 			return fmt.Errorf("update job progress: update order_documents status: %w", err)
 		}
@@ -2552,20 +2532,6 @@ UPDATE orders
 SET status = 'SPOOLING', updated_at_ns = ?
 WHERE order_id = ? AND status NOT IN ('PRINTING','COMPLETED','FAILED_REFUNDABLE','PAUSED_ERROR');
 `), eventNS, orderID)
-		}
-	} else {
-		// Legacy single-job orders table update
-		_, err = tx.ExecContext(ctx, s.rebind(`
-UPDATE orders
-SET status = ?, updated_at_ns = ?
-WHERE job_id = ?;
-`), string(event.Status), eventNS, targetJobID)
-		if err != nil {
-			return fmt.Errorf("update job progress: update order status: %w", err)
-		}
-
-		if event.Status == contracts.JobStatusCompleted || event.Status == contracts.JobStatusFailedRefundable {
-			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
 		}
 	}
 
