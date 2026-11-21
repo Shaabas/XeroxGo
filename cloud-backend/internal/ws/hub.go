@@ -180,9 +180,15 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if jobID == "" && msg.Job != nil {
 				jobID = msg.Job.JobID
 			}
+			if msg.Progress != nil && msg.Progress.KioskID != kioskID {
+				continue // fail closed: acknowledgement cannot claim a different kiosk
+			}
 			if jobID != "" && h.db != nil {
-				_ = h.db.MarkDispatchIntentAcknowledged(ctx, jobID)
-				if msg.Progress != nil && msg.Progress.KioskID == kioskID && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
+				if err := h.db.MarkDispatchAcknowledgedForKiosk(ctx, kioskID, jobID); err != nil {
+					log.Printf("[HUB] Could not persist job ack %s for kiosk %s: %v", jobID, kioskID, err)
+					continue
+				}
+				if msg.Progress != nil && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
 					if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err == nil {
 						h.onProgressFault(ctx, kioskID, *msg.Progress)
 					}
