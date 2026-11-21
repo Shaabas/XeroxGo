@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 

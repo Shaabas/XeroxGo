@@ -40,10 +40,6 @@ func DefaultTariff() TariffConfig {
 		ColorSimplexPricePaise: DefaultColorSimplexPaise,
 		ColorDuplexPricePaise:  DefaultColorDuplexPaise,
 		ColorEnabled:           DefaultColorEnabled,
-		BWPricePerSheetPaise:    DefaultBWSimplexPaise,
-		ColorPricePerSheetPaise: DefaultColorSimplexPaise,
-		BWPricePerSidePaise:    DefaultBWSimplexPaise,
-		ColorPricePerSidePaise: DefaultColorSimplexPaise,
 		UpdatedAt:               now,
 	}
 }
