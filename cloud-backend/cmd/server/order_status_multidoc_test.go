@@ -22,6 +22,8 @@ type customerOrderStatus struct {
 	SheetsPrinted      int    `json:"sheets_printed"`
 	DocumentsTotal     int    `json:"documents_total"`
 	DocumentsCompleted int    `json:"documents_completed"`
+	DispatchPending    bool   `json:"dispatch_pending"`
+	AwaitingDelivery   int    `json:"documents_awaiting_delivery"`
 	ErrorReason        string `json:"error_reason"`
 }
 
