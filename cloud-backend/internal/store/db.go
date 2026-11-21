@@ -2386,6 +2386,16 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		return fmt.Errorf("update job progress: kiosk ID mismatch: event has %q, order belongs to %q", event.KioskID, orderKioskID)
 	}
 
+	// A processed refund is terminal. Never admit delayed kiosk events that
+	// could move the order back to PRINTING or reallocate its paper.
+	var processedRefunds int
+	if err := tx.QueryRowContext(ctx, s.rebind(
+		"SELECT COUNT(*) FROM refund_requests WHERE order_id = ? AND status = 'PROCESSED'"),
+		orderID).Scan(&processedRefunds); err != nil {
+		return fmt.Errorf("update job progress: query refund safety: %w", err)
+	}
+	if processedRefunds > 0 { return nil }
+
 	// 3. Verify progress bounds
 	if isRecovery {
 		if event.PagesPrinted > recRemainingPages {
