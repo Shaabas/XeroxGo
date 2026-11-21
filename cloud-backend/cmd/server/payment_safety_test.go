@@ -453,15 +453,15 @@ func TestPaymentSafety_ExpiredPIN_RecoveryAndRelease(t *testing.T) {
 	releaseReq.Header.Set("Authorization", "Bearer "+kSec)
 	releaseReq.Header.Set("Content-Type", "application/json")
 	releaseResp, err := http.DefaultClient.Do(releaseReq)
-	if err != nil || releaseResp.StatusCode != http.StatusOK {
-		t.Fatalf("release failed: %v, status: %d", err, releaseResp.StatusCode)
+	if err != nil || releaseResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("hub-less paid release must durably queue delivery (HTTP 202): %v, status: %d", err, releaseResp.StatusCode)
 	}
 	var releaseData map[string]interface{}
 	_ = json.NewDecoder(releaseResp.Body).Decode(&releaseData)
 	releaseResp.Body.Close()
 
-	if releaseData["status"] != "DISPATCHED" {
-		t.Fatalf("expected DISPATCHED status from release, got %v", releaseData["status"])
+	if releaseData["status"] != "DISPATCH_PENDING" {
+		t.Fatalf("expected durable dispatch pending until Pi reconnect, got %v", releaseData["status"])
 	}
 
 	// Verify order status in DB is DISPATCHED
@@ -516,8 +516,8 @@ func TestPaymentSafety_MismatchedSessionNotes_Prevented(t *testing.T) {
 	relReq.Header.Set("Authorization", "Bearer "+kSec)
 	relReq.Header.Set("Content-Type", "application/json")
 	relResp, _ := http.DefaultClient.Do(relReq)
-	if relResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK releasing with genuine session, got %d", relResp.StatusCode)
+	if relResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("genuine session must authorize paid delivery even with hub offline (HTTP 202), got %d", relResp.StatusCode)
 	}
 	relResp.Body.Close()
 }
@@ -656,11 +656,16 @@ func TestPaymentSafety_RestartPreservationAndReconciliation(t *testing.T) {
 	relReq.Header.Set("Authorization", "Bearer "+kioskSecret)
 	relReq.Header.Set("Content-Type", "application/json")
 	relResp, err := http.DefaultClient.Do(relReq)
-	if err != nil || relResp.StatusCode != http.StatusOK {
-		t.Fatalf("release after restart failed: %v, status: %d", err, relResp.StatusCode)
+	if err != nil || relResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("hub-less paid release after restart must preserve dispatch intents (202): %v, status: %d", err, relResp.StatusCode)
 	}
 	relResp.Body.Close()
 
+	// Confirm release after restart remains queued until a new Pi connection.
+	pending, err := st2.GetPendingDispatchOrders(context.Background(), kioskID)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("restart lost paid dispatch intent: %+v %v", pending, err)
+	}
 	// Verify order status is DISPATCHED
 	ordFinal, err := st2.GetOrder(context.Background(), orderID)
 	if err != nil || ordFinal.Status != contracts.JobStatusDispatched {
