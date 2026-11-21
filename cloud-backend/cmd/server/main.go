@@ -1220,10 +1220,10 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// PHYSICAL PRINT AUTHORIZATION GATE
-	// A verified payment with a dispatch error must never be reported as
-	// successfully dispatched. It becomes a durable refund obligation; safe
-	// cancellation of any already-sent documents is still required.
+	// A verified payment creates durable per-document intents in the same
+	// transaction as capture. WebSocket transport errors are NOT evidence
+	// of printing failure or a safe physical stop. Preserve the paid order,
+	// reservation, and intents; reconnect retries the same immutable JobIDs.
 	if captureRes.DispatchEligible {
 		log.Printf("[PAYMENT] Order %s authorized for print (active session %s)", orderID, captureRes.ActiveSessionID)
 		var dispatchErr error
@@ -1233,33 +1233,29 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 			for _, cmd := range captureRes.Commands {
 				if err := s.hub.SendJob(r.Context(), cmd); err != nil {
 					dispatchErr = err
+					s.noteDispatchDeliveryFailure(orderID, cmd.JobID, err)
 					break
 				}
 				if err := s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID); err != nil {
 					dispatchErr = err
+					s.noteDispatchDeliveryFailure(orderID, cmd.JobID, err)
 					break
 				}
 			}
 		} else if captureRes.Command != nil {
 			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
 				dispatchErr = err
+				s.noteDispatchDeliveryFailure(orderID, captureRes.Command.JobID, err)
 			} else if err := s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID); err != nil {
 				dispatchErr = err
+				s.noteDispatchDeliveryFailure(orderID, captureRes.Command.JobID, err)
 			}
 		}
 		if dispatchErr != nil {
-			log.Printf("[PAYMENT] Paid order %s failed dispatch; refund safety reconciliation required: %v", orderID, dispatchErr)
-			if err := s.db.BlockKiosk(r.Context(), kioskID, "payment captured but print dispatch failed; attendant inspection required"); err != nil {
-				log.Printf("[PAYMENT] Could not latch kiosk failure: %v", err)
-			}
-			if err := s.db.RecordRefundRequired(r.Context(), orderID); err != nil {
-				log.Printf("[REFUND] Could not persist obligation for %s: %v", orderID, err)
-				http.Error(w, "payment recorded; unable to persist refund obligation", http.StatusInternalServerError)
-				return
-			}
+			log.Printf("[PAYMENT] Order %s paid; transport delivery unresolved, preserving intents for reconnect: %v", orderID, dispatchErr)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"paid_refund_required"}`))
+			_, _ = w.Write([]byte(`{"status":"dispatch_pending"}`))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
