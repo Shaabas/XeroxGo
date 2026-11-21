@@ -30,7 +30,6 @@ COPY --from=builder /bin/xeroxgo-cloud /app/xeroxgo-cloud
 ENV PORT=8080 \
     XEROXGO_CLOUD_DB=/data/xeroxgo-cloud.db \
     XEROXGO_JOBS_DIR=/data/jobs \
-    XEROXGO_PRICE_PER_SHEET_PAISE=500 \
     XEROXGO_DEV_MODE=1 \
     DEMO_MODE=1
 

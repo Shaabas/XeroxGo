@@ -28,12 +28,12 @@ func TestSupabaseIntegration(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Pricing test
-	if err := s.SetPricePerSheetPaise(ctx, 500); err != nil {
-		t.Fatalf("SetPricePerSheetPaise failed: %v", err)
+	if err := s.SetDetailedPricing(ctx, 500, 700, 800, 1000, false); err != nil {
+		t.Fatalf("SetDetailedPricing failed: %v", err)
 	}
-	price, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 500 {
-		t.Fatalf("GetPricePerSheetPaise failed: %v, got %d", err, price)
+	p, err := s.GetPricing(ctx)
+	if err != nil || p.BWSimplexPricePaise != 500 {
+		t.Fatalf("GetPricing failed: %v, got %+v", err, p)
 	}
 
 	// 2. Order creation test

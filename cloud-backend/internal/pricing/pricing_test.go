@@ -3,9 +3,162 @@ package pricing
 import (
 	"strings"
 	"testing"
-
-	"xeroxgo/pkg/contracts"
 )
+
+func TestCalculateDocumentPricePaise_CanonicalMatrix(t *testing.T) {
+	tariff := TariffConfig{
+		BWSimplexPricePaise:    300,
+		BWDuplexPricePaise:     500,
+		ColorSimplexPricePaise: 800,
+		ColorDuplexPricePaise:  1000,
+		ColorEnabled:           true,
+	}
+
+	testCases := []struct {
+		name     string
+		pages    int
+		isColor  bool
+		isDuplex bool
+		copies   int
+		expected int64
+	}{
+		// 3-page odd duplex test cases: 5 for first 2 pages (1 full sheet), 3 for 3rd page = 8 (800 paise)
+		{name: "3-page BW Duplex (1 copy)", pages: 3, isColor: false, isDuplex: true, copies: 1, expected: 800},
+		{name: "3-page BW Duplex (2 copies)", pages: 3, isColor: false, isDuplex: true, copies: 2, expected: 1600},
+		{name: "1-page BW Duplex (1 copy)", pages: 1, isColor: false, isDuplex: true, copies: 1, expected: 300},
+		{name: "2-page BW Duplex (1 copy)", pages: 2, isColor: false, isDuplex: true, copies: 1, expected: 500},
+		{name: "4-page BW Duplex (1 copy)", pages: 4, isColor: false, isDuplex: true, copies: 1, expected: 1000},
+		{name: "5-page BW Duplex (1 copy)", pages: 5, isColor: false, isDuplex: true, copies: 1, expected: 1300}, // 5 + 5 + 3 = 13 (1300 paise)
+
+		// Single-sided BW (1-5 pages)
+		{name: "1-page BW Simplex", pages: 1, isColor: false, isDuplex: false, copies: 1, expected: 300},
+		{name: "2-page BW Simplex", pages: 2, isColor: false, isDuplex: false, copies: 1, expected: 600},
+		{name: "3-page BW Simplex", pages: 3, isColor: false, isDuplex: false, copies: 1, expected: 900},
+		{name: "4-page BW Simplex", pages: 4, isColor: false, isDuplex: false, copies: 1, expected: 1200},
+		{name: "5-page BW Simplex", pages: 5, isColor: false, isDuplex: false, copies: 1, expected: 1500},
+
+		// Color Duplex (1-5 pages)
+		{name: "1-page Color Duplex", pages: 1, isColor: true, isDuplex: true, copies: 1, expected: 800},
+		{name: "2-page Color Duplex", pages: 2, isColor: true, isDuplex: true, copies: 1, expected: 1000},
+		{name: "3-page Color Duplex", pages: 3, isColor: true, isDuplex: true, copies: 1, expected: 1800}, // 10 + 8 = 18
+		{name: "4-page Color Duplex", pages: 4, isColor: true, isDuplex: true, copies: 1, expected: 2000},
+		{name: "5-page Color Duplex", pages: 5, isColor: true, isDuplex: true, copies: 1, expected: 2800}, // 10 + 10 + 8 = 28
+
+		// Color Simplex (1-5 pages)
+		{name: "1-page Color Simplex", pages: 1, isColor: true, isDuplex: false, copies: 1, expected: 800},
+		{name: "2-page Color Simplex", pages: 2, isColor: true, isDuplex: false, copies: 1, expected: 1600},
+		{name: "3-page Color Simplex", pages: 3, isColor: true, isDuplex: false, copies: 1, expected: 2400},
+		{name: "4-page Color Simplex", pages: 4, isColor: true, isDuplex: false, copies: 1, expected: 3200},
+		{name: "5-page Color Simplex", pages: 5, isColor: true, isDuplex: false, copies: 1, expected: 4000},
+
+		// Multi-copy tests
+		{name: "5-page BW Duplex (3 copies)", pages: 5, isColor: false, isDuplex: true, copies: 3, expected: 3900},
+		{name: "4-page Color Simplex (5 copies)", pages: 4, isColor: true, isDuplex: false, copies: 5, expected: 16000},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := CalculateDocumentPricePaise(tariff, tc.pages, tc.isColor, tc.isDuplex, tc.copies)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actual != tc.expected {
+				t.Fatalf("got %d paise, want %d paise", actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestCalculateDocumentPricePaise_ColorDisabledFallback(t *testing.T) {
+	tariff := TariffConfig{
+		BWSimplexPricePaise:    300,
+		BWDuplexPricePaise:     500,
+		ColorSimplexPricePaise: 800,
+		ColorDuplexPricePaise:  1000,
+		ColorEnabled:           false, // Hardware does not support color
+	}
+
+	// When ColorEnabled is false, requesting color MUST fall back to B&W rates
+	cases := []struct {
+		name     string
+		pages    int
+		isDuplex bool
+		copies   int
+		expected int64
+	}{
+		{"1-page Color Simplex with Color disabled -> BW Simplex", 1, false, 1, 300},
+		{"3-page Color Duplex with Color disabled -> BW Duplex (5+3=8)", 3, true, 1, 800},
+		{"4-page Color Duplex with Color disabled -> BW Duplex (2*5=10)", 4, true, 1, 1000},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := CalculateDocumentPricePaise(tariff, tc.pages, true, tc.isDuplex, tc.copies)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if actual != tc.expected {
+				t.Fatalf("got %d paise, want %d paise", actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestCalculateDocumentPricePaise_RejectInvalidInputs(t *testing.T) {
+	validTariff := DefaultTariff()
+
+	invalidCases := []struct {
+		name       string
+		tariff     TariffConfig
+		sides      int
+		copies     int
+		wantErrSub string
+	}{
+		{"zero sides", validTariff, 0, 1, "imposedSides must be > 0"},
+		{"negative sides", validTariff, -3, 1, "imposedSides must be > 0"},
+		{"zero copies", validTariff, 1, 0, "copies must be > 0"},
+		{"negative copies", validTariff, 1, -2, "copies must be > 0"},
+		{"zero BW simplex rate", TariffConfig{BWSimplexPricePaise: 0, BWDuplexPricePaise: 500, ColorSimplexPricePaise: 800, ColorDuplexPricePaise: 1000}, 1, 1, "all tariff rates must be > 0"},
+		{"negative BW duplex rate", TariffConfig{BWSimplexPricePaise: 300, BWDuplexPricePaise: -500, ColorSimplexPricePaise: 800, ColorDuplexPricePaise: 1000}, 1, 1, "all tariff rates must be > 0"},
+		{"zero Color simplex rate", TariffConfig{BWSimplexPricePaise: 300, BWDuplexPricePaise: 500, ColorSimplexPricePaise: 0, ColorDuplexPricePaise: 1000}, 1, 1, "all tariff rates must be > 0"},
+		{"zero Color duplex rate", TariffConfig{BWSimplexPricePaise: 300, BWDuplexPricePaise: 500, ColorSimplexPricePaise: 800, ColorDuplexPricePaise: 0}, 1, 1, "all tariff rates must be > 0"},
+	}
+
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CalculateDocumentPricePaise(tc.tariff, tc.sides, false, false, tc.copies)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("expected error containing %q, got %q", tc.wantErrSub, err.Error())
+			}
+		})
+	}
+}
+
+func TestCalculateDocumentPricePaise_Overflow(t *testing.T) {
+	tariff := TariffConfig{
+		BWSimplexPricePaise:    1000,
+		BWDuplexPricePaise:     2000,
+		ColorSimplexPricePaise: 1000,
+		ColorDuplexPricePaise:  2000,
+		ColorEnabled:           true,
+	}
+
+	// Multiplication by copies overflows MaxInt64
+	_, err := CalculateDocumentPricePaise(tariff, 10, false, false, int(MaxInt64/5000))
+	if err == nil {
+		t.Fatalf("expected overflow error, got nil")
+	}
+
+	// Duplex full sheets overflow
+	hugeSides := int(MaxInt64 / 1000)
+	_, err = CalculateDocumentPricePaise(tariff, hugeSides, false, true, 2)
+	if err == nil {
+		t.Fatalf("expected overflow error for huge sides in duplex, got nil")
+	}
+}
 
 func TestCalculatePricePaise_Valid(t *testing.T) {
 	cases := []struct {
@@ -63,13 +216,11 @@ func TestCalculatePricePaise_InvalidInputs(t *testing.T) {
 }
 
 func TestCalculatePricePaise_Overflow(t *testing.T) {
-	// 2 * 2^62 = 2^63 which overflows signed int64
 	_, err := CalculatePricePaise(2, int64(1<<62))
 	if err == nil {
 		t.Fatalf("expected overflow error for 2 * (1<<62), got nil")
 	}
 
-	// Large valid multiplication right below max
 	divisor := int64(10)
 	priceNearMax := MaxInt64 / divisor
 	total, err := CalculatePricePaise(int(divisor), priceNearMax)
@@ -81,144 +232,21 @@ func TestCalculatePricePaise_Overflow(t *testing.T) {
 		t.Fatalf("expected %d, got %d", expected, total)
 	}
 
-	// Just over maximum
 	_, err = CalculatePricePaise(int(divisor)+1, priceNearMax+1)
 	if err == nil {
 		t.Fatalf("expected overflow error, got nil")
 	}
 }
 
-func TestResolveUnitPrice_FourTiers(t *testing.T) {
-	tariff := TariffConfig{
-		BWSimplexPricePaise:    200,
-		BWDuplexPricePaise:     150,
-		ColorSimplexPricePaise: 1000,
-		ColorDuplexPricePaise:  750,
-		ColorEnabled:           true,
-	}
-
-	tests := []struct {
-		name      string
-		colorMode string
-		duplex    contracts.DuplexMode
-		wantPrice int64
-	}{
-		{"BW Simplex", "BW", contracts.DuplexSimplex, 200},
-		{"BW Duplex LongEdge", "BW", contracts.DuplexLongEdge, 150},
-		{"BW Duplex ShortEdge", "BW", contracts.DuplexShortEdge, 150},
-		{"Color Simplex", "COLOR", contracts.DuplexSimplex, 1000},
-		{"Color Duplex LongEdge", "COLOR", contracts.DuplexLongEdge, 750},
-		{"Color Duplex ShortEdge", "COLOR", contracts.DuplexShortEdge, 750},
-		{"Case-insensitive color string", "color", contracts.DuplexSimplex, 1000},
-		{"Case-insensitive bw string", "bw", contracts.DuplexLongEdge, 150},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			price := ResolveUnitPrice(tariff, tc.colorMode, tc.duplex, 0)
-			if price != tc.wantPrice {
-				t.Fatalf("ResolveUnitPrice(%s, %s) = %d, want %d", tc.colorMode, tc.duplex, price, tc.wantPrice)
-			}
-		})
-	}
-}
-
-func TestResolveUnitPrice_ColorDisabledFallback(t *testing.T) {
-	tariff := TariffConfig{
-		BWSimplexPricePaise:    250,
-		BWDuplexPricePaise:     180,
-		ColorSimplexPricePaise: 1200,
-		ColorDuplexPricePaise:  900,
-		ColorEnabled:           false, // Hardware does not support color
-	}
-
-	// Requesting COLOR when ColorEnabled=false MUST fall back to BW rates
-	simpPrice := ResolveUnitPrice(tariff, "COLOR", contracts.DuplexSimplex, 0)
-	if simpPrice != 250 {
-		t.Fatalf("expected BW simplex fallback 250, got %d", simpPrice)
-	}
-
-	dupPrice := ResolveUnitPrice(tariff, "COLOR", contracts.DuplexLongEdge, 0)
-	if dupPrice != 180 {
-		t.Fatalf("expected BW duplex fallback 180, got %d", dupPrice)
-	}
-}
-
-func TestResolveUnitPriceFromConfig_NoPricing(t *testing.T) {
-	tariff := TariffConfig{} // empty
-
-	// When hasPricing is false, use fallbackUnitPrice if provided
-	priceWithFallback := ResolveUnitPriceFromConfig(false, tariff, "BW", contracts.DuplexSimplex, 350)
-	if priceWithFallback != 350 {
-		t.Fatalf("expected fallback price 350, got %d", priceWithFallback)
-	}
-
-	// When fallbackUnitPrice is <= 0 and hasPricing is false, use DefaultBWSimplexPaise (200)
-	defaultPrice := ResolveUnitPriceFromConfig(false, tariff, "BW", contracts.DuplexSimplex, 0)
-	if defaultPrice != DefaultBWSimplexPaise {
-		t.Fatalf("expected default price %d, got %d", DefaultBWSimplexPaise, defaultPrice)
-	}
-}
-
-func TestResolveUnitPrice_ZeroOrNegativeTiersFallback(t *testing.T) {
-	// Tariff with zero prices
-	tariffZero := TariffConfig{
-		BWSimplexPricePaise: 0,
-		ColorEnabled:        false,
-	}
-
-	// Falls back to fallbackUnitPrice
-	price := ResolveUnitPrice(tariffZero, "BW", contracts.DuplexSimplex, 300)
-	if price != 300 {
-		t.Fatalf("expected fallback 300, got %d", price)
-	}
-
-	// Falls back to DefaultBWSimplexPaise (200) when fallback is also 0
-	priceDef := ResolveUnitPrice(tariffZero, "BW", contracts.DuplexSimplex, 0)
-	if priceDef != DefaultBWSimplexPaise {
-		t.Fatalf("expected default %d, got %d", DefaultBWSimplexPaise, priceDef)
-	}
-}
-
-func TestComputeDuplexDiscount(t *testing.T) {
-	// Standard 25% discount: (200 * 3) / 4 = 150
-	d1 := ComputeDuplexDiscount(200, 150)
-	if d1 != 150 {
-		t.Fatalf("ComputeDuplexDiscount(200) = %d, want 150", d1)
-	}
-
-	// 1000 * 3 / 4 = 750
-	d2 := ComputeDuplexDiscount(1000, 750)
-	if d2 != 750 {
-		t.Fatalf("ComputeDuplexDiscount(1000) = %d, want 750", d2)
-	}
-
-	// 350 * 3 / 4 = 262
-	d3 := ComputeDuplexDiscount(350, 150)
-	if d3 != 262 {
-		t.Fatalf("ComputeDuplexDiscount(350) = %d, want 262", d3)
-	}
-
-	// Non-positive simplex falls back to default
-	dZero := ComputeDuplexDiscount(0, 150)
-	if dZero != 150 {
-		t.Fatalf("ComputeDuplexDiscount(0) = %d, want fallback 150", dZero)
-	}
-}
-
 func TestDefaultTariff(t *testing.T) {
 	def := DefaultTariff()
-	if def.BWSimplexPricePaise != 200 || def.BWDuplexPricePaise != 150 {
-		t.Fatalf("unexpected BW defaults: %+v", def)
+	if def.BWSimplexPricePaise != 300 || def.BWDuplexPricePaise != 500 {
+		t.Fatalf("unexpected BW canonical defaults: %+v", def)
 	}
-	if def.ColorSimplexPricePaise != 1000 || def.ColorDuplexPricePaise != 750 {
-		t.Fatalf("unexpected Color defaults: %+v", def)
+	if def.ColorSimplexPricePaise != 800 || def.ColorDuplexPricePaise != 1000 {
+		t.Fatalf("unexpected Color canonical defaults: %+v", def)
 	}
 	if def.ColorEnabled != false {
 		t.Fatalf("expected ColorEnabled false by default")
 	}
-	if def.BWPricePerSheetPaise != 200 || def.ColorPricePerSheetPaise != 1000 {
-		t.Fatalf("unexpected compatibility sheet prices: %+v", def)
-	}
 }
-

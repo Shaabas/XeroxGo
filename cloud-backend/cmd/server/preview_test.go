@@ -34,12 +34,11 @@ func setupPreviewTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
-		devMode:            true,
+		addr:           "localhost:0",
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		downloadSecret: []byte("test_secret_key_1234567890"),
+		devMode:        true,
 	}
 
 	hub := ws.NewHub(s)
@@ -49,6 +48,8 @@ func setupPreviewTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		hub:      hub,
 		convWake: make(chan struct{}, 10),
 	}
+
+	_ = s.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, false)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/documents/preview", app.handleDocumentPreview)
@@ -173,11 +174,11 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			nup:               "2",
 			duplex:            "DUPLEX_LONG_EDGE",
 			copies:            "1",
-			wantBilledSides:   3,   // Blank pad excluded from billing!
-			wantTotalSheets:   2,   // ceil(3/2) = 2 physical sheets
+			wantBilledSides:   3, // Blank pad excluded from billing!
+			wantTotalSheets:   2, // ceil(3/2) = 2 physical sheets
 			wantNormalizedPgs: 3,
 			wantPaddedPgs:     4,   // 3 sides + 1 blank padding page
-			wantPricePaise:    450, // 3 * 150 paise
+			wantPricePaise:    350, // 1 sheet * 150 + 1 odd page * 200 = 350 paise
 		},
 		{
 			name:              "4-up Simplex 1 copy (ceil(6/4) = 2 sides)",
@@ -199,7 +200,7 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			wantTotalSheets:   1, // ceil(2/2) = 1 sheet
 			wantNormalizedPgs: 2,
 			wantPaddedPgs:     2,
-			wantPricePaise:    300, // 2 * 150 paise
+			wantPricePaise:    150, // 1 sheet * 150 paise
 		},
 		{
 			name:              "6-up Simplex 1 copy (ceil(6/6) = 1 side)",
@@ -217,11 +218,11 @@ func TestDocumentPreview_NUpModes(t *testing.T) {
 			nup:               "6",
 			duplex:            "DUPLEX_LONG_EDGE",
 			copies:            "1",
-			wantBilledSides:   1,   // Blank pad excluded from billing
-			wantTotalSheets:   1,   // ceil(1/2) = 1 sheet
+			wantBilledSides:   1, // Blank pad excluded from billing
+			wantTotalSheets:   1, // ceil(1/2) = 1 sheet
 			wantNormalizedPgs: 1,
 			wantPaddedPgs:     2,   // 1 content side + 1 blank padding page
-			wantPricePaise:    150, // 1 * 150 paise
+			wantPricePaise:    200, // 0 full sheets + 1 odd page * 200 paise = 200
 		},
 	}
 
@@ -301,8 +302,8 @@ func TestDocumentPreview_PricingAndDuplexBlankPadding(t *testing.T) {
 		if pp := rr.Header().Get("X-Padded-Pages"); pp != "4" {
 			t.Errorf("X-Padded-Pages = %q, want 4", pp)
 		}
-		if tp := rr.Header().Get("X-Total-Price-Paise"); tp != "450" {
-			t.Errorf("X-Total-Price-Paise = %q, want 450", tp)
+		if tp := rr.Header().Get("X-Total-Price-Paise"); tp != "350" {
+			t.Errorf("X-Total-Price-Paise = %q, want 350", tp)
 		}
 
 		verifyPDFStructureAndPages(t, rr.Body.Bytes(), 4)
@@ -337,8 +338,8 @@ func TestDocumentPreview_PricingAndDuplexBlankPadding(t *testing.T) {
 		if ts := int(resp["total_sheets"].(float64)); ts != 4 {
 			t.Errorf("total_sheets = %d, want 4", ts)
 		}
-		if tp := int64(resp["total_price_paise"].(float64)); tp != 900 {
-			t.Errorf("total_price_paise = %d, want 900", tp)
+		if tp := int64(resp["total_price_paise"].(float64)); tp != 700 {
+			t.Errorf("total_price_paise = %d, want 700", tp)
 		}
 		if pp := int(resp["padded_pages"].(float64)); pp != 4 {
 			t.Errorf("padded_pages = %d, want 4", pp)

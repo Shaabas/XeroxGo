@@ -3,12 +3,18 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/pkg/contracts"
+)
+
+var (
+	ErrPricingNotConfigured = errors.New("pricing has not been configured")
+	ErrPricingInvalid       = errors.New("invalid or incomplete tariff rates in database")
 )
 
 // PricingConfig represents comprehensive pricing for monochrome and color prints (simplex and duplex)
@@ -32,44 +38,26 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	var legacyPrice, bwPrice, colorPrice, bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
+	var bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
 	var colorEnabledInt int
 	var updatedNS int64
-	query := "SELECT price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise, bw_simplex_price_paise, bw_duplex_price_paise, color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns FROM pricing WHERE id = 1;"
+	query := "SELECT bw_simplex_price_paise, bw_duplex_price_paise, color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns FROM pricing WHERE id = 1;"
 	err := s.db.QueryRowContext(ctx, query).Scan(
-		&legacyPrice, &bwPrice, &colorPrice,
 		&bwSimplex, &bwDuplex,
 		&colorSimplex, &colorDuplex,
 		&colorEnabledInt, &updatedNS,
 	)
-	if err == sql.ErrNoRows {
-		return PricingConfig{}, fmt.Errorf("get pricing: pricing has not been configured")
+	if errors.Is(err, sql.ErrNoRows) {
+		return PricingConfig{}, fmt.Errorf("get pricing: %w", ErrPricingNotConfigured)
 	}
 	if err != nil {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	if bwSimplex <= 0 {
-		if bwPrice > 0 {
-			bwSimplex = bwPrice
-		} else if legacyPrice > 0 {
-			bwSimplex = legacyPrice
-		} else {
-			bwSimplex = pricing.DefaultBWSimplexPaise
-		}
-	}
-	if bwDuplex <= 0 {
-		bwDuplex = pricing.ComputeDuplexDiscount(bwSimplex, pricing.DefaultBWDuplexPaise)
-	}
-	if colorSimplex <= 0 {
-		if colorPrice > 0 {
-			colorSimplex = colorPrice
-		} else {
-			colorSimplex = pricing.DefaultColorSimplexPaise
-		}
-	}
-	if colorDuplex <= 0 {
-		colorDuplex = pricing.ComputeDuplexDiscount(colorSimplex, pricing.DefaultColorDuplexPaise)
+	// Fail closed if any canonical rate is invalid or missing.
+	// Do not read legacy physical columns as pricing authorities or silent fallbacks.
+	if bwSimplex <= 0 || bwDuplex <= 0 || colorSimplex <= 0 || colorDuplex <= 0 {
+		return PricingConfig{}, fmt.Errorf("get pricing: %w", ErrPricingInvalid)
 	}
 
 	return PricingConfig{
@@ -78,11 +66,7 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		ColorSimplexPricePaise: colorSimplex,
 		ColorDuplexPricePaise:  colorDuplex,
 		ColorEnabled:           colorEnabledInt == 1,
-		BWPricePerSheetPaise:    bwSimplex,
-		ColorPricePerSheetPaise: colorSimplex,
-		BWPricePerSidePaise:    bwSimplex,
-		ColorPricePerSidePaise: colorSimplex,
-		UpdatedAt:               time.Unix(0, updatedNS).UTC(),
+		UpdatedAt:              time.Unix(0, updatedNS).UTC(),
 	}, nil
 }
 
@@ -142,13 +126,6 @@ ON CONFLICT(id) DO UPDATE SET
 		return fmt.Errorf("set pricing: %w", err)
 	}
 	return nil
-}
-
-// SetPricing updates or inserts the dual pricing configuration (backward compatible).
-func (s *Store) SetPricing(ctx context.Context, bwPrice, colorPrice int64) error {
-	bwDuplex := pricing.ComputeDuplexDiscount(bwPrice, pricing.DefaultBWDuplexPaise)
-	colorDuplex := pricing.ComputeDuplexDiscount(colorPrice, pricing.DefaultColorDuplexPaise)
-	return s.SetDetailedPricing(ctx, bwPrice, bwDuplex, colorPrice, colorDuplex, false)
 }
 
 // DailyTrendItem represents volume and revenue aggregated by calendar day.

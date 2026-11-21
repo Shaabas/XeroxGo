@@ -155,13 +155,31 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# Gate 6 — Frontend Conversion Test Suite
+# Gate 6 — Frontend Test Suite
 # -----------------------------------------------------------------------------
-echo "=== Gate 6: Frontend Conversion Test Suite ==="
-if node --test frontend/js/conversion_test.js; then
-    echo "Gate 6 PASSED: Frontend conversion tests passed."
+echo "=== Gate 6: Frontend Test Suite ==="
+gate6_passed=true
+
+echo "Checking JavaScript syntax..."
+if ! node --check frontend/js/admin.js; then
+    echo "ERROR: node --check frontend/js/admin.js failed."
+    gate6_passed=false
+fi
+if ! node --check frontend/js/portal.js; then
+    echo "ERROR: node --check frontend/js/portal.js failed."
+    gate6_passed=false
+fi
+
+echo "Running frontend test suite..."
+if ! node --test frontend/js/conversion_test.js frontend/js/pricing_test.js; then
+    echo "ERROR: Frontend tests failed."
+    gate6_passed=false
+fi
+
+if [[ "$gate6_passed" == "true" ]]; then
+    echo "Gate 6 PASSED: Frontend syntax checks and tests passed."
 else
-    echo "Gate 6 FAILED: Frontend tests failed."
+    echo "Gate 6 FAILED: Frontend checks failed."
     FAILED=1
 fi
 echo ""

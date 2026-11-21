@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -64,11 +65,10 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
+		addr:           "localhost:0",
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		downloadSecret: []byte("test_secret_key_1234567890"),
 	}
 
 	hub := ws.NewHub(s)
@@ -78,6 +78,8 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		hub:      hub,
 		convWake: make(chan struct{}, 10),
 	}
+
+	_ = s.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, false)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/k/", app.handleUpload)
@@ -116,7 +118,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantTotalCost: 1200, // 3 pages * 2 copies * 200 paise = 1200
 		},
 		{
-			name:          "duplex_3p_2copies_example_from_spec",
+			name: "duplex_3p_2copies_example_from_spec",
 			// Requirement 10: 3 pages * 2 copies in duplex = 6 printed sides, 4 physical sheets.
 			pdfPath:       doc3p,
 			copies:        "2",
@@ -125,7 +127,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    4, // ceil(3/2) * 2 = 4 sheets
 			wantCopies:    2,
-			wantTotalCost: 1200, // 6 printed sides * 200 paise = 1200
+			wantTotalCost: 700, // (150 + 200) * 2 = 700
 		},
 		{
 			name:          "duplex_3p_1copy",
@@ -136,7 +138,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    2, // ceil(3/2) * 1 = 2 sheets
 			wantCopies:    1,
-			wantTotalCost: 600, // 3 printed sides * 200 paise = 600
+			wantTotalCost: 350, // 150 + 200 = 350
 		},
 		{
 			name:          "custom_range_1_3_5_on_5p_simplex_2copies",
@@ -160,7 +162,7 @@ func TestUpload_PageCalculationsAndAuthoritativeCounts(t *testing.T) {
 			wantPages:     3,
 			wantSheets:    4, // ceil(3/2) * 2 = 4
 			wantCopies:    2,
-			wantTotalCost: 1200,
+			wantTotalCost: 700,
 		},
 		{
 			name:       "invalid_custom_range_out_of_bounds",
@@ -409,8 +411,8 @@ func TestUpload_10PagePDF_Select_2_4_6_Duplex(t *testing.T) {
 	if int(resp["copies"].(float64)) != 2 {
 		t.Errorf("copies = %v, want 2", resp["copies"])
 	}
-	if int64(resp["total_price_paise"].(float64)) != 1200 {
-		t.Errorf("total_price_paise = %v, want 1200 (6 printed sides * 200 paise)", resp["total_price_paise"])
+	if int64(resp["total_price_paise"].(float64)) != 700 {
+		t.Errorf("total_price_paise = %v, want 700", resp["total_price_paise"])
 	}
 
 	orderID := resp["order_id"].(string)
@@ -484,4 +486,3 @@ func TestUpload_OfficeConvertedPDF_WithPageRange(t *testing.T) {
 		t.Errorf("total_sheets = %v, want 1", resp["total_sheets"])
 	}
 }
-

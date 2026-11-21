@@ -249,31 +249,32 @@ func TestPricingPersistence(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Error before pricing configured
-	if _, err := s.GetPricePerSheetPaise(ctx); err == nil {
+	if _, err := s.GetPricing(ctx); err == nil {
 		t.Fatalf("expected error for unconfigured pricing, got nil")
 	}
 
-	// 2. Set valid positive integer price
-	if err := s.SetPricePerSheetPaise(ctx, 350); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(350) failed: %v", err)
+	// 2. Set valid 4-tier pricing
+	if err := s.SetDetailedPricing(ctx, 350, 500, 800, 1000, true); err != nil {
+		t.Fatalf("SetDetailedPricing(350, ...) failed: %v", err)
 	}
 
 	// 3. Read back price
-	price, err := s.GetPricePerSheetPaise(ctx)
+	p, err := s.GetPricing(ctx)
 	if err != nil {
-		t.Fatalf("GetPricePerSheetPaise failed: %v", err)
+		t.Fatalf("GetPricing failed: %v", err)
 	}
-	if price != 350 {
-		t.Fatalf("expected price 350, got %d", price)
+	if p.BWSimplexPricePaise != 350 || p.BWDuplexPricePaise != 500 ||
+		p.ColorSimplexPricePaise != 800 || p.ColorDuplexPricePaise != 1000 || !p.ColorEnabled {
+		t.Fatalf("unexpected price config: %+v", p)
 	}
 
 	// 4. Replace price
-	if err := s.SetPricePerSheetPaise(ctx, 400); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(400) failed: %v", err)
+	if err := s.SetDetailedPricing(ctx, 400, 600, 900, 1200, false); err != nil {
+		t.Fatalf("SetDetailedPricing(400, ...) failed: %v", err)
 	}
-	price, err = s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("expected price 400, got %d (err: %v)", price, err)
+	p, err = s.GetPricing(ctx)
+	if err != nil || p.BWSimplexPricePaise != 400 || p.BWDuplexPricePaise != 600 || p.ColorEnabled {
+		t.Fatalf("expected price 400, got %+v (err: %v)", p, err)
 	}
 
 	// 5. Reopen preserves configured price
@@ -284,23 +285,23 @@ func TestPricingPersistence(t *testing.T) {
 	}
 	defer s2.Close()
 
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price after reopen mismatch: got %d (err: %v)", price, err)
+	p, err = s2.GetPricing(ctx)
+	if err != nil || p.BWSimplexPricePaise != 400 || p.BWDuplexPricePaise != 600 {
+		t.Fatalf("price after reopen mismatch: got %+v (err: %v)", p, err)
 	}
 
 	// 6. Zero and negative prices rejected
-	if err := s2.SetPricePerSheetPaise(ctx, 0); err == nil {
+	if err := s2.SetDetailedPricing(ctx, 0, 600, 900, 1200, false); err == nil {
 		t.Fatalf("expected error for price=0, got nil")
 	}
-	if err := s2.SetPricePerSheetPaise(ctx, -50); err == nil {
+	if err := s2.SetDetailedPricing(ctx, -50, 600, 900, 1200, false); err == nil {
 		t.Fatalf("expected error for negative price, got nil")
 	}
 
 	// 7. Failed update did not change previous price
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price changed after rejected updates: got %d, want 400", price)
+	p, err = s2.GetPricing(ctx)
+	if err != nil || p.BWSimplexPricePaise != 400 {
+		t.Fatalf("price changed after rejected updates: got %+v, want 400", p)
 	}
 }
 
@@ -706,11 +707,11 @@ func TestRejectsInvalidInput(t *testing.T) {
 	if err := s.UpdateOrderStatus(nil, "some-order", contracts.JobStatusPrinting); err == nil {
 		t.Fatalf("expected error for nil context in UpdateOrderStatus, got nil")
 	}
-	if err := s.SetPricePerSheetPaise(nil, 100); err == nil {
-		t.Fatalf("expected error for nil context in SetPricePerSheetPaise, got nil")
+	if err := s.SetDetailedPricing(nil, 100, 200, 300, 400, false); err == nil {
+		t.Fatalf("expected error for nil context in SetDetailedPricing, got nil")
 	}
-	if _, err := s.GetPricePerSheetPaise(nil); err == nil {
-		t.Fatalf("expected error for nil context in GetPricePerSheetPaise, got nil")
+	if _, err := s.GetPricing(nil); err == nil {
+		t.Fatalf("expected error for nil context in GetPricing, got nil")
 	}
 	if _, err := s.RecordWebhook(nil, "evt-nil"); err == nil {
 		t.Fatalf("expected error for nil context in RecordWebhook, got nil")

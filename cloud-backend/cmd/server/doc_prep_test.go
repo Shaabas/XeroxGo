@@ -218,11 +218,13 @@ func TestDocPrep_ExecuteNormalizationAndPricing(t *testing.T) {
 	}
 
 	pricing := store.PricingConfig{
-		BWSimplexPricePaise: 200,
-		BWDuplexPricePaise:  150,
+		BWSimplexPricePaise:    200,
+		BWDuplexPricePaise:     150,
+		ColorSimplexPricePaise: 800,
+		ColorDuplexPricePaise:  1000,
 	}
 
-	res, err := app.executeNormalizationAndPricing(context.Background(), pdfPath, outPath, opts, pricing, true)
+	res, err := app.executeNormalizationAndPricing(context.Background(), pdfPath, outPath, opts, pricing)
 	if err != nil {
 		t.Fatalf("executeNormalizationAndPricing failed: %v", err)
 	}
@@ -237,10 +239,7 @@ func TestDocPrep_ExecuteNormalizationAndPricing(t *testing.T) {
 	if res.PrintedSides != 4 {
 		t.Fatalf("expected 4 printed sides, got %d", res.PrintedSides)
 	}
-	if res.UnitPrice != 200 {
-		t.Fatalf("expected unit price 200, got %d", res.UnitPrice)
-	}
-	// 4 sides * 200 paise = 800 paise
+	// 2 pages * 200 paise * 2 copies = 800 paise
 	if res.PricePaise != 800 {
 		t.Fatalf("expected price 800 paise, got %d", res.PricePaise)
 	}

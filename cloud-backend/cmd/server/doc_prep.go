@@ -230,20 +230,18 @@ func prepareInputPDF(
 // normalizedDocResult contains the authoritative output from normalization, pricing, and sheet accounting.
 type normalizedDocResult struct {
 	NormResult   *pdf.NormalizedResult
-	UnitPrice    int64
 	PrintedSides int
 	PricePaise   int64
 }
 
 // executeNormalizationAndPricing executes canonical normalization on the prepared input PDF
-// and calculates authoritative unit price and total price in integer paise.
+// and calculates authoritative total price in integer paise using the canonical pricing calculator.
 func (s *appServer) executeNormalizationAndPricing(
 	ctx context.Context,
 	inputPDFPath string,
 	outputPath string,
 	opts docPrintOptions,
 	pricingConfig store.PricingConfig,
-	hasPricing bool,
 ) (*normalizedDocResult, error) {
 	normRes, err := pdf.NormalizeAndCountWithOptions(ctx, inputPDFPath, outputPath, pdf.NormalizeOptions{
 		Copies:        opts.Copies,
@@ -257,16 +255,16 @@ func (s *appServer) executeNormalizationAndPricing(
 		return nil, err
 	}
 
-	unitPrice := s.resolveUnitPrice(pricingConfig, hasPricing, opts.ColorMode, opts.Duplex)
-	printedSides := normRes.TotalPages * opts.Copies
-	docPrice, err := pricing.CalculatePricePaise(printedSides, unitPrice)
+	isDuplex := opts.Duplex == contracts.DuplexLongEdge || opts.Duplex == contracts.DuplexShortEdge
+	isColor := strings.EqualFold(opts.ColorMode, "COLOR")
+	docPrice, err := pricing.CalculateDocumentPricePaise(pricingConfig, normRes.TotalPages, isColor, isDuplex, opts.Copies)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate price: %w", err)
 	}
 
+	printedSides := normRes.TotalPages * opts.Copies
 	return &normalizedDocResult{
 		NormResult:   normRes,
-		UnitPrice:    unitPrice,
 		PrintedSides: printedSides,
 		PricePaise:   docPrice,
 	}, nil

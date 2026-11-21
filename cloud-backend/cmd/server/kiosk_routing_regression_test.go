@@ -38,15 +38,14 @@ func setupRoutingRegressionServer(t *testing.T, demoMode bool) (*appServer, *htt
 	hub.SetKioskSecret([]byte(kioskSecret))
 
 	cfg := &serverConfig{
-		addr:               ":0",
-		dbPath:             dbPath,
-		jobsDir:            filepath.Join(tempDir, "jobs"),
-		pricePerSheetPaise: 500,
-		devMode:            true,
-		demoMode:           demoMode,
-		downloadSecret:     []byte("dev_secret_download_1234567890"),
-		webhookSecret:      []byte("dev_secret_webhook_1234567890"),
-		kioskSecret:        []byte(kioskSecret),
+		addr:           ":0",
+		dbPath:         dbPath,
+		jobsDir:        filepath.Join(tempDir, "jobs"),
+		devMode:        true,
+		demoMode:       demoMode,
+		downloadSecret: []byte("dev_secret_download_1234567890"),
+		webhookSecret:  []byte("dev_secret_webhook_1234567890"),
+		kioskSecret:    []byte(kioskSecret),
 	}
 
 	app := &appServer{

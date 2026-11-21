@@ -37,15 +37,14 @@ func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Ser
 	pinLimiter := NewPINRateLimiter(st, 10, 1*time.Minute, 1*time.Minute)
 
 	cfg := &serverConfig{
-		addr:               ":0",
-		dbPath:             dbPath,
-		jobsDir:            filepath.Join(tempDir, "jobs"),
-		pricePerSheetPaise: 500,
-		devMode:            true,
-		demoMode:           demoMode,
-		downloadSecret:     []byte("dev_secret_download_1234567890"),
-		webhookSecret:      []byte("dev_secret_webhook_1234567890"),
-		kioskSecret:        []byte("dev_secret_kiosk_1234567890"),
+		addr:           ":0",
+		dbPath:         dbPath,
+		jobsDir:        filepath.Join(tempDir, "jobs"),
+		devMode:        true,
+		demoMode:       demoMode,
+		downloadSecret: []byte("dev_secret_download_1234567890"),
+		webhookSecret:  []byte("dev_secret_webhook_1234567890"),
+		kioskSecret:    []byte("dev_secret_kiosk_1234567890"),
 	}
 
 	app := &appServer{
