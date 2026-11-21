@@ -669,24 +669,27 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dispatch job to kiosk physical printer
-	if s.hub != nil {
-		if len(order.Documents) > 0 {
-			for _, doc := range order.Documents {
-				jobCmd := doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
-				if err := s.hub.SendJob(r.Context(), jobCmd); err != nil {
-					log.Printf("[RELEASE] Warning: failed to send child job %s to kiosk %s: %v", doc.JobID, kioskID, err)
-					break
-				}
-				_ = s.db.MarkDispatchIntentSent(r.Context(), doc.JobID)
-			}
-		} else {
-			if err := s.hub.SendJob(r.Context(), order.Command); err != nil {
-				log.Printf("[RELEASE] Warning: failed to send job %s to kiosk %s: %v", order.Command.JobID, kioskID, err)
-			} else {
-				_ = s.db.MarkDispatchIntentSent(r.Context(), order.Command.JobID)
-			}
+	// ReleasePaidOrder has atomically persisted the paid authorization and
+	// every child dispatch intent. Send failures are transport uncertainty,
+	// not printer faults; keep the intents for the next authenticated Pi reconnect.
+	commands := make([]contracts.PrintJobCommand, 0, len(order.Documents))
+	if len(order.Documents) > 0 {
+		for _, doc := range order.Documents {
+			commands = append(commands, doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents)))
 		}
+	} else {
+		commands = append(commands, order.Command)
+	}
+	if err := s.deliverAuthorizedJobs(r.Context(), orderID, commands); err != nil {
+		log.Printf("[RELEASE] Paid order %s authorized, but delivery unresolved; preserving intents: %v", orderID, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"order_id": orderID,
+			"kiosk_id": kioskID,
+			"status":   "DISPATCH_PENDING",
+		})
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
