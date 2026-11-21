@@ -783,7 +783,9 @@ func (s *appServer) handleRecoveryPIN(w http.ResponseWriter, r *http.Request) {
 	// Generate fresh 4-digit PIN with collision retry
 	const maxRetries = 25
 	var newPIN string
-	newExpiry := time.Now().UTC().Add(customerPINValidity)
+	// Recovery is only for an already-paid PAID_WAITING order. It must not
+	// introduce a new five-minute deadline after payment.
+	newExpiry := store.PaidPINExpiry()
 	renewed := false
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
