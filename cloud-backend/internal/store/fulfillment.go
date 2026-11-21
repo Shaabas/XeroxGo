@@ -220,3 +220,38 @@ AND status NOT IN ('COMPLETED', 'FAILED_REFUNDABLE');`), now, orderID)
 	}
 	return tx.Commit()
 }
+
+// Pending refunds need provider reconciliation: a successful API response does
+// not necessarily mean funds have completed their return.
+func (s *Store) ListPendingRefunds(ctx context.Context, olderThan time.Time) ([]RefundRequest, error) {
+	rows, err := s.db.QueryContext(ctx, s.rebind(`
+SELECT order_id, payment_id, provider, amount_paise, status, idempotency_key,
+provider_refund_id, safe_stop_verified, last_error
+FROM refund_requests WHERE status = 'PENDING' AND provider_refund_id <> ''
+AND updated_at_ns < ? ORDER BY updated_at_ns ASC LIMIT 50;`), olderThan.UnixNano())
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var items []RefundRequest
+	for rows.Next() {
+		var r RefundRequest
+		var confirmed int
+		if err := rows.Scan(&r.OrderID, &r.PaymentID, &r.Provider, &r.AmountPaise,
+			&r.Status, &r.IdempotencyKey, &r.ProviderRefundID, &confirmed, &r.LastError); err != nil {
+			return nil, err
+		}
+		r.SafeStopVerified = confirmed != 0
+		items = append(items, r)
+	}
+	return items, rows.Err()
+}
+
+// A kiosk with an unconfirmed stop must not be restored to service.
+func (s *Store) HasUnsafeRefundStops(ctx context.Context, kioskID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, s.rebind(`
+SELECT COUNT(*) FROM refund_requests rr
+JOIN orders o ON o.order_id = rr.order_id
+WHERE o.kiosk_id = ? AND rr.safe_stop_verified = 0
+AND rr.status <> 'PROCESSED';`), kioskID).Scan(&n)
+	return n > 0, err
+}
