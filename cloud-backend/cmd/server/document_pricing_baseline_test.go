@@ -37,12 +37,11 @@ func setupDocPricingBaselineServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
-		devMode:            true,
+		addr:           "localhost:0",
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		downloadSecret: []byte("test_secret_key_1234567890"),
+		devMode:        true,
 	}
 
 	hub := ws.NewHub(s)
@@ -52,6 +51,8 @@ func setupDocPricingBaselineServer(t *testing.T) (*appServer, *http.ServeMux) {
 		hub:      hub,
 		convWake: make(chan struct{}, 10),
 	}
+
+	_ = s.SetDetailedPricing(context.Background(), 200, 150, 1000, 750, false)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/documents/preview", app.handleDocumentPreview)
@@ -355,15 +356,15 @@ func TestDocumentPricing_MultiFileCollationOrderAndPadding(t *testing.T) {
 	// Expected aggregations:
 	// Total billed sides = 2 + 3 + 1 = 6
 	// Total sheets = 2 + 2 + 1 = 5
-	// Total price = 400 + 450 + 200 = 1050 paise
+	// Total price = 400 + 350 + 200 = 950 paise
 	if totalPages != 6 {
 		t.Errorf("total_pages (billed sides) = %d, want 6", totalPages)
 	}
 	if totalSheets != 5 {
 		t.Errorf("total_sheets = %d, want 5", totalSheets)
 	}
-	if totalPricePaise != 1050 {
-		t.Errorf("total_price_paise = %d, want 1050", totalPricePaise)
+	if totalPricePaise != 950 {
+		t.Errorf("total_price_paise = %d, want 950", totalPricePaise)
 	}
 
 	// In multi-document printing architecture, no concatenated merged PDF is created.
@@ -400,9 +401,9 @@ func TestDocumentPricing_MultiFileCollationOrderAndPadding(t *testing.T) {
 		t.Errorf("dAlpha Page 2 = %q", p2)
 	}
 
-	// DocBeta: 3 content pages, duplex -> 4 pages on disk (with duplex blank back padding), 450 paise
+	// DocBeta: 3 content pages, duplex -> 4 pages on disk (with duplex blank back padding), 350 paise
 	dBeta := docs[1]
-	if dBeta.OriginalFilename != "DocBeta_3p.pdf" || dBeta.TotalPages != 3 || dBeta.TotalSheets != 2 || dBeta.PricePaise != 450 {
+	if dBeta.OriginalFilename != "DocBeta_3p.pdf" || dBeta.TotalPages != 3 || dBeta.TotalSheets != 2 || dBeta.PricePaise != 350 {
 		t.Errorf("dBeta mismatch: %+v", dBeta)
 	}
 	dBetaPath := filepath.Join(app.cfg.jobsDir, sha256ChecksumString(dBeta.JobID)+".pdf")
@@ -481,10 +482,10 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		t.Errorf("BW Simplex price = %d, want 1000", pBwSimp)
 	}
 
-	// 2. BW Duplex: 4 pages * 1 copy * 175 paise = 700 paise
+	// 2. BW Duplex: floor(4/2) = 2 sheets * 175 paise = 350 paise
 	pBwDup := uploadTest("BW", "DUPLEX_LONG_EDGE", 1)
-	if pBwDup != 700 {
-		t.Errorf("BW Duplex price = %d, want 700", pBwDup)
+	if pBwDup != 350 {
+		t.Errorf("BW Duplex price = %d, want 350", pBwDup)
 	}
 
 	// 3. Color Simplex: 4 pages * 1 copy * 1250 paise = 5000 paise
@@ -493,10 +494,10 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		t.Errorf("Color Simplex price = %d, want 5000", pColSimp)
 	}
 
-	// 4. Color Duplex: 4 pages * 1 copy * 900 paise = 3600 paise
+	// 4. Color Duplex: floor(4/2) = 2 sheets * 900 paise = 1800 paise
 	pColDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1)
-	if pColDup != 3600 {
-		t.Errorf("Color Duplex price = %d, want 3600", pColDup)
+	if pColDup != 1800 {
+		t.Errorf("Color Duplex price = %d, want 1800", pColDup)
 	}
 
 	// 5. Disable Color in DB: test graceful fallback to B&W rates
@@ -510,10 +511,10 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		t.Errorf("Color disabled Simplex price = %d, want BW fallback 1000", pFallbackSimp)
 	}
 
-	// Request Color Duplex with Color disabled -> should be charged BW Duplex (700 paise)
+	// Request Color Duplex with Color disabled -> should be charged BW Duplex (350 paise)
 	pFallbackDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1)
-	if pFallbackDup != 700 {
-		t.Errorf("Color disabled Duplex price = %d, want BW fallback 700", pFallbackDup)
+	if pFallbackDup != 350 {
+		t.Errorf("Color disabled Duplex price = %d, want BW fallback 350", pFallbackDup)
 	}
 }
 

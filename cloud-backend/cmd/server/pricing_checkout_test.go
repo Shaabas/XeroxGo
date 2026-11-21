@@ -38,13 +38,12 @@ func setupPricingTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
 
 	webhookSecret := []byte("whsec_test_secret_32_characters_ok")
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
-		webhookSecret:      webhookSecret,
-		devMode:            true,
+		addr:           "localhost:0",
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		downloadSecret: []byte("test_secret_key_1234567890"),
+		webhookSecret:  webhookSecret,
+		devMode:        true,
 	}
 
 	hub := ws.NewHub(s)
@@ -137,7 +136,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 		pageRange     string
 		wantPages     int
 		wantSheets    int
-		wantUnitPrice int64
 		wantTotalCost int64
 	}{
 		{
@@ -148,7 +146,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "BW",
 			wantPages:     1,
 			wantSheets:    1,
-			wantUnitPrice: 200,
 			wantTotalCost: 200, // 1 * 1 * 200
 		},
 		{
@@ -159,8 +156,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "BW",
 			wantPages:     3,
 			wantSheets:    4,   // ceil(3/2) * 2 = 4
-			wantUnitPrice: 150, // Duplex rate
-			wantTotalCost: 900, // 6 printed sides * 150 paise = 900 paise (₹9.00)
+			wantTotalCost: 700, // (150 + 200) * 2 = 700 paise (₹7.00)
 		},
 		{
 			name:          "5-page Color Simplex 1 copy",
@@ -170,7 +166,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "COLOR",
 			wantPages:     5,
 			wantSheets:    5,
-			wantUnitPrice: 1000,
 			wantTotalCost: 5000, // 5 * 1 * 1000
 		},
 		{
@@ -181,8 +176,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			colorMode:     "COLOR",
 			wantPages:     5,
 			wantSheets:    6,    // ceil(5/2) * 2 = 6
-			wantUnitPrice: 750,  // Color duplex rate
-			wantTotalCost: 7500, // 10 printed sides * 750 paise = 7500 paise (₹75.00)
+			wantTotalCost: 5000, // (2 * 750 + 1 * 1000) * 2 = 5000 paise (₹50.00)
 		},
 		{
 			name:          "5-page custom range 1,3,5 B&W Duplex 2 copies",
@@ -193,8 +187,7 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			pageRange:     "1,3,5",
 			wantPages:     3,
 			wantSheets:    4,   // ceil(3/2) * 2 = 4
-			wantUnitPrice: 150, // B&W duplex rate
-			wantTotalCost: 900, // 3 pages * 2 copies = 6 sides * 150 = 900 paise
+			wantTotalCost: 700, // (150 + 200) * 2 = 700 paise
 		},
 	}
 
@@ -204,7 +197,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 
 			gotPages := int(resp["total_pages"].(float64))
 			gotSheets := int(resp["total_sheets"].(float64))
-			gotUnitPrice := int64(resp["unit_price_paise"].(float64))
 			gotTotalCost := int64(resp["total_price_paise"].(float64))
 
 			if gotPages != tc.wantPages {
@@ -212,9 +204,6 @@ func TestPricing_TiersAndConfigurations(t *testing.T) {
 			}
 			if gotSheets != tc.wantSheets {
 				t.Errorf("total_sheets = %d, want %d", gotSheets, tc.wantSheets)
-			}
-			if gotUnitPrice != tc.wantUnitPrice {
-				t.Errorf("unit_price_paise = %d, want %d", gotUnitPrice, tc.wantUnitPrice)
 			}
 			if gotTotalCost != tc.wantTotalCost {
 				t.Errorf("total_price_paise = %d, want %d", gotTotalCost, tc.wantTotalCost)
@@ -240,11 +229,7 @@ func TestPricing_FractionalRupeesCalculation(t *testing.T) {
 
 	orderID := resp["order_id"].(string)
 	totalCost := int64(resp["total_price_paise"].(float64))
-	unitPrice := int64(resp["unit_price_paise"].(float64))
 
-	if unitPrice != 150 {
-		t.Fatalf("unit_price_paise = %d, want 150", unitPrice)
-	}
 	if totalCost != 450 {
 		t.Fatalf("total_price_paise = %d, want 450 (₹4.50)", totalCost)
 	}

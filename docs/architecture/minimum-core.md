@@ -126,7 +126,7 @@ Both binaries have strictly validated startup dependencies:
    - `XEROXGO_DOWNLOAD_SECRET`: Min 16 bytes for HMAC-SHA256 URL signing ([`main.go:1759`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1759)).
    - `XEROXGO_WEBHOOK_SECRET`: Min 16 bytes for Razorpay webhook verification ([`main.go:1760`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1760)).
    - `XEROXGO_KIOSK_SECRET`: Min 16 bytes for WebSocket authentication ([`main.go:1839`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1839)).
-5. **Pricing Configuration:** `XEROXGO_PRICE_PER_SHEET_PAISE` or existing record in `pricing` table ([`main.go:1789-1808`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1789-L1808)).
+5. **Pricing Configuration:** Authoritative tariff records in `pricing` table (configured via `/api/admin/pricing` or initial dev defaults).
 6. **Payment Provider:** `PAYMENT_PROVIDER=razorpay` requires `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`. Defaults to Mock provider if unset ([`main.go:1858-1876`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1858-L1876)).
 
 #### Kiosk Daemon (`kiosk-daemon/cmd/daemon/main.go:243-295`)

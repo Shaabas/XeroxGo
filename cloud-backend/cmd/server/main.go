@@ -32,15 +32,14 @@ import (
 )
 
 type serverConfig struct {
-	addr               string
-	dbPath             string
-	jobsDir            string
-	pricePerSheetPaise int64
-	devMode            bool
-	demoMode           bool
-	downloadSecret     []byte
-	webhookSecret      []byte
-	kioskSecret        []byte
+	addr           string
+	dbPath         string
+	jobsDir        string
+	devMode        bool
+	demoMode       bool
+	downloadSecret []byte
+	webhookSecret  []byte
+	kioskSecret    []byte
 }
 
 type appServer struct {
@@ -252,9 +251,6 @@ func parseDuplex(val interface{}) contracts.DuplexMode {
 	}
 }
 
-func (s *appServer) resolveUnitPrice(pricingConfig store.PricingConfig, hasPricing bool, colorMode string, duplex contracts.DuplexMode) int64 {
-	return pricing.ResolveUnitPriceFromConfig(hasPricing, pricingConfig, colorMode, duplex, s.cfg.pricePerSheetPaise)
-}
 func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -309,12 +305,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pricing, err := s.db.GetPricing(r.Context())
-	hasPricing := err == nil
 	if err != nil {
-		pricing = store.DefaultPricingConfig()
-	}
-	if len(fileHeaders) > 1 || len(metaItems) > 0 {
-		hasPricing = true
+		http.Error(w, "pricing unavailable: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 	colorEnabled := pricing.ColorEnabled
 
@@ -349,7 +342,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	var totalOrderPricePaise int64
 	var totalOrderPages int
 	var totalOrderSheets int
-	var firstUnitPrice int64
 	anyDuplex := false
 	anyColor := false
 
@@ -399,14 +391,10 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		jobPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
 		createdJobFiles = append(createdJobFiles, jobPDFPath)
 
-		res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, jobPDFPath, docOpts, pricing, hasPricing)
+		res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, jobPDFPath, docOpts, pricing)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("normalization failed for %q: %v", originalFilename, err), http.StatusBadRequest)
 			return
-		}
-
-		if idx == 0 {
-			firstUnitPrice = res.UnitPrice
 		}
 
 		jobDownloadURL := generateSignedJobDownloadURL(baseURL, orderID, jobID, s.cfg.downloadSecret, 24*time.Hour)
@@ -527,11 +515,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"documents_count":   len(docs),
 		"total_price_paise": totalOrderPricePaise,
 		"status":            string(contracts.JobStatusPendingPayment),
-	}
-	if !isMultiFile {
-		resp["price_per_sheet_paise"] = firstUnitPrice
-		resp["price_per_side_paise"] = firstUnitPrice
-		resp["unit_price_paise"] = firstUnitPrice
 	}
 	docSummaries := make([]map[string]interface{}, len(docs))
 	for i, d := range docs {
@@ -737,7 +720,8 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 
 	pricing, err := s.db.GetPricing(r.Context())
 	if err != nil {
-		pricing = store.DefaultPricingConfig()
+		http.Error(w, "pricing unavailable: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, 0)
@@ -765,7 +749,7 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}()
 	_ = tmpOutput.Close()
 
-	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, pricing, true)
+	res, err := s.executeNormalizationAndPricing(r.Context(), prep.PDFPath, tmpOutputName, opts, pricing)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("preview generation failed: %v", err), http.StatusBadRequest)
 		return
@@ -780,16 +764,16 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"billed_sides":      res.PrintedSides,
-			"total_sheets":     res.NormResult.TotalSheets,
-			"copies":           opts.Copies,
+			"total_sheets":      res.NormResult.TotalSheets,
+			"copies":            opts.Copies,
 			"total_price_paise": res.PricePaise,
-			"normalized_pages": res.NormResult.TotalPages,
-			"padded_pages":     res.NormResult.PaddedPages,
-			"sha256_checksum":  res.NormResult.SHA256Checksum,
-			"color_mode":       opts.ColorMode,
-			"duplex":           string(opts.Duplex),
-			"orientation":      opts.Orientation,
-			"pages_per_sheet":  opts.PagesPerSheet,
+			"normalized_pages":  res.NormResult.TotalPages,
+			"padded_pages":      res.NormResult.PaddedPages,
+			"sha256_checksum":   res.NormResult.SHA256Checksum,
+			"color_mode":        opts.ColorMode,
+			"duplex":            string(opts.Duplex),
+			"orientation":       opts.Orientation,
+			"pages_per_sheet":   opts.PagesPerSheet,
 		})
 		return
 	}
@@ -1365,26 +1349,15 @@ func main() {
 	defer storeDB.Close()
 
 	ctx := context.Background()
-	var pricePaise int64
-	priceEnv := os.Getenv("XEROXGO_PRICE_PER_SHEET_PAISE")
-	if priceEnv != "" {
-		p, err := strconv.ParseInt(priceEnv, 10, 64)
-		if err != nil || p <= 0 {
-			log.Fatalf("invalid XEROXGO_PRICE_PER_SHEET_PAISE: %s", priceEnv)
-		}
-		if err := storeDB.SetPricePerSheetPaise(ctx, p); err != nil {
-			log.Fatalf("failed to persist price per sheet: %v", err)
-		}
-		pricePaise = p
-	} else {
-		p, err := storeDB.GetPricePerSheetPaise(ctx)
-		if err == nil && p > 0 {
-			pricePaise = p
-		} else if devMode {
-			pricePaise = 500
-			_ = storeDB.SetPricePerSheetPaise(ctx, pricePaise)
+	// Ensure database has pricing configured. In development, seed default canonical pricing if unconfigured.
+	if _, err := storeDB.GetPricing(ctx); err != nil {
+		if devMode {
+			def := pricing.DefaultTariff()
+			if err := storeDB.SetDetailedPricing(ctx, def.BWSimplexPricePaise, def.BWDuplexPricePaise, def.ColorSimplexPricePaise, def.ColorDuplexPricePaise, def.ColorEnabled); err != nil {
+				log.Fatalf("failed to initialize default dev pricing: %v", err)
+			}
 		} else {
-			log.Fatalf("pricing unconfigured in production mode")
+			log.Fatalf("pricing unconfigured in production mode: %v", err)
 		}
 	}
 
@@ -1420,15 +1393,14 @@ func main() {
 	}
 
 	cfg := &serverConfig{
-		addr:               addr,
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: pricePaise,
-		devMode:            devMode,
-		demoMode:           demoMode,
-		downloadSecret:     []byte(dlSecretStr),
-		webhookSecret:      []byte(whSecretStr),
-		kioskSecret:        kioskSecretBytes,
+		addr:           addr,
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		devMode:        devMode,
+		demoMode:       demoMode,
+		downloadSecret: []byte(dlSecretStr),
+		webhookSecret:  []byte(whSecretStr),
+		kioskSecret:    kioskSecretBytes,
 	}
 
 	rzpKeyID := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_ID"))
@@ -1482,7 +1454,7 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v, price=%d paise)", addr, devMode, pricePaise)
+		log.Printf("XeroxGo cloud backend listening on %s (dev_mode=%v)", addr, devMode)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrCh <- err
 		}

@@ -36,11 +36,10 @@ func setupTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		downloadSecret:     []byte("test_secret_key_1234567890"),
+		addr:           "localhost:0",
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		downloadSecret: []byte("test_secret_key_1234567890"),
 	}
 
 	hub := ws.NewHub(s)
@@ -378,5 +377,3 @@ func TestConvertRoute_RetiredReturns404(t *testing.T) {
 		t.Fatalf("expected non-empty JobID and Token, got %+v", res)
 	}
 }
-
-

@@ -53,14 +53,13 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 	downloadSecret := []byte("dl_sec_multi_integ_test_32_bytes")
 
 	cfg := &serverConfig{
-		addr:               "localhost:0",
-		dbPath:             dbPath,
-		jobsDir:            jobsDir,
-		pricePerSheetPaise: 200,
-		kioskSecret:        []byte(kioskSecret),
-		webhookSecret:      []byte(webhookSecret),
-		downloadSecret:     downloadSecret,
-		devMode:            true,
+		addr:           "localhost:0",
+		dbPath:         dbPath,
+		jobsDir:        jobsDir,
+		kioskSecret:    []byte(kioskSecret),
+		webhookSecret:  []byte(webhookSecret),
+		downloadSecret: downloadSecret,
+		devMode:        true,
 	}
 
 	hub := ws.NewHub(st)
@@ -221,8 +220,8 @@ func TestMultiDoc_Cloud_FullFlowAndPricing(t *testing.T) {
 	if totalSheets != 8 { // 2 + 4 + 2 = 8
 		t.Fatalf("expected 8 sheets, got %d", totalSheets)
 	}
-	if totalPricePaise != 4850 { // 450 (doc 0) + 4000 (doc 1) + 400 (doc 2) = 4850
-		t.Fatalf("expected 4850 paise, got %d", totalPricePaise)
+	if totalPricePaise != 4600 { // 800 (doc 0) + 3200 (doc 1) + 600 (doc 2) = 4600
+		t.Fatalf("expected 4600 paise, got %d", totalPricePaise)
 	}
 
 	// 2. Kiosk PIN lookup

@@ -171,10 +171,12 @@
 
     const tabNavOverview = document.getElementById('tab-nav-overview');
     const tabNavOrders = document.getElementById('tab-nav-orders');
+    const tabNavPricing = document.getElementById('tab-nav-pricing');
     const tabNavAds = document.getElementById('tab-nav-ads');
 
     const viewOverview = document.getElementById('view-overview');
     const viewOrders = document.getElementById('view-orders');
+    const viewPricing = document.getElementById('view-pricing');
     const viewAds = document.getElementById('view-ads');
 
     // Toast element
@@ -303,10 +305,10 @@
     // --- Tab Navigation ---
     function switchNavTab(tabName) {
       activeNavTab = tabName;
-      [tabNavOverview, tabNavOrders, tabNavAds].forEach(btn => {
+      [tabNavOverview, tabNavOrders, tabNavPricing, tabNavAds].forEach(btn => {
         if (btn) btn.classList.remove('active');
       });
-      [viewOverview, viewOrders, viewAds].forEach(view => {
+      [viewOverview, viewOrders, viewPricing, viewAds].forEach(view => {
         if (view) view.classList.add('hidden');
       });
 
@@ -318,6 +320,10 @@
         if (tabNavOrders) tabNavOrders.classList.add('active');
         if (viewOrders) viewOrders.classList.remove('hidden');
         loadOrders();
+      } else if (tabName === 'pricing') {
+        if (tabNavPricing) tabNavPricing.classList.add('active');
+        if (viewPricing) viewPricing.classList.remove('hidden');
+        loadPricing();
       } else if (tabName === 'ads') {
         if (tabNavAds) tabNavAds.classList.add('active');
         if (viewAds) viewAds.classList.remove('hidden');
@@ -327,6 +333,7 @@
 
     if (tabNavOverview) tabNavOverview.addEventListener('click', () => switchNavTab('overview'));
     if (tabNavOrders) tabNavOrders.addEventListener('click', () => switchNavTab('orders'));
+    if (tabNavPricing) tabNavPricing.addEventListener('click', () => switchNavTab('pricing'));
     if (tabNavAds) tabNavAds.addEventListener('click', () => switchNavTab('ads'));
 
     // ==========================================
@@ -685,7 +692,158 @@
     }
 
     // ==========================================
-    // 3. PROMOTIONAL ADS & SIMULATOR
+    // 3. PRICING CONTROLLER & COST ESTIMATOR
+    // ==========================================
+    const pricingForm = document.getElementById('pricing-form');
+    const priceBwSimplexInput = document.getElementById('price-bw-simplex-input');
+    const priceBwDuplexInput = document.getElementById('price-bw-duplex-input');
+    const priceColorSimplexInput = document.getElementById('price-color-simplex-input');
+    const priceColorDuplexInput = document.getElementById('price-color-duplex-input');
+    const pricingColorEnabledToggle = document.getElementById('pricing-color-enabled-toggle');
+    const pricingSaveBtn = document.getElementById('pricing-save-btn');
+
+    const calcPagesInput = document.getElementById('calc-pages-input');
+    const calcResultSheets = document.getElementById('calc-result-sheets');
+    const calcResultBw = document.getElementById('calc-result-bw');
+    const calcResultColor = document.getElementById('calc-result-color');
+
+    let currentBWSimplexPaise = 300;
+    let currentBWDuplexPaise = 500;
+    let currentColorSimplexPaise = 800;
+    let currentColorDuplexPaise = 1000;
+    let currentColorEnabled = false;
+
+    async function loadPricing() {
+      try {
+        const res = await apiRequest('/api/admin/pricing');
+        if (!res.ok) throw new Error('Failed to load pricing');
+        const data = await parseResponseJSON(res);
+
+        currentBWSimplexPaise = data.bw_simplex_price_paise || 300;
+        currentBWDuplexPaise = data.bw_duplex_price_paise || 500;
+        currentColorSimplexPaise = data.color_simplex_price_paise || 800;
+        currentColorDuplexPaise = data.color_duplex_price_paise || 1000;
+        currentColorEnabled = Boolean(data.color_enabled);
+
+        if (priceBwSimplexInput) priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
+        if (priceBwDuplexInput) priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
+        if (priceColorSimplexInput) priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
+        if (priceColorDuplexInput) priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
+        if (pricingColorEnabledToggle) pricingColorEnabledToggle.checked = currentColorEnabled;
+
+        updateCostEstimator();
+      } catch (err) {
+        showToast('Pricing load error: ' + err.message);
+      }
+    }
+
+    function updateCostEstimator() {
+      if (!calcPagesInput) return;
+      const pages = Math.max(1, parseInt(calcPagesInput.value, 10) || 1);
+      const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
+      const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
+
+      const bwSimplex = priceBwSimplexInput && priceBwSimplexInput.value ? parseFloat(priceBwSimplexInput.value) : (currentBWSimplexPaise / 100);
+      const bwDuplex = priceBwDuplexInput && priceBwDuplexInput.value ? parseFloat(priceBwDuplexInput.value) : (currentBWDuplexPaise / 100);
+      const colorSimplex = priceColorSimplexInput && priceColorSimplexInput.value ? parseFloat(priceColorSimplexInput.value) : (currentColorSimplexPaise / 100);
+      const colorDuplex = priceColorDuplexInput && priceColorDuplexInput.value ? parseFloat(priceColorDuplexInput.value) : (currentColorDuplexPaise / 100);
+
+      let bwCost = 0;
+      let colorCost = 0;
+      if (isDuplex) {
+        const fullSheets = Math.floor(pages / 2);
+        const hasOddPage = (pages % 2 !== 0);
+        bwCost = (fullSheets * bwDuplex) + (hasOddPage ? bwSimplex : 0);
+        colorCost = (fullSheets * colorDuplex) + (hasOddPage ? colorSimplex : 0);
+      } else {
+        bwCost = pages * bwSimplex;
+        colorCost = pages * colorSimplex;
+      }
+
+      if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
+      if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
+      if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
+    }
+
+    if (calcPagesInput) calcPagesInput.addEventListener('input', updateCostEstimator);
+    document.querySelectorAll('input[name="calc-duplex"]').forEach(r => {
+      r.addEventListener('change', updateCostEstimator);
+    });
+    if (priceBwSimplexInput) priceBwSimplexInput.addEventListener('input', updateCostEstimator);
+    if (priceBwDuplexInput) priceBwDuplexInput.addEventListener('input', updateCostEstimator);
+    if (priceColorSimplexInput) priceColorSimplexInput.addEventListener('input', updateCostEstimator);
+    if (priceColorDuplexInput) priceColorDuplexInput.addEventListener('input', updateCostEstimator);
+    if (pricingColorEnabledToggle) pricingColorEnabledToggle.addEventListener('change', updateCostEstimator);
+
+    function parseRupeesToPaise(valStr) {
+      const trimmed = valStr ? String(valStr).trim() : '';
+      if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
+        return null;
+      }
+      const num = parseFloat(trimmed);
+      if (isNaN(num) || num <= 0) {
+        return null;
+      }
+      const paise = Math.round(num * 100);
+      if (paise <= 0) {
+        return null;
+      }
+      return paise;
+    }
+
+    if (pricingForm) {
+      pricingForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const bwSimplexPaise = parseRupeesToPaise(priceBwSimplexInput.value);
+        const bwDuplexPaise = parseRupeesToPaise(priceBwDuplexInput.value);
+        const colorSimplexPaise = parseRupeesToPaise(priceColorSimplexInput.value);
+        const colorDuplexPaise = parseRupeesToPaise(priceColorDuplexInput.value);
+        const colorEnabled = pricingColorEnabledToggle ? pricingColorEnabledToggle.checked : false;
+
+        if (bwSimplexPaise === null || bwDuplexPaise === null || colorSimplexPaise === null || colorDuplexPaise === null) {
+          alert('All prices must be valid positive numbers with at most two decimal places.');
+          return;
+        }
+
+        pricingSaveBtn.disabled = true;
+        pricingSaveBtn.textContent = 'Saving...';
+
+        try {
+          const res = await apiRequest('/api/admin/pricing', {
+            method: 'PUT',
+            body: {
+              bw_simplex_price_paise: bwSimplexPaise,
+              bw_duplex_price_paise: bwDuplexPaise,
+              color_simplex_price_paise: colorSimplexPaise,
+              color_duplex_price_paise: colorDuplexPaise,
+              color_enabled: colorEnabled
+            }
+          });
+
+          if (!res.ok) {
+            const data = await parseResponseJSON(res);
+            throw new Error(data.error || 'Failed to save');
+          }
+
+          currentBWSimplexPaise = bwSimplexPaise;
+          currentBWDuplexPaise = bwDuplexPaise;
+          currentColorSimplexPaise = colorSimplexPaise;
+          currentColorDuplexPaise = colorDuplexPaise;
+          currentColorEnabled = colorEnabled;
+
+          updateCostEstimator();
+          showToast('Print rates saved');
+        } catch (err) {
+          alert('Save error: ' + err.message);
+        } finally {
+          pricingSaveBtn.disabled = false;
+          pricingSaveBtn.textContent = 'Save Rates';
+        }
+      });
+    }
+
+    // ==========================================
+    // 4. PROMOTIONAL ADS & SIMULATOR
     // ==========================================
     const SYSTEM_DEFAULT_CARDS = [
       {

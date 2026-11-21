@@ -3,18 +3,15 @@ package pricing
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
-
-	"xeroxgo/pkg/contracts"
 )
 
 const (
-	// Default tariff rates in integer paise (₹1 = 100 paise)
-	DefaultBWSimplexPaise    int64 = 200  // ₹2.00
-	DefaultBWDuplexPaise     int64 = 150  // ₹1.50 (discounted rate for duplex long/short edge)
-	DefaultColorSimplexPaise int64 = 1000 // ₹10.00
-	DefaultColorDuplexPaise  int64 = 750  // ₹7.50
+	// Canonical default rates in integer paise (₹1 = 100 paise)
+	DefaultBWSimplexPaise    int64 = 300  // ₹3.00 per printed side
+	DefaultBWDuplexPaise     int64 = 500  // ₹5.00 per complete two-sided sheet
+	DefaultColorSimplexPaise int64 = 800  // ₹8.00 per printed side
+	DefaultColorDuplexPaise  int64 = 1000 // ₹10.00 per complete two-sided sheet
 	DefaultColorEnabled      bool  = false
 
 	MaxInt64 = int64(1<<63 - 1)
@@ -23,42 +20,106 @@ const (
 // TariffConfig represents comprehensive pricing for monochrome and color prints (simplex and duplex)
 // along with hardware capabilities.
 type TariffConfig struct {
-	BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
-	BWDuplexPricePaise     int64     `json:"bw_duplex_price_paise"`
-	ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
-	ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
-	ColorEnabled           bool      `json:"color_enabled"`
+	BWSimplexPricePaise     int64     `json:"bw_simplex_price_paise"`
+	BWDuplexPricePaise      int64     `json:"bw_duplex_price_paise"`
+	ColorSimplexPricePaise  int64     `json:"color_simplex_price_paise"`
+	ColorDuplexPricePaise   int64     `json:"color_duplex_price_paise"`
+	ColorEnabled            bool      `json:"color_enabled"`
 	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
 	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
-	BWPricePerSidePaise    int64     `json:"bw_price_per_side_paise,omitempty"`
-	ColorPricePerSidePaise int64     `json:"color_price_per_side_paise,omitempty"`
+	BWPricePerSidePaise     int64     `json:"bw_price_per_side_paise,omitempty"`
+	ColorPricePerSidePaise  int64     `json:"color_price_per_side_paise,omitempty"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
-// DefaultTariff returns a complete default 4-tier tariff configuration.
+// DefaultTariff returns a complete default 4-tier tariff configuration with canonical rates.
 func DefaultTariff() TariffConfig {
 	now := time.Now().UTC()
 	return TariffConfig{
-		BWSimplexPricePaise:    DefaultBWSimplexPaise,
-		BWDuplexPricePaise:     DefaultBWDuplexPaise,
-		ColorSimplexPricePaise: DefaultColorSimplexPaise,
-		ColorDuplexPricePaise:  DefaultColorDuplexPaise,
-		ColorEnabled:           DefaultColorEnabled,
+		BWSimplexPricePaise:     DefaultBWSimplexPaise,
+		BWDuplexPricePaise:      DefaultBWDuplexPaise,
+		ColorSimplexPricePaise:  DefaultColorSimplexPaise,
+		ColorDuplexPricePaise:   DefaultColorDuplexPaise,
+		ColorEnabled:            DefaultColorEnabled,
 		BWPricePerSheetPaise:    DefaultBWSimplexPaise,
 		ColorPricePerSheetPaise: DefaultColorSimplexPaise,
-		BWPricePerSidePaise:    DefaultBWSimplexPaise,
-		ColorPricePerSidePaise: DefaultColorSimplexPaise,
+		BWPricePerSidePaise:     DefaultBWSimplexPaise,
+		ColorPricePerSidePaise:  DefaultColorSimplexPaise,
 		UpdatedAt:               now,
 	}
 }
 
-// ComputeDuplexDiscount calculates the standard duplex discount (3/4 of simplex, 25% discount).
-func ComputeDuplexDiscount(simplexPrice int64, defaultDuplex int64) int64 {
-	duplex := (simplexPrice * 3) / 4
-	if duplex <= 0 {
-		return defaultDuplex
+// CalculateDocumentPricePaise calculates the total price in integer paise for a document
+// based on canonical tariff configuration:
+// - B&W simplex: tariff.BWSimplexPricePaise (300 paise / ₹3)
+// - B&W duplex: tariff.BWDuplexPricePaise (500 paise / ₹5 per 2-sided sheet)
+// - Color simplex: tariff.ColorSimplexPricePaise (800 paise / ₹8)
+// - Color duplex: tariff.ColorDuplexPricePaise (1000 paise / ₹10 per 2-sided sheet)
+//
+// For duplex printing:
+//   - Every complete two-sided sheet (floor(imposedSides/2)) is billed at the duplex sheet rate.
+//   - Any odd trailing side (imposedSides%2 != 0) is billed at the simplex rate,
+//     preserving historical odd-page behavior.
+//
+// For simplex printing:
+// - Imposed sides are billed at the simplex rate.
+//
+// Both duplex-edge modes (long-edge and short-edge) have identical billing.
+// Blank normalization padding is never billed as printed content (caller passes unpadded imposed sides).
+// If color is requested while tariff.ColorEnabled is false, rates fall back to B&W rates.
+//
+// Rejects invalid quantities (imposedSides <= 0, copies <= 0), non-positive rates, and arithmetic overflow.
+func CalculateDocumentPricePaise(tariff TariffConfig, imposedSides int, isColor bool, isDuplex bool, copies int) (int64, error) {
+	if imposedSides <= 0 {
+		return 0, fmt.Errorf("calculate price: imposedSides must be > 0, got %d", imposedSides)
 	}
-	return duplex
+	if copies <= 0 {
+		return 0, fmt.Errorf("calculate price: copies must be > 0, got %d", copies)
+	}
+
+	if tariff.BWSimplexPricePaise <= 0 || tariff.BWDuplexPricePaise <= 0 ||
+		tariff.ColorSimplexPricePaise <= 0 || tariff.ColorDuplexPricePaise <= 0 {
+		return 0, errors.New("calculate price: all tariff rates must be > 0")
+	}
+
+	useColor := isColor && tariff.ColorEnabled
+	var simplexRate, duplexRate int64
+	if useColor {
+		simplexRate = tariff.ColorSimplexPricePaise
+		duplexRate = tariff.ColorDuplexPricePaise
+	} else {
+		simplexRate = tariff.BWSimplexPricePaise
+		duplexRate = tariff.BWDuplexPricePaise
+	}
+
+	var singleCopyPrice int64
+	if isDuplex {
+		fullSheets := int64(imposedSides / 2)
+		hasOddPage := (imposedSides%2 != 0)
+
+		if fullSheets > 0 && duplexRate > MaxInt64/fullSheets {
+			return 0, errors.New("calculate price: total price overflows int64")
+		}
+		singleCopyPrice = fullSheets * duplexRate
+
+		if hasOddPage {
+			if singleCopyPrice > MaxInt64-simplexRate {
+				return 0, errors.New("calculate price: total price overflows int64")
+			}
+			singleCopyPrice += simplexRate
+		}
+	} else {
+		if int64(imposedSides) > MaxInt64/simplexRate {
+			return 0, errors.New("calculate price: total price overflows int64")
+		}
+		singleCopyPrice = int64(imposedSides) * simplexRate
+	}
+
+	if int64(copies) > MaxInt64/singleCopyPrice {
+		return 0, errors.New("calculate price: total price overflows int64")
+	}
+
+	return singleCopyPrice * int64(copies), nil
 }
 
 // CalculatePricePaise computes the total price in integer paise for a given
@@ -79,45 +140,3 @@ func CalculatePricePaise(totalSides int, pricePerSidePaise int64) (int64, error)
 
 	return int64(totalSides) * pricePerSidePaise, nil
 }
-
-// ResolveUnitPrice resolves the authoritative unit price in paise based on the 4-tier tariff matrix,
-// requested color mode, duplex mode, and fallback options.
-func ResolveUnitPrice(tariff TariffConfig, colorMode string, duplex contracts.DuplexMode, fallbackUnitPrice int64) int64 {
-	isDuplex := duplex != contracts.DuplexSimplex
-	var unitPrice int64
-
-	if strings.EqualFold(colorMode, "COLOR") && tariff.ColorEnabled {
-		if isDuplex {
-			unitPrice = tariff.ColorDuplexPricePaise
-		} else {
-			unitPrice = tariff.ColorSimplexPricePaise
-		}
-	} else {
-		if isDuplex {
-			unitPrice = tariff.BWDuplexPricePaise
-		} else {
-			unitPrice = tariff.BWSimplexPricePaise
-		}
-	}
-
-	if unitPrice <= 0 {
-		unitPrice = fallbackUnitPrice
-	}
-	if unitPrice <= 0 {
-		unitPrice = DefaultBWSimplexPaise
-	}
-	return unitPrice
-}
-
-// ResolveUnitPriceFromConfig resolves the unit price, properly handling cases where dynamic database
-// pricing is unavailable (hasPricing == false).
-func ResolveUnitPriceFromConfig(hasPricing bool, tariff TariffConfig, colorMode string, duplex contracts.DuplexMode, fallbackUnitPrice int64) int64 {
-	if !hasPricing {
-		if fallbackUnitPrice > 0 {
-			return fallbackUnitPrice
-		}
-		return DefaultBWSimplexPaise
-	}
-	return ResolveUnitPrice(tariff, colorMode, duplex, fallbackUnitPrice)
-}
-

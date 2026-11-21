@@ -101,20 +101,20 @@ func TestMultiFileUploadAndOrderCreation(t *testing.T) {
 		t.Errorf("documents_count = %d, want 3", docsCount)
 	}
 
-	// Doc 1: 3 printed sides (duplex rate ₹1.50 = 150 paise) = 450 paise
+	// Doc 1: 3 printed sides (duplex rate ₹1.50 = 150 paise/sheet + 200 simplex) = 350 paise
 	// Doc 2: 2 printed sides (simplex rate ₹2.00 = 200 paise) = 400 paise
 	// Doc 3: 1 printed side (simplex rate ₹2.00 = 200 paise) = 200 paise
 	// Total printed pages/sides = 3 + 2 + 1 = 6
 	// Total sheets = 2 (for doc1 3p duplex) + 2 (doc2 2p simplex) + 1 (doc3 1p simplex) = 5 physical sheets
-	// Total price = 450 + 400 + 200 = 1050 paise
+	// Total price = 350 + 400 + 200 = 950 paise
 	if totalPages != 6 {
 		t.Errorf("total_pages = %d, want 6", totalPages)
 	}
 	if totalSheets != 5 {
 		t.Errorf("total_sheets = %d, want 5", totalSheets)
 	}
-	if totalPricePaise != 1050 {
-		t.Errorf("total_price_paise = %d, want 1050", totalPricePaise)
+	if totalPricePaise != 950 {
+		t.Errorf("total_price_paise = %d, want 950", totalPricePaise)
 	}
 
 	// In multi-document printing architecture, no concatenated merged PDF is created.
@@ -134,9 +134,9 @@ func TestMultiFileUploadAndOrderCreation(t *testing.T) {
 		t.Fatalf("expected 3 child documents, got %d", len(docs))
 	}
 
-	// Doc 1: 3 content pages, duplex -> 4 pages on disk (with duplex blank back padding), 450 paise
+	// Doc 1: 3 content pages, duplex -> 4 pages on disk (with duplex blank back padding), 350 paise
 	doc1 := docs[0]
-	if doc1.DocumentIndex != 0 || doc1.TotalPages != 3 || doc1.TotalSheets != 2 || doc1.PricePaise != 450 {
+	if doc1.DocumentIndex != 0 || doc1.TotalPages != 3 || doc1.TotalSheets != 2 || doc1.PricePaise != 350 {
 		t.Errorf("doc1 mismatch: %+v", doc1)
 	}
 	d1PDFPath := filepath.Join(app.cfg.jobsDir, sha256ChecksumString(doc1.JobID)+".pdf")
@@ -344,8 +344,8 @@ func TestMultiFileUploadWithOrientationAndNUp(t *testing.T) {
 	if totalSheets != 3 {
 		t.Errorf("total_sheets = %d, want 3", totalSheets)
 	}
-	if totalPricePaise != 700 {
-		t.Errorf("total_price_paise = %d, want 700", totalPricePaise)
+	if totalPricePaise != 550 {
+		t.Errorf("total_price_paise = %d, want 550", totalPricePaise)
 	}
 
 	orderID, _ := resp["order_id"].(string)
@@ -376,9 +376,9 @@ func TestMultiFileUploadWithOrientationAndNUp(t *testing.T) {
 		t.Errorf("doc1 PDF pages = %d, want 2", getPDFPageCount(t, d1PDFPath))
 	}
 
-	// Doc 2: 6 pages, 4-up -> 2 imposed sides, 1 sheet, 300 paise
+	// Doc 2: 6 pages, 4-up -> 2 imposed sides, 1 sheet, 150 paise
 	doc2 := docs[1]
-	if doc2.DocumentIndex != 1 || doc2.TotalPages != 2 || doc2.TotalSheets != 1 || doc2.PricePaise != 300 {
+	if doc2.DocumentIndex != 1 || doc2.TotalPages != 2 || doc2.TotalSheets != 1 || doc2.PricePaise != 150 {
 		t.Errorf("doc2 mismatch: %+v", doc2)
 	}
 	d2PDFPath := filepath.Join(app.cfg.jobsDir, sha256ChecksumString(doc2.JobID)+".pdf")

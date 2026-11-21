@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
+	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -247,17 +248,17 @@ CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     price_per_sheet_paise BIGINT NOT NULL
         CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
+    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 300
         CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
+    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 800
         CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
+    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 300
         CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
+    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 500
         CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
+    color_simplex_price_paise BIGINT NOT NULL DEFAULT 800
         CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
+    color_duplex_price_paise BIGINT NOT NULL DEFAULT 1000
         CHECK (color_duplex_price_paise > 0),
     color_enabled INTEGER NOT NULL DEFAULT 0,
     updated_at_ns BIGINT NOT NULL
@@ -434,12 +435,12 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 		}
 
 		pgMigrations := []string{
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 300;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 800;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 300;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 500;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 800;",
+			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
 			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
 			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
 			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS pin_expires_at_ns BIGINT NOT NULL DEFAULT 0;",
@@ -620,17 +621,17 @@ CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     price_per_sheet_paise BIGINT NOT NULL
         CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
+    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 300
         CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
+    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 800
         CHECK (color_price_per_sheet_paise > 0),
-    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
+    bw_simplex_price_paise BIGINT NOT NULL DEFAULT 300
         CHECK (bw_simplex_price_paise > 0),
-    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
+    bw_duplex_price_paise BIGINT NOT NULL DEFAULT 500
         CHECK (bw_duplex_price_paise > 0),
-    color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000
+    color_simplex_price_paise BIGINT NOT NULL DEFAULT 800
         CHECK (color_simplex_price_paise > 0),
-    color_duplex_price_paise BIGINT NOT NULL DEFAULT 750
+    color_duplex_price_paise BIGINT NOT NULL DEFAULT 1000
         CHECK (color_duplex_price_paise > 0),
     color_enabled INTEGER NOT NULL DEFAULT 0,
     updated_at_ns BIGINT NOT NULL
@@ -743,22 +744,22 @@ func migrateSQLiteSchema(db *sql.DB) error {
 		_ = rows.Close()
 	}
 	if !colsPricing["bw_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 200;")
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 300;")
 	}
 	if !colsPricing["color_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 800;")
 	}
 	if !colsPricing["bw_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 200;")
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 300;")
 	}
 	if !colsPricing["bw_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 150;")
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 500;")
 	}
 	if !colsPricing["color_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 800;")
 	}
 	if !colsPricing["color_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 750;")
+		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
 	}
 	if !colsPricing["color_enabled"] {
 		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_enabled INTEGER NOT NULL DEFAULT 0;")
@@ -1655,8 +1656,8 @@ ORDER BY document_index ASC;
 	for rows.Next() {
 		var (
 			dJobID, dOrdID, dFilename, dURL, dCheck, dDuplex, dColor, dRange, dOrient, dStatus string
-			dIdx, dPages, dSheets, dCopies, dPPS                                                int
-			dPrice, dCreatedNS, dUpdatedNS                                                      int64
+			dIdx, dPages, dSheets, dCopies, dPPS                                               int
+			dPrice, dCreatedNS, dUpdatedNS                                                     int64
 		)
 		if err := rows.Scan(
 			&dJobID, &dOrdID, &dIdx, &dFilename, &dURL, &dCheck,
@@ -1712,8 +1713,8 @@ WHERE job_id = ?;
 `
 	var (
 		dJobID, dOrdID, dFilename, dURL, dCheck, dDuplex, dColor, dRange, dOrient, dStatus string
-		dIdx, dPages, dSheets, dCopies, dPPS                                                int
-		dPrice, dCreatedNS, dUpdatedNS                                                      int64
+		dIdx, dPages, dSheets, dCopies, dPPS                                               int
+		dPrice, dCreatedNS, dUpdatedNS                                                     int64
 	)
 	err := s.db.QueryRowContext(ctx, s.rebind(query), jobID).Scan(
 		&dJobID, &dOrdID, &dIdx, &dFilename, &dURL, &dCheck,
@@ -2185,12 +2186,24 @@ WHERE order_id = ?;
 
 // SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.
 func (s *Store) SetPricePerSheetPaise(ctx context.Context, pricePaise int64) error {
-	cfg, _ := s.GetPricing(ctx)
-	colorPrice := cfg.ColorPricePerSheetPaise
-	if colorPrice <= 0 {
-		colorPrice = 1000
+	cfg, err := s.GetPricing(ctx)
+	bwDuplex := pricing.DefaultBWDuplexPaise
+	colorPrice := pricing.DefaultColorSimplexPaise
+	colorDuplex := pricing.DefaultColorDuplexPaise
+	colorEnabled := false
+	if err == nil {
+		if cfg.BWDuplexPricePaise > 0 {
+			bwDuplex = cfg.BWDuplexPricePaise
+		}
+		if cfg.ColorSimplexPricePaise > 0 {
+			colorPrice = cfg.ColorSimplexPricePaise
+		}
+		if cfg.ColorDuplexPricePaise > 0 {
+			colorDuplex = cfg.ColorDuplexPricePaise
+		}
+		colorEnabled = cfg.ColorEnabled
 	}
-	return s.SetPricing(ctx, pricePaise, colorPrice)
+	return s.SetDetailedPricing(ctx, pricePaise, bwDuplex, colorPrice, colorDuplex, colorEnabled)
 }
 
 // GetPricePerSheetPaise retrieves the configured per-sheet pricing.
@@ -2199,7 +2212,7 @@ func (s *Store) GetPricePerSheetPaise(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return cfg.BWPricePerSheetPaise, nil
+	return cfg.BWSimplexPricePaise, nil
 }
 
 // RecordWebhook atomically attempts to record a webhook ID.
@@ -2917,7 +2930,7 @@ VALUES (?, ?, ?, 'PAYMENT_PENDING', ?, ?, ?, ?);
 
 			var (
 				existingID, existingKiosk, existingStatus string
-				existingPrice, expNS, createNS, updateNS   int64
+				existingPrice, expNS, createNS, updateNS  int64
 			)
 			queryExisting := s.rebind(`
 SELECT session_id, kiosk_id, status, price_paise, expires_at_ns, created_at_ns, updated_at_ns
