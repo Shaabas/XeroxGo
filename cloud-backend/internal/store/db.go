@@ -2648,7 +2648,7 @@ WHERE job_id = ?;
 }
 
 // GetExpiredOrderIDs returns order IDs whose stored PDF artifacts have exceeded retention.
-// - completedThreshold applies to orders in terminal states (COMPLETED, PAUSED_ERROR, FAILED_REFUNDABLE).
+// - completedThreshold applies only to COMPLETED orders, or FAILED_REFUNDABLE orders with no captured payment or a PROCESSED refund. PAUSED_ERROR never qualifies.
 // - pendingThreshold applies to unpaid orders still in PENDING_PAYMENT.
 func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pendingThreshold time.Time) ([]string, error) {
 	if s == nil || s.db == nil {
@@ -2662,9 +2662,21 @@ func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pend
 	}
 
 	query := `
-SELECT order_id FROM orders
-WHERE (status IN ('COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE') AND updated_at_ns <= ?)
-   OR (status = 'PENDING_PAYMENT' AND created_at_ns <= ?);
+SELECT o.order_id FROM orders o
+WHERE (
+    o.updated_at_ns <= ?
+    AND (
+      o.status = 'COMPLETED'
+      OR (
+        o.status = 'FAILED_REFUNDABLE'
+        AND (
+          NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id AND p.status IN ('captured', 'CAPTURED'))
+          OR EXISTS (SELECT 1 FROM refund_requests rr WHERE rr.order_id = o.order_id AND rr.status = 'PROCESSED')
+        )
+      )
+    )
+  )
+  OR (o.status = 'PENDING_PAYMENT' AND o.created_at_ns <= ?);
 `
 	rows, err := s.db.QueryContext(ctx, s.rebind(query), completedThreshold.UnixNano(), pendingThreshold.UnixNano())
 	if err != nil {
