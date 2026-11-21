@@ -31,12 +31,6 @@ const (
 	TelemetryRatingOdometerAvailable            TelemetryRating = "ODOMETER_AVAILABLE_UNVERIFIED_EJECTION"
 	TelemetryRatingQueueOnly                    TelemetryRating = "QUEUE_ONLY_UNCERTAIN_EJECTION"
 	TelemetryRatingAbsent                       TelemetryRating = "ABSENT"
-
-	// Deprecated aliases maintained for backward compatibility; read-only capability discovery
-	// never establishes physical ejection correctness or post-jam recovery.
-	TelemetryRatingVerifiedFull         = TelemetryRatingOdometerAndIPPSheetsAvailable
-	TelemetryRatingVerifiedOdometer     = TelemetryRatingOdometerAvailable
-	TelemetryRatingVerifiedOdometerOnly = TelemetryRatingOdometerAvailable
 )
 
 // TargetConfig specifies the endpoints and queues targeted for fingerprinting.
