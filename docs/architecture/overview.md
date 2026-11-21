@@ -55,7 +55,7 @@ flowchart LR
 ### Tier Descriptions & Responsibilities:
 1. **Client Tier (`frontend/`):** Lightweight Single-Page Application (SPA) and Progressive Web App (PWA). Employs in-browser PDF parsing via Mozilla PDF.js ([`frontend/vendor/pdf.min.mjs`](file:///home/shabas/Projects/XeroxGo/frontend/vendor/pdf.min.mjs)) and PDF page manipulation via PDF-Lib ([`frontend/vendor/pdf-lib.min.js`](file:///home/shabas/Projects/XeroxGo/frontend/vendor/pdf-lib.min.js)).
 2. **Edge / CDN Tier (`frontend/vercel.json`):** Vercel Edge rules terminate SSL, rewrite client routes, and proxy API calls (`/api/*`, `/pay/*`) to the cloud backend. When `XEROXGO_PROXY_SECRET` is configured, Vercel injects an HMAC header to prevent direct public scraping of cloud origin endpoints ([`cloud-backend/cmd/server/main.go:2015-2031`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L2015-L2031)).
-3. **Cloud Backend Tier (`cloud-backend/`):** Built as a statically linked binary with `CGO_ENABLED=0`. Encapsulates document conversion, imposition normalization, 4-digit PIN generation, transaction session locking, payment webhooks, and the bi-directional WebSocket hub.
+3. **Cloud Backend Tier (`cloud-backend/`):** Built as a statically linked binary with `CGO_ENABLED=0`. Encapsulates document conversion, imposition normalization, 4-digit PIN generation, transaction session locking, demo payment capture, and the bi-directional WebSocket hub.
 4. **Persistence Tier (`deploy/supabase/schema.sql`, `cloud-backend/internal/store/db.go`):** Supports dual database backends without code divergence:
    - **PostgreSQL (Supabase):** Uses `github.com/jackc/pgx/v5` with `QueryExecModeExec` to ensure compatibility with Supabase transaction poolers (Supavisor / PgBouncer) ([`db.go:134-135`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L134-L135)).
    - **SQLite:** Uses `modernc.org/sqlite` (pure Go, zero CGO) for local development, CI tests, and single-node setups.
@@ -105,9 +105,9 @@ sequenceDiagram
     Note over Customer,Kiosk: 3. Dynamic Payment
     Kiosk->>Cloud: POST /api/k/{id}/sessions/{id}/initiate-payment
     Cloud->>DB: INSERT payment_attempts
-    Cloud-->>Kiosk: Scannable UPI QR Payload
+    Cloud-->>Kiosk: Scannable XeroxGo demo checkout URL
     Kiosk->>Customer: Render PAYMENT_PENDING Screen with QR Code
-    Customer->>Cloud: Scans & Pays (or Webhook Callback)
+    Customer->>Cloud: Confirms simulated payment at /pay/{token}
     Cloud->>DB: UPDATE payments & Mark Order DISPATCHED
     Cloud->>Kiosk: Send PrintJobCommand over WebSocket
 
@@ -151,19 +151,12 @@ sequenceDiagram
    - Cloud validates that kiosk printer is online, paper supply is adequate, output tray is clear, and cover is closed via cached WebSocket hub telemetry ([`session_handler.go:76-162`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/session_handler.go#L76-L162)).
    - Cloud creates `kiosk_sessions` record (`status=PAYMENT_PENDING`, default TTL 5 minutes) and atomically locks the order with a unique `claim_token` ([`db.go:2189-2364`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L2189-L2364)).
 
-#### Phase 3: Dynamic Payment & Dispatch
-1. **Initiate Payment (`POST /api/k/{kiosk_id}/sessions/{session_id}/initiate-payment`):**
-   - Cloud calls payment provider (`Razorpay` or `MockProvider`) to generate a dynamic UPI payment string ([`session_handler.go:363-564`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/session_handler.go#L363-L564)).
-   - Persists attempt in `payment_attempts` with an idempotency key.
-   - Returns UPI payload (`upi://pay?pa=...&am=...&tr=...`) to kiosk.
-2. **Kiosk QR Screen:** Kiosk renders `PAYMENT_PENDING` screen showing a 2D barcode (QR code) alongside an animated countdown timer ([`renderer.go:1142-1240`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/ui_ipc/renderer.go#L1142-L1240)).
-3. **Payment Webhook Capture (`POST /api/webhooks/razorpay` or Demo Pay):**
-   - Payment provider invokes cloud webhook upon successful UPI transfer.
-   - Cloud verifies HMAC signature, records webhook ID in `payment_webhooks` to prevent replay attacks ([`main.go:1417-1450`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1417-L1450)).
-   - Updates `payments` table and transitions `payment_attempts` to `PAID`.
-   - Atomically checks session status:
-     - **Session Active:** Transitions order to `DISPATCHED`, marks session `COMPLETED`, records `dispatch_intents`, and dispatches `PrintJobCommand` over WebSocket ([`db.go:2537-2760`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L2537-L2760)).
-     - **Session Expired / Canceled:** Transitions order to `PAID_WAITING`. Job is held safely in cloud until customer re-claims it ([`main.go:1537-1560`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1537-L1560)).
+#### Phase 3: Demo Payment & Dispatch
+1. The kiosk posts to `/api/k/{kiosk_id}/sessions/{session_id}/initiate-payment`. The cloud verifies the active session and paper commitment, saves one demo payment attempt and returns `/pay/{unpredictable_token}` for the kiosk QR.
+2. The customer scans the QR and confirms a **simulated** payment on XeroxGo's own webpage. No UPI charge or external payment processor is used.
+3. `handleDemoPaymentSubmit` calls `CapturePaymentAndCheckDispatch` idempotently. With an active kiosk session, it durably creates a print intent for each child document and sends jobs via the WebSocket hub.
+4. Interrupted delivery leaves paid orders and their immutable job intents pending for reconnection, without duplicate print submission. A late paid checkout stays `PAID_WAITING` until a fresh kiosk session reclaims it.
+5. On physical faults, safe-stop checks still guard the **simulated** refund worker.
 
 #### Phase 4: Kiosk Spooler & CUPS Execution
 1. **Command Ingestion:** Kiosk spooler receives `PrintJobCommand` over WebSocket ([`kiosk-daemon/internal/spooler/client.go:600`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/spooler/client.go#L600)).
@@ -225,8 +218,8 @@ stateDiagram-v2
 | `[*] ` | `UPLOADED` | Multipart upload saved to staging disk | [`main.go:275-300`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L275-L300) |
 | `UPLOADED` | `NORMALIZED` | Page count extracted, blank padding added, checksum generated | [`normalizer.go:343-440`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/pdf/normalizer.go#L343-L440) |
 | `NORMALIZED` | `PENDING_PAYMENT` | 4-digit PIN reserved in `pin_reservations` and order saved | [`main.go:136`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L136), [`db.go:853`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L853) |
-| `PENDING_PAYMENT` | `DISPATCHED` | Webhook confirms payment while `kiosk_sessions` is active | [`db.go:2537-2760`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L2537-L2760) |
-| `PENDING_PAYMENT` | `PAID_WAITING` | Webhook confirms payment after session expired or canceled | [`main.go:1537-1560`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1537-L1560) |
+| `PENDING_PAYMENT` | `DISPATCHED` | Demo checkout confirms simulated payment while `kiosk_sessions` is active | [`db.go:2537-2760`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L2537-L2760) |
+| `PENDING_PAYMENT` | `PAID_WAITING` | Demo checkout confirms simulated payment after session expired or canceled | [`main.go:1537-1560`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1537-L1560) |
 | `PAID_WAITING` | `DISPATCHED` | Customer claims order on kiosk via `/claim` or `/release` | [`session_handler.go:566-670`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/session_handler.go#L566-L670) |
 | `DISPATCHED` | `SPOOLING` | Kiosk receives `PrintJobCommand` and begins HTTP download | [`spooler/client.go:1008`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/spooler/client.go#L1008) |
 | `SPOOLING` | `PRINTING` | Checksum matches; job submitted to CUPS queue (`lp`) | [`spooler/client.go:1095`](file:///home/shabas/Projects/XeroxGo/kiosk-daemon/internal/spooler/client.go#L1095) |
@@ -244,7 +237,7 @@ Defined in [`cloud-backend/internal/store/db.go:98-105`](file:///home/shabas/Pro
 ```mermaid
 stateDiagram-v2
     [*] --> PAYMENT_PENDING: Customer claims order at kiosk
-    PAYMENT_PENDING --> COMPLETED: Payment webhook captures order
+    PAYMENT_PENDING --> COMPLETED: Demo checkout authorizes order
     PAYMENT_PENDING --> CANCELED: User presses cancel or inactivity timeout
     PAYMENT_PENDING --> EXPIRED: Session TTL (default 5m) elapses
     COMPLETED --> [*]

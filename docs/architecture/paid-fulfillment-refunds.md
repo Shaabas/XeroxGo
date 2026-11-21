@@ -1,159 +1,38 @@
-# Paid fulfillment, printer faults and refund lifecycle
+# Demo payment, paid printing and simulated refunds
 
-## Invariant
+XeroxGo currently has one payment implementation. The kiosk QR opens the cloud-hosted
+`/pay/{token}` webpage, where customers confirm simulated payment. No money
+moves, no UPI request is generated and no external payment gateway is configured.
 
-The five-minute deadline controls **unpaid reservation** only. A verified captured
-payment moves the customer into the paid fulfillment lifecycle, preserving its
-paper commitment. The customer may leave after a fault; no customer action
-is necessary for the refund worker to run.
+## Order lifecycle
+- Mobile upload reserves the complete order's physical sheet count and issues a 4-digit PIN, valid for five minutes while unpaid.
+- Entering the PIN at the kiosk creates one active transaction session; paper and printer health are checked before the demo checkout.
+- Payment initiation creates a stored attempt and returns a random demo token. The customer follows the kiosk QR and confirms on the demo webpage.
+- `CapturePaymentAndCheckDispatch` authorizes the order exactly once; durable child-document intents are recorded for reconnect.
+- Paid orders do not expire simply because the unpaid PIN deadline or kiosk session elapsed. A still-reserved PIN remains valid until fulfillment or terminal failure. An expired PIN can be securely rotated using the order's recovery credential.
+- Successful printing closes the entitlement and releases the reservation. An interrupted WebSocket send is never interpreted as a printer failure.
 
-## Order / PIN
+## Faults and simulated refunds
+- A printer or print-job fault pauses sibling jobs and triggers safe-stop verification. Ambiguous CUPS submissions and mechanically uncertain output are **not** considered stopped.
+- The cloud records one full simulated refund obligation for the funding payment. It does not mark it processed until the Pi confirms the CUPS jobs are canceled, aborted or never submitted.
+- The mock refund worker uses a durable idempotency key, retries without issuing a second simulated refund, and records processed/pending/failed status.
+- Duplicate demo captures do not create new print entitlements. Unexpected second captures are recorded separately as simulated excess-refund obligations.
+- An unavailable printer, stale kiosk heartbeat or absent dispatch intent by itself does not expire a paid entitlement or create an automatic refund.
+- The attendant restores a blocked kiosk only after fresh healthy telemetry and verified safe stops using the independent operator credential.
 
-- Unpaid order: five-minute PIN expiry; physical sheets reserved at mobile upload.
-- Captured payment: the existing still-valid PIN is extended and its countdown
-  disappears. This is not a paid payment-session timeout.
-- An expired or recycled PIN is **not** revived by late capture. The mobile
-  checkout can use its previously issued secret recovery credential to rotate a
-  new paid PIN for a `PAID_WAITING` order, without further payment.
-- Completed / provider-confirmed refunded order: PIN becomes invalid and cannot
-  authorize a duplicate print.
-- Paid orders do not lose their paper commitment when an unpaid PIN would expire.
+## Data model
+New demo databases use `orders`, `order_documents`, `pin_reservations`,
+`kiosk_sessions`, `payment_attempts`, `payments`, `order_funding_payments`,
+`payment_refund_requests`, `dispatch_intents` and `kiosk_service_flags`.
+There is no migration of historical demo orders, retired refund tables,
+older PDF artifacts or alternate payment endpoints. Begin with a fresh demo
+database when deploying this branch.
 
-## Paid dispatch transport and reconnect
+The Raspberry Pi SQLite store still journals jobs and CUPS submission
+uncertainty to prevent double printing. That is active crash recovery,
+not backwards compatibility.
 
-- Payment capture atomically records **one print authorization** plus a
-  `PENDING` intent for each child document. It does **not** prove the Pi
-  received a command or that the printer started printing.
-- A WebSocket disconnect, unavailable cloud hub, failed write, or failed
-  persistence of `SENT` is **delivery uncertainty**, not a printer fault.
-  Such an event must never block a healthy kiosk or create a
-  `FULFILLMENT_FAILED` refund obligation.
-- The webhook acknowledges an already captured payment with
-  `dispatch_pending` when immediate transport fails. Paid kiosk release
-  responds HTTP 202 with `DISPATCH_PENDING`; the kiosk client treats this
-  as durably accepted for eventual delivery, not as proof of printing.
-- On the next authenticated Pi WebSocket connection, previously `SENT`
-  but unacknowledged intents revert to `PENDING`. The cloud resends their
-  immutable child JobIDs. The Pi's durable SQLite deduplication prevents
-  accepted jobs from being submitted twice to CUPS; confirmed
-  `ACKNOWLEDGED` and `COMPLETED` jobs are never replayed.
-- Delivery errors are recorded in the intent's `last_error` and retry
-  counter, without discarding its physical-print authorization. An
-  interrupted multi-document send preserves all sibling intents.
-- A parent order may already be `SPOOLING` or `PRINTING` while later child
-  delivery intents remain `PENDING`. Those intents remain replayable after
-  reconnect if the funding payment is valid and the order has no fault.
-  Once any child reports `PAUSED_ERROR`, the parent is durably paused and
-  pending siblings cannot be replayed or submitted to CUPS.
-- Reconnect verifies the **funding payment**, not whichever captured
-  payment arrived most recently; an excess capture (including mismatched
-  amount) cannot block legitimate print delivery.
-- Real printer faults and safe-stop failures remain separate terminal
-  safety paths. Existing orders previously latched out-of-service or
-  marked for refund must be reviewed individually before any remediation;
-  a deployment does not blindly un-block or reverse a provider refund.
-- A valid authenticated session must have authorized the initial dispatch.
-  A payment arriving after a canceled/expired session remains
-  `PAID_WAITING` until the customer explicitly reclaims it.
-
-## Physical-fault to refund sequence
-
-1. Pi reports jam/cover/output fault or job `PAUSED_ERROR`.
-2. Cloud durably latches `kiosk_service_flags.out_of_service`. All mobile
-   stock checks and new checkout sessions are rejected, even after telemetry
-   returns healthy, until an authenticated operator explicitly restores service.
-3. Cloud creates a **full refund obligation for the funding payment**
-   (`payment_refund_requests.REQUIRED`). This is not the same as a processed refund.
-4. Pi stops queued sibling jobs, persists `PAUSED_ERROR` for each blocked
-   unstarted child, and tries to cancel **every** CUPS child job. Only
-   confirmed `canceled`/`aborted` or never-submitted jobs count as safe.
-   A held, processing, unknown, or ambiguous job is **not** safe.
-   Paused records survive daemon restarts; while connected, the Pi retries
-   safe-stop verification/attestation every 30 seconds until resolved.
-5. Pi sends an authenticated `safe_stop` attestation to cloud. Cloud verifies
-   kiosk/order identity and persists `safe_stop_verified=1`.
-6. Only then may the worker submit a full refund with the funding payment's
-   durable idempotency key. Retries reuse the same key; pending refunds are polled for
-   provider completion. The UI differentiates required, pending, retrying and
-   processed. No bank-settlement timeline is promised.
-7. A captured `PAID_WAITING` order remains a durable fulfillment entitlement
-   even if no dispatch intent exists, the kiosk goes offline, or its checkout
-   session expires. **Elapsed time alone must never produce `PAUSED_ERROR` or a
-   `FULFILLMENT_FAILED` refund obligation.** The two-minute auto-refund worker
-   path and its unsafe database helpers have been removed.
-8. On return, an unprinted customer may claim their still-valid paid PIN, or
-   securely rotate an expired/recycled PIN using their original recovery
-   credential. A new session authorizes a first dispatch without recharging.
-9. A genuine terminal fulfillment failure still creates a funding-payment
-   refund obligation through an explicit failure path. Its safe-stop requirement
-   remains in force. Preexisting refund obligations are not silently canceled,
-   reversed, or reclassified by this policy change.
-10. Failed/ambiguous CUPS cancellation must remain visibly unresolved pending
-    operator reconciliation. **Never** tell the customer refund is completed
-    until the provider reports it.
-11. The operator restores the kiosk only after fresh healthy printer telemetry,
-    verified safe-stop obligations and both kiosk and operator authentication.
-
-## Payment-level capture and refund accounting
-
-- Exactly one verified captured payment may fund an order and authorize printing.
-  The binding is serialized per order and persisted in `order_funding_payments`.
-- A provider-signed capture matched to a persisted attempt but carrying an
-  incorrect amount is recorded as refund-only, never applied to printing.
-  Unassociated captures still require secure provider/order reconciliation.
-- Every additional distinct captured payment is persisted atomically with a
-  separate `payment_refund_requests` obligation, even if the order has already
-  completed. Repeated callbacks for the same payment ID do not duplicate money.
-- `EXCESS_CAPTURE` refunds are actionable independently; they do **not** stop
-  the legitimate order, require CUPS cancellation, or release its paid PIN.
-- `FULFILLMENT_FAILED` refunds apply only to the funding payment and still
-  require verified physical safe-stop before submission.
-- Each payment's refund carries a unique stable Razorpay idempotency key,
-  provider refund ID, status and retry history.
-- The old `refund_requests` table remains read-only as a migration source
-  and legacy archive; `payment_refund_requests` is the only live refund ledger.
-  Startup copies legacy provider IDs and in-flight obligations without resetting
-  already migrated rows. Historical extra captures are **quarantined** in
-  `RECONCILIATION_REQUIRED`, with safe-stop false. They must never trigger
-  automatic refund submission until an operator checks provider refund history
-  and records the verified disposition. The authenticated admin overview lists
-  such captures through `/api/admin/refunds/reconciliation`. No blind
-  "issue refund" action is provided. Recent captures created by this code
-  continue to use the automatic safe refund flow.
-- Older `orders.total_pages` / `orders.total_sheets` values that were zero
-  are populated from complete child-document totals, otherwise from the legacy
-  `print_configs` totals on opening the store. Orders without trustworthy
-  totals require operator inspection; physical stock is never fabricated.
-- Orders with unresolved refund obligations are protected from normal artifact
-  cleanup; completed legitimate orders may still have excess refunds pending.
-
-## Refund states
-
-`REQUIRED → REQUESTING → PENDING → PROCESSED`; a failed attempt can be
-retried using the identical provider idempotency key. A processed refund is
-terminal for printing. The DB stores provider IDs and paid/refund amounts per captured payment.
-
-## Required runtime configuration
-
-- `PAYMENT_PROVIDER=razorpay` and Razorpay credentials for actual refund
-  requests; mock provider performs no real financial transfer.
-- `XEROXGO_OPERATOR_TOKEN` (at least 16 characters, **independent** of the
-  kiosk secret) is needed for an attendant to restore service.
-- Authenticated `POST /api/k/{kiosk_id}/restore-service`, including a valid
-  kiosk Authorization Bearer header and `X-XeroxGo-Operator-Token`, performs
-  restoration only after clean live telemetry and no unsafe outstanding stops.
-- `XEROXGO_TEST_POSTGRES_URL` points to disposable Postgres in GitHub CI.
-  Never use the live Supabase DB for tests.
-
-## Deployment caveats
-
-- PR #18 remains draft. GitHub CI, disposable PostgreSQL, real Raspberry Pi and
-  physical printer safe-stop evidence are required before live refunds.
-- The stopped job can have mechanical pages in its physical output path even
-  after CUPS cancellation. Hardware fault validation remains mandatory.
-- Operator credential provisioning/communication is not automated. The cloud
-  stores an out-of-service flag and logs fault reasons; a separate notification
-  channel can be added if the venue needs one.
-- Absence of a matching safe-stop confirmation intentionally blocks a monetary
-  refund rather than risking a refund followed by continued printing. Those
-  orders need operator attention and must not be falsely labeled refunded.
+## Verification boundary
+GitHub checks and simulated printer tests cannot establish physical sheet
+delivery certainty. A Raspberry Pi and physical printer test remains necessary
+before relying on hardware safe-stop or odometer evidence.
