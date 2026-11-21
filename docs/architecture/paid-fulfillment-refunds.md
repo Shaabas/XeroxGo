@@ -40,6 +40,11 @@ is necessary for the refund worker to run.
 - Delivery errors are recorded in the intent's `last_error` and retry
   counter, without discarding its physical-print authorization. An
   interrupted multi-document send preserves all sibling intents.
+- A parent order may already be `SPOOLING` or `PRINTING` while later child
+  delivery intents remain `PENDING`. Those intents remain replayable after
+  reconnect if the funding payment is valid and the order has no fault.
+  Once any child reports `PAUSED_ERROR`, the parent is durably paused and
+  pending siblings cannot be replayed or submitted to CUPS.
 - Reconnect verifies the **funding payment**, not whichever captured
   payment arrived most recently; an excess capture (including mismatched
   amount) cannot block legitimate print delivery.
@@ -59,9 +64,12 @@ is necessary for the refund worker to run.
    returns healthy, until an authenticated operator explicitly restores service.
 3. Cloud creates a **full refund obligation for the funding payment**
    (`payment_refund_requests.REQUIRED`). This is not the same as a processed refund.
-4. Pi stops queued sibling jobs and tries to cancel **every** CUPS child job.
-   Only confirmed `canceled`/`aborted` or never-submitted jobs count as safe.
+4. Pi stops queued sibling jobs, persists `PAUSED_ERROR` for each blocked
+   unstarted child, and tries to cancel **every** CUPS child job. Only
+   confirmed `canceled`/`aborted` or never-submitted jobs count as safe.
    A held, processing, unknown, or ambiguous job is **not** safe.
+   Paused records survive daemon restarts; while connected, the Pi retries
+   safe-stop verification/attestation every 30 seconds until resolved.
 5. Pi sends an authenticated `safe_stop` attestation to cloud. Cloud verifies
    kiosk/order identity and persists `safe_stop_verified=1`.
 6. Only then may the worker submit a full refund with the funding payment's
@@ -102,10 +110,20 @@ is necessary for the refund worker to run.
   require verified physical safe-stop before submission.
 - Each payment's refund carries a unique stable Razorpay idempotency key,
   provider refund ID, status and retry history.
-- The old `refund_requests` table is retained as a legacy archive. Startup
-  migrates its existing obligations into the payment-scoped table, preserving
-  in-flight state and provider identifiers, and backfills previously unrecorded
-  surplus captured payments. Repeat startup must not reset these records.
+- The old `refund_requests` table remains read-only as a migration source
+  and legacy archive; `payment_refund_requests` is the only live refund ledger.
+  Startup copies legacy provider IDs and in-flight obligations without resetting
+  already migrated rows. Historical extra captures are **quarantined** in
+  `RECONCILIATION_REQUIRED`, with safe-stop false. They must never trigger
+  automatic refund submission until an operator checks provider refund history
+  and records the verified disposition. The authenticated admin overview lists
+  such captures through `/api/admin/refunds/reconciliation`. No blind
+  "issue refund" action is provided. Recent captures created by this code
+  continue to use the automatic safe refund flow.
+- Older `orders.total_pages` / `orders.total_sheets` values that were zero
+  are populated from complete child-document totals, otherwise from the legacy
+  `print_configs` totals on opening the store. Orders without trustworthy
+  totals require operator inspection; physical stock is never fabricated.
 - Orders with unresolved refund obligations are protected from normal artifact
   cleanup; completed legitimate orders may still have excess refunds pending.
 
