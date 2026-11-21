@@ -120,6 +120,11 @@ func (s *appServer) generateUniquePIN(ctx context.Context, kioskID string) (stri
 }
 
 func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int) error {
+	return s.createOrderWithPINRetryAndPaperCheck(ctx, order, maxAttempts, -1)
+}
+
+// Mobile order finalization uses the checked variant, not the internal bypass.
+func (s *appServer) createOrderWithPINRetryAndPaperCheck(ctx context.Context, order *store.Order, maxAttempts, availableStock int) error {
 	if s.db == nil {
 		return errors.New("database not initialized")
 	}
@@ -132,7 +137,11 @@ func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Or
 			return fmt.Errorf("generate pin: %w", err)
 		}
 		order.Command.DisplayCode = pin
-		err = s.db.CreateOrder(ctx, *order)
+		if availableStock >= 0 {
+			err = s.db.CreateOrderWithPaperCheck(ctx, *order, availableStock)
+		} else {
+			err = s.db.CreateOrder(ctx, *order)
+		}
 		if err == nil {
 			return nil
 		}
@@ -504,8 +513,28 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
-	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
-		http.Error(w, "failed to persist order", http.StatusInternalServerError)
+	// Reserve physical sheets before the PIN becomes visible on the mobile site.
+	// This checks latest kiosk telemetry; the store atomically accounts for
+	// every other active reservation while persisting the order and its PIN.
+	availableStock, condErr := s.checkPrinterCondition(kioskID)
+	if condErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(condErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": condErr.Message, "code": condErr.Code})
+		return
+	}
+	if err := s.createOrderWithPINRetryAndPaperCheck(r.Context(), &order, 25, availableStock); err != nil {
+		if errors.Is(err, store.ErrInsufficientPaper) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "not enough paper is available for this order; try a smaller order or another kiosk",
+				"code": "INSUFFICIENT_PAPER",
+			})
+			return
+		}
+		log.Printf("[UPLOAD] Failed to persist reserved order: %v", err)
+		http.Error(w, "failed to reserve paper and issue PIN", http.StatusInternalServerError)
 		return
 	}
 	success = true
