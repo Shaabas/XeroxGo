@@ -69,17 +69,6 @@ func TestSupabaseIntegration(t *testing.T) {
 		t.Fatalf("retrieved display code mismatch: %s", retrieved.Command.DisplayCode)
 	}
 
-	// 3. Webhook idempotency test
-	webhookID := fmt.Sprintf("wh-it-%d", time.Now().Unix())
-	first, err := s.RecordWebhook(ctx, webhookID)
-	if err != nil || !first {
-		t.Fatalf("expected first RecordWebhook to succeed, got %v, err=%v", first, err)
-	}
-	second, err := s.RecordWebhook(ctx, webhookID)
-	if err != nil || second {
-		t.Fatalf("expected second RecordWebhook to return false, got %v, err=%v", second, err)
-	}
-
 	// 4. Job progress update test
 	event := contracts.JobProgressEvent{
 		JobID:         testJobID,

@@ -1827,42 +1827,6 @@ WHERE order_id = ?;
 	return nil
 }
 
-// RecordWebhook atomically attempts to record a webhook ID.
-// Returns (true, nil) if inserted for the first time, (false, nil) if already existed.
-func (s *Store) RecordWebhook(ctx context.Context, webhookID string) (bool, error) {
-	if s == nil || s.db == nil {
-		return false, fmt.Errorf("record webhook: store is closed or nil")
-	}
-	if ctx == nil {
-		return false, fmt.Errorf("record webhook: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return false, fmt.Errorf("record webhook: %w", err)
-	}
-	if strings.TrimSpace(webhookID) == "" {
-		return false, fmt.Errorf("record webhook: webhookID cannot be empty or whitespace-only")
-	}
-
-	receivedNS := time.Now().UTC().UnixNano()
-
-	query := `
-INSERT INTO payment_webhooks (webhook_id, received_at_ns)
-VALUES (?, ?)
-ON CONFLICT(webhook_id) DO NOTHING;
-`
-	res, err := s.db.ExecContext(ctx, s.rebind(query), webhookID, receivedNS)
-	if err != nil {
-		return false, fmt.Errorf("record webhook: %w", err)
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("record webhook: check rows affected: %w", err)
-	}
-
-	return rows == 1, nil
-}
-
 // UpdateJobProgress validates and atomically persists the latest progress event for a job.
 func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgressEvent) error {
 	if s == nil || s.db == nil {
