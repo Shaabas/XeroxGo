@@ -3422,6 +3422,7 @@ WHERE order_id = ?;
 	// 3. A genuine capture with the wrong amount is still real money.
 	// It cannot fund printing, but must have a durable refund obligation.
 	if p.AmountPaise != pricePaise {
+		if err := s.ensureRefundableOrderSnapshot(ctx, tx, p.OrderID); err != nil { return nil, err }
 		if err := s.recordExcessCaptureInTx(ctx, tx, p, orderKioskID, nowNS); err != nil {
 			return nil, fmt.Errorf("capture payment: refund incorrect amount: %w", err)
 		}
@@ -3469,6 +3470,7 @@ VALUES(?,?,?) ON CONFLICT(order_id) DO NOTHING;`), p.OrderID, earlierID, nowNS)
 	if fundingPaymentID != p.PaymentID {
 		// Unlike webhook replay, this is different money. Never send a new job.
 		// Persist the payment and its independently refundable obligation together.
+		if err := s.ensureRefundableOrderSnapshot(ctx, tx, p.OrderID); err != nil { return nil, err }
 		if err := s.recordExcessCaptureInTx(ctx, tx, p, orderKioskID, nowNS); err != nil {
 			return nil, fmt.Errorf("capture payment: record surplus: %w", err)
 		}
