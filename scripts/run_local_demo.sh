@@ -150,7 +150,7 @@ fi
 if [ "${SMOKE_TEST_MODE}" -eq 1 ]; then
   echo "Running XeroxGo Automated End-to-End Smoke Test..."
 
-  python3 - "${PORT}" "${KIOSK_ID}" "${TEMP_DIR}" "${PREVIEW_PNG}" "${CLOUD_JOBS}" "${KIOSK_DB}" << 'EOF'
+  python3 - "${PORT}" "${KIOSK_ID}" "${TEMP_DIR}" "${PREVIEW_PNG}" "${CLOUD_JOBS}" "${KIOSK_DB}" "${KIOSK_SECRET}" << 'EOF'
 import sys
 import os
 import time
@@ -167,6 +167,7 @@ temp_dir = sys.argv[3]
 preview_png = sys.argv[4]
 cloud_jobs = sys.argv[5]
 kiosk_db = sys.argv[6]
+kiosk_secret = sys.argv[7]
 
 base_url = f"http://127.0.0.1:{port}"
 
@@ -252,17 +253,25 @@ if price_paise != 2250:
     print(f"Expected price 2250 paise, got {price_paise}", file=sys.stderr)
     sys.exit(1)
 
-# 3. Simulate payment
-sim_url = f"{base_url}/api/orders/{order_id}/simulate-payment"
-sim_req = urllib.request.Request(sim_url, data=b"", method="POST")
-with urllib.request.urlopen(sim_req, timeout=10) as resp:
-    if resp.status != 200:
-        print(f"Payment simulation failed with status {resp.status}", file=sys.stderr)
-        sys.exit(1)
-    sim_data = json.loads(resp.read().decode())
-    if sim_data.get("status") not in ("DISPATCHED", "PAID_WAITING"):
-        print(f"Unexpected status after payment simulation: {sim_data}", file=sys.stderr)
-        sys.exit(1)
+# 3. Use the sole kiosk session and demo checkout flow.
+def kiosk_post(path):
+    req = urllib.request.Request(base_url + path, data=b"", method="POST",
+        headers={"Authorization": "Bearer " + kiosk_secret})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.loads(response.read().decode())
+
+claimed = kiosk_post(f"/api/k/{kiosk_id}/orders/{order_id}/claim")
+session_id = claimed["session_id"]
+attempt = kiosk_post(f"/api/k/{kiosk_id}/sessions/{session_id}/initiate-payment")
+demo_token = attempt["demo_token"]
+if not demo_token.startswith("dmo_"):
+    raise RuntimeError("demo token missing")
+confirm = urllib.request.Request(base_url + "/pay/" + demo_token, data=b"",
+    method="POST", headers={"Accept": "application/json"})
+with urllib.request.urlopen(confirm, timeout=10) as response:
+    paid = json.loads(response.read().decode())
+if paid.get("status") not in ("dispatched", "dispatch_pending", "paid_unprinted"):
+    raise RuntimeError("unexpected demo payment result: " + str(paid))
 
 # 4. Poll status until COMPLETED
 status_url = f"{base_url}/api/orders/{order_id}/status"

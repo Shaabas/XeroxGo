@@ -2200,11 +2200,11 @@
       } else if (st === 'REFUND_REQUIRED') {
         checkoutStatusMsg.textContent = 'Printing failed. You may leave; the kiosk is being stopped safely before a full refund is submitted.';
       } else if (st === 'REFUND_PENDING') {
-        checkoutStatusMsg.textContent = 'A full refund has been requested from the payment provider. You may leave; the refund status will be updated.';
+        checkoutStatusMsg.textContent = 'A simulated refund was requested. You may leave; its demo status will be updated.';
       } else if (st === 'REFUND_RETRYING') {
         checkoutStatusMsg.textContent = 'Refund processing is delayed. XeroxGo will retry automatically; your payment has not been forgotten.';
       } else if (st === 'REFUNDED') {
-        checkoutStatusMsg.textContent = 'Your refund has been processed by the payment provider. Bank settlement may take additional time.';
+        checkoutStatusMsg.textContent = 'Your simulated refund has been processed.';
       } else if (st === 'PAUSED_ERROR' || st === 'FAILED_REFUNDABLE') {
         checkoutStatusMsg.textContent = 'Printing interrupted. Please leave the kiosk to the attendant; your order will be reviewed for a refund.';
       } else {
@@ -2215,10 +2215,10 @@
       const extraReconciliation = Number(statusData.excess_refunds_reconciliation_required) || 0;
       if (extraTotal > 0) {
         const extraMessage = extraReconciliation > 0
-          ? 'An additional payment requires provider reconciliation before any further refund can be requested.'
+          ? 'An additional simulated payment requires review before further action.'
           : extraUnresolved > 0
             ? 'An additional payment was detected; its refund is being processed separately.'
-            : 'An additional payment was refunded by the payment provider.';
+            : 'An additional simulated payment was refunded.';
         checkoutStatusMsg.textContent += (checkoutStatusMsg.textContent ? ' ' : '') + extraMessage;
       }
     }
