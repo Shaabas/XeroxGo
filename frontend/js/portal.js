@@ -2051,6 +2051,9 @@
 
   function startExpiryCountdown(expiryISO) {
     if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+    // Reset on every order; a missing/invalid expiry must never reuse
+    // the previous order's countdown. The server timestamp is authoritative.
+    authoritativeExpiryMs = 0;
     if (expiryISO) {
       const parsed = Date.parse(expiryISO);
       if (!isNaN(parsed)) {
@@ -2058,7 +2061,7 @@
       }
     }
     if (!authoritativeExpiryMs) {
-      authoritativeExpiryMs = Date.now() + 2 * 60 * 60 * 1000;
+      authoritativeExpiryMs = Date.now() + 5 * 60 * 1000;
     }
 
     function tick() {
