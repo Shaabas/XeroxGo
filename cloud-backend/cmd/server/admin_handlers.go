@@ -256,3 +256,28 @@ func (app *appServer) handleAdminKioskFaults(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"out_of_service_kiosks":items})
 }
+
+
+// Historic captured payments have deliberately not been automatically
+// refunded: the provider could already have processed an external refund.
+// Administrators must reconcile them against provider records first.
+func (app *appServer) handleAdminRefundReconciliations(w http.ResponseWriter, r *http.Request) {
+	if _, ok := app.authenticateAdminRequest(r); !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	reviews, err := app.db.ListHistoricalCaptureReviews(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "unable to retrieve captured payment reconciliation")
+		return
+	}
+	if reviews == nil {
+		reviews = []store.HistoricalCaptureReview{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"reconciliation_required": reviews})
+}
