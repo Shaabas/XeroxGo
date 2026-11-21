@@ -60,6 +60,10 @@ func (s *appServer) processRefundsOnce(ctx context.Context) error {
 			log.Printf("[REFUND] refund %s remains pending: %v", item.ProviderRefundID, err)
 			continue
 		}
+		if result.PaymentID != item.PaymentID || result.Amount != item.AmountPaise || result.ID != item.ProviderRefundID {
+			log.Printf("[REFUND] Provider refund response mismatch for order %s; operator review required", item.OrderID)
+			continue
+		}
 		switch result.Status {
 		case "processed":
 			_ = s.db.RecordRefundResult(ctx, item.OrderID, result.ID, store.RefundProcessed, "")
