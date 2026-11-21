@@ -713,6 +713,7 @@ func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
 		OrderSummary:   summary,
 		SessionID:      sessID,
 		QRContent:      c.currentQRPayload,
+		PINLoading:     c.isClaiming,
 		PINError:       c.pinError,
 		TimeoutSeconds: remainingSeconds,
 		PrinterModel:   c.cfg.PrinterModel,
