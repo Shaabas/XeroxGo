@@ -120,6 +120,26 @@ func TestPaymentWebhook_KnownAttemptWrongAmountCreatesRefundOnly(t *testing.T) {
 	if err!=nil||len(ready)!=1||ready[0].PaymentID!="pay_webhook_wrong_amount"||ready[0].AmountPaise!=100{
 		t.Fatalf("wrong amount missing from financial ledger: %+v %v",ready,err)
 	}
+	att,err:=st.GetPaymentAttemptByProviderOrder(ctx,"mock","mock_order_wrong_amount")
+	if err!=nil||att==nil||att.Status!="CREATED"{
+		t.Fatalf("underpayment wrongly marked valid checkout attempt paid: %+v %v",att,err)
+	}
+	// The first underpayment must not prevent a second real captured payment
+	// of the correct amount from funding and dispatching the same order.
+	correct:=[]byte(`{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_webhook_correct_amount","order_id":"mock_order_wrong_amount","amount":400,"currency":"INR","status":"captured"}}}}`)
+	mac=hmac.New(sha256.New,app.cfg.webhookSecret)
+	_,_=mac.Write(correct)
+	req2:=httptest.NewRequest(http.MethodPost,"/api/webhooks/razorpay",bytes.NewReader(correct))
+	req2.Header.Set("X-Razorpay-Signature",hex.EncodeToString(mac.Sum(nil)))
+	w2:=httptest.NewRecorder()
+	app.handleRazorpayWebhook(w2,req2)
+	if w2.Code!=http.StatusOK || !bytes.Contains(w2.Body.Bytes(),[]byte("dispatch_pending")){
+		t.Fatalf("second correctly funded payment not queued: HTTP %d %s",w2.Code,w2.Body.String())
+	}
+	ord,err:=st.GetOrder(ctx,orderID)
+	if err!=nil||ord.Status!=contracts.JobStatusDispatched{
+		t.Fatalf("correct capture did not authorize printing: %+v %v",ord,err)
+	}
 }
 
 func TestRefundWorker_PaidWaitingNeverExpiresByAgeOrSession(t *testing.T) {
