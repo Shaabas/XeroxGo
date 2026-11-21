@@ -15,6 +15,8 @@ type OrderPrintProgress struct {
 	DocumentsCompleted int
 	DocumentsPrinting  int
 	DocumentsSpooling  int
+	DocumentsPaused    int
+	DocumentsFailed    int
 	PagesPrinted       int
 	SheetsPrinted      int
 	ErrorReason        string
@@ -43,6 +45,8 @@ SELECT COUNT(d.job_id),
  COALESCE(SUM(CASE WHEN d.status = 'COMPLETED' THEN 1 ELSE 0 END), 0),
  COALESCE(SUM(CASE WHEN d.status = 'PRINTING' THEN 1 ELSE 0 END), 0),
  COALESCE(SUM(CASE WHEN d.status = 'SPOOLING' THEN 1 ELSE 0 END), 0),
+ COALESCE(SUM(CASE WHEN d.status = 'PAUSED_ERROR' THEN 1 ELSE 0 END), 0),
+ COALESCE(SUM(CASE WHEN d.status = 'FAILED_REFUNDABLE' THEN 1 ELSE 0 END), 0),
  COALESCE(SUM(p.pages_printed), 0),
  COALESCE(SUM(p.sheets_printed), 0),
  COALESCE((
@@ -60,6 +64,7 @@ WHERE d.order_id = ?;`
 	err := s.db.QueryRowContext(ctx, s.rebind(query), orderID, orderID).Scan(
 		&out.DocumentsTotal, &out.DocumentsCompleted,
 		&out.DocumentsPrinting, &out.DocumentsSpooling,
+		&out.DocumentsPaused, &out.DocumentsFailed,
 		&out.PagesPrinted, &out.SheetsPrinted, &out.ErrorReason,
 	)
 	if err != nil {
