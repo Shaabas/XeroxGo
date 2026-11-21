@@ -189,9 +189,17 @@ func TestPaymentLedger_LegacyPendingRefundMigration(t *testing.T) {
 		primary.ProviderRefundID != "rfnd_existing" || primary.Status != RefundPending {
 		t.Fatalf("migration lost existing provider refund identity: %+v %v", primary, err)
 	}
+	// Historic surplus money might already have been refunded manually.
+	// Startup must never automatically submit a second provider refund.
 	ready, err := s.ListActionableRefunds(ctx, now.Add(time.Hour))
-	if err != nil || len(ready) != 1 || ready[0].PaymentID != "pay_legacy_1" {
-		t.Fatalf("migration did not recover excess capture: %+v %v", ready, err)
+	if err != nil || len(ready) != 0 {
+		t.Fatalf("historic excess capture was automatically refundable: %+v %v", ready, err)
+	}
+	var status string
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT status FROM payment_refund_requests WHERE payment_id=?",
+		"pay_legacy_1").Scan(&status); err != nil || status != "RECONCILIATION_REQUIRED" {
+		t.Fatalf("historic surplus lost safe manual reconciliation state: %q %v", status, err)
 	}
 }
 
@@ -250,9 +258,14 @@ VALUES(?,?,?,'',100,'captured','mock',?);`),
 	}
 	if funded!=0{t.Fatal("restart wrongly turned underpayment into print authorization")}
 	ready,err:=s.ListActionableRefunds(ctx,now.Add(time.Hour))
-	if err!=nil||len(ready)!=1||ready[0].PaymentID!="pay_wrong_restart"||
-		ready[0].Reason!=RefundReasonExcess||ready[0].AmountPaise!=100{
-		t.Fatalf("restart lost underpayment refund: %+v %v",ready,err)
+	if err!=nil||len(ready)!=0{
+		t.Fatalf("historic underpayment needs provider reconciliation, not automatic refund: %+v %v",ready,err)
+	}
+	var historicStatus string
+	if err:=s.db.QueryRowContext(ctx,
+		"SELECT status FROM payment_refund_requests WHERE payment_id=?",
+		"pay_wrong_restart").Scan(&historicStatus);err!=nil||historicStatus!="RECONCILIATION_REQUIRED"{
+		t.Fatalf("historic underpayment not queued for manual reconciliation: %q %v",historicStatus,err)
 	}
 	exact,err:=s.CapturePaymentAndCheckDispatch(ctx,PaymentRecord{
 		PaymentID:"pay_correct_restart",OrderID:orderID,KioskID:kioskID,
