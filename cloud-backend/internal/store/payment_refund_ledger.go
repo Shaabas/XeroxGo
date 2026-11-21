@@ -110,6 +110,19 @@ ON CONFLICT(payment_id) DO NOTHING;`),
 	return tx.Commit()
 }
 
+// A surplus capture must not silently succeed against an incomplete order.
+// It uses the same required print-configuration invariant as GetOrder, but
+// checks it inside the capture transaction (avoids SQLite connection deadlock).
+func (s *Store) ensureRefundableOrderSnapshot(ctx context.Context, tx *sql.Tx, orderID string) error {
+	var found int
+	err := tx.QueryRowContext(ctx, s.rebind(
+		"SELECT 1 FROM print_configs WHERE order_id=?"), orderID).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: order %s has no print configuration", ErrOrderNotFound, orderID)
+	}
+	return err
+}
+
 // Atomic with the new payment row: no surplus capture can be acknowledged
 // without also creating its independent refund obligation.
 func (s *Store) recordExcessCaptureInTx(ctx context.Context,tx *sql.Tx,p PaymentRecord,kioskID string,nowNS int64) error {
