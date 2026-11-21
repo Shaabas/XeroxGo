@@ -1009,7 +1009,6 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"excess_refunds_total": excessSummary.Total,
 		"excess_refunds_processed": excessSummary.Processed,
 		"excess_refunds_unresolved": excessSummary.Unresolved,
-		"excess_refunds_reconciliation_required": excessSummary.ReconciliationRequired,
 	})
 }
 
@@ -1284,7 +1283,6 @@ func (app *appServer) routes() *http.ServeMux {
 	mux.HandleFunc("/api/admin/analytics", app.handleAdminAnalytics)
 	mux.HandleFunc("/api/admin/orders", app.handleAdminOrders)
 	mux.HandleFunc("/api/admin/kiosks/faults", app.handleAdminKioskFaults)
-	mux.HandleFunc("/api/admin/refunds/reconciliation", app.handleAdminRefundReconciliations)
 	mux.HandleFunc("/api/admin/orders/export", app.handleAdminOrdersExport)
 
 	return mux

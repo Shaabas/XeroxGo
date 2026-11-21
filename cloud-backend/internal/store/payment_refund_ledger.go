@@ -15,28 +15,22 @@ const (
 	RefundReasonExcess = "EXCESS_CAPTURE"
 )
 
-// Razorpay's refund idempotency key permits ASCII letters, digits, '-' and '_'.
+// Demo refund obligations require a stable idempotency key per captured payment.
 func refundIdempotencyKey(paymentID string) string {
 	sum := sha256.Sum256([]byte(paymentID))
 	return "xeroxgo_pay_" + hex.EncodeToString(sum[:16])
 }
 
-// Additive, idempotent migration. Preserve the old order-scoped refund table
-// for audit and copy all in-flight statuses, refund IDs and idempotency keys.
-// Historic surplus captures may already have been manually refunded outside
-// XeroxGo. Backfill them as RECONCILIATION_REQUIRED (not worker-actionable);
-// an operator must compare with provider records before any new refund.
-func (s *Store) migratePaymentRefundSchema(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil { return err }
-	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS order_funding_payments(
+// Fresh demo schema only. No migration of historical orders or provider
+// refund obligations is supported.
+func (s *Store) initPaymentRefundSchema(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS order_funding_payments (
 	order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
 	payment_id TEXT NOT NULL UNIQUE,
 	created_at_ns BIGINT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS payment_refund_requests(
+CREATE TABLE IF NOT EXISTS payment_refund_requests (
 	payment_id TEXT PRIMARY KEY,
 	order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
 	provider TEXT NOT NULL,
@@ -54,66 +48,8 @@ CREATE TABLE IF NOT EXISTS payment_refund_requests(
 CREATE INDEX IF NOT EXISTS idx_payment_refunds_order ON payment_refund_requests(order_id,reason);
 CREATE INDEX IF NOT EXISTS idx_payment_refunds_worker ON payment_refund_requests(status,updated_at_ns);
 `)
-	if err != nil { return fmt.Errorf("refund migration schema: %w", err) }
-	// The old obligation's payment is authoritative for orders already
-	// being refunded, including ambiguous same-timestamp captures.
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO order_funding_payments(order_id,payment_id,created_at_ns)
-SELECT order_id,payment_id,created_at_ns FROM refund_requests WHERE payment_id <> ''
-ON CONFLICT(order_id) DO NOTHING;`)
-	if err != nil { return fmt.Errorf("refund migration legacy funding: %w", err) }
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO order_funding_payments(order_id,payment_id,created_at_ns)
-SELECT p.order_id,p.payment_id,p.created_at_ns FROM payments p
-JOIN orders o ON o.order_id=p.order_id
-WHERE LOWER(p.status) IN ('captured','paid')
-AND p.amount_paise=o.price_paise
-AND NOT EXISTS (
-	SELECT 1 FROM payments x WHERE x.order_id=p.order_id
-	AND LOWER(x.status) IN ('captured','paid') AND x.amount_paise=o.price_paise
-	AND (x.created_at_ns < p.created_at_ns OR
-	(x.created_at_ns=p.created_at_ns AND x.payment_id < p.payment_id))
-)
-ON CONFLICT(order_id) DO NOTHING;`)
-	if err != nil { return fmt.Errorf("refund migration funding: %w", err) }
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO payment_refund_requests(
-	payment_id,order_id,provider,amount_paise,reason,status,idempotency_key,
-	provider_refund_id,safe_stop_verified,attempts,last_error,created_at_ns,updated_at_ns)
-SELECT payment_id,order_id,provider,amount_paise,'FULFILLMENT_FAILED',status,idempotency_key,
-	provider_refund_id,safe_stop_verified,attempts,last_error,created_at_ns,updated_at_ns
-FROM refund_requests WHERE payment_id <> ''
-ON CONFLICT(payment_id) DO NOTHING;`)
-	if err != nil { return fmt.Errorf("refund migration legacy obligations: %w", err) }
-	rows, err := tx.QueryContext(ctx, `
-SELECT p.payment_id,p.order_id,p.provider,p.amount_paise,p.created_at_ns
-FROM payments p LEFT JOIN order_funding_payments f ON f.order_id=p.order_id
-WHERE LOWER(p.status) IN ('captured','paid')
-AND (f.payment_id IS NULL OR p.payment_id <> f.payment_id);`)
-	if err != nil { return err }
-	type item struct { id, orderID, provider string; amount, at int64 }
-	var extra []item
-	for rows.Next() {
-		var x item
-		if err := rows.Scan(&x.id,&x.orderID,&x.provider,&x.amount,&x.at); err != nil {
-			rows.Close(); return err
-		}
-		extra=append(extra,x)
-	}
-	if err := rows.Err(); err != nil { rows.Close(); return err }
-	rows.Close()
-	for _, x := range extra {
-		if x.amount <= 0 { return fmt.Errorf("invalid historic captured amount %s",x.id) }
-		_, err = tx.ExecContext(ctx,s.rebind(`
-INSERT INTO payment_refund_requests(
-	payment_id,order_id,provider,amount_paise,reason,status,idempotency_key,
-	safe_stop_verified,created_at_ns,updated_at_ns)
-VALUES (?,?,?,?,'EXCESS_CAPTURE','RECONCILIATION_REQUIRED',?,0,?,?)
-ON CONFLICT(payment_id) DO NOTHING;`),
-			x.id,x.orderID,x.provider,x.amount,refundIdempotencyKey(x.id),x.at,x.at)
-		if err != nil { return fmt.Errorf("backfill excess payment %s: %w",x.id,err) }
-	}
-	return tx.Commit()
+	if err != nil { return fmt.Errorf("initialize demo refund schema: %w", err) }
+	return nil
 }
 
 // A surplus capture must not silently succeed against an incomplete order.
@@ -199,7 +135,6 @@ type ExcessRefundSummary struct {
 	Total int
 	Processed int
 	Unresolved int
-	ReconciliationRequired int
 }
 
 func (s *Store) GetExcessRefundSummary(ctx context.Context, orderID string) (ExcessRefundSummary, error) {
@@ -209,36 +144,8 @@ SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='PROCESSED' THEN 1 ELSE 0 END),0)
 COALESCE(SUM(CASE WHEN status <> 'PROCESSED' THEN 1 ELSE 0 END),0),
 COALESCE(SUM(CASE WHEN status='RECONCILIATION_REQUIRED' THEN 1 ELSE 0 END),0)
 FROM payment_refund_requests WHERE order_id=? AND reason='EXCESS_CAPTURE';`),
-		orderID).Scan(&out.Total,&out.Processed,&out.Unresolved,&out.ReconciliationRequired)
+		orderID).Scan(&out.Total,&out.Processed,&out.Unresolved)
 	return out, err
 }
 
 
-// HistoricalCaptureReview is a captured payment imported from a prior
-// deployment without verified evidence of whether a refund was issued.
-// It is never picked up by the automatic refund worker.
-type HistoricalCaptureReview struct {
-	OrderID     string `json:"order_id"`
-	PaymentID   string `json:"payment_id"`
-	Provider    string `json:"provider"`
-	AmountPaise int64  `json:"amount_paise"`
-	CreatedAtNS int64  `json:"created_at_ns"`
-}
-
-func (s *Store) ListHistoricalCaptureReviews(ctx context.Context) ([]HistoricalCaptureReview, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT order_id, payment_id, provider, amount_paise, created_at_ns
-FROM payment_refund_requests
-WHERE reason='EXCESS_CAPTURE' AND status='RECONCILIATION_REQUIRED'
-ORDER BY created_at_ns ASC LIMIT 200;`)
-	if err != nil { return nil, err }
-	defer rows.Close()
-	var out []HistoricalCaptureReview
-	for rows.Next() {
-		var review HistoricalCaptureReview
-		if err := rows.Scan(&review.OrderID, &review.PaymentID, &review.Provider,
-			&review.AmountPaise, &review.CreatedAtNS); err != nil { return nil, err }
-		out = append(out, review)
-	}
-	return out, rows.Err()
-}

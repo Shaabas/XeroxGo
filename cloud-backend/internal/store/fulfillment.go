@@ -42,50 +42,15 @@ type RefundRequest struct {
 }
 
 func (s *Store) ensureFulfillmentSchema(ctx context.Context) error {
-	// Both statements work in the Postgres and SQLite development stores.
-	const schema = `
+	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS kiosk_service_flags (
     kiosk_id TEXT PRIMARY KEY,
     out_of_service INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '',
     updated_at_ns BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS refund_requests (
-    order_id TEXT PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
-    payment_id TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    amount_paise BIGINT NOT NULL CHECK(amount_paise > 0),
-    status TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL UNIQUE,
-    provider_refund_id TEXT NOT NULL DEFAULT '',
-    safe_stop_verified INTEGER NOT NULL DEFAULT 0,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT NOT NULL DEFAULT '',
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_refund_requests_status ON refund_requests(status, updated_at_ns);
-`
-	if _, err := s.db.ExecContext(ctx, schema); err != nil { return err }
-	// Older deployments may have orders.total_sheets/pages=0 even though
-	// child documents or the legacy print config hold accurate totals.
-	// Restore those authoritative values before the new paper-accounting
-	// and customer-status paths read the orders table.
-	for _, query := range []string{
-		`UPDATE orders SET total_sheets = COALESCE(
-			NULLIF((SELECT SUM(total_sheets) FROM order_documents WHERE order_id=orders.order_id), 0),
-			(SELECT total_sheets FROM print_configs WHERE order_id=orders.order_id), 0)
-		WHERE total_sheets <= 0;`,
-		`UPDATE orders SET total_pages = COALESCE(
-			NULLIF((SELECT SUM(total_pages) FROM order_documents WHERE order_id=orders.order_id), 0),
-			(SELECT total_pages FROM print_configs WHERE order_id=orders.order_id), 0)
-		WHERE total_pages <= 0;`,
-	} {
-		if _, err := s.db.ExecContext(ctx, query); err != nil {
-			return fmt.Errorf("backfill legacy order totals: %w", err)
-		}
-	}
-	return s.migratePaymentRefundSchema(ctx)
+);`)
+	if err != nil { return fmt.Errorf("initialize kiosk service flags: %w", err) }
+	return s.initPaymentRefundSchema(ctx)
 }
 
 func (s *Store) BlockKiosk(ctx context.Context, kioskID, reason string) error {
@@ -154,7 +119,7 @@ func (s *Store) RecordRefundRequired(ctx context.Context, orderID string) error 
 	var paymentID, provider string
 	var amount int64
 	// Only the capture funding the print order is subject to physical safe-stop.
-	// The first historic capture is the fallback for older manually seeded data.
+	// Only the order's canonical funding capture is refundable for fulfillment failure.
 	err := s.db.QueryRowContext(ctx, s.rebind("\nSELECT p.payment_id,p.provider,p.amount_paise\nFROM payments p LEFT JOIN order_funding_payments f ON f.order_id=p.order_id\nWHERE p.order_id=? AND LOWER(p.status) IN ('captured','paid')\nAND (p.payment_id=f.payment_id OR (f.payment_id IS NULL AND NOT EXISTS(\n  SELECT 1 FROM payments older WHERE older.order_id=p.order_id\n  AND LOWER(older.status) IN ('captured','paid')\n  AND (older.created_at_ns < p.created_at_ns OR\n    (older.created_at_ns=p.created_at_ns AND older.payment_id < p.payment_id))\n)))\nLIMIT 1;"), orderID).Scan(&paymentID,&provider,&amount)
 	if errors.Is(err,sql.ErrNoRows) { return nil }
 	if err!=nil { return err }

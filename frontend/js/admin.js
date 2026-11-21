@@ -315,7 +315,6 @@
         if (viewOverview) viewOverview.classList.remove('hidden');
         loadAnalytics();
         loadKioskFaults();
-        loadHistoricRefundReviews();
       } else if (tabName === 'orders') {
         if (tabNavOrders) tabNavOrders.classList.add('active');
         if (viewOrders) viewOrders.classList.remove('hidden');
@@ -370,36 +369,6 @@
       } catch (err) {
         panel.classList.remove('hidden');
         list.textContent = 'Unable to verify kiosk service status. Refresh or check backend connectivity.';
-      }
-    }
-
-    async function loadHistoricRefundReviews() {
-      const panel = document.getElementById('refund-reconciliation-alerts');
-      const list = document.getElementById('refund-reconciliation-items');
-      if (!panel || !list) return;
-      try {
-        const response = await apiRequest('/api/admin/refunds/reconciliation');
-        if (!response.ok) throw new Error('Provider reconciliation unavailable');
-        const data = await parseResponseJSON(response);
-        const reviews = Array.isArray(data.reconciliation_required) ? data.reconciliation_required : [];
-        list.replaceChildren();
-        if (reviews.length === 0) {
-          panel.classList.add('hidden');
-          return;
-        }
-        panel.classList.remove('hidden');
-        const note = document.createElement('p');
-        note.textContent = 'Do not issue another refund until its provider transaction has been manually reconciled.';
-        list.appendChild(note);
-        for (const item of reviews) {
-          const entry = document.createElement('div');
-          entry.style.marginTop = '8px';
-          entry.textContent = `${item.order_id} / ${item.payment_id} — ${Number(item.amount_paise) || 0} paise (${item.provider})`;
-          list.appendChild(entry);
-        }
-      } catch (err) {
-        panel.classList.remove('hidden');
-        list.textContent = 'Could not verify historical payment reconciliation. Check backend connectivity.';
       }
     }
 

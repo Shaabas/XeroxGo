@@ -162,52 +162,6 @@ func TestPaymentLedger_PrimaryFailureRequiresStopButExcessDoesNot(t *testing.T) 
 	}
 }
 
-func TestPaymentLedger_LegacyPendingRefundMigration(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "legacy.db")
-	s, err := Open(dbPath)
-	if err != nil { t.Fatal(err) }
-	ctx := context.Background()
-	now := time.Now().UTC()
-	id, kiosk := "ord_legacy_payment", "kiosk_legacy_payment"
-	createTestOrderWithSheets(t, s, ctx, id, kiosk, "9624", 2, contracts.JobStatusPaidWaiting, now)
-	for i := 0; i < 2; i++ {
-		_, err := s.db.ExecContext(ctx, s.rebind(
-			"INSERT INTO payments(payment_id,order_id,kiosk_id,session_id,amount_paise,status,provider,created_at_ns) VALUES(?,?,?,'',400,'captured','mock',?)"),
-			fmt.Sprintf("pay_legacy_%d", i), id, kiosk, now.Add(time.Duration(i)*time.Second).UnixNano())
-		if err != nil { t.Fatal(err) }
-	}
-	_, err = s.db.ExecContext(ctx, s.rebind(
-		"INSERT INTO refund_requests(order_id,payment_id,provider,amount_paise,status,idempotency_key,provider_refund_id,safe_stop_verified,created_at_ns,updated_at_ns) VALUES(?,?,'mock',400,'PENDING',?,'rfnd_existing',1,?,?)"),
-		id, "pay_legacy_0", "xeroxgo_refund_"+id, now.UnixNano(), now.UnixNano())
-	if err != nil { t.Fatal(err) }
-	if err := s.Close(); err != nil { t.Fatal(err) }
-	s, err = Open(dbPath)
-	if err != nil { t.Fatal(err) }
-	defer s.Close()
-	primary, err := s.GetRefundRequest(ctx, id)
-	if err != nil || primary == nil || primary.PaymentID != "pay_legacy_0" ||
-		primary.ProviderRefundID != "rfnd_existing" || primary.Status != RefundPending {
-		t.Fatalf("migration lost existing provider refund identity: %+v %v", primary, err)
-	}
-	// Historic surplus money might already have been refunded manually.
-	// Startup must never automatically submit a second provider refund.
-	ready, err := s.ListActionableRefunds(ctx, now.Add(time.Hour))
-	if err != nil || len(ready) != 0 {
-		t.Fatalf("historic excess capture was automatically refundable: %+v %v", ready, err)
-	}
-	var status string
-	if err := s.db.QueryRowContext(ctx,
-		"SELECT status FROM payment_refund_requests WHERE payment_id=?",
-		"pay_legacy_1").Scan(&status); err != nil || status != "RECONCILIATION_REQUIRED" {
-		t.Fatalf("historic surplus lost safe manual reconciliation state: %q %v", status, err)
-	}
-	reviews, err := s.ListHistoricalCaptureReviews(ctx)
-	if err != nil || len(reviews) != 1 ||
-		reviews[0].PaymentID != "pay_legacy_1" || reviews[0].AmountPaise != 400 {
-		t.Fatalf("historic surplus not visible for operator reconciliation: %+v %v", reviews, err)
-	}
-}
-
 func TestPaymentLedger_WrongAmountCaptureRefundedNotApplied(t *testing.T) {
 	s := openPaymentLedgerTestStore(t)
 	ctx := context.Background()
@@ -236,48 +190,6 @@ func TestPaymentLedger_WrongAmountCaptureRefundedNotApplied(t *testing.T) {
 	ready, err := s.ListActionableRefunds(ctx,now.Add(time.Hour))
 	if err != nil || len(ready)!=1 || ready[0].PaymentID!="pay_wrong_amount" || ready[0].AmountPaise!=100 {
 		t.Fatalf("wrong amount should be independently refunded in full: %+v %v",ready,err)
-	}
-}
-
-
-func TestPaymentLedger_RestartBackfillsWrongAmountWithoutFundingOrder(t *testing.T) {
-	dbPath:=filepath.Join(t.TempDir(),"wrong_amount_restart.db")
-	s,err:=Open(dbPath)
-	if err!=nil{t.Fatal(err)}
-	ctx:=context.Background()
-	now:=time.Now().UTC()
-	const orderID,kioskID="ord_restart_wrong_amount","kiosk_restart_wrong_amount"
-	createTestOrderWithSheets(t,s,ctx,orderID,kioskID,"3295",2,contracts.JobStatusPendingPayment,now)
-	_,err=s.db.ExecContext(ctx,s.rebind(`
-INSERT INTO payments(payment_id,order_id,kiosk_id,session_id,amount_paise,status,provider,created_at_ns)
-VALUES(?,?,?,'',100,'captured','mock',?);`),
-		"pay_wrong_restart",orderID,kioskID,now.UnixNano())
-	if err!=nil{t.Fatal(err)}
-	if err:=s.Close();err!=nil{t.Fatal(err)}
-	s,err=Open(dbPath)
-	if err!=nil{t.Fatal(err)}
-	defer s.Close()
-	var funded int
-	if err:=s.db.QueryRowContext(ctx,"SELECT COUNT(*) FROM order_funding_payments WHERE order_id=?",orderID).Scan(&funded);err!=nil{
-		t.Fatal(err)
-	}
-	if funded!=0{t.Fatal("restart wrongly turned underpayment into print authorization")}
-	ready,err:=s.ListActionableRefunds(ctx,now.Add(time.Hour))
-	if err!=nil||len(ready)!=0{
-		t.Fatalf("historic underpayment needs provider reconciliation, not automatic refund: %+v %v",ready,err)
-	}
-	var historicStatus string
-	if err:=s.db.QueryRowContext(ctx,
-		"SELECT status FROM payment_refund_requests WHERE payment_id=?",
-		"pay_wrong_restart").Scan(&historicStatus);err!=nil||historicStatus!="RECONCILIATION_REQUIRED"{
-		t.Fatalf("historic underpayment not queued for manual reconciliation: %q %v",historicStatus,err)
-	}
-	exact,err:=s.CapturePaymentAndCheckDispatch(ctx,PaymentRecord{
-		PaymentID:"pay_correct_restart",OrderID:orderID,KioskID:kioskID,
-		AmountPaise:400,Status:"captured",Provider:"mock",
-	},now.Add(time.Second))
-	if err!=nil||exact.ExcessCapture||exact.OrderStatus!=contracts.JobStatusPaidWaiting{
-		t.Fatalf("later legitimate payment not accepted: %+v %v",exact,err)
 	}
 }
 
