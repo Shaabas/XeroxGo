@@ -10,6 +10,20 @@ jobs:
   verify:
     name: Verification Gates (Gate 1 - 6)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: xeroxgo_test
+          POSTGRES_PASSWORD: local_ci_only_password
+          POSTGRES_DB: xeroxgo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U xeroxgo_test -d xeroxgo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -33,6 +47,8 @@ jobs:
           sudo apt-get install -y qpdf ghostscript libreoffice poppler-utils cups-filters
 
       - name: Run Verification Gates
+        env:
+          XEROXGO_TEST_POSTGRES_URL: postgres://xeroxgo_test:local_ci_only_password@127.0.0.1:5432/xeroxgo_test?sslmode=disable
         run: ./scripts/verify_gate.sh
 
   deploy-frontend:
