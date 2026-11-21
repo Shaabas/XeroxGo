@@ -1290,17 +1290,37 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	secondsRemaining := int64(0)
+	pinExpiry := ""
 	now := time.Now().UTC()
-	if !order.PINExpiresAt.IsZero() {
+	if order.Status == contracts.JobStatusPendingPayment {
+		pinExpiry = order.PINExpiresAt.Format(time.RFC3339)
 		if !now.Before(order.PINExpiresAt) {
-			secondsRemaining = 0
-			if currentStatus == string(contracts.JobStatusPendingPayment) {
-				currentStatus = "EXPIRED"
-			}
+			currentStatus = "EXPIRED"
 		} else {
-			rem := order.PINExpiresAt.Sub(now)
-			secondsRemaining = int64(math.Ceil(rem.Seconds()))
+			secondsRemaining = int64(math.Ceil(order.PINExpiresAt.Sub(now).Seconds()))
 		}
+	}
+
+	// Refund progress is distinct from print-job state and is never guessed
+	// from the FAILED_REFUNDABLE label.
+	refundStatus := ""
+	refundStopVerified := false
+	if refund, err := s.db.GetRefundRequest(r.Context(), orderID); err == nil && refund != nil {
+		refundStatus = refund.Status
+		refundStopVerified = refund.SafeStopVerified
+		switch refund.Status {
+		case store.RefundProcessed:
+			currentStatus = "REFUNDED"
+		case store.RefundPending, store.RefundRequesting:
+			currentStatus = "REFUND_PENDING"
+		case store.RefundFailed:
+			currentStatus = "REFUND_RETRYING"
+		default:
+			currentStatus = "REFUND_REQUIRED"
+		}
+	}
+	if order.Status == contracts.JobStatusCompleted && refundStatus == "" {
+		currentStatus = "COMPLETED"
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1308,16 +1328,18 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"order_id":          order.OrderID,
 		"display_code":      order.Command.DisplayCode,
 		"status":            currentStatus,
-		"total_pages":       order.Command.TotalPages,
-		"total_sheets":      order.Command.TotalSheets,
+		"total_pages":       order.TotalPages,
+		"total_sheets":      order.TotalSheets,
 		"copies":            order.Command.Copies,
 		"duplex":            string(order.Command.Duplex),
 		"pages_printed":     pagesPrinted,
 		"sheets_printed":    sheetsPrinted,
 		"error_reason":      errorReason,
 		"price_paise":       order.PricePaise,
-		"pin_expires_at":    order.PINExpiresAt.Format(time.RFC3339),
+		"pin_expires_at":    pinExpiry,
 		"seconds_remaining": secondsRemaining,
+		"refund_status":     refundStatus,
+		"refund_stop_verified": refundStopVerified,
 	})
 }
 
@@ -1514,6 +1536,7 @@ func main() {
 	defer stop()
 
 	go app.startConversionWorker(sigCtx)
+	go app.startRefundWorker(sigCtx)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
@@ -1566,6 +1589,8 @@ func (app *appServer) routes() *http.ServeMux {
 			app.handleGetSession(w, r)
 		case strings.HasSuffix(path, "/refill"):
 			app.handleKioskRefill(w, r)
+		case strings.HasSuffix(path, "/restore-service"):
+			app.handleRestoreKioskService(w, r)
 		default:
 			http.NotFound(w, r)
 		}
