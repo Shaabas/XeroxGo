@@ -133,6 +133,9 @@ ORDER BY created_at_ns ASC LIMIT 1;`), orderID).Scan(&paymentID, &provider, &amo
 	if errors.Is(err, sql.ErrNoRows) { return nil } // unpaid orders need no refund
 	if err != nil { return err }
 	if amount <= 0 { return errors.New("invalid captured amount") }
+	var orderStatus string
+	if err := s.db.QueryRowContext(ctx, s.rebind("SELECT status FROM orders WHERE order_id = ?"), orderID).Scan(&orderStatus); err != nil { return err }
+	if orderStatus == "COMPLETED" { return nil }
 	now := time.Now().UTC().UnixNano()
 	_, err = s.db.ExecContext(ctx, s.rebind(`
 INSERT INTO refund_requests(order_id, payment_id, provider, amount_paise, status, idempotency_key, created_at_ns, updated_at_ns)
@@ -208,11 +211,15 @@ func (s *Store) RecordRefundResult(ctx context.Context, orderID, providerRefundI
 	if err != nil { return err }
 	defer tx.Rollback()
 	now := time.Now().UTC().UnixNano()
-	_, err = tx.ExecContext(ctx, s.rebind(`
+	result, err := tx.ExecContext(ctx, s.rebind(`
 UPDATE refund_requests SET status = ?, provider_refund_id = ?, last_error = ?, updated_at_ns = ?
-WHERE order_id = ? AND status IN ('REQUESTING','PENDING','FAILED');`),
+WHERE order_id = ? AND safe_stop_verified = 1
+AND status IN ('REQUESTING','PENDING','FAILED');`),
 		status, providerRefundID, errorText, now, orderID)
 	if err != nil { return err }
+	n, err := result.RowsAffected()
+	if err != nil { return err }
+	if n != 1 { return fmt.Errorf("refund result for %s rejected: invalid transition or missing safe stop", orderID) }
 	if status == RefundProcessed {
 		// Once the provider reports processed, do not allow the order to print.
 		_, err = tx.ExecContext(ctx, s.rebind(`
