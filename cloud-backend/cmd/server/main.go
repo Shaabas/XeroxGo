@@ -1396,6 +1396,7 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"excess_refunds_total": excessSummary.Total,
 		"excess_refunds_processed": excessSummary.Processed,
 		"excess_refunds_unresolved": excessSummary.Unresolved,
+		"excess_refunds_reconciliation_required": excessSummary.ReconciliationRequired,
 	})
 }
 
