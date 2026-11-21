@@ -23,3 +23,20 @@ WHERE job_id = ? AND status IN ('PENDING','SENT');`),
 		reason, time.Now().UTC().UnixNano(), jobID)
 	return err
 }
+
+
+// A WebSocket ack belongs to the authenticated kiosk connection, not merely
+// to an attacker- or peer-supplied job_id. A mismatched kiosk cannot suppress
+// this order's pending replay.
+func (s *Store) MarkDispatchAcknowledgedForKiosk(ctx context.Context, kioskID, jobID string) error {
+	if s == nil || s.db == nil { return errors.New("store not initialized") }
+	kioskID = strings.TrimSpace(kioskID)
+	jobID = strings.TrimSpace(jobID)
+	if kioskID == "" || jobID == "" { return errors.New("kioskID and jobID required") }
+	_, err := s.db.ExecContext(ctx, s.rebind(`
+UPDATE dispatch_intents
+SET status='ACKNOWLEDGED',acknowledged_at_ns=?,updated_at_ns=?
+WHERE kiosk_id=? AND job_id=? AND status IN ('PENDING','SENT');`),
+		time.Now().UTC().UnixNano(),time.Now().UTC().UnixNano(),kioskID,jobID)
+	return err
+}
