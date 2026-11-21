@@ -280,3 +280,32 @@ VALUES(?,?,?,'',100,'captured','mock',?);`),
 		t.Fatalf("later legitimate payment not accepted: %+v %v",exact,err)
 	}
 }
+
+
+func TestPaymentLedger_ExpiredUnpaidRetentionPreservesCapturedUnderpayment(t *testing.T) {
+	s:=openPaymentLedgerTestStore(t)
+	ctx:=context.Background()
+	now:=time.Now().UTC()
+	const kiosk="kiosk_retention_money"
+	createTestOrderWithSheets(t,s,ctx,"ord_retention_paid_wrong",kiosk,"8812",2,contracts.JobStatusPendingPayment,now)
+	createTestOrderWithSheets(t,s,ctx,"ord_retention_truly_unpaid",kiosk,"8813",2,contracts.JobStatusPendingPayment,now)
+	result,err:=s.CapturePaymentAndCheckDispatch(ctx,PaymentRecord{
+		PaymentID:"pay_retention_wrong",OrderID:"ord_retention_paid_wrong",
+		KioskID:kiosk,AmountPaise:100,Provider:"mock",Status:"captured",
+	},now)
+	if err!=nil||!result.ExcessCapture{
+		t.Fatalf("wrong amount not durably captured for refund: %+v %v",result,err)
+	}
+	expired,err:=s.GetExpiredOrderIDs(ctx,now.Add(time.Hour),now.Add(time.Hour))
+	if err!=nil{t.Fatal(err)}
+	for _,id:=range expired {
+		if id=="ord_retention_paid_wrong"{
+			t.Fatal("retention would delete captured payment and refund through unpaid order expiry")
+		}
+	}
+	foundUnpaid:=false
+	for _,id:=range expired{
+		if id=="ord_retention_truly_unpaid"{foundUnpaid=true}
+	}
+	if !foundUnpaid{t.Fatalf("truly unpaid expired order not cleaned up: %+v",expired)}
+}
