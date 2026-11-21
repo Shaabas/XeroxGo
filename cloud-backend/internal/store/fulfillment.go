@@ -67,6 +67,24 @@ CREATE TABLE IF NOT EXISTS refund_requests (
 CREATE INDEX IF NOT EXISTS idx_refund_requests_status ON refund_requests(status, updated_at_ns);
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil { return err }
+	// Older deployments may have orders.total_sheets/pages=0 even though
+	// child documents or the legacy print config hold accurate totals.
+	// Restore those authoritative values before the new paper-accounting
+	// and customer-status paths read the orders table.
+	for _, query := range []string{
+		`UPDATE orders SET total_sheets = COALESCE(
+			NULLIF((SELECT SUM(total_sheets) FROM order_documents WHERE order_id=orders.order_id), 0),
+			(SELECT total_sheets FROM print_configs WHERE order_id=orders.order_id), 0)
+		WHERE total_sheets <= 0;`,
+		`UPDATE orders SET total_pages = COALESCE(
+			NULLIF((SELECT SUM(total_pages) FROM order_documents WHERE order_id=orders.order_id), 0),
+			(SELECT total_pages FROM print_configs WHERE order_id=orders.order_id), 0)
+		WHERE total_pages <= 0;`,
+	} {
+		if _, err := s.db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("backfill legacy order totals: %w", err)
+		}
+	}
 	return s.migratePaymentRefundSchema(ctx)
 }
 
