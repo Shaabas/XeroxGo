@@ -10,18 +10,6 @@
       "destination": "https://xeroxgo-cloud.onrender.com/pay/:match*"
     },
     {
-      "source": "/payment/:match*",
-      "destination": "https://xeroxgo-cloud.onrender.com/pay/:match*"
-    },
-    {
-      "source": "/payment",
-      "destination": "/"
-    },
-    {
-      "source": "/payment/",
-      "destination": "/"
-    },
-    {
       "source": "/admin",
       "destination": "/admin.html"
     },
@@ -90,15 +78,6 @@
     },
     {
       "source": "/k/(.*)",
-      "headers": [
-        {
-          "key": "Cache-Control",
-          "value": "no-cache, no-store, must-revalidate"
-        }
-      ]
-    },
-    {
-      "source": "/payment(.*)",
       "headers": [
         {
           "key": "Cache-Control",
