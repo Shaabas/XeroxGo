@@ -174,8 +174,10 @@ func (s *appServer) handlePINLookup(w http.ResponseWriter, r *http.Request) {
 		KioskID:          order.Command.KioskID,
 		Status:           string(order.Status),
 		TotalPricePaise:  order.PricePaise,
-		TotalPages:       order.Command.TotalPages,
-		TotalSheets:      order.Command.TotalSheets,
+		// The print command targets the first document of a multi-file order;
+		// the checkout must display the authoritative whole-order totals.
+		TotalPages:       order.TotalPages,
+		TotalSheets:      order.TotalSheets,
 		Copies:           order.Command.Copies,
 		Duplex:           string(order.Command.Duplex),
 		ColorMode:        order.ColorMode,
