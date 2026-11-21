@@ -1401,20 +1401,10 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	demoFlag := flag.Bool("demo-mode", false, "Enable demo mode with simulated QR payments")
 	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
 	flag.Parse()
 
-	demoEnv := strings.TrimSpace(os.Getenv("DEMO_MODE"))
-	if demoEnv == "" {
-		demoEnv = strings.TrimSpace(os.Getenv("XEROXGO_DEMO_MODE"))
-	}
-	demoMode := true
-	if demoEnv == "0" || strings.ToLower(demoEnv) == "false" {
-		demoMode = false
-	} else if *demoFlag {
-		demoMode = true
-	}
+	demoMode := true // XeroxGo currently supports only demo checkout.
 
 	addr := strings.TrimSpace(*addrFlag)
 	if addr == "" {
@@ -1545,29 +1535,8 @@ func main() {
 		kioskSecret:        kioskSecretBytes,
 	}
 
-	rzpKeyID := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_ID"))
-	rzpKeySecret := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_SECRET"))
-	paymentProviderType := strings.ToLower(strings.TrimSpace(os.Getenv("PAYMENT_PROVIDER")))
-
-	var paymentProv payments.Provider
-	if paymentProviderType == "razorpay" || (paymentProviderType == "" && rzpKeyID != "" && rzpKeySecret != "") {
-		if rzpKeyID == "" || rzpKeySecret == "" {
-			log.Fatalf("RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be set when PAYMENT_PROVIDER=razorpay")
-		}
-		var err error
-		paymentProv, err = payments.NewRazorpayProvider(payments.RazorpayConfig{
-			KeyID:         rzpKeyID,
-			KeySecret:     rzpKeySecret,
-			WebhookSecret: whSecretStr,
-		})
-		if err != nil {
-			log.Fatalf("failed to initialize Razorpay provider: %v", err)
-		}
-		log.Printf("[PAYMENT] Initialized Razorpay payment provider (key_id=%s)", rzpKeyID)
-	} else {
-		paymentProv = payments.NewMockProvider(whSecretStr)
-		log.Printf("[PAYMENT] Initialized Mock payment provider (real payments disabled by default)")
-	}
+	paymentProv := payments.NewMockProvider(whSecretStr)
+	log.Printf("[PAYMENT] Demo-only payment system enabled")
 
 	pinLimiter := NewPINRateLimiter(storeDB, 5, 2*time.Minute, 2*time.Minute)
 	app := &appServer{

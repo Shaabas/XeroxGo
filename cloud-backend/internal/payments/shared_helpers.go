@@ -74,8 +74,7 @@ func CalculateDocumentPricePaise(imposedPages int, isColor bool, isDuplex bool, 
 // CalculatePricePaise computes the total price in integer paise for a given
 // printed sides count and configured price per side. It validates that both
 // arguments are positive and protects against int64 overflow.
-// Deprecated: Provider-independent price arithmetic has been moved to internal/pricing.
-// This wrapper is preserved for backward compatibility.
+// Existing provider-independent price arithmetic delegates to the canonical pricing package.
 func CalculatePricePaise(totalSides int, pricePerSidePaise int64) (int64, error) {
 	return pricing.CalculatePricePaise(totalSides, pricePerSidePaise)
 }
