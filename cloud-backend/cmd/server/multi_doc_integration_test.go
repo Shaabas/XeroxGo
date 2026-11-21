@@ -61,7 +61,6 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 		webhookSecret:      []byte(webhookSecret),
 		downloadSecret:     downloadSecret,
 		devMode:            true,
-		demoMode:           true,
 	}
 
 	hub := ws.NewHub(st)

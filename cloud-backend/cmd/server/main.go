@@ -41,7 +41,6 @@ type serverConfig struct {
 	jobsDir            string
 	pricePerSheetPaise int64
 	devMode            bool
-	demoMode           bool
 	downloadSecret     []byte
 	webhookSecret      []byte
 	kioskSecret        []byte
@@ -184,10 +183,7 @@ func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	demo := false
-	if s.cfg != nil {
-		demo = s.cfg.demoMode
-	}
+	demo := true
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "ok",
 		"demo_mode": demo,
@@ -897,7 +893,6 @@ func main() {
 	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
 	flag.Parse()
 
-	demoMode := true // XeroxGo currently supports only demo checkout.
 
 	addr := strings.TrimSpace(*addrFlag)
 	if addr == "" {
@@ -1002,7 +997,7 @@ func main() {
 
 	hub := ws.NewHub(storeDB)
 	kioskSecretStr := os.Getenv("XEROXGO_KIOSK_SECRET")
-	if kioskSecretStr == "" && demoMode {
+	if kioskSecretStr == "" && devMode {
 		kioskSecretStr = "dev_kiosk_secret_32_bytes_long_1234"
 	}
 	var kioskSecretBytes []byte
@@ -1019,7 +1014,6 @@ func main() {
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: pricePaise,
 		devMode:            devMode,
-		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
 		webhookSecret:      []byte(whSecretStr),
 		kioskSecret:        kioskSecretBytes,

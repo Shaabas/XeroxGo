@@ -29,11 +29,6 @@ func (s *appServer) handleDemoPayRoutes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if s.cfg == nil || !s.cfg.demoMode {
-		http.NotFound(w, r)
-		return
-	}
-
 	token := strings.TrimPrefix(r.URL.Path, "/pay/")
 	token = strings.TrimSpace(token)
 	if token == "" || strings.Contains(token, "/") {

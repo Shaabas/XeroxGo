@@ -30,7 +30,7 @@ func (s *appServer) handleFixtureSimulatePayment(w http.ResponseWriter, r *http.
 		http.Error(w, "payment simulation only available in development mode", http.StatusForbidden)
 		return
 	}
-	if s.cfg.demoMode && r.URL.Query().Get("force") != "1" && r.URL.Query().Get("bypass") != "1" {
+	if r.URL.Query().Get("force") != "1" {
 		http.Error(w, "direct order simulation is disabled in demo mode; use secure /pay/{token} checkout (or append ?force=1 to bypass)", http.StatusForbidden)
 		return
 	}

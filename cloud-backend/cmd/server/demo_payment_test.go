@@ -19,7 +19,7 @@ import (
 )
 
 // setupDemoTestServer initializes an isolated in-memory/temp-file cloud server with mock hub.
-func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Server, *store.Store, func()) {
+func setupDemoTestServer(t *testing.T) (*appServer, *httptest.Server, *store.Store, func()) {
 	t.Helper()
 	tempDir, err := os.MkdirTemp("", "xeroxgo_demo_test_*")
 	if err != nil {
@@ -42,7 +42,6 @@ func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Ser
 		jobsDir:            filepath.Join(tempDir, "jobs"),
 		pricePerSheetPaise: 500,
 		devMode:            true,
-		demoMode:           demoMode,
 		downloadSecret:     []byte("dev_secret_download_1234567890"),
 		webhookSecret:      []byte("dev_secret_webhook_1234567890"),
 		kioskSecret:        []byte("dev_secret_kiosk_1234567890"),
@@ -123,7 +122,7 @@ func createTestOrderAndSession(t *testing.T, st *store.Store, kioskID, orderID, 
 }
 
 func TestDemoCheckoutAlwaysUsesXeroxGoPage(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 	const kioskID, orderID = "kiosk-demo-only", "ord_demo_only"
 	sess := createTestOrderAndSession(t, st, kioskID, orderID, "1111", 2, 1000)
@@ -148,7 +147,7 @@ func TestDemoCheckoutAlwaysUsesXeroxGoPage(t *testing.T) {
 }
 
 func TestDemoCheckoutPage_Rendering(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-render-test"
@@ -209,7 +208,7 @@ func TestDemoCheckoutPage_Rendering(t *testing.T) {
 }
 
 func TestDemoCheckoutPage_JSONEndpoint(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-json-test"
@@ -252,7 +251,7 @@ func TestDemoCheckoutPage_JSONEndpoint(t *testing.T) {
 }
 
 func TestDemoCheckoutPage_ExpiredAndAlreadyPaid(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-status-test"
@@ -323,7 +322,7 @@ func TestDemoCheckoutPage_ExpiredAndAlreadyPaid(t *testing.T) {
 }
 
 func TestDemoPaymentSubmit_DispatchedAndIdempotency(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-dispatch-test"
@@ -405,7 +404,7 @@ func TestDemoPaymentSubmit_DispatchedAndIdempotency(t *testing.T) {
 }
 
 func TestDemoPaymentSubmit_AbsentOrExpiredSession_Holding(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-hold-test"
