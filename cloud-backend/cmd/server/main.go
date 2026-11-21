@@ -1226,33 +1226,15 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 	// reservation, and intents; reconnect retries the same immutable JobIDs.
 	if captureRes.DispatchEligible {
 		log.Printf("[PAYMENT] Order %s authorized for print (active session %s)", orderID, captureRes.ActiveSessionID)
-		var dispatchErr error
-		if s.hub == nil {
-			dispatchErr = errors.New("kiosk communication hub unavailable")
-		} else if len(captureRes.Commands) > 0 {
-			for _, cmd := range captureRes.Commands {
-				if err := s.hub.SendJob(r.Context(), cmd); err != nil {
-					dispatchErr = err
-					s.noteDispatchDeliveryFailure(orderID, cmd.JobID, err)
-					break
-				}
-				if err := s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID); err != nil {
-					dispatchErr = err
-					s.noteDispatchDeliveryFailure(orderID, cmd.JobID, err)
-					break
-				}
-			}
-		} else if captureRes.Command != nil {
-			if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-				dispatchErr = err
-				s.noteDispatchDeliveryFailure(orderID, captureRes.Command.JobID, err)
-			} else if err := s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID); err != nil {
-				dispatchErr = err
-				s.noteDispatchDeliveryFailure(orderID, captureRes.Command.JobID, err)
-			}
+		commands := captureRes.Commands
+		if len(commands) == 0 && captureRes.Command != nil {
+			commands = []contracts.PrintJobCommand{*captureRes.Command}
 		}
-		if dispatchErr != nil {
-			log.Printf("[PAYMENT] Order %s paid; transport delivery unresolved, preserving intents for reconnect: %v", orderID, dispatchErr)
+		if err := s.deliverAuthorizedJobs(r.Context(), orderID, commands); err != nil {
+			// Captured money and per-document dispatch intents are durable.
+			// A network write error cannot prove the printer was stopped, and
+			// cannot justify blocking the kiosk or refunding the payment.
+			log.Printf("[PAYMENT] Order %s delivery unresolved; retry on authenticated Pi reconnect: %v", orderID, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"dispatch_pending"}`))
