@@ -423,23 +423,26 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Verify paper supply against other commitments
+	// Revalidate the existing reservation against live stock, but do not
+	// allocate additional paper when opening checkout.
 	committedSheets, cErr := s.db.GetCommittedPaperSheets(r.Context(), kioskID, orderID, now)
-	if cErr == nil {
-		// The order-level total is authoritative; do not assume a single sheet.
-		if ord.TotalSheets <= 0 {
-			http.Error(w, "invalid order sheet count", http.StatusInternalServerError)
-			return
-		}
-		if (stock - committedSheets) < ord.TotalSheets {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "insufficient paper in kiosk tray to fulfill order",
-				"code":  "INSUFFICIENT_PAPER",
-			})
-			return
-		}
+	if cErr != nil {
+		log.Printf("[PAYMENT] Unable to verify paper commitments: %v", cErr)
+		http.Error(w, "unable to verify reserved paper", http.StatusServiceUnavailable)
+		return
+	}
+	if ord.TotalSheets <= 0 {
+		http.Error(w, "invalid order sheet count", http.StatusInternalServerError)
+		return
+	}
+	if stock-committedSheets < ord.TotalSheets {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "insufficient paper in kiosk tray to fulfill order",
+			"code": "INSUFFICIENT_PAPER",
+		})
+		return
 	}
 
 	// Idempotency: check if an active, unexpired payment attempt already exists for this session
