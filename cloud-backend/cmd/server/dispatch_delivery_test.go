@@ -63,6 +63,11 @@ func TestDispatchDelivery_OfflinePaymentReconnectsWithoutRefundOrDoublePrint(t *
 	if err != nil || len(intents)!=1 || intents[0].Status!="PENDING" {
 		t.Fatalf("durable intent was removed before reconnect: %+v %v",intents,err)
 	}
+	pendingStatus := statusForOrder(t,app,orderID)
+	if pendingStatus.Status != "DISPATCHED" || !pendingStatus.DispatchPending ||
+		pendingStatus.AwaitingDelivery != 1 {
+		t.Fatalf("paid offline order must advertise queued delivery, not printing: %+v",pendingStatus)
+	}
 	if got := sendWebhook(); got != "already_processed" {
 		t.Fatalf("duplicate provider notification must not send again: %q",got)
 	}
@@ -103,6 +108,10 @@ func TestDispatchDelivery_OfflinePaymentReconnectsWithoutRefundOrDoublePrint(t *
 		time.Sleep(10*time.Millisecond)
 	}
 	if status!="ACKNOWLEDGED"{t.Fatalf("durable Pi ack not received: %q %v",status,err)}
+	deliveredStatus := statusForOrder(t,app,orderID)
+	if deliveredStatus.DispatchPending || deliveredStatus.AwaitingDelivery != 0 {
+		t.Fatalf("acknowledged Pi delivery still shown as queued: %+v",deliveredStatus)
+	}
 	pending,err:=st.GetPendingDispatchOrders(context.Background(),kioskID)
 	if err!=nil || len(pending)!=0 {
 		t.Fatalf("acknowledged job would be redundantly sent: %+v %v",pending,err)
