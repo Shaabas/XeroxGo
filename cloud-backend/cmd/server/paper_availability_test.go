@@ -163,9 +163,18 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		t.Fatalf("expected 409 Conflict when jammed, got %d", res2.StatusCode)
 	}
 	_ = json.NewDecoder(res2.Body).Decode(&errResp)
-	if errResp["code"] != "PRINTER_ERROR" {
-		t.Errorf("code = %s, want PRINTER_ERROR", errResp["code"])
+	if errResp["code"] != "PRINTER_ERROR" && errResp["code"] != "KIOSK_OUT_OF_SERVICE" {
+		t.Errorf("code = %s, want hardware fault or sticky kiosk outage", errResp["code"])
 	}
+
+	// The cloud latches a physical jam until a human restores the kiosk.
+	// Test subsequent paper conditions independently after explicit simulated
+	// attendant clearance (production requires operator credentials).
+	blocked, _, err := st.GetKioskBlock(ctx, kioskID)
+	if err != nil || !blocked {
+		t.Fatalf("hardware jam must latch kiosk out of service: blocked=%v err=%v", blocked, err)
+	}
+	if err := st.ClearKioskBlock(ctx, kioskID); err != nil { t.Fatal(err) }
 
 	// 3. Connect/update with Tray UNKNOWN -> HTTP 409 Conflict (PAPER_UNKNOWN)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
