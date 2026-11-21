@@ -30,12 +30,6 @@
 - Kiosk "Esc" exits the checkout session; it is not a command to delete the customer's pending mobile order.
 - There is no legacy paper-count fallback or automatic migration of historic development records with missing totals.
 
-## Public payment rollout gate
-
-- Real-provider payment initiation for orders with more than one document is **disabled by default**. The server rejects it with HTTP 409 and code `MULTIDOC_PAYMENTS_DISABLED` before creating a provider payment or local payment attempt.
-- After explicit hardware verification and authorization, an operator may deliberately set `XEROXGO_ENABLE_PUBLIC_MULTIDOC_PAYMENTS=true` on the cloud backend. No other value enables it. Development/demo mode alone never overrides the real-provider gate.
-- Mock-provider multi-document checkout and single-document payments remain available. The gate does not change already captured payments, refunds, dispatch intents, or recovery.
-
 ## Testing
 
 - Mobile upload rejects offline/stale/insufficient printer stock without issuing any PIN.
