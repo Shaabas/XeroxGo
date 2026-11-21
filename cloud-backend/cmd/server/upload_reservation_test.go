@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
 	"xeroxgo/pkg/contracts"
 )
 
