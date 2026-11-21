@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -71,6 +72,23 @@ func TestMobileUploadReservesLastSheetBeforeIssuingPIN(t *testing.T) {
 	pin, ok := first["display_code"].(string)
 	if !ok || len(pin) != 4 || first["total_sheets"] != float64(1) {
 		t.Fatalf("PIN must be issued only after reserving 1 sheet: %v", first)
+	}
+
+	// The PIN and the logical paper reservation both expire at five minutes.
+	expiryText, ok := first["pin_expires_at"].(string)
+	if !ok { t.Fatalf("upload did not return PIN expiry: %v", first) }
+	expiry, err := time.Parse(time.RFC3339, expiryText)
+	if err != nil { t.Fatal(err) }
+	if remaining := time.Until(expiry); remaining < 4*time.Minute+45*time.Second || remaining > customerPINValidity+time.Second {
+		t.Fatalf("PIN validity should be five minutes, remaining=%v", remaining)
+	}
+	reserved, err := app.db.GetCommittedPaperSheets(context.Background(), "kiosk-mobile-stock", "", expiry.Add(-time.Nanosecond))
+	if err != nil || reserved != 1 {
+		t.Fatalf("expected one reserved sheet before PIN expiry: reserved=%d err=%v", reserved, err)
+	}
+	released, err := app.db.GetCommittedPaperSheets(context.Background(), "kiosk-mobile-stock", "", expiry.Add(time.Nanosecond))
+	if err != nil || released != 0 {
+		t.Fatalf("PIN expiration must free unpaid sheets: reserved=%d err=%v", released, err)
 	}
 
 	status, second := postOrder()
