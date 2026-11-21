@@ -2104,11 +2104,19 @@
     if (!statusData || !checkoutLiveStatusBox) return;
     const st = statusData.status || '';
 
-    if (statusData.pin_expires_at) {
-      const parsed = Date.parse(statusData.pin_expires_at);
-      if (!isNaN(parsed)) {
-        authoritativeExpiryMs = parsed;
+    // The five-minute clock is for UNPAID orders only. Verified payment
+    // creates a durable fulfillment/refund obligation, not another deadline.
+    if (st && st !== 'PENDING_PAYMENT' && st !== 'EXPIRED') {
+      authoritativeExpiryMs = 0;
+      if (expiryCountdownTimer) {
+        clearInterval(expiryCountdownTimer);
+        expiryCountdownTimer = null;
       }
+      if (pinExpiryText) pinExpiryText.classList.add('hidden');
+    } else if (statusData.pin_expires_at) {
+      const parsed = Date.parse(statusData.pin_expires_at);
+      if (!isNaN(parsed)) authoritativeExpiryMs = parsed;
+      if (pinExpiryText) pinExpiryText.classList.remove('hidden');
     }
 
     if (st === 'EXPIRED') {
@@ -2146,7 +2154,17 @@
       if (st === 'PRINTING') {
         checkoutStatusMsg.textContent = `Printing page ${statusData.pages_printed || 1} of ${statusData.total_pages || 1}...`;
       } else if (st === 'COMPLETED') {
-        checkoutStatusMsg.textContent = 'Your documents have finished printing!';
+        checkoutStatusMsg.textContent = 'Printing completed. Collect your documents.';
+      } else if (st === 'REFUND_REQUIRED') {
+        checkoutStatusMsg.textContent = 'Printing failed. You may leave; the kiosk is being stopped safely before a full refund is submitted.';
+      } else if (st === 'REFUND_PENDING') {
+        checkoutStatusMsg.textContent = 'A full refund has been requested from the payment provider. You may leave; the refund status will be updated.';
+      } else if (st === 'REFUND_RETRYING') {
+        checkoutStatusMsg.textContent = 'Refund processing is delayed. XeroxGo will retry automatically; your payment has not been forgotten.';
+      } else if (st === 'REFUNDED') {
+        checkoutStatusMsg.textContent = 'Your refund has been processed by the payment provider. Bank settlement may take additional time.';
+      } else if (st === 'PAUSED_ERROR' || st === 'FAILED_REFUNDABLE') {
+        checkoutStatusMsg.textContent = 'Printing interrupted. Please leave the kiosk to the attendant; your order will be reviewed for a refund.';
       } else {
         checkoutStatusMsg.textContent = '';
       }
