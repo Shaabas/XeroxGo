@@ -63,7 +63,10 @@ func (p *RazorpayProvider) GetRefund(ctx context.Context, refundID string) (Refu
 	if resp.StatusCode != http.StatusOK {
 		return RefundResult{}, fmt.Errorf("razorpay fetch refund HTTP %d", resp.StatusCode)
 	}
-	return parseRefundResponse(raw, "", 0)
+	result, err := parseRefundResponse(raw, "", 0)
+	if err != nil { return RefundResult{}, err }
+	if result.ID != refundID { return RefundResult{}, errors.New("razorpay refund ID mismatch") }
+	return result, nil
 }
 
 func parseRefundResponse(raw []byte, expectedPaymentID string, expectedAmount int64) (RefundResult, error) {
