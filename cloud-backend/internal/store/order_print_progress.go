@@ -24,8 +24,7 @@ type OrderPrintProgress struct {
 
 // GetOrderPrintProgress aggregates only child jobs belonging to this order.
 // One SQL statement gives a consistent snapshot of document counts, physical
-// progress, and the latest non-empty error. Legacy orders with zero child
-// records must use GetJobProgress on their original job ID instead.
+// progress, and the latest non-empty error for canonical child documents.
 func (s *Store) GetOrderPrintProgress(ctx context.Context, orderID string) (OrderPrintProgress, error) {
 	if s == nil || s.db == nil {
 		return OrderPrintProgress{}, errors.New("store not initialized")

@@ -28,10 +28,6 @@ func TestAdsAndAdminAuth(t *testing.T) {
 	}
 	defer s.Close()
 
-	// 1. Test SeedDefaultAds
-	if err := s.SeedDefaultAds(ctx); err != nil {
-		t.Fatalf("SeedDefaultAds failed: %v", err)
-	}
 	ads, err := s.GetActiveAds(ctx)
 	if err != nil {
 		t.Fatalf("GetActiveAds failed: %v", err)

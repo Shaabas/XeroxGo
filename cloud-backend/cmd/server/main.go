@@ -980,9 +980,6 @@ func main() {
 	// Initialize default promo ads & bootstrap admin user
 	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer bootstrapCancel()
-	if err := storeDB.SeedDefaultAds(bootstrapCtx); err != nil {
-		log.Printf("[WARN] Failed to seed default ads: %v", err)
-	}
 	adminUser := os.Getenv("XEROXGO_ADMIN_USER")
 	if adminUser == "" {
 		adminUser = "admin"

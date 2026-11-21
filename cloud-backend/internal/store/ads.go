@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -26,38 +25,8 @@ func hashPassword(password string) (string, error) {
 	return string(bytes), nil
 }
 
-func computeIteratedHash(password, salt string, iterations int) string {
-	h := sha256.New()
-	h.Write([]byte(salt + ":" + password))
-	digest := h.Sum(nil)
-	for i := 1; i < iterations; i++ {
-		h.Reset()
-		h.Write(digest)
-		digest = h.Sum(nil)
-	}
-	return hex.EncodeToString(digest)
-}
-
 func verifyPassword(password, storedHash string) bool {
-	// Standard bcrypt hash verification ($2a$, $2b$, $2y$)
-	if strings.HasPrefix(storedHash, "$2") {
-		return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
-	}
-
-	// Backward-compatible fallback for legacy $sha256$ hashes
-	parts := strings.Split(storedHash, "$")
-	if len(parts) == 5 && parts[1] == "sha256" {
-		var iterations int
-		if _, err := fmt.Sscanf(parts[2], "%d", &iterations); err != nil || iterations < 1 {
-			return false
-		}
-		salt := parts[3]
-		expectedHash := parts[4]
-		actualHash := computeIteratedHash(password, salt, iterations)
-		return subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) == 1
-	}
-
-	return false
+	return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
 }
 
 func hashToken(token string) string {
@@ -70,7 +39,7 @@ var systemDefaultAds = []contracts.AdItem{
 	{
 		ID:          "ad-quick-easy",
 		Title:       "Quick & Easy",
-		Description: "Direct UPI payment. No coins, no cash needed.",
+		Description: "Secure demo checkout for your printing session.",
 		Type:        contracts.AdTypeGradient,
 		GradientC0:  "#1E3A8A",
 		GradientC1:  "#2563EB",
@@ -115,18 +84,6 @@ func GetSystemDefaultAds() []contracts.AdItem {
 
 func isSystemDefaultAdID(id string) bool {
 	return id == "ad-quick-easy" || id == "ad-high-quality" || id == "ad-skip-queue"
-}
-
-// SeedDefaultAds cleans up legacy seeded default ad IDs from the custom ads table.
-// Default ads are now permanent system fallbacks and not stored as custom ads.
-func (s *Store) SeedDefaultAds(ctx context.Context) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("seed ads: store is closed or nil")
-	}
-
-	q := s.rebind("DELETE FROM ads WHERE id IN ('ad-quick-easy', 'ad-high-quality', 'ad-skip-queue')")
-	_, err := s.db.ExecContext(ctx, q)
-	return err
 }
 
 // BootstrapAdmin creates the initial admin user if none exists.
