@@ -225,3 +225,40 @@ func TestPaymentLedger_WrongAmountCaptureRefundedNotApplied(t *testing.T) {
 		t.Fatalf("wrong amount should be independently refunded in full: %+v %v",ready,err)
 	}
 }
+
+
+func TestPaymentLedger_RestartBackfillsWrongAmountWithoutFundingOrder(t *testing.T) {
+	dbPath:=filepath.Join(t.TempDir(),"wrong_amount_restart.db")
+	s,err:=Open(dbPath)
+	if err!=nil{t.Fatal(err)}
+	ctx:=context.Background()
+	now:=time.Now().UTC()
+	const orderID,kioskID="ord_restart_wrong_amount","kiosk_restart_wrong_amount"
+	createTestOrderWithSheets(t,s,ctx,orderID,kioskID,"3295",2,contracts.JobStatusPendingPayment,now)
+	_,err=s.db.ExecContext(ctx,s.rebind(`
+INSERT INTO payments(payment_id,order_id,kiosk_id,session_id,amount_paise,status,provider,created_at_ns)
+VALUES(?,?,?,'',100,'captured','mock',?);`),
+		"pay_wrong_restart",orderID,kioskID,now.UnixNano())
+	if err!=nil{t.Fatal(err)}
+	if err:=s.Close();err!=nil{t.Fatal(err)}
+	s,err=Open(dbPath)
+	if err!=nil{t.Fatal(err)}
+	defer s.Close()
+	var funded int
+	if err:=s.db.QueryRowContext(ctx,"SELECT COUNT(*) FROM order_funding_payments WHERE order_id=?",orderID).Scan(&funded);err!=nil{
+		t.Fatal(err)
+	}
+	if funded!=0{t.Fatal("restart wrongly turned underpayment into print authorization")}
+	ready,err:=s.ListActionableRefunds(ctx,now.Add(time.Hour))
+	if err!=nil||len(ready)!=1||ready[0].PaymentID!="pay_wrong_restart"||
+		ready[0].Reason!=RefundReasonExcess||ready[0].AmountPaise!=100{
+		t.Fatalf("restart lost underpayment refund: %+v %v",ready,err)
+	}
+	exact,err:=s.CapturePaymentAndCheckDispatch(ctx,PaymentRecord{
+		PaymentID:"pay_correct_restart",OrderID:orderID,KioskID:kioskID,
+		AmountPaise:400,Status:"captured",Provider:"mock",
+	},now.Add(time.Second))
+	if err!=nil||exact.ExcessCapture||exact.OrderStatus!=contracts.JobStatusPaidWaiting{
+		t.Fatalf("later legitimate payment not accepted: %+v %v",exact,err)
+	}
+}
