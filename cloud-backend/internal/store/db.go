@@ -245,12 +245,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
     bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
         CHECK (bw_simplex_price_paise > 0),
     bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
@@ -374,6 +368,7 @@ CREATE TABLE IF NOT EXISTS kiosk_sessions (
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';
 
 CREATE TABLE IF NOT EXISTS payments (
     payment_id TEXT PRIMARY KEY,
@@ -433,80 +428,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			return nil, fmt.Errorf("open store: postgres schema init: %w", err)
 		}
 
-		pgMigrations := []string{
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
-			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS pin_expires_at_ns BIGINT NOT NULL DEFAULT 0;",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_pages INTEGER NOT NULL DEFAULT 0;",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_sheets INTEGER NOT NULL DEFAULT 0;",
-			"CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);",
-			"CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);",
-			"CREATE TABLE IF NOT EXISTS order_documents (job_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, document_index INTEGER NOT NULL CHECK (document_index >= 0), original_filename TEXT NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, total_pages INTEGER NOT NULL CHECK (total_pages > 0), total_sheets INTEGER NOT NULL CHECK (total_sheets > 0), copies INTEGER NOT NULL CHECK (copies > 0), duplex TEXT NOT NULL, color_mode TEXT NOT NULL DEFAULT 'BW', page_range TEXT NOT NULL DEFAULT '', orientation TEXT NOT NULL DEFAULT 'AUTO', pages_per_sheet INTEGER NOT NULL DEFAULT 1, price_paise BIGINT NOT NULL CHECK (price_paise >= 0), status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(order_id, document_index));",
-			"CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);",
-			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
-			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
-			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS recovery_records (recovery_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, kiosk_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, confirmed_sheets_printed INTEGER NOT NULL, remaining_pages INTEGER NOT NULL, remaining_sheets INTEGER NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(job_id, sequence_id));",
-			"CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);",
-			"CREATE TABLE IF NOT EXISTS pin_reservations (kiosk_id TEXT NOT NULL, pin TEXT NOT NULL, order_id TEXT NOT NULL, expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, PRIMARY KEY (kiosk_id, pin));",
-			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_order ON pin_reservations (order_id);",
-			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_expiry ON pin_reservations (kiosk_id, expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS pin_rate_limits (kiosk_id TEXT PRIMARY KEY, failed_attempts INTEGER NOT NULL DEFAULT 0, first_failure_ns BIGINT NOT NULL DEFAULT 0, last_failure_ns BIGINT NOT NULL DEFAULT 0, blocked_until_ns BIGINT NOT NULL DEFAULT 0, updated_at_ns BIGINT NOT NULL DEFAULT 0);",
-			"CREATE TABLE IF NOT EXISTS kiosk_sessions (session_id TEXT PRIMARY KEY, kiosk_id TEXT NOT NULL, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, status TEXT NOT NULL, price_paise BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
-			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, created_at_ns BIGINT NOT NULL);",
-			"CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';",
-			"CREATE TABLE IF NOT EXISTS dispatch_intents (job_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, dispatched_at_ns BIGINT NOT NULL DEFAULT 0, acknowledged_at_ns BIGINT NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');",
-			"ALTER TABLE dispatch_intents ADD COLUMN IF NOT EXISTS acknowledged_at_ns BIGINT NOT NULL DEFAULT 0;",
-			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);",
-			"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_name = 'dispatch_intents' AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = 'job_id') THEN ALTER TABLE dispatch_intents DROP CONSTRAINT IF EXISTS dispatch_intents_pkey; ALTER TABLE dispatch_intents ADD PRIMARY KEY (job_id); END IF; END $$;",
-			"ALTER TABLE job_progress DROP CONSTRAINT IF EXISTS job_progress_job_id_fkey;",
-			"ALTER TABLE recovery_records DROP CONSTRAINT IF EXISTS recovery_records_job_id_fkey;",
-			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', demo_token TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
-			"ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS demo_token TEXT NOT NULL DEFAULT '';",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order_id);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (session_id);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);",
-		}
-
-		// Preflight check: detect existing duplicate active sessions before migrating.
-		// Fail closed on any database query error or if duplicate active sessions exist.
-		var dupActiveSessions int
-		if err := db.QueryRowContext(ctx, `
-SELECT COUNT(1) FROM (
-    SELECT order_id FROM kiosk_sessions 
-    WHERE status = 'PAYMENT_PENDING' 
-    GROUP BY order_id 
-    HAVING COUNT(1) > 1
-) dups;
-`).Scan(&dupActiveSessions); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("open store: postgres migration preflight query failed: %w", err)
-		}
-		if dupActiveSessions > 0 {
-			_ = db.Close()
-			return nil, fmt.Errorf("open store: postgres migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
-		}
-
-		for _, mig := range pgMigrations {
-			if _, err := db.Exec(mig); err != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("open store: postgres migration: %w", err)
-			}
-		}
-
+		
 		store := &Store{db: db, dialect: "postgres"}
 		if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
 			_ = db.Close()
@@ -623,12 +545,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
     bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
         CHECK (bw_simplex_price_paise > 0),
     bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
@@ -718,190 +634,6 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
-`
-	if _, err := db.Exec(schema); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open store: create schema: %w", err)
-	}
-
-	if err := migrateSQLiteSchema(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open store: sqlite migration: %w", err)
-	}
-
-	store := &Store{db: db, dialect: "sqlite"}
-	if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open store: fulfillment schema: %w", err)
-	}
-	return store, nil
-}
-
-func migrateSQLiteSchema(db *sql.DB) error {
-	colsPricing := make(map[string]bool)
-	rows, err := db.Query("PRAGMA table_info(pricing);")
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsPricing[name] = true
-			}
-		}
-		_ = rows.Close()
-	}
-	if !colsPricing["bw_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["color_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["bw_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["bw_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 150;")
-	}
-	if !colsPricing["color_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["color_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 750;")
-	}
-	if !colsPricing["color_enabled"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_enabled INTEGER NOT NULL DEFAULT 0;")
-	}
-
-	colsConfigs := make(map[string]bool)
-	rowsCfg, err := db.Query("PRAGMA table_info(print_configs);")
-	if err == nil {
-		for rowsCfg.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rowsCfg.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsConfigs[name] = true
-			}
-		}
-		_ = rowsCfg.Close()
-	}
-	if !colsConfigs["color_mode"] {
-		_, _ = db.Exec("ALTER TABLE print_configs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
-	}
-
-	colsOrders := make(map[string]bool)
-	rowsOrd, err := db.Query("PRAGMA table_info(orders);")
-	if err == nil {
-		for rowsOrd.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rowsOrd.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsOrders[name] = true
-			}
-		}
-		_ = rowsOrd.Close()
-	}
-	if !colsOrders["pin_expires_at_ns"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN pin_expires_at_ns INTEGER NOT NULL DEFAULT 0;")
-	}
-	if !colsOrders["claim_token"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';")
-	}
-	if !colsOrders["total_pages"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN total_pages INTEGER NOT NULL DEFAULT 0;")
-	}
-	if !colsOrders["total_sheets"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN total_sheets INTEGER NOT NULL DEFAULT 0;")
-	}
-	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);")
-	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);")
-
-	_, _ = db.Exec(`
-CREATE TABLE IF NOT EXISTS order_documents (
-    job_id TEXT PRIMARY KEY,
-    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
-    document_index INTEGER NOT NULL CHECK (document_index >= 0),
-    original_filename TEXT NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
-    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
-    copies INTEGER NOT NULL CHECK (copies > 0),
-    duplex TEXT NOT NULL,
-    color_mode TEXT NOT NULL DEFAULT 'BW',
-    page_range TEXT NOT NULL DEFAULT '',
-    orientation TEXT NOT NULL DEFAULT 'AUTO',
-    pages_per_sheet INTEGER NOT NULL DEFAULT 1,
-    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(order_id, document_index)
-);
-CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);
-`)
-
-	// Preflight check: detect existing duplicate active sessions before migrating SQLite.
-	// Must fail closed on any database query error or if duplicate active sessions exist.
-	var tableCount int
-	if err := db.QueryRow("SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='kiosk_sessions';").Scan(&tableCount); err != nil {
-		return fmt.Errorf("open store: sqlite check kiosk_sessions table: %w", err)
-	}
-	if tableCount > 0 {
-		var dupActiveSessions int
-		if err := db.QueryRow(`
-SELECT COUNT(1) FROM (
-    SELECT order_id FROM kiosk_sessions 
-    WHERE status = 'PAYMENT_PENDING' 
-    GROUP BY order_id 
-    HAVING COUNT(1) > 1
-) dups;
-`).Scan(&dupActiveSessions); err != nil {
-			return fmt.Errorf("open store: sqlite migration preflight failed: %w", err)
-		}
-		if dupActiveSessions > 0 {
-			return fmt.Errorf("open store: sqlite migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
-		}
-	}
-
-	_, _ = db.Exec(`
-CREATE TABLE IF NOT EXISTS conversions (
-    id TEXT PRIMARY KEY,
-    token TEXT NOT NULL,
-    original_filename TEXT NOT NULL,
-    file_size BIGINT NOT NULL,
-    status TEXT NOT NULL,
-    error_message TEXT NOT NULL DEFAULT '',
-    input_path TEXT NOT NULL,
-    output_path TEXT NOT NULL DEFAULT '',
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    expires_at_ns BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
-CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
-
-CREATE TABLE IF NOT EXISTS recovery_records (
-    recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL,
-    kiosk_id TEXT NOT NULL,
-    sequence_id INTEGER NOT NULL,
-    confirmed_sheets_printed INTEGER NOT NULL,
-    remaining_pages INTEGER NOT NULL,
-    remaining_sheets INTEGER NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(job_id, sequence_id)
-);
-CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS pin_reservations (
     kiosk_id TEXT NOT NULL,
@@ -989,133 +721,19 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (ses
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);
-`)
-
-	colsDispatch := make(map[string]bool)
-	jobIdIsPK := false
-	rowsDisp, err := db.Query("PRAGMA table_info(dispatch_intents);")
-	if err != nil {
-		return fmt.Errorf("open store: sqlite inspect dispatch_intents: %w", err)
-	}
-	for rowsDisp.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt *string
-		if err := rowsDisp.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rowsDisp.Close()
-			return fmt.Errorf("open store: sqlite scan dispatch_intents column info: %w", err)
-		}
-		colsDispatch[name] = true
-		if name == "job_id" && pk == 1 {
-			jobIdIsPK = true
-		}
-	}
-	if err := rowsDisp.Err(); err != nil {
-		_ = rowsDisp.Close()
-		return fmt.Errorf("open store: sqlite iterate dispatch_intents column info: %w", err)
-	}
-	_ = rowsDisp.Close()
-
-	if len(colsDispatch) > 0 && !jobIdIsPK {
-		var dupJobs int
-		if err := db.QueryRow("SELECT COUNT(1) FROM (SELECT job_id FROM dispatch_intents GROUP BY job_id HAVING COUNT(1) > 1);").Scan(&dupJobs); err != nil {
-			return fmt.Errorf("open store: sqlite preflight dispatch_intents duplicate check: %w", err)
-		}
-		if dupJobs > 0 {
-			return fmt.Errorf("open store: sqlite migration failed: found %d duplicate job_id records in dispatch_intents; manual resolution required", dupJobs)
-		}
-
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("open store: sqlite begin dispatch_intents migration tx: %w", err)
-		}
-		defer tx.Rollback()
-
-		migrationSQL := `
-CREATE TABLE dispatch_intents_new (
-    job_id TEXT PRIMARY KEY,
-    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
-    kiosk_id TEXT NOT NULL,
-    session_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    dispatched_at_ns BIGINT NOT NULL DEFAULT 0,
-    acknowledged_at_ns BIGINT NOT NULL DEFAULT 0,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT NOT NULL DEFAULT ''
-);
-INSERT INTO dispatch_intents_new (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error)
-SELECT job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error
-FROM dispatch_intents;
-DROP TABLE dispatch_intents;
-ALTER TABLE dispatch_intents_new RENAME TO dispatch_intents;
-CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
-CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';
 `
-		if _, err := tx.Exec(migrationSQL); err != nil {
-			return fmt.Errorf("open store: sqlite execute dispatch_intents migration: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("open store: sqlite commit dispatch_intents migration: %w", err)
-		}
-		colsDispatch["acknowledged_at_ns"] = true
+	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: create schema: %w", err)
 	}
 
-	if len(colsDispatch) > 0 && !colsDispatch["acknowledged_at_ns"] {
-		if _, err := db.Exec("ALTER TABLE dispatch_intents ADD COLUMN acknowledged_at_ns INTEGER NOT NULL DEFAULT 0;"); err != nil {
-			return fmt.Errorf("open store: sqlite add acknowledged_at_ns column: %w", err)
-		}
+	store := &Store{db: db, dialect: "sqlite"}
+	if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: fulfillment schema: %w", err)
 	}
-	if _, err := db.Exec("UPDATE dispatch_intents SET status = 'PENDING' WHERE status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL);"); err != nil {
-		return fmt.Errorf("open store: sqlite reset unacknowledged dispatch intents: %w", err)
-	}
-
-	colsPayAttempts := make(map[string]bool)
-	rowsPay, err := db.Query("PRAGMA table_info(payment_attempts);")
-	if err != nil {
-		return fmt.Errorf("open store: sqlite inspect payment_attempts: %w", err)
-	}
-	for rowsPay.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt *string
-		if err := rowsPay.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rowsPay.Close()
-			return fmt.Errorf("open store: sqlite scan payment_attempts column info: %w", err)
-		}
-		colsPayAttempts[name] = true
-	}
-	if err := rowsPay.Err(); err != nil {
-		_ = rowsPay.Close()
-		return fmt.Errorf("open store: sqlite iterate payment_attempts column info: %w", err)
-	}
-	_ = rowsPay.Close()
-
-	if len(colsPayAttempts) > 0 && !colsPayAttempts["demo_token"] {
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("open store: sqlite begin payment_attempts migration: %w", err)
-		}
-		defer tx.Rollback()
-		if _, err := tx.Exec("ALTER TABLE payment_attempts ADD COLUMN demo_token TEXT NOT NULL DEFAULT '';"); err != nil {
-			return fmt.Errorf("open store: sqlite add demo_token column: %w", err)
-		}
-		if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);"); err != nil {
-			return fmt.Errorf("open store: sqlite create idx_payment_attempts_demo_token: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("open store: sqlite commit payment_attempts migration: %w", err)
-		}
-	}
-
-	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';"); err != nil {
-		return fmt.Errorf("open store: sqlite create idx_kiosk_sessions_active_order: %w", err)
-	}
-
-	return nil
+	return store, nil
 }
 
 // Close closes the underlying SQLite database connection.
