@@ -770,7 +770,7 @@ func (s *appServer) handleRecoveryPIN(w http.ResponseWriter, r *http.Request) {
 	// Generate fresh 4-digit PIN with collision retry
 	const maxRetries = 25
 	var newPIN string
-	newExpiry := time.Now().UTC().Add(15 * time.Minute)
+	newExpiry := time.Now().UTC().Add(customerPINValidity)
 	renewed := false
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
