@@ -13,6 +13,10 @@ import (
 // 2100 is within Go's signed nanosecond range and provides a durable PIN lease.
 var paidPINDeadline = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 
+// PaidPINExpiry is used when securely rotating a paid order's lost/expired PIN.
+// It is NOT a payment session timeout and is revoked at fulfillment closure.
+func PaidPINExpiry() time.Time { return paidPINDeadline }
+
 // A refund must not be submitted until the Pi has confirmed that every CUPS
 // job for the affected order is canceled, aborted, or was never submitted.
 // A jammed/held job is NOT a safe-stop confirmation.
