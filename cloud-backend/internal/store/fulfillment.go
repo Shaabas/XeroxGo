@@ -331,3 +331,24 @@ ORDER BY p.created_at_ns ASC LIMIT 1;`),
 	if err := tx.Commit(); err != nil { return false, err }
 	return true, nil
 }
+
+type KioskServiceFlag struct {
+	KioskID      string `json:"kiosk_id"`
+	Reason       string `json:"reason"`
+	UpdatedAtNS  int64  `json:"updated_at_ns"`
+}
+
+func (s *Store) ListOutOfServiceKiosks(ctx context.Context) ([]KioskServiceFlag, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT kiosk_id, reason, updated_at_ns FROM kiosk_service_flags
+WHERE out_of_service = 1 ORDER BY updated_at_ns DESC LIMIT 100;`)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	list := make([]KioskServiceFlag, 0)
+	for rows.Next() {
+		var x KioskServiceFlag
+		if err := rows.Scan(&x.KioskID, &x.Reason, &x.UpdatedAtNS); err != nil { return nil, err }
+		list = append(list, x)
+	}
+	return list, rows.Err()
+}
