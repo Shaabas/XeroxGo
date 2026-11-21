@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -67,4 +71,53 @@ func TestRefundWorker_ExcessCaptureIsRefundedOnceWithoutStoppingPrinting(t *test
 	}
 	if err := app.processRefundsOnce(ctx); err != nil { t.Fatal(err) }
 	if mock.RefundedCount != 1 { t.Fatalf("refund duplicated on repeated worker run: %d",mock.RefundedCount) }
+}
+
+func TestPaymentWebhook_KnownAttemptWrongAmountCreatesRefundOnly(t *testing.T) {
+	app, _, st, _ := setupPaperTestServer(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const orderID, kioskID = "ord_webhook_amount", "kiosk_webhook_amount"
+	order := store.Order{
+		OrderID: orderID, Status: contracts.JobStatusPendingPayment,
+		PricePaise: 400, PINExpiresAt: now.Add(5*time.Minute),
+		Command: contracts.PrintJobCommand{
+			JobID: "job_webhook_amount", OrderID: orderID, KioskID: kioskID,
+			DisplayCode: "2783", TotalPages: 2, TotalSheets: 2,
+			Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+		},
+	}
+	if err := st.CreateOrder(ctx, order); err != nil { t.Fatal(err) }
+	session, err := st.CreateOrGetKioskSession(ctx,kioskID,orderID,5*time.Minute,now)
+	if err != nil { t.Fatal(err) }
+	attempt := store.PaymentAttempt{
+		AttemptID: "att_wrong_amount", OrderID: orderID, KioskID: kioskID,
+		SessionID: session.SessionID, Provider: "mock",
+		ProviderOrderID: "mock_order_wrong_amount", AmountPaise: 400,
+		Currency: "INR", Status: "CREATED", ExpiresAt: now.Add(5*time.Minute),
+	}
+	if err := st.CreatePaymentAttempt(ctx, attempt); err != nil { t.Fatal(err) }
+	raw := []byte(`{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_webhook_wrong_amount","order_id":"mock_order_wrong_amount","amount":100,"currency":"INR","status":"captured"}}}}`)
+	mac := hmac.New(sha256.New, app.cfg.webhookSecret)
+	_, _ = mac.Write(raw)
+	req := httptest.NewRequest(http.MethodPost,"/api/webhooks/razorpay",bytes.NewReader(raw))
+	req.Header.Set("X-Razorpay-Signature",hex.EncodeToString(mac.Sum(nil)))
+	w := httptest.NewRecorder()
+	app.handleRazorpayWebhook(w,req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("signed amount mismatch should be accounted and refunded, got %d: %s",w.Code,w.Body.String())
+	}
+	var status map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(),&status);err!=nil{t.Fatal(err)}
+	if status["status"]!="excess_payment_refund_required"{
+		t.Fatalf("wrong amount was not classified as refund-only: %+v",status)
+	}
+	orderAfter,err:=st.GetOrder(ctx,orderID)
+	if err!=nil||orderAfter.Status!=contracts.JobStatusPendingPayment{
+		t.Fatalf("wrong amount authorized printing: %+v %v",orderAfter,err)
+	}
+	ready,err:=st.ListActionableRefunds(ctx,now.Add(time.Hour))
+	if err!=nil||len(ready)!=1||ready[0].PaymentID!="pay_webhook_wrong_amount"||ready[0].AmountPaise!=100{
+		t.Fatalf("wrong amount missing from financial ledger: %+v %v",ready,err)
+	}
 }
