@@ -19,6 +19,38 @@ is necessary for the refund worker to run.
   authorize a duplicate print.
 - Paid orders do not lose their paper commitment when an unpaid PIN would expire.
 
+## Paid dispatch transport and reconnect
+
+- Payment capture atomically records **one print authorization** plus a
+  `PENDING` intent for each child document. It does **not** prove the Pi
+  received a command or that the printer started printing.
+- A WebSocket disconnect, unavailable cloud hub, failed write, or failed
+  persistence of `SENT` is **delivery uncertainty**, not a printer fault.
+  Such an event must never block a healthy kiosk or create a
+  `FULFILLMENT_FAILED` refund obligation.
+- The webhook acknowledges an already captured payment with
+  `dispatch_pending` when immediate transport fails. Paid kiosk release
+  responds HTTP 202 with `DISPATCH_PENDING`; the kiosk client treats this
+  as durably accepted for eventual delivery, not as proof of printing.
+- On the next authenticated Pi WebSocket connection, previously `SENT`
+  but unacknowledged intents revert to `PENDING`. The cloud resends their
+  immutable child JobIDs. The Pi's durable SQLite deduplication prevents
+  accepted jobs from being submitted twice to CUPS; confirmed
+  `ACKNOWLEDGED` and `COMPLETED` jobs are never replayed.
+- Delivery errors are recorded in the intent's `last_error` and retry
+  counter, without discarding its physical-print authorization. An
+  interrupted multi-document send preserves all sibling intents.
+- Reconnect verifies the **funding payment**, not whichever captured
+  payment arrived most recently; an excess capture (including mismatched
+  amount) cannot block legitimate print delivery.
+- Real printer faults and safe-stop failures remain separate terminal
+  safety paths. Existing orders previously latched out-of-service or
+  marked for refund must be reviewed individually before any remediation;
+  a deployment does not blindly un-block or reverse a provider refund.
+- A valid authenticated session must have authorized the initial dispatch.
+  A payment arriving after a canceled/expired session remains
+  `PAID_WAITING` until the customer explicitly reclaims it.
+
 ## Physical-fault to refund sequence
 
 1. Pi reports jam/cover/output fault or job `PAUSED_ERROR`.
