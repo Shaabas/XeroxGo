@@ -98,6 +98,29 @@ func TestDispatchDelivery_MultiDocumentPartialTransportFailureReplaysSafely(t *t
 	if remaining[0].JobID!=docs[1].JobID||remaining[1].JobID!=docs[2].JobID{
 		t.Fatalf("incorrect order or duplicate after reconnect: %+v",remaining)
 	}
+	// A later child jam freezes the complete order, including undelivered
+	// siblings. Its parent may never be promoted back to PRINTING by a
+	// delayed progress packet from another child.
+	if err:=s.UpdateJobProgress(ctx,contracts.JobProgressEvent{
+		JobID:docs[1].JobID,KioskID:kioskID,Status:contracts.JobStatusPausedError,
+		ErrorReason:"paper jam in second document",Timestamp:now.Add(2*time.Second),
+	});err!=nil{t.Fatal(err)}
+	faulted,err:=s.GetOrder(ctx,orderID)
+	if err!=nil||faulted.Status!=contracts.JobStatusPausedError{
+		t.Fatalf("child jam did not freeze parent: %+v %v",faulted,err)
+	}
+	noReplay,err:=s.GetPendingDispatchOrders(ctx,kioskID)
+	if err!=nil||len(noReplay)!=0{
+		t.Fatalf("faulted order still eligible for sibling delivery: %+v %v",noReplay,err)
+	}
+	if err:=s.UpdateJobProgress(ctx,contracts.JobProgressEvent{
+		JobID:docs[2].JobID,KioskID:kioskID,Status:contracts.JobStatusSpooling,
+		Timestamp:now.Add(3*time.Second),
+	});err!=nil{t.Fatal(err)}
+	stillFaulted,err:=s.GetOrder(ctx,orderID)
+	if err!=nil||stillFaulted.Status!=contracts.JobStatusPausedError{
+		t.Fatalf("delayed sibling spooling resurrected faulted order: %+v %v",stillFaulted,err)
+	}
 }
 
 func TestDispatchDelivery_UseFundingPaymentDespiteLaterSurplusCapture(t *testing.T) {
