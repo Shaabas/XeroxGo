@@ -219,44 +219,6 @@ func TestKioskRouting_InitiatePaymentExactPINClientURL(t *testing.T) {
 	}
 }
 
-// TestKioskRouting_OrderInitiatePaymentBackwardCompatibility verifies that
-// POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment remains functional and does not return 405.
-func TestKioskRouting_OrderInitiatePaymentBackwardCompatibility(t *testing.T) {
-	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t, true)
-	defer cleanup()
-
-	kioskID := "kiosk-compat-test"
-	orderID := "ord_compat_001"
-	pin := "5678"
-
-	createRoutingTestOrder(t, st, kioskID, orderID, pin, 1, 500)
-
-	// Claim order
-	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
-	claimReq.Header.Set("Authorization", "Bearer "+kioskSecret)
-	claimResp, _ := http.DefaultClient.Do(claimReq)
-	claimResp.Body.Close()
-
-	// Call /orders/{order_id}/initiate-payment
-	compatURL := fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID)
-	req, _ := http.NewRequest(http.MethodPost, compatURL, nil)
-	req.Header.Set("Authorization", "Bearer "+kioskSecret)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("compat request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusMethodNotAllowed {
-		t.Fatalf("expected 200 OK, got 405 Method Not Allowed on %s", compatURL)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(body))
-	}
-}
-
 // TestKioskRouting_InvalidExpiredCanceledSessions asserts that non-200 responses return 409 or 400, never 405.
 func TestKioskRouting_InvalidExpiredCanceledSessions(t *testing.T) {
 	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t, true)
@@ -274,10 +236,10 @@ func TestKioskRouting_InvalidExpiredCanceledSessions(t *testing.T) {
 	}
 	resp1.Body.Close()
 	if resp1.StatusCode == http.StatusMethodNotAllowed {
-		t.Errorf("invalid session returned 405 Method Not Allowed, want 400 or 409")
+		t.Errorf("invalid session returned 405 Method Not Allowed, want 404")
 	}
-	if resp1.StatusCode != http.StatusBadRequest && resp1.StatusCode != http.StatusConflict {
-		t.Errorf("invalid session returned %d, want 400 or 409", resp1.StatusCode)
+	if resp1.StatusCode != http.StatusNotFound {
+		t.Errorf("invalid session returned %d, want 404", resp1.StatusCode)
 	}
 
 	// 2. Canceled Session

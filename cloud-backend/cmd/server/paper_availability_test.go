@@ -323,7 +323,7 @@ func TestPaperAvailability_PaymentInitiation_Revalidation(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// 3. Initiate payment -> Revalidation catches the shortage and blocks payment!
-	payURL := fmt.Sprintf("%s/api/k/%s/orders/ord_pay_reval/initiate-payment", server.URL, kioskID)
+	payURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", server.URL, kioskID, sess.SessionID)
 	reqPay, _ := http.NewRequest(http.MethodPost, payURL, nil)
 	reqPay.Header.Set("Authorization", "Bearer "+secret)
 	resPay, err := http.DefaultClient.Do(reqPay)

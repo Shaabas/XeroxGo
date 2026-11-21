@@ -584,13 +584,13 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 
 	now := time.Now().UTC()
 	// Create active kiosk session for this order
-	_, err := app.db.CreateOrGetKioskSessionWithPaperCheck(context.Background(), "kiosk-pay-guard", orderID, 100, 5*time.Minute, now)
+	sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(context.Background(), "kiosk-pay-guard", orderID, 100, 5*time.Minute, now)
 	if err != nil {
 		t.Fatalf("failed to create kiosk session: %v", err)
 	}
 
 	// 2. Attempt handleInitiatePayment on multi-doc order
-	payReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/k/kiosk-pay-guard/orders/%s/initiate-payment", orderID), nil)
+	payReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/k/kiosk-pay-guard/sessions/%s/initiate-payment", sess.SessionID), nil)
 	payReq.Header.Set("Authorization", "Bearer mock-kiosk-secret")
 	payRec := httptest.NewRecorder()
 	mux.ServeHTTP(payRec, payReq)

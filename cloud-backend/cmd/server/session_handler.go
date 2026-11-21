@@ -369,6 +369,10 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 	requested, err := s.db.GetKioskSession(r.Context(), sessionID, now)
+	if errors.Is(err, store.ErrSessionNotFound) {
+		http.Error(w, "payment session not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		http.Error(w, "unable to resolve checkout session", http.StatusInternalServerError)
 		return

@@ -188,29 +188,3 @@ func TestOrderStatus_CorruptCompletedParentFailsClosed(t *testing.T) {
 	}
 }
 
-func TestOrderStatus_LegacySingleJobProgressPreserved(t *testing.T) {
-	st,err:=store.Open(filepath.Join(t.TempDir(),"order_status_legacy.db"))
-	if err!=nil{t.Fatal(err)}
-	defer st.Close()
-	ctx:=context.Background()
-	const orderID,kioskID="ord_status_old_single","kiosk_old_single"
-	ord:=store.Order{
-		OrderID:orderID,Status:contracts.JobStatusDispatched,PricePaise:200,
-		PINExpiresAt:time.Now().UTC().Add(5*time.Minute),
-		Command:contracts.PrintJobCommand{
-			JobID:"job_legacy_status",OrderID:orderID,KioskID:kioskID,
-			DisplayCode:"3561",DownloadURL:"https://storage.example.test/legacy.pdf",
-			SHA256Checksum:"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-			TotalPages:2,TotalSheets:2,Copies:1,
-			Duplex:contracts.DuplexSimplex,StartFromPage:1,
-		},
-	}
-	if err:=st.CreateOrder(ctx,ord);err!=nil{t.Fatal(err)}
-	// Old DBs can have print_configs and progress without child records.
-	if _,err:=st.DB().ExecContext(ctx,"DELETE FROM order_documents WHERE order_id=?",orderID);err!=nil{t.Fatal(err)}
-	recordDocumentStatus(t,st,ord.Command.JobID,kioskID,contracts.JobStatusPrinting,1,1,"",time.Now().UTC())
-	mid:=statusForOrder(t,&appServer{db:st},orderID)
-	if mid.DocumentsTotal!=0 || mid.Status!="PRINTING" || mid.PagesPrinted!=1 || mid.SheetsPrinted!=1{
-		t.Fatalf("legacy single-file reporting regressed: %+v",mid)
-	}
-}

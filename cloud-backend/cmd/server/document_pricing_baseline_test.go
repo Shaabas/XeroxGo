@@ -271,7 +271,7 @@ func TestDocumentPricing_PreviewAndUploadParity(t *testing.T) {
 			}
 
 			// Verify actual saved job PDF in jobsDir matches preview padded page count
-			jobHash := sha256ChecksumString(orderID)
+			jobHash := sha256ChecksumString(order.Documents[0].JobID)
 			savedPDFPath := filepath.Join(app.cfg.jobsDir, jobHash+".pdf")
 			savedPageCount := getPDFPageCount(t, savedPDFPath)
 			if savedPageCount != prevPaddedPages {
