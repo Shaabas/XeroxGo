@@ -1036,6 +1036,11 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 		}
 	}()
 
+	// Paused jobs survive Pi restarts in SQLite. Reconcile their safe-stop
+	// attestation periodically while connected: a missed WebSocket message
+	// must not strand a refund after CUPS has been verifiably stopped.
+	go c.refundSafeStopRetryLoop(connCtx)
+
 	// Reader loop
 	for {
 		var msg wireMessage
@@ -3727,6 +3732,58 @@ func (c *Client) cloudKeepAliveLoop(ctx context.Context, healthURL string) {
 	}
 }
 
+
+// refundSafeStopRetryLoop rebuilds work exclusively from persisted paused
+// jobs, avoiding an additional queue or second recovery state machine.
+// It runs immediately on authenticated reconnect and retries if a previous
+// attempt could not reach the cloud or safely classify a CUPS job.
+func (c *Client) refundSafeStopRetryLoop(ctx context.Context) {
+	if c.cfg.StateStore == nil {
+		return
+	}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		c.reconcilePausedOrderSafeStops(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Client) reconcilePausedOrderSafeStops(ctx context.Context) {
+	jobs, err := c.cfg.StateStore.GetIncompleteJobs(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("[REFUND] Cannot read persisted paused jobs: %v", err)
+		}
+		return
+	}
+	seenOrders := make(map[string]bool)
+	for _, job := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		if job.Status != contracts.JobStatusPausedError &&
+			job.Status != contracts.JobStatusFailedRefundable {
+			continue
+		}
+		orderID := strings.TrimSpace(job.Command.OrderID)
+		if orderID == "" || seenOrders[orderID] {
+			continue
+		}
+		seenOrders[orderID] = true
+		// The stop barrier is rebuilt before any retry; existing sibling
+		// state checks in processJob also protect after a process restart.
+		c.blockedPrintOrders.Store(orderID, true)
+		c.tryConfirmRefundSafeStop(job.Command.JobID)
+	}
+}
 
 // tryConfirmRefundSafeStop must run outside sendMu. It is deliberately
 // conservative: ambiguous submission/CUPS state never unlocks a refund.
