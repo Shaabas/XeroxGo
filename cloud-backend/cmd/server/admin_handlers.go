@@ -236,3 +236,23 @@ func sanitizeCSVField(s string) string {
 	}
 	return s
 }
+
+// handleAdminKioskFaults exposes actionable kiosk outages to the authenticated
+// attendant dashboard. It never exposes payment credentials or recovery tokens.
+func (app *appServer) handleAdminKioskFaults(w http.ResponseWriter, r *http.Request) {
+	if _, ok := app.authenticateAdminRequest(r); !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	items, err := app.db.ListOutOfServiceKiosks(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "unable to retrieve kiosk faults")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"out_of_service_kiosks":items})
+}
