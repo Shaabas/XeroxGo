@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -89,5 +88,4 @@ func TestFulfillment_ExpiredPINCannotResurrectOnLatePayment(t *testing.T) {
 	if got.PINExpiresAt.After(now) {
 		t.Fatal("late capture resurrected an expired or possibly reused PIN")
 	}
-	_ = errors.New // keep the test independent of provider errors
 }
