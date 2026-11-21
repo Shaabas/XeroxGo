@@ -15,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
-	"xeroxgo/cloud-backend/internal/pricing"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -49,6 +48,14 @@ func (s *Store) DB() *sql.DB {
 		return nil
 	}
 	return s.db
+}
+
+// Dialect returns the database dialect ("postgres" or "sqlite").
+func (s *Store) Dialect() string {
+	if s == nil {
+		return ""
+	}
+	return s.dialect
 }
 
 func (s *Store) rebind(query string) string {
@@ -2182,37 +2189,6 @@ WHERE order_id = ?;
 	}
 
 	return nil
-}
-
-// SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.
-func (s *Store) SetPricePerSheetPaise(ctx context.Context, pricePaise int64) error {
-	cfg, err := s.GetPricing(ctx)
-	bwDuplex := pricing.DefaultBWDuplexPaise
-	colorPrice := pricing.DefaultColorSimplexPaise
-	colorDuplex := pricing.DefaultColorDuplexPaise
-	colorEnabled := false
-	if err == nil {
-		if cfg.BWDuplexPricePaise > 0 {
-			bwDuplex = cfg.BWDuplexPricePaise
-		}
-		if cfg.ColorSimplexPricePaise > 0 {
-			colorPrice = cfg.ColorSimplexPricePaise
-		}
-		if cfg.ColorDuplexPricePaise > 0 {
-			colorDuplex = cfg.ColorDuplexPricePaise
-		}
-		colorEnabled = cfg.ColorEnabled
-	}
-	return s.SetDetailedPricing(ctx, pricePaise, bwDuplex, colorPrice, colorDuplex, colorEnabled)
-}
-
-// GetPricePerSheetPaise retrieves the configured per-sheet pricing.
-func (s *Store) GetPricePerSheetPaise(ctx context.Context) (int64, error) {
-	cfg, err := s.GetPricing(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return cfg.BWSimplexPricePaise, nil
 }
 
 // RecordWebhook atomically attempts to record a webhook ID.

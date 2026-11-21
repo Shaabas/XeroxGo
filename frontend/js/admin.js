@@ -707,10 +707,10 @@
     const calcResultBw = document.getElementById('calc-result-bw');
     const calcResultColor = document.getElementById('calc-result-color');
 
-    let currentBWSimplexPaise = 300;
-    let currentBWDuplexPaise = 500;
-    let currentColorSimplexPaise = 800;
-    let currentColorDuplexPaise = 1000;
+    let currentBWSimplexPaise = null;
+    let currentBWDuplexPaise = null;
+    let currentColorSimplexPaise = null;
+    let currentColorDuplexPaise = null;
     let currentColorEnabled = false;
 
     async function loadPricing() {
@@ -719,20 +719,84 @@
         if (!res.ok) throw new Error('Failed to load pricing');
         const data = await parseResponseJSON(res);
 
-        currentBWSimplexPaise = data.bw_simplex_price_paise || 300;
-        currentBWDuplexPaise = data.bw_duplex_price_paise || 500;
-        currentColorSimplexPaise = data.color_simplex_price_paise || 800;
-        currentColorDuplexPaise = data.color_duplex_price_paise || 1000;
+        if (
+          !data ||
+          typeof data.bw_simplex_price_paise !== 'number' || data.bw_simplex_price_paise <= 0 ||
+          typeof data.bw_duplex_price_paise !== 'number' || data.bw_duplex_price_paise <= 0 ||
+          typeof data.color_simplex_price_paise !== 'number' || data.color_simplex_price_paise <= 0 ||
+          typeof data.color_duplex_price_paise !== 'number' || data.color_duplex_price_paise <= 0
+        ) {
+          throw new Error('Invalid or incomplete pricing configuration received from server');
+        }
+
+        currentBWSimplexPaise = data.bw_simplex_price_paise;
+        currentBWDuplexPaise = data.bw_duplex_price_paise;
+        currentColorSimplexPaise = data.color_simplex_price_paise;
+        currentColorDuplexPaise = data.color_duplex_price_paise;
         currentColorEnabled = Boolean(data.color_enabled);
 
-        if (priceBwSimplexInput) priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
-        if (priceBwDuplexInput) priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
-        if (priceColorSimplexInput) priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
-        if (priceColorDuplexInput) priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
-        if (pricingColorEnabledToggle) pricingColorEnabledToggle.checked = currentColorEnabled;
+        if (priceBwSimplexInput) {
+          priceBwSimplexInput.value = (currentBWSimplexPaise / 100).toFixed(2);
+          priceBwSimplexInput.disabled = false;
+        }
+        if (priceBwDuplexInput) {
+          priceBwDuplexInput.value = (currentBWDuplexPaise / 100).toFixed(2);
+          priceBwDuplexInput.disabled = false;
+        }
+        if (priceColorSimplexInput) {
+          priceColorSimplexInput.value = (currentColorSimplexPaise / 100).toFixed(2);
+          priceColorSimplexInput.disabled = false;
+        }
+        if (priceColorDuplexInput) {
+          priceColorDuplexInput.value = (currentColorDuplexPaise / 100).toFixed(2);
+          priceColorDuplexInput.disabled = false;
+        }
+        if (pricingColorEnabledToggle) {
+          pricingColorEnabledToggle.checked = currentColorEnabled;
+          pricingColorEnabledToggle.disabled = false;
+        }
+        if (pricingSaveBtn) {
+          pricingSaveBtn.disabled = false;
+          pricingSaveBtn.textContent = 'Save Changes';
+        }
 
         updateCostEstimator();
       } catch (err) {
+        currentBWSimplexPaise = null;
+        currentBWDuplexPaise = null;
+        currentColorSimplexPaise = null;
+        currentColorDuplexPaise = null;
+        currentColorEnabled = false;
+
+        if (priceBwSimplexInput) {
+          priceBwSimplexInput.value = '';
+          priceBwSimplexInput.placeholder = '--';
+          priceBwSimplexInput.disabled = true;
+        }
+        if (priceBwDuplexInput) {
+          priceBwDuplexInput.value = '';
+          priceBwDuplexInput.placeholder = '--';
+          priceBwDuplexInput.disabled = true;
+        }
+        if (priceColorSimplexInput) {
+          priceColorSimplexInput.value = '';
+          priceColorSimplexInput.placeholder = '--';
+          priceColorSimplexInput.disabled = true;
+        }
+        if (priceColorDuplexInput) {
+          priceColorDuplexInput.value = '';
+          priceColorDuplexInput.placeholder = '--';
+          priceColorDuplexInput.disabled = true;
+        }
+        if (pricingColorEnabledToggle) {
+          pricingColorEnabledToggle.disabled = true;
+        }
+        if (pricingSaveBtn) {
+          pricingSaveBtn.disabled = true;
+          pricingSaveBtn.textContent = 'Pricing Unavailable';
+        }
+
+        updateCostEstimator();
         showToast('Pricing load error: ' + err.message);
       }
     }
@@ -743,26 +807,48 @@
       const isDuplex = document.querySelector('input[name="calc-duplex"]:checked')?.value === 'duplex';
       const sheets = isDuplex ? Math.ceil(pages / 2) : pages;
 
-      const bwSimplex = priceBwSimplexInput && priceBwSimplexInput.value ? parseFloat(priceBwSimplexInput.value) : (currentBWSimplexPaise / 100);
-      const bwDuplex = priceBwDuplexInput && priceBwDuplexInput.value ? parseFloat(priceBwDuplexInput.value) : (currentBWDuplexPaise / 100);
-      const colorSimplex = priceColorSimplexInput && priceColorSimplexInput.value ? parseFloat(priceColorSimplexInput.value) : (currentColorSimplexPaise / 100);
-      const colorDuplex = priceColorDuplexInput && priceColorDuplexInput.value ? parseFloat(priceColorDuplexInput.value) : (currentColorDuplexPaise / 100);
-
-      let bwCost = 0;
-      let colorCost = 0;
-      if (isDuplex) {
-        const fullSheets = Math.floor(pages / 2);
-        const hasOddPage = (pages % 2 !== 0);
-        bwCost = (fullSheets * bwDuplex) + (hasOddPage ? bwSimplex : 0);
-        colorCost = (fullSheets * colorDuplex) + (hasOddPage ? colorSimplex : 0);
-      } else {
-        bwCost = pages * bwSimplex;
-        colorCost = pages * colorSimplex;
-      }
+      const bwSimplex = (priceBwSimplexInput && priceBwSimplexInput.value && !isNaN(parseFloat(priceBwSimplexInput.value)))
+        ? parseFloat(priceBwSimplexInput.value)
+        : (currentBWSimplexPaise !== null ? currentBWSimplexPaise / 100 : null);
+      const bwDuplex = (priceBwDuplexInput && priceBwDuplexInput.value && !isNaN(parseFloat(priceBwDuplexInput.value)))
+        ? parseFloat(priceBwDuplexInput.value)
+        : (currentBWDuplexPaise !== null ? currentBWDuplexPaise / 100 : null);
+      const colorSimplex = (priceColorSimplexInput && priceColorSimplexInput.value && !isNaN(parseFloat(priceColorSimplexInput.value)))
+        ? parseFloat(priceColorSimplexInput.value)
+        : (currentColorSimplexPaise !== null ? currentColorSimplexPaise / 100 : null);
+      const colorDuplex = (priceColorDuplexInput && priceColorDuplexInput.value && !isNaN(parseFloat(priceColorDuplexInput.value)))
+        ? parseFloat(priceColorDuplexInput.value)
+        : (currentColorDuplexPaise !== null ? currentColorDuplexPaise / 100 : null);
 
       if (calcResultSheets) calcResultSheets.textContent = `${sheets} sheet${sheets > 1 ? 's' : ''}`;
-      if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
-      if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
+
+      if (bwSimplex !== null && bwDuplex !== null) {
+        let bwCost = 0;
+        if (isDuplex) {
+          const fullSheets = Math.floor(pages / 2);
+          const hasOddPage = (pages % 2 !== 0);
+          bwCost = (fullSheets * bwDuplex) + (hasOddPage ? bwSimplex : 0);
+        } else {
+          bwCost = pages * bwSimplex;
+        }
+        if (calcResultBw) calcResultBw.textContent = `₹${bwCost.toFixed(2)}`;
+      } else {
+        if (calcResultBw) calcResultBw.textContent = '--';
+      }
+
+      if (colorSimplex !== null && colorDuplex !== null) {
+        let colorCost = 0;
+        if (isDuplex) {
+          const fullSheets = Math.floor(pages / 2);
+          const hasOddPage = (pages % 2 !== 0);
+          colorCost = (fullSheets * colorDuplex) + (hasOddPage ? colorSimplex : 0);
+        } else {
+          colorCost = pages * colorSimplex;
+        }
+        if (calcResultColor) calcResultColor.textContent = `₹${colorCost.toFixed(2)}`;
+      } else {
+        if (calcResultColor) calcResultColor.textContent = '--';
+      }
     }
 
     if (calcPagesInput) calcPagesInput.addEventListener('input', updateCostEstimator);
@@ -794,6 +880,9 @@
     if (pricingForm) {
       pricingForm.addEventListener('submit', async (e) => {
         e.preventDefault();
+        if (pricingSaveBtn && pricingSaveBtn.disabled) {
+          return;
+        }
         const bwSimplexPaise = parseRupeesToPaise(priceBwSimplexInput.value);
         const bwDuplexPaise = parseRupeesToPaise(priceBwDuplexInput.value);
         const colorSimplexPaise = parseRupeesToPaise(priceColorSimplexInput.value);

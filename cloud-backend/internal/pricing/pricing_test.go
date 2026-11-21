@@ -249,7 +249,4 @@ func TestDefaultTariff(t *testing.T) {
 	if def.ColorEnabled != false {
 		t.Fatalf("expected ColorEnabled false by default")
 	}
-	if def.BWPricePerSheetPaise != 300 || def.ColorPricePerSheetPaise != 800 {
-		t.Fatalf("unexpected compatibility sheet prices: %+v", def)
-	}
 }

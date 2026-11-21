@@ -155,11 +155,11 @@ fi
 echo ""
 
 # -----------------------------------------------------------------------------
-# Gate 6 — Frontend Conversion Test Suite
+# Gate 6 — Frontend Test Suite
 # -----------------------------------------------------------------------------
-echo "=== Gate 6: Frontend Conversion Test Suite ==="
-if node --test frontend/js/conversion_test.js; then
-    echo "Gate 6 PASSED: Frontend conversion tests passed."
+echo "=== Gate 6: Frontend Test Suite ==="
+if node --test frontend/js/conversion_test.js frontend/js/pricing_test.js; then
+    echo "Gate 6 PASSED: Frontend tests passed."
 else
     echo "Gate 6 FAILED: Frontend tests failed."
     FAILED=1

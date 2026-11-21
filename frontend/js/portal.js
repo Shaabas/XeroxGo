@@ -46,15 +46,15 @@
   function setPricingConfig(tariff) {
     if (
       tariff &&
-      typeof tariff.bw_simplex_paise === 'number' && tariff.bw_simplex_paise > 0 &&
-      typeof tariff.bw_duplex_paise === 'number' && tariff.bw_duplex_paise > 0 &&
-      typeof tariff.color_simplex_paise === 'number' && tariff.color_simplex_paise > 0 &&
-      typeof tariff.color_duplex_paise === 'number' && tariff.color_duplex_paise > 0
+      typeof tariff.bw_simplex_price_paise === 'number' && tariff.bw_simplex_price_paise > 0 &&
+      typeof tariff.bw_duplex_price_paise === 'number' && tariff.bw_duplex_price_paise > 0 &&
+      typeof tariff.color_simplex_price_paise === 'number' && tariff.color_simplex_price_paise > 0 &&
+      typeof tariff.color_duplex_price_paise === 'number' && tariff.color_duplex_price_paise > 0
     ) {
-      rateBWSimplexPaise = tariff.bw_simplex_paise;
-      rateBWDuplexPaise = tariff.bw_duplex_paise;
-      rateColorSimplexPaise = tariff.color_simplex_paise;
-      rateColorDuplexPaise = tariff.color_duplex_paise;
+      rateBWSimplexPaise = tariff.bw_simplex_price_paise;
+      rateBWDuplexPaise = tariff.bw_duplex_price_paise;
+      rateColorSimplexPaise = tariff.color_simplex_price_paise;
+      rateColorDuplexPaise = tariff.color_duplex_price_paise;
       kioskColorEnabled = Boolean(tariff.color_enabled);
       pricingLoaded = true;
     } else {
@@ -2405,6 +2405,7 @@
         calculateDocPrice,
         fetchPricing,
         setPricingConfig,
+        formatRupees,
         switchView,
         openSettings
       };

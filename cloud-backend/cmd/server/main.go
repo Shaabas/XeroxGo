@@ -1270,6 +1270,60 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// initPricing ensures database has pricing configured before serving traffic.
+// Default tariff seeding is strictly restricted to an explicitly unconfigured,
+// newly created local SQLite database in dev mode.
+// PostgreSQL databases, existing databases, database connectivity failures,
+// and invalid existing rows MUST fail closed and never seed or rewrite tariffs automatically.
+func initPricing(ctx context.Context, s *store.Store, isPostgres bool, devMode bool) error {
+	if s == nil {
+		return fmt.Errorf("pricing initialization: store is nil")
+	}
+
+	_, err := s.GetPricing(ctx)
+	if err == nil {
+		// Valid pricing exists. Never overwrite existing tariffs or color_enabled.
+		return nil
+	}
+
+	// Fail closed on connectivity failures, canceled contexts, or invalid/corrupted existing rows
+	if !errors.Is(err, store.ErrPricingNotConfigured) {
+		return fmt.Errorf("pricing check failed closed: %w", err)
+	}
+
+	// Never seed or rewrite PostgreSQL tariff records automatically, even when dev mode is enabled.
+	if isPostgres || s.Dialect() != "sqlite" {
+		return fmt.Errorf("pricing unconfigured in PostgreSQL database: manual operator configuration required (%w)", err)
+	}
+
+	// For SQLite, default seeding is only allowed in dev mode.
+	if !devMode {
+		return fmt.Errorf("pricing unconfigured in production SQLite database: %w", err)
+	}
+
+	// Allow default seeding only for an explicitly unconfigured, newly created local SQLite database.
+	// Verify pricing table has 0 rows and orders table has 0 rows.
+	var pricingRows int
+	if countErr := s.DB().QueryRowContext(ctx, "SELECT COUNT(1) FROM pricing;").Scan(&pricingRows); countErr != nil {
+		return fmt.Errorf("failed to check pricing table row count: %w", countErr)
+	}
+	if pricingRows > 0 {
+		return fmt.Errorf("pricing table has %d rows but GetPricing failed: failing closed", pricingRows)
+	}
+
+	var orderRows int
+	if orderErr := s.DB().QueryRowContext(ctx, "SELECT COUNT(1) FROM orders;").Scan(&orderRows); orderErr == nil && orderRows > 0 {
+		return fmt.Errorf("pricing missing in existing SQLite database with %d orders: failing closed", orderRows)
+	}
+
+	def := pricing.DefaultTariff()
+	if setErr := s.SetDetailedPricing(ctx, def.BWSimplexPricePaise, def.BWDuplexPricePaise, def.ColorSimplexPricePaise, def.ColorDuplexPricePaise, def.ColorEnabled); setErr != nil {
+		return fmt.Errorf("failed to initialize default dev pricing: %w", setErr)
+	}
+	log.Printf("[INFO] Initialized default canonical pricing for newly created local SQLite database")
+	return nil
+}
+
 func main() {
 	demoFlag := flag.Bool("demo-mode", false, "Enable demo mode with simulated QR payments")
 	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
@@ -1349,16 +1403,8 @@ func main() {
 	defer storeDB.Close()
 
 	ctx := context.Background()
-	// Ensure database has pricing configured. In development, seed default canonical pricing if unconfigured.
-	if _, err := storeDB.GetPricing(ctx); err != nil {
-		if devMode {
-			def := pricing.DefaultTariff()
-			if err := storeDB.SetDetailedPricing(ctx, def.BWSimplexPricePaise, def.BWDuplexPricePaise, def.ColorSimplexPricePaise, def.ColorDuplexPricePaise, def.ColorEnabled); err != nil {
-				log.Fatalf("failed to initialize default dev pricing: %v", err)
-			}
-		} else {
-			log.Fatalf("pricing unconfigured in production mode: %v", err)
-		}
+	if err := initPricing(ctx, storeDB, isPostgres, devMode); err != nil {
+		log.Fatalf("failed to initialize pricing: %v", err)
 	}
 
 	// Initialize default promo ads & bootstrap admin user

@@ -341,3 +341,179 @@ func TestCanonicalPricing_MissingTariffFailClosed(t *testing.T) {
 		t.Fatalf("expected 500 for upload when pricing missing, got %d: %s", upRec.Code, upRec.Body.String())
 	}
 }
+
+func TestInitPricing_PostgresNeverSeedsEvenInDevMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "postgres_sim.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	// Even with devMode = true, PostgreSQL connection must NEVER seed default tariffs
+	err = initPricing(ctx, s, true /* isPostgres */, true /* devMode */)
+	if err == nil {
+		t.Fatalf("expected error from initPricing on Postgres, got nil")
+	}
+
+	var count int
+	if err := s.DB().QueryRow("SELECT COUNT(1) FROM pricing;").Scan(&count); err != nil {
+		t.Fatalf("failed to query pricing count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 pricing rows in Postgres database, got %d", count)
+	}
+}
+
+func TestInitPricing_FailsClosedOnInvalidExistingRows(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "invalid_rows.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	// Insert an invalid row (rates <= 0) by disabling check constraints temporarily
+	_, err = s.DB().Exec(`
+PRAGMA ignore_check_constraints = ON;
+INSERT INTO pricing (id, price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise,
+                     bw_simplex_price_paise, bw_duplex_price_paise,
+                     color_simplex_price_paise, color_duplex_price_paise,
+                     color_enabled, updated_at_ns)
+VALUES (1, 1, 1, 1, 0, 0, 0, 0, 0, 1000);
+PRAGMA ignore_check_constraints = OFF;
+`)
+	if err != nil {
+		t.Fatalf("failed to insert invalid pricing row: %v", err)
+	}
+
+	// initPricing must fail closed on invalid existing rows and never overwrite with defaults
+	err = initPricing(ctx, s, false /* isPostgres */, true /* devMode */)
+	if err == nil {
+		t.Fatalf("expected initPricing to fail closed on invalid existing rows, got nil")
+	}
+
+	var bwSimplex int64
+	if err := s.DB().QueryRow("SELECT bw_simplex_price_paise FROM pricing WHERE id = 1;").Scan(&bwSimplex); err != nil {
+		t.Fatalf("failed to query bw_simplex: %v", err)
+	}
+	if bwSimplex != 0 {
+		t.Fatalf("invalid row was overwritten with %d, must remain untouched", bwSimplex)
+	}
+}
+
+func TestInitPricing_FailsClosedOnDatabaseReadError(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "db_error.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+
+	// Canceled context simulating connectivity / timeout error
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = initPricing(canceledCtx, s, false /* isPostgres */, true /* devMode */)
+	if err == nil {
+		t.Fatalf("expected initPricing to fail closed on canceled context, got nil")
+	}
+
+	_ = s.Close()
+	// Calling with closed database must also fail closed
+	err = initPricing(context.Background(), s, false, true)
+	if err == nil {
+		t.Fatalf("expected initPricing to fail closed on closed database, got nil")
+	}
+}
+
+func TestInitPricing_PreservesExistingTariffsAndColorEnabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "preserve_rates.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	// Set custom existing tariffs and color_enabled = true
+	if err := s.SetDetailedPricing(ctx, 450, 650, 950, 1250, true); err != nil {
+		t.Fatalf("SetDetailedPricing failed: %v", err)
+	}
+
+	// Run initPricing with devMode = true
+	if err := initPricing(ctx, s, false /* isPostgres */, true /* devMode */); err != nil {
+		t.Fatalf("initPricing returned unexpected error: %v", err)
+	}
+
+	// Verify rates and color_enabled were NOT overwritten
+	p, err := s.GetPricing(ctx)
+	if err != nil {
+		t.Fatalf("GetPricing failed: %v", err)
+	}
+	if p.BWSimplexPricePaise != 450 || p.BWDuplexPricePaise != 650 ||
+		p.ColorSimplexPricePaise != 950 || p.ColorDuplexPricePaise != 1250 ||
+		!p.ColorEnabled {
+		t.Fatalf("existing tariffs or color_enabled were modified by initPricing: %+v", p)
+	}
+}
+
+func TestInitPricing_SeedsOnlyForNewlyCreatedDevSQLite(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "fresh_dev.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. In production mode (devMode = false), missing pricing must fail closed
+	if err := initPricing(ctx, s, false /* isPostgres */, false /* devMode */); err == nil {
+		t.Fatalf("expected error in production mode for unconfigured pricing, got nil")
+	}
+
+	// 2. In dev mode with newly created database, seeding succeeds
+	if err := initPricing(ctx, s, false /* isPostgres */, true /* devMode */); err != nil {
+		t.Fatalf("expected successful seeding in dev mode, got: %v", err)
+	}
+
+	p, err := s.GetPricing(ctx)
+	if err != nil {
+		t.Fatalf("GetPricing failed: %v", err)
+	}
+	if p.BWSimplexPricePaise != 300 || p.BWDuplexPricePaise != 500 ||
+		p.ColorSimplexPricePaise != 800 || p.ColorDuplexPricePaise != 1000 ||
+		p.ColorEnabled != false {
+		t.Fatalf("unexpected seeded default rates: %+v", p)
+	}
+
+	// 3. Existing SQLite database with orders but unconfigured pricing must fail closed
+	tmpDir2 := t.TempDir()
+	dbPath2 := filepath.Join(tmpDir2, "existing_with_orders.db")
+	s2, err := store.Open(dbPath2)
+	if err != nil {
+		t.Fatalf("failed to open test store 2: %v", err)
+	}
+	defer s2.Close()
+
+	// Insert a dummy order to simulate an existing database with history
+	_, err = s2.DB().Exec(`
+INSERT INTO orders (order_id, job_id, kiosk_id, display_code, status, price_paise, created_at_ns, updated_at_ns)
+VALUES ('ord-test-1', 'job-test-1', 'kiosk-1', '1234', 'COMPLETED', 500, 1000, 1000);
+`)
+	if err != nil {
+		t.Fatalf("failed to insert test order: %v", err)
+	}
+
+	// Attempt initPricing on existing database missing pricing
+	if err := initPricing(ctx, s2, false, true); err == nil {
+		t.Fatalf("expected initPricing to fail closed on existing SQLite database with orders, got nil")
+	}
+}

@@ -26,37 +26,35 @@ func TestPricingDual(t *testing.T) {
 		t.Fatalf("expected error for unconfigured pricing, got nil")
 	}
 
-	// 2. Set custom dual pricing
-	if err := s.SetPricing(ctx, 350, 1500); err != nil {
-		t.Fatalf("SetPricing failed: %v", err)
+	// 2. Set custom 4-tier pricing
+	if err := s.SetDetailedPricing(ctx, 350, 550, 1500, 2000, false); err != nil {
+		t.Fatalf("SetDetailedPricing failed: %v", err)
 	}
 
 	p2, err := s.GetPricing(ctx)
 	if err != nil {
 		t.Fatalf("GetPricing after set failed: %v", err)
 	}
-	if p2.BWPricePerSheetPaise != 350 || p2.ColorPricePerSheetPaise != 1500 {
-		t.Fatalf("expected (350, 1500), got (%d, %d)", p2.BWPricePerSheetPaise, p2.ColorPricePerSheetPaise)
+	if p2.BWSimplexPricePaise != 350 || p2.BWDuplexPricePaise != 550 ||
+		p2.ColorSimplexPricePaise != 1500 || p2.ColorDuplexPricePaise != 2000 || p2.ColorEnabled {
+		t.Fatalf("unexpected p2: %+v", p2)
 	}
 
-	// 3. Legacy bridge check
-	legacyBW, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil {
-		t.Fatalf("GetPricePerSheetPaise failed: %v", err)
+	// 3. Validation: reject negative/zero prices
+	if err := s.SetDetailedPricing(ctx, 0, 500, 1000, 1500, false); err == nil {
+		t.Fatalf("expected error for bwSimplex=0, got nil")
 	}
-	if legacyBW != 350 {
-		t.Fatalf("expected legacy BW price 350, got %d", legacyBW)
+	if err := s.SetDetailedPricing(ctx, 200, 500, -50, 1500, false); err == nil {
+		t.Fatalf("expected error for colorSimplex < 0, got nil")
 	}
-
-	// 4. Validation: reject negative/zero prices
-	if err := s.SetPricing(ctx, 0, 1000); err == nil {
-		t.Fatalf("expected error for bwPrice=0, got nil")
+	if err := s.SetDetailedPricing(ctx, 200, 0, 1000, 1500, false); err == nil {
+		t.Fatalf("expected error for bwDuplex=0, got nil")
 	}
-	if err := s.SetPricing(ctx, 200, -50); err == nil {
-		t.Fatalf("expected error for colorPrice < 0, got nil")
+	if err := s.SetDetailedPricing(ctx, 200, 500, 1000, -10, false); err == nil {
+		t.Fatalf("expected error for colorDuplex < 0, got nil")
 	}
 
-	// 5. Test detailed 4-tier pricing and colorEnabled flag
+	// 4. Test detailed 4-tier pricing and colorEnabled flag
 	if err := s.SetDetailedPricing(ctx, 200, 150, 1000, 750, true); err != nil {
 		t.Fatalf("SetDetailedPricing failed: %v", err)
 	}

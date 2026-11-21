@@ -20,32 +20,24 @@ const (
 // TariffConfig represents comprehensive pricing for monochrome and color prints (simplex and duplex)
 // along with hardware capabilities.
 type TariffConfig struct {
-	BWSimplexPricePaise     int64     `json:"bw_simplex_price_paise"`
-	BWDuplexPricePaise      int64     `json:"bw_duplex_price_paise"`
-	ColorSimplexPricePaise  int64     `json:"color_simplex_price_paise"`
-	ColorDuplexPricePaise   int64     `json:"color_duplex_price_paise"`
-	ColorEnabled            bool      `json:"color_enabled"`
-	BWPricePerSheetPaise    int64     `json:"bw_price_per_sheet_paise"`
-	ColorPricePerSheetPaise int64     `json:"color_price_per_sheet_paise"`
-	BWPricePerSidePaise     int64     `json:"bw_price_per_side_paise,omitempty"`
-	ColorPricePerSidePaise  int64     `json:"color_price_per_side_paise,omitempty"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
+	BWDuplexPricePaise     int64     `json:"bw_duplex_price_paise"`
+	ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
+	ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
+	ColorEnabled           bool      `json:"color_enabled"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // DefaultTariff returns a complete default 4-tier tariff configuration with canonical rates.
 func DefaultTariff() TariffConfig {
 	now := time.Now().UTC()
 	return TariffConfig{
-		BWSimplexPricePaise:     DefaultBWSimplexPaise,
-		BWDuplexPricePaise:      DefaultBWDuplexPaise,
-		ColorSimplexPricePaise:  DefaultColorSimplexPaise,
-		ColorDuplexPricePaise:   DefaultColorDuplexPaise,
-		ColorEnabled:            DefaultColorEnabled,
-		BWPricePerSheetPaise:    DefaultBWSimplexPaise,
-		ColorPricePerSheetPaise: DefaultColorSimplexPaise,
-		BWPricePerSidePaise:     DefaultBWSimplexPaise,
-		ColorPricePerSidePaise:  DefaultColorSimplexPaise,
-		UpdatedAt:               now,
+		BWSimplexPricePaise:    DefaultBWSimplexPaise,
+		BWDuplexPricePaise:     DefaultBWDuplexPaise,
+		ColorSimplexPricePaise: DefaultColorSimplexPaise,
+		ColorDuplexPricePaise:  DefaultColorDuplexPaise,
+		ColorEnabled:           DefaultColorEnabled,
+		UpdatedAt:              now,
 	}
 }
 
