@@ -1991,8 +1991,18 @@
       const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
 
       if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(errText || 'Failed to submit order to kiosk');
+        const contentType = resp.headers.get('content-type') || '';
+        let message = 'Failed to submit order to kiosk';
+        if (contentType.includes('application/json')) {
+          const problem = await resp.json().catch(() => ({}));
+          message = problem.error || message;
+          if (problem.code === 'INSUFFICIENT_PAPER') {
+            message = 'Not enough paper is available for this order. Please reduce the sheet count or choose another kiosk.';
+          }
+        } else {
+          message = (await resp.text()).trim() || message;
+        }
+        throw new Error(message);
       }
 
       const data = await resp.json();
