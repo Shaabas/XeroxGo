@@ -2694,38 +2694,29 @@ func (s *Store) getCommittedPaperSheetsTx(ctx context.Context, q queryable, kios
 	query := s.rebind(`
 SELECT COALESCE(SUM(c.committed_sheets), 0)
 FROM (
-    -- print_configs describes the first document in a multi-document order.
-    -- Reserve the entire order, falling back to print_configs for legacy rows.
-    SELECT CASE WHEN o.total_sheets > 0 THEN o.total_sheets ELSE pc.total_sheets END AS committed_sheets
+    -- Reserve all sheets in each pending order, not just its first document.
+    SELECT o.total_sheets AS committed_sheets
     FROM orders o
-    JOIN print_configs pc ON o.order_id = pc.order_id
     JOIN kiosk_sessions ks ON o.order_id = ks.order_id
     WHERE o.kiosk_id = ?
       AND o.status = 'PENDING_PAYMENT'
       AND ks.status = 'PAYMENT_PENDING'
       AND ks.expires_at_ns > ?
       AND (? = '' OR o.order_id != ?)
-    GROUP BY o.order_id, o.total_sheets, pc.total_sheets
+    GROUP BY o.order_id, o.total_sheets
 
     UNION ALL
 
-    -- Paid/in-flight orders reserve only sheets still to be printed.
-    -- Sum job progress across all child documents, not just the first job.
-    SELECT CASE WHEN paid.remaining_sheets > 0 THEN paid.remaining_sheets ELSE 0 END AS committed_sheets
+    -- For paid/in-flight orders, subtract progress across every child document.
+    SELECT CASE WHEN paid.remaining_sheets > 0 THEN paid.remaining_sheets ELSE 0 END
     FROM (
-        SELECT
-            (CASE WHEN o.total_sheets > 0 THEN o.total_sheets ELSE pc.total_sheets END)
-            - COALESCE(
-                (SELECT SUM(jp_doc.sheets_printed)
-                 FROM order_documents od
-                 JOIN job_progress jp_doc ON jp_doc.job_id = od.job_id
-                 WHERE od.order_id = o.order_id),
-                legacy_progress.sheets_printed,
-                0
-            ) AS remaining_sheets
+        SELECT o.total_sheets - COALESCE(
+            (SELECT SUM(jp.sheets_printed)
+             FROM order_documents od
+             JOIN job_progress jp ON jp.job_id = od.job_id
+             WHERE od.order_id = o.order_id), 0
+        ) AS remaining_sheets
         FROM orders o
-        JOIN print_configs pc ON o.order_id = pc.order_id
-        LEFT JOIN job_progress legacy_progress ON o.job_id = legacy_progress.job_id
         WHERE o.kiosk_id = ?
           AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
           AND (? = '' OR o.order_id != ?)
@@ -2788,15 +2779,16 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 	var (
 		orderKioskID   string
 		statusStr      string
-		pricePaise     int64
-		pinExpiresAtNS int64
+		pricePaise      int64
+		pinExpiresAtNS  int64
+		orderTotalSheets int
 	)
 	queryOrder := s.rebind(`
-SELECT kiosk_id, status, price_paise, pin_expires_at_ns
+SELECT kiosk_id, status, price_paise, pin_expires_at_ns, total_sheets
 FROM orders
 WHERE order_id = ?;
 `)
-	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS)
+	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS, &orderTotalSheets)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrOrderNotFound
@@ -2876,22 +2868,9 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 
 	// 3. If paper checking is enabled (availableStock >= 0), verify sufficient available sheets
 	if availableStock >= 0 {
-		// Use the full order total, falling back to the first-document config
-		// for legacy rows. Keep requiring a print config as before.
-		var totalSheets int
-		querySheets := s.rebind(`
-SELECT CASE WHEN o.total_sheets > 0 THEN o.total_sheets ELSE pc.total_sheets END
-FROM orders o JOIN print_configs pc ON pc.order_id = o.order_id
-WHERE o.order_id = ?;`)
-		err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrOrderNotFound
-			}
-			return nil, fmt.Errorf("create kiosk session: query print config: %w", err)
-		}
-		if totalSheets <= 0 {
-			totalSheets = 1
+		// Orders own the authoritative total for all documents.
+		if orderTotalSheets <= 0 {
+			return nil, fmt.Errorf("create kiosk session: invalid order total_sheets %d", orderTotalSheets)
 		}
 
 		committedSheets, err := s.getCommittedPaperSheetsTx(ctx, tx, kioskID, orderID, nowNS)
@@ -2899,7 +2878,7 @@ WHERE o.order_id = ?;`)
 			return nil, fmt.Errorf("create kiosk session: check paper commitments: %w", err)
 		}
 		effectiveAvailable := availableStock - committedSheets
-		if effectiveAvailable < totalSheets {
+		if effectiveAvailable < orderTotalSheets {
 			return nil, ErrInsufficientPaper
 		}
 	}
