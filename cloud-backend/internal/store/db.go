@@ -4379,8 +4379,13 @@ ORDER BY created_at_ns ASC;
 			return nil, fmt.Errorf("get pending dispatch orders: order %s not found", cand.orderID)
 		}
 
-		// Never dispatch unpaid, canceled, expired, or unauthorized orders
-		if ord.Status != contracts.JobStatusDispatched {
+		// A funded multi-document order remains dispatch-authorized while
+		// earlier children are SPOOLING or PRINTING. Reconnect must deliver
+		// unacknowledged later children without resending acknowledged ones.
+		// Faults and completion never authorize additional delivery.
+		if ord.Status != contracts.JobStatusDispatched &&
+			ord.Status != contracts.JobStatusSpooling &&
+			ord.Status != contracts.JobStatusPrinting {
 			if ord.Status == contracts.JobStatusFailedRefundable || string(ord.Status) == "CANCELED" {
 				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
 			}
