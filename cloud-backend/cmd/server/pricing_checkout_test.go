@@ -370,8 +370,18 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 	rrMismatch := httptest.NewRecorder()
 	mux.ServeHTTP(rrMismatch, reqMismatch)
 
-	if rrMismatch.Code != http.StatusBadRequest {
-		t.Errorf("expected mismatch payment webhook to return 400 Bad Request, got %d (body: %s)", rrMismatch.Code, rrMismatch.Body.String())
+	if rrMismatch.Code != http.StatusOK {
+		t.Errorf("signed wrong-amount capture must persist refund-only money, got HTTP %d (body: %s)", rrMismatch.Code, rrMismatch.Body.String())
+	}
+	var wrongResult map[string]string
+	if err := json.Unmarshal(rrMismatch.Body.Bytes(), &wrongResult); err != nil { t.Fatal(err) }
+	if wrongResult["status"] != "excess_payment_refund_required" {
+		t.Fatalf("underpaid captured money was not marked for refund: %+v", wrongResult)
+	}
+	refunds, err := app.db.ListActionableRefunds(ctx, time.Now().Add(time.Hour))
+	if err != nil || len(refunds) != 1 || refunds[0].AmountPaise != 300 ||
+		refunds[0].Reason != store.RefundReasonExcess {
+		t.Fatalf("wrong payment not independently refundable: %+v %v",refunds,err)
 	}
 
 	// Verify order status was NOT changed to paid
