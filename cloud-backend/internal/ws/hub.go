@@ -250,6 +250,18 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 	if strings.TrimSpace(cmd.JobID) == "" {
 		return fmt.Errorf("send job: empty job ID")
 	}
+	// This is the final dispatch safety gate, including delayed webhooks and
+	// reconnect reconciliation. Faulted/refunding orders must never be printed.
+	if h.db != nil {
+		blocked, reason, err := h.db.GetKioskBlock(ctx, cmd.KioskID)
+		if err != nil { return fmt.Errorf("send job: verify kiosk service state: %w", err) }
+		if blocked { return fmt.Errorf("send job: kiosk out of service: %s", reason) }
+		if cmd.OrderID != "" {
+			refund, err := h.db.GetRefundRequest(ctx, cmd.OrderID)
+			if err != nil { return fmt.Errorf("send job: verify refund obligation: %w", err) }
+			if refund != nil { return fmt.Errorf("send job: order %s has a pending or processed refund", cmd.OrderID) }
+		}
+	}
 	if strings.TrimSpace(cmd.KioskID) == "" {
 		return fmt.Errorf("send job: empty kiosk ID")
 	}
