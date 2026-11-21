@@ -19,6 +19,8 @@ type MockProvider struct {
 	FailReason    string
 	CustomQR      string
 	CreatedCount  int
+	RefundedCount int
+	Refunds map[string]RefundResult
 }
 
 // NewMockProvider initializes a new MockProvider with a webhook secret.
@@ -106,3 +108,29 @@ func (m *MockProvider) VerifyWebhookSignature(payload []byte, signature string) 
 	return VerifyWebhookSignature(payload, signature, m.WebhookSecret)
 }
 
+
+// Refund returns an idempotent simulated refund. No external money is moved.
+func (m *MockProvider) Refund(ctx context.Context, paymentID string, amountPaise int64, key string) (RefundResult, error) {
+	if err := ctx.Err(); err != nil { return RefundResult{}, err }
+	if paymentID == "" || amountPaise <= 0 || key == "" { return RefundResult{}, errors.New("invalid mock refund") }
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Refunds == nil { m.Refunds = make(map[string]RefundResult) }
+	if prev, exists := m.Refunds[key]; exists {
+		if prev.PaymentID != paymentID || prev.Amount != amountPaise {
+			return RefundResult{}, errors.New("idempotency key reused with different refund")
+		}
+		return prev, nil
+	}
+	r := RefundResult{ID:"rfnd_mock_"+key, PaymentID:paymentID, Amount:amountPaise, Status:"processed"}
+	m.Refunds[key] = r
+	m.RefundedCount++
+	return r, nil
+}
+func (m *MockProvider) GetRefund(ctx context.Context, refundID string) (RefundResult, error) {
+	if err := ctx.Err(); err != nil { return RefundResult{}, err }
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.Refunds { if r.ID == refundID { return r, nil } }
+	return RefundResult{}, errors.New("refund not found")
+}
