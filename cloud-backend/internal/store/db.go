@@ -2391,7 +2391,7 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 	// monetary refund is in flight.
 	var refundStopped int
 	if err := tx.QueryRowContext(ctx, s.rebind(
-		"SELECT COUNT(*) FROM refund_requests WHERE order_id = ? AND (safe_stop_verified = 1 OR status = 'PROCESSED')"),
+		"SELECT COUNT(*) FROM payment_refund_requests WHERE order_id = ? AND reason = 'FULFILLMENT_FAILED' AND (safe_stop_verified = 1 OR status = 'PROCESSED')"),
 		orderID).Scan(&refundStopped); err != nil {
 		return fmt.Errorf("update job progress: query refund safety: %w", err)
 	}
@@ -2667,14 +2667,21 @@ SELECT o.order_id FROM orders o
 WHERE (
     o.updated_at_ns <= ?
     AND (
-      o.status = 'COMPLETED'
+      (o.status = 'COMPLETED' AND NOT EXISTS (
+          SELECT 1 FROM payment_refund_requests rr
+          WHERE rr.order_id = o.order_id AND rr.status <> 'PROCESSED'
+      ))
       OR (
         o.status = 'FAILED_REFUNDABLE'
         AND (
           NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id AND p.status IN ('captured', 'CAPTURED'))
-          OR EXISTS (SELECT 1 FROM refund_requests rr WHERE rr.order_id = o.order_id AND rr.status = 'PROCESSED')
+          OR EXISTS (SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id = o.order_id AND rr.reason = 'FULFILLMENT_FAILED' AND rr.status = 'PROCESSED')
         )
       )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM payment_refund_requests rr
+      WHERE rr.order_id = o.order_id AND rr.status <> 'PROCESSED'
     )
   )
   OR (o.status = 'PENDING_PAYMENT' AND o.created_at_ns <= ?);
@@ -3276,6 +3283,7 @@ type PaymentCaptureResult struct {
 	OrderStatus      contracts.JobStatus
 	DispatchEligible bool
 	AlreadyProcessed bool
+	ExcessCapture    bool
 	ActiveSessionID  string
 	PricePaise       int64
 	KioskID          string
@@ -3328,6 +3336,14 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 		return nil, fmt.Errorf("capture payment: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Serialize distinct captures per order. The funding decision, capture row,
+	// and any surplus refund obligation must commit as one transaction.
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22616, hashtext($1));", p.OrderID); err != nil {
+			return nil, fmt.Errorf("capture payment: acquire funding lock: %w", err)
+		}
+	}
 
 	// 1. Check if payment record already exists
 	var (
@@ -3409,6 +3425,52 @@ WHERE order_id = ?;
 	}
 
 	currentStatus := contracts.JobStatus(statusStr)
+
+	// Precisely one captured payment may fund a print order. Historic captures
+	// are preferred if this row has not been backfilled yet. New distinct
+	// captures on dispatched/terminal orders are always surplus.
+	var fundingPaymentID string
+	err = tx.QueryRowContext(ctx, s.rebind(
+		"SELECT payment_id FROM order_funding_payments WHERE order_id = ?"), p.OrderID).Scan(&fundingPaymentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if currentStatus == contracts.JobStatusPendingPayment || currentStatus == contracts.JobStatusPaidWaiting {
+			var earlierID string
+			err = tx.QueryRowContext(ctx, s.rebind(`
+SELECT payment_id FROM payments WHERE order_id = ?
+AND LOWER(status) IN ('captured','paid') ORDER BY created_at_ns ASC, payment_id ASC LIMIT 1;`),
+				p.OrderID).Scan(&earlierID)
+			if errors.Is(err, sql.ErrNoRows) {
+				earlierID = p.PaymentID
+			} else if err != nil {
+				return nil, fmt.Errorf("capture payment: find existing funding: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, s.rebind(`
+INSERT INTO order_funding_payments(order_id,payment_id,created_at_ns)
+VALUES(?,?,?) ON CONFLICT(order_id) DO NOTHING;`), p.OrderID, earlierID, nowNS)
+			if err != nil { return nil, fmt.Errorf("capture payment: allocate funding: %w", err) }
+			err = tx.QueryRowContext(ctx, s.rebind(
+				"SELECT payment_id FROM order_funding_payments WHERE order_id = ?"), p.OrderID).Scan(&fundingPaymentID)
+		}
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("capture payment: determine funding: %w", err)
+	}
+	if fundingPaymentID != p.PaymentID {
+		// Unlike webhook replay, this is different money. Never send a new job.
+		// Persist the payment and its independently refundable obligation together.
+		if err := s.recordExcessCaptureInTx(ctx, tx, p, orderKioskID, nowNS); err != nil {
+			return nil, fmt.Errorf("capture payment: record surplus: %w", err)
+		}
+		if err := tx.Commit(); err != nil { return nil, fmt.Errorf("capture payment: commit surplus: %w", err) }
+		return &PaymentCaptureResult{
+			OrderStatus: currentStatus,
+			DispatchEligible: false,
+			AlreadyProcessed: true,
+			ExcessCapture: true,
+			PricePaise: pricePaise,
+			KioskID: orderKioskID,
+		}, nil
+	}
 
 	// 4. Check if order is already terminal or dispatched
 	if currentStatus == contracts.JobStatusCompleted ||
