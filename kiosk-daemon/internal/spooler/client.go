@@ -119,6 +119,9 @@ type Client struct {
 	jobQueue   chan contracts.PrintJobCommand
 	activeMu   sync.Mutex
 	activeJobs map[string]bool
+	// Local stop barrier prevents already-queued sibling documents from
+	// starting after a print failure, independent of cloud connectivity.
+	blockedPrintOrders sync.Map
 
 	deferredMu   sync.Mutex
 	deferredJobs []contracts.PrintJobCommand
@@ -1120,6 +1123,15 @@ func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEv
 	// An error alone cannot release money: cancel every queued CUPS child
 	// and prove it is safe before attesting the stop to the cloud.
 	if event.Status == contracts.JobStatusPausedError || event.Status == contracts.JobStatusFailedRefundable {
+		if c.cfg.StateStore != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if job, err := c.cfg.StateStore.GetJob(ctx, event.JobID); err == nil && job != nil {
+				if orderID := strings.TrimSpace(job.Command.OrderID); orderID != "" {
+					c.blockedPrintOrders.Store(orderID, true)
+				}
+			}
+			cancel()
+		}
 		go c.tryConfirmRefundSafeStop(event.JobID)
 	}
 }
@@ -2061,6 +2073,10 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 	if strings.TrimSpace(cmd.OrderID) == "" {
 		cmd.OrderID = cmd.JobID
+	}
+	if _, blocked := c.blockedPrintOrders.Load(cmd.OrderID); blocked {
+		log.Printf("[SPOOLER] Refusing to print queued document %s: order %s is faulted", cmd.JobID, cmd.OrderID)
+		return
 	}
 
 	if c.pinController != nil && c.pinController.HasActiveTransaction() {
