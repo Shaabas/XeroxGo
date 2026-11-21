@@ -179,6 +179,7 @@
   let activeOrderId = null;
   let activeDisplayCode = '';
   let activeRecoveryToken = '';
+  let paidPINRecoveryRequestedForOrder = '';
   let orderPollTimer = null;
   let expiryCountdownTimer = null;
 
@@ -2103,6 +2104,7 @@
   function updateCheckoutStatus(statusData) {
     if (!statusData || !checkoutLiveStatusBox) return;
     const st = statusData.status || '';
+    const originalPINExpired = authoritativeExpiryMs > 0 && Date.now() >= authoritativeExpiryMs;
 
     // The five-minute clock is for UNPAID orders only. Verified payment
     // creates a durable fulfillment/refund obligation, not another deadline.
@@ -2128,6 +2130,16 @@
 
     if (st && st !== 'PENDING_PAYMENT' && st !== 'EXPIRED') {
       checkoutLiveStatusBox.classList.remove('hidden');
+    }
+    // A delayed capture may arrive after the old PIN was released. Do not
+    // resurrect the potentially reused PIN: rotate it using the secure
+    // recovery credential, for the SAME paid order, without charging again.
+    if (st === 'PAID_WAITING' && originalPINExpired && activeOrderId &&
+        paidPINRecoveryRequestedForOrder !== activeOrderId) {
+      paidPINRecoveryRequestedForOrder = activeOrderId;
+      requestRecoveryPIN().then(result => {
+        if (!result) paidPINRecoveryRequestedForOrder = '';
+      });
     }
 
     if (checkoutStatusPill) {
@@ -2197,9 +2209,11 @@
             pinBoxes[i].textContent = activeDisplayCode[i] || '-';
           }
         }
-        if (recData.pin_expires_at) {
-          startExpiryCountdown(recData.pin_expires_at);
-        }
+        // Paid recovery PINs do not carry a customer-facing timer.
+        if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+        expiryCountdownTimer = null;
+        authoritativeExpiryMs = 0;
+        if (pinExpiryText) pinExpiryText.classList.add('hidden');
         return recData;
       }
     } catch (_) { }
@@ -2235,6 +2249,7 @@
       activeOrderId = null;
       activeDisplayCode = '';
       activeRecoveryToken = '';
+      paidPINRecoveryRequestedForOrder = '';
       switchView('cart');
       renderCart();
     });
