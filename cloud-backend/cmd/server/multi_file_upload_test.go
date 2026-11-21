@@ -17,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"xeroxgo/pkg/contracts"
 )
 
 func TestMultiFileUploadAndOrderCreation(t *testing.T) {
