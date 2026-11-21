@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -46,6 +49,16 @@ func TestRefundWorker_ExcessCaptureIsRefundedOnceWithoutStoppingPrinting(t *test
 	}
 	if err := app.processRefundsOnce(ctx); err != nil { t.Fatal(err) }
 	if mock.RefundedCount != 1 { t.Fatalf("expected one excess refund, got %d",mock.RefundedCount) }
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/orders/"+orderID+"/status", nil)
+	statusResponse := httptest.NewRecorder()
+	app.handleOrderStatus(statusResponse, statusReq)
+	if statusResponse.Code != http.StatusOK { t.Fatalf("order status HTTP %d", statusResponse.Code) }
+	var state map[string]interface{}
+	if err := json.Unmarshal(statusResponse.Body.Bytes(), &state); err != nil { t.Fatal(err) }
+	if state["excess_refunds_total"] != float64(1) || state["excess_refunds_processed"] != float64(1) ||
+		state["excess_refunds_unresolved"] != float64(0) {
+		t.Fatalf("customer status omits finished surplus refund: %+v", state)
+	}
 	ref, err := st.GetRefundRequest(ctx, orderID)
 	if err != nil || ref != nil { t.Fatalf("surplus refund should not trigger fulfillment failure: %+v %v", ref, err) }
 	ord, err := st.GetOrder(ctx, orderID)
