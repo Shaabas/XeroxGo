@@ -38,6 +38,7 @@ type RefundRequest struct {
 	ProviderRefundID string
 	SafeStopVerified bool
 	LastError        string
+	Reason           string
 }
 
 func (s *Store) ensureFulfillmentSchema(ctx context.Context) error {
@@ -65,8 +66,8 @@ CREATE TABLE IF NOT EXISTS refund_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_refund_requests_status ON refund_requests(status, updated_at_ns);
 `
-	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if _, err := s.db.ExecContext(ctx, schema); err != nil { return err }
+	return s.migratePaymentRefundSchema(ctx)
 }
 
 func (s *Store) BlockKiosk(ctx context.Context, kioskID, reason string) error {
@@ -134,204 +135,124 @@ WHERE order_id = ? AND display_code <> '' AND pin_expires_at_ns > ?;`),
 func (s *Store) RecordRefundRequired(ctx context.Context, orderID string) error {
 	var paymentID, provider string
 	var amount int64
-	err := s.db.QueryRowContext(ctx, s.rebind(`
-SELECT payment_id, provider, amount_paise FROM payments
-WHERE order_id = ? AND status IN ('captured', 'CAPTURED')
-ORDER BY created_at_ns ASC LIMIT 1;`), orderID).Scan(&paymentID, &provider, &amount)
-	if errors.Is(err, sql.ErrNoRows) { return nil } // unpaid orders need no refund
-	if err != nil { return err }
-	if amount <= 0 { return errors.New("invalid captured amount") }
+	// Only the capture funding the print order is subject to physical safe-stop.
+	// The first historic capture is the fallback for older manually seeded data.
+	err := s.db.QueryRowContext(ctx, s.rebind("\nSELECT p.payment_id,p.provider,p.amount_paise\nFROM payments p LEFT JOIN order_funding_payments f ON f.order_id=p.order_id\nWHERE p.order_id=? AND LOWER(p.status) IN ('captured','paid')\nAND (p.payment_id=f.payment_id OR (f.payment_id IS NULL AND NOT EXISTS(\n  SELECT 1 FROM payments older WHERE older.order_id=p.order_id\n  AND LOWER(older.status) IN ('captured','paid')\n  AND (older.created_at_ns < p.created_at_ns OR\n    (older.created_at_ns=p.created_at_ns AND older.payment_id < p.payment_id))\n)))\nLIMIT 1;"), orderID).Scan(&paymentID,&provider,&amount)
+	if errors.Is(err,sql.ErrNoRows) { return nil }
+	if err!=nil { return err }
+	if amount<=0 { return errors.New("invalid captured amount") }
 	var orderStatus string
-	if err := s.db.QueryRowContext(ctx, s.rebind("SELECT status FROM orders WHERE order_id = ?"), orderID).Scan(&orderStatus); err != nil { return err }
-	if orderStatus == "COMPLETED" { return nil }
-	now := time.Now().UTC().UnixNano()
-	_, err = s.db.ExecContext(ctx, s.rebind(`
-INSERT INTO refund_requests(order_id, payment_id, provider, amount_paise, status, idempotency_key, created_at_ns, updated_at_ns)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(order_id) DO NOTHING;`),
-		orderID, paymentID, provider, amount, RefundRequired, "xeroxgo_refund_"+orderID, now, now)
+	if err:=s.db.QueryRowContext(ctx,s.rebind("SELECT status FROM orders WHERE order_id=?"),orderID).Scan(&orderStatus);err!=nil{return err}
+	if orderStatus=="COMPLETED" {return nil}
+	now:=time.Now().UTC().UnixNano()
+	_,err=s.db.ExecContext(ctx,s.rebind("\nINSERT INTO payment_refund_requests(\n payment_id,order_id,provider,amount_paise,reason,status,idempotency_key,\n created_at_ns,updated_at_ns)\nVALUES(?,?,?,?,'FULFILLMENT_FAILED','REQUIRED',?,?,?)\nON CONFLICT(payment_id) DO NOTHING;"),
+		paymentID,orderID,provider,amount,refundIdempotencyKey(paymentID),now,now)
 	return err
 }
-
-func (s *Store) GetRefundRequest(ctx context.Context, orderID string) (*RefundRequest, error) {
+func (s *Store) GetRefundRequest(ctx context.Context, orderID string) (*RefundRequest,error) {
 	var v RefundRequest
 	var safe int
-	err := s.db.QueryRowContext(ctx, s.rebind(`
-SELECT order_id, payment_id, provider, amount_paise, status, idempotency_key, provider_refund_id,
-safe_stop_verified, last_error FROM refund_requests WHERE order_id = ?;`), orderID).Scan(
-		&v.OrderID, &v.PaymentID, &v.Provider, &v.AmountPaise, &v.Status,
-		&v.IdempotencyKey, &v.ProviderRefundID, &safe, &v.LastError)
-	if errors.Is(err, sql.ErrNoRows) { return nil, nil }
-	v.SafeStopVerified = safe != 0
-	return &v, err
+	err:=s.db.QueryRowContext(ctx,s.rebind("\nSELECT order_id,payment_id,provider,amount_paise,reason,status,idempotency_key,\nprovider_refund_id,safe_stop_verified,last_error\nFROM payment_refund_requests WHERE order_id=? AND reason='FULFILLMENT_FAILED'\nORDER BY created_at_ns ASC LIMIT 1;"),orderID).Scan(
+		&v.OrderID,&v.PaymentID,&v.Provider,&v.AmountPaise,&v.Reason,&v.Status,
+		&v.IdempotencyKey,&v.ProviderRefundID,&safe,&v.LastError)
+	if errors.Is(err,sql.ErrNoRows){return nil,nil}
+	if err!=nil{return nil,err}
+	v.SafeStopVerified=safe!=0
+	return &v,nil
 }
-
 // Pi emits safe-stop only AFTER verifying every child job is safely canceled
 // or never submitted. It is not sufficient to receive PAUSED_ERROR alone.
-func (s *Store) ConfirmRefundSafeStop(ctx context.Context, orderID string) error {
-	_, err := s.db.ExecContext(ctx, s.rebind(`
-UPDATE refund_requests SET safe_stop_verified = 1, updated_at_ns = ?
-WHERE order_id = ? AND status IN ('REQUIRED', 'FAILED');`),
-		time.Now().UTC().UnixNano(), orderID)
+func (s *Store) ConfirmRefundSafeStop(ctx context.Context,orderID string)error{
+	_,err:=s.db.ExecContext(ctx,s.rebind("\nUPDATE payment_refund_requests SET safe_stop_verified=1,updated_at_ns=?\nWHERE order_id=? AND reason='FULFILLMENT_FAILED' AND status IN ('REQUIRED','FAILED');"),
+		time.Now().UTC().UnixNano(),orderID)
 	return err
 }
-
-func (s *Store) ListActionableRefunds(ctx context.Context, olderThan time.Time) ([]RefundRequest, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
-SELECT order_id, payment_id, provider, amount_paise, status, idempotency_key,
-provider_refund_id, safe_stop_verified, last_error
-FROM refund_requests WHERE safe_stop_verified = 1
-AND ((status IN ('REQUIRED', 'FAILED')) OR (status = 'REQUESTING' AND updated_at_ns < ?))
-ORDER BY created_at_ns ASC LIMIT 50;`), olderThan.UnixNano())
-	if err != nil { return nil, err }
+func (s *Store) ListActionableRefunds(ctx context.Context,olderThan time.Time)([]RefundRequest,error){
+	rows,err:=s.db.QueryContext(ctx,s.rebind("\nSELECT order_id,payment_id,provider,amount_paise,reason,status,idempotency_key,\nprovider_refund_id,safe_stop_verified,last_error\nFROM payment_refund_requests WHERE safe_stop_verified=1\nAND (status IN ('REQUIRED','FAILED') OR (status='REQUESTING' AND updated_at_ns < ?))\nORDER BY created_at_ns ASC LIMIT 50;"),olderThan.UnixNano())
+	if err!=nil{return nil,err}
 	defer rows.Close()
 	var out []RefundRequest
-	for rows.Next() {
+	for rows.Next(){
 		var v RefundRequest
 		var safe int
-		if err := rows.Scan(&v.OrderID, &v.PaymentID, &v.Provider, &v.AmountPaise, &v.Status,
-			&v.IdempotencyKey, &v.ProviderRefundID, &safe, &v.LastError); err != nil { return nil, err }
-		v.SafeStopVerified = safe != 0
-		out = append(out, v)
+		if err:=rows.Scan(&v.OrderID,&v.PaymentID,&v.Provider,&v.AmountPaise,&v.Reason,
+			&v.Status,&v.IdempotencyKey,&v.ProviderRefundID,&safe,&v.LastError);err!=nil{return nil,err}
+		v.SafeStopVerified=safe!=0
+		out=append(out,v)
 	}
-	return out, rows.Err()
+	return out,rows.Err()
 }
-
 // Compare-and-swap prevents two replicas from concurrently submitting the
 // same refund. Crashes can retry the same provider idempotency key after 60s.
-func (s *Store) ClaimRefund(ctx context.Context, orderID string, retryBefore time.Time) (bool, error) {
-	res, err := s.db.ExecContext(ctx, s.rebind(`
-UPDATE refund_requests SET status = 'REQUESTING', attempts = attempts + 1,
-updated_at_ns = ?, last_error = ''
-WHERE order_id = ? AND safe_stop_verified = 1
-AND (status IN ('REQUIRED', 'FAILED') OR (status = 'REQUESTING' AND updated_at_ns < ?));`),
-		time.Now().UTC().UnixNano(), orderID, retryBefore.UnixNano())
-	if err != nil { return false, err }
-	n, err := res.RowsAffected()
-	return n == 1, err
+func (s *Store) ClaimRefund(ctx context.Context,orderID string,retryBefore time.Time)(bool,error){
+	r,err:=s.GetRefundRequest(ctx,orderID)
+	if err!=nil||r==nil{return false,err}
+	return s.ClaimRefundPayment(ctx,r.PaymentID,retryBefore)
 }
-
-func (s *Store) RecordRefundResult(ctx context.Context, orderID, providerRefundID, status, errorText string) error {
-	if status != RefundPending && status != RefundProcessed && status != RefundFailed {
-		return errors.New("unsupported refund result")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil { return err }
-	defer tx.Rollback()
-	now := time.Now().UTC().UnixNano()
-	result, err := tx.ExecContext(ctx, s.rebind(`
-UPDATE refund_requests SET status = ?, provider_refund_id = ?, last_error = ?, updated_at_ns = ?
-WHERE order_id = ? AND safe_stop_verified = 1
-AND status IN ('REQUESTING','PENDING','FAILED');`),
-		status, providerRefundID, errorText, now, orderID)
-	if err != nil { return err }
-	n, err := result.RowsAffected()
-	if err != nil { return err }
-	if n != 1 { return fmt.Errorf("refund result for %s rejected: invalid transition or missing safe stop", orderID) }
-	if status == RefundProcessed {
-		// Once the provider reports processed, do not allow the order to print.
-		_, err = tx.ExecContext(ctx, s.rebind(`
-UPDATE orders SET status = 'FAILED_REFUNDABLE', updated_at_ns = ? WHERE order_id = ?
-AND status NOT IN ('COMPLETED', 'FAILED_REFUNDABLE');`), now, orderID)
-		if err != nil { return err }
-		_, err = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?"), orderID)
-		if err != nil { return err }
-	}
-	return tx.Commit()
+func (s *Store) RecordRefundResult(ctx context.Context,orderID,providerRefundID,status,errorText string)error{
+	r,err:=s.GetRefundRequest(ctx,orderID)
+	if err!=nil{return err}
+	if r==nil{return fmt.Errorf("no fulfillment refund for order %s",orderID)}
+	return s.RecordRefundResultForPayment(ctx,r.PaymentID,providerRefundID,status,errorText)
 }
-
 // Pending refunds need provider reconciliation: a successful API response does
 // not necessarily mean funds have completed their return.
-func (s *Store) ListPendingRefunds(ctx context.Context, olderThan time.Time) ([]RefundRequest, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
-SELECT order_id, payment_id, provider, amount_paise, status, idempotency_key,
-provider_refund_id, safe_stop_verified, last_error
-FROM refund_requests WHERE status = 'PENDING' AND provider_refund_id <> ''
-AND updated_at_ns < ? ORDER BY updated_at_ns ASC LIMIT 50;`), olderThan.UnixNano())
-	if err != nil { return nil, err }
+func (s *Store) ListPendingRefunds(ctx context.Context,olderThan time.Time)([]RefundRequest,error){
+	rows,err:=s.db.QueryContext(ctx,s.rebind("\nSELECT order_id,payment_id,provider,amount_paise,reason,status,idempotency_key,\nprovider_refund_id,safe_stop_verified,last_error\nFROM payment_refund_requests WHERE status='PENDING' AND provider_refund_id <> ''\nAND updated_at_ns < ? ORDER BY updated_at_ns ASC LIMIT 50;"),olderThan.UnixNano())
+	if err!=nil{return nil,err}
 	defer rows.Close()
-	var items []RefundRequest
-	for rows.Next() {
-		var r RefundRequest
-		var confirmed int
-		if err := rows.Scan(&r.OrderID, &r.PaymentID, &r.Provider, &r.AmountPaise,
-			&r.Status, &r.IdempotencyKey, &r.ProviderRefundID, &confirmed, &r.LastError); err != nil {
-			return nil, err
-		}
-		r.SafeStopVerified = confirmed != 0
-		items = append(items, r)
+	var out []RefundRequest
+	for rows.Next(){
+		var v RefundRequest
+		var safe int
+		if err:=rows.Scan(&v.OrderID,&v.PaymentID,&v.Provider,&v.AmountPaise,&v.Reason,
+			&v.Status,&v.IdempotencyKey,&v.ProviderRefundID,&safe,&v.LastError);err!=nil{return nil,err}
+		v.SafeStopVerified=safe!=0
+		out=append(out,v)
 	}
-	return items, rows.Err()
+	return out,rows.Err()
 }
-
 // A kiosk with an unconfirmed stop must not be restored to service.
-func (s *Store) HasUnsafeRefundStops(ctx context.Context, kioskID string) (bool, error) {
+func (s *Store) HasUnsafeRefundStops(ctx context.Context,kioskID string)(bool,error){
 	var n int
-	err := s.db.QueryRowContext(ctx, s.rebind(`
-SELECT COUNT(*) FROM refund_requests rr
-JOIN orders o ON o.order_id = rr.order_id
-WHERE o.kiosk_id = ? AND rr.safe_stop_verified = 0
-AND rr.status <> 'PROCESSED';`), kioskID).Scan(&n)
-	return n > 0, err
+	err:=s.db.QueryRowContext(ctx,s.rebind("\nSELECT COUNT(*) FROM payment_refund_requests rr\nJOIN orders o ON o.order_id=rr.order_id\nWHERE o.kiosk_id=? AND rr.reason='FULFILLMENT_FAILED'\nAND rr.safe_stop_verified=0 AND rr.status <> 'PROCESSED';"),kioskID).Scan(&n)
+	return n>0,err
 }
-
 // ListPaidWithoutDispatch returns captured orders with no active kiosk checkout,
 // no durable CUPS dispatch intent and no refund obligation. These are provably
 // never dispatched by XeroxGo, unlike jobs with an uncertain SENT intent.
-func (s *Store) ListPaidWithoutDispatch(ctx context.Context, cutoff time.Time, now time.Time) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(`
-SELECT o.order_id FROM orders o
-WHERE o.status = 'PAID_WAITING'
-AND EXISTS (SELECT 1 FROM payments p
-            WHERE p.order_id = o.order_id AND p.status IN ('captured','CAPTURED')
-            AND p.created_at_ns < ?)
-AND NOT EXISTS (SELECT 1 FROM dispatch_intents di WHERE di.order_id = o.order_id)
-AND NOT EXISTS (SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id = o.order_id
-                AND ks.status = 'PAYMENT_PENDING' AND ks.expires_at_ns > ?)
-AND NOT EXISTS (SELECT 1 FROM refund_requests rr WHERE rr.order_id = o.order_id)
-ORDER BY o.created_at_ns ASC LIMIT 30;`), cutoff.UnixNano(), now.UnixNano())
-	if err != nil { return nil, err }
+func (s *Store) ListPaidWithoutDispatch(ctx context.Context,cutoff time.Time,now time.Time)([]string,error){
+	rows,err:=s.db.QueryContext(ctx,s.rebind("\nSELECT o.order_id FROM orders o WHERE o.status='PAID_WAITING'\nAND EXISTS(SELECT 1 FROM payments p WHERE p.order_id=o.order_id\nAND LOWER(p.status) IN ('captured','paid') AND p.created_at_ns < ?)\nAND NOT EXISTS(SELECT 1 FROM dispatch_intents di WHERE di.order_id=o.order_id)\nAND NOT EXISTS(SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id=o.order_id\nAND ks.status='PAYMENT_PENDING' AND ks.expires_at_ns > ?)\nAND NOT EXISTS(SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id=o.order_id\nAND rr.reason='FULFILLMENT_FAILED')\nORDER BY o.created_at_ns ASC LIMIT 30;"),cutoff.UnixNano(),now.UnixNano())
+	if err!=nil{return nil,err}
 	defer rows.Close()
-	var ids []string
-	for rows.Next() { var id string; if err := rows.Scan(&id); err != nil { return nil, err }; ids = append(ids,id) }
-	return ids, rows.Err()
+	var out []string
+	for rows.Next(){var id string;if err:=rows.Scan(&id);err!=nil{return nil,err};out=append(out,id)}
+	return out,rows.Err()
 }
-
 // FailNeverDispatchedPaidOrder atomically transitions a paid order to a refund
 // obligation only if no job was ever scheduled for physical dispatch. This is
 // safe to auto-refund even if the Pi is offline, since no dispatch intent exists.
-func (s *Store) FailNeverDispatchedPaidOrder(ctx context.Context, orderID string, now time.Time) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil { return false, err }
+func (s *Store) FailNeverDispatchedPaidOrder(ctx context.Context,orderID string,now time.Time)(bool,error){
+	tx,err:=s.db.BeginTx(ctx,nil)
+	if err!=nil{return false,err}
 	defer tx.Rollback()
-	nowNS := now.UTC().UnixNano()
-	// This conditional update is the serialization point against a concurrent
-	// PAID_WAITING -> DISPATCHED transition.
-	res, err := tx.ExecContext(ctx, s.rebind(`
-UPDATE orders SET status = 'PAUSED_ERROR', updated_at_ns = ?
-WHERE order_id = ? AND status = 'PAID_WAITING'
-AND NOT EXISTS(SELECT 1 FROM dispatch_intents di WHERE di.order_id = orders.order_id)
-AND NOT EXISTS(SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id = orders.order_id
-AND ks.status = 'PAYMENT_PENDING' AND ks.expires_at_ns > ?)
-AND EXISTS(SELECT 1 FROM payments p WHERE p.order_id = orders.order_id AND p.status IN ('captured','CAPTURED'))
-AND NOT EXISTS(SELECT 1 FROM refund_requests rr WHERE rr.order_id = orders.order_id);`), nowNS, orderID, nowNS)
-	if err != nil { return false, err }
-	affected, err := res.RowsAffected()
-	if err != nil { return false, err }
-	if affected == 0 { return false, nil }
-	_, err = tx.ExecContext(ctx, s.rebind(`
-INSERT INTO refund_requests(order_id, payment_id, provider, amount_paise, status,
- idempotency_key, safe_stop_verified, created_at_ns, updated_at_ns)
-SELECT ?, p.payment_id, p.provider, p.amount_paise, 'REQUIRED',
- ?, 1, ?, ? FROM payments p
-WHERE p.order_id = ? AND p.status IN ('captured','CAPTURED')
-ORDER BY p.created_at_ns ASC LIMIT 1;`),
-		orderID, "xeroxgo_refund_"+orderID, nowNS, nowNS, orderID)
-	if err != nil { return false, err }
-	if err := tx.Commit(); err != nil { return false, err }
-	return true, nil
+	nowNS:=now.UTC().UnixNano()
+	res,err:=tx.ExecContext(ctx,s.rebind("\nUPDATE orders SET status='PAUSED_ERROR',updated_at_ns=?\nWHERE order_id=? AND status='PAID_WAITING'\nAND NOT EXISTS(SELECT 1 FROM dispatch_intents di WHERE di.order_id=orders.order_id)\nAND NOT EXISTS(SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id=orders.order_id\nAND ks.status='PAYMENT_PENDING' AND ks.expires_at_ns > ?)\nAND EXISTS(SELECT 1 FROM payments p WHERE p.order_id=orders.order_id\nAND LOWER(p.status) IN ('captured','paid'))\nAND NOT EXISTS(SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id=orders.order_id\nAND rr.reason='FULFILLMENT_FAILED');"),nowNS,orderID,nowNS)
+	if err!=nil{return false,err}
+	n,err:=res.RowsAffected()
+	if err!=nil{return false,err}
+	if n==0{return false,nil}
+	// This branch is unchanged in policy (Problem 2); only its ledger key and
+	// funding-payment selection are made correct.
+	var paymentID,provider string
+	var amount int64
+	err=tx.QueryRowContext(ctx,s.rebind("\nSELECT p.payment_id,p.provider,p.amount_paise FROM payments p\nLEFT JOIN order_funding_payments f ON f.order_id=p.order_id\nWHERE p.order_id=? AND LOWER(p.status) IN ('captured','paid')\nAND (p.payment_id=f.payment_id OR (f.payment_id IS NULL AND NOT EXISTS(\n SELECT 1 FROM payments older WHERE older.order_id=p.order_id\n AND LOWER(older.status) IN ('captured','paid')\n AND (older.created_at_ns<p.created_at_ns OR\n (older.created_at_ns=p.created_at_ns AND older.payment_id<p.payment_id))\n)))\nLIMIT 1;"),orderID).Scan(&paymentID,&provider,&amount)
+	if err!=nil{return false,err}
+	_,err=tx.ExecContext(ctx,s.rebind("\nINSERT INTO payment_refund_requests(payment_id,order_id,provider,amount_paise,reason,\n status,idempotency_key,safe_stop_verified,created_at_ns,updated_at_ns)\nVALUES(?,?,?,?,'FULFILLMENT_FAILED','REQUIRED',?,1,?,?)\nON CONFLICT(payment_id) DO NOTHING;"),paymentID,orderID,provider,amount,refundIdempotencyKey(paymentID),nowNS,nowNS)
+	if err!=nil{return false,err}
+	if err:=tx.Commit();err!=nil{return false,err}
+	return true,nil
 }
-
 type KioskServiceFlag struct {
 	KioskID      string `json:"kiosk_id"`
 	Reason       string `json:"reason"`
