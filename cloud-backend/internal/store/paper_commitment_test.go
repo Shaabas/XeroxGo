@@ -12,8 +12,7 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
-func createTestOrderWithSheets(t *testing.T, s *Store, ctx context.Context, orderID, kioskID, pin string, sheets int, status contracts.JobStatus, now time.Time) {
-	t.Helper()
+func makeTestOrderWithSheets(orderID, kioskID, pin string, sheets int, status contracts.JobStatus, now time.Time) Order {
 	cmd := contracts.PrintJobCommand{
 		JobID:          "job_" + orderID,
 		KioskID:        kioskID,
@@ -26,14 +25,18 @@ func createTestOrderWithSheets(t *testing.T, s *Store, ctx context.Context, orde
 		StartFromPage:  1,
 		DisplayCode:    pin,
 	}
-	ord := Order{
+	return Order{
 		OrderID:      orderID,
 		Command:      cmd,
 		Status:       status,
 		PricePaise:   int64(sheets * 200),
 		PINExpiresAt: now.Add(30 * time.Minute),
 	}
-	if err := s.CreateOrder(ctx, ord); err != nil {
+}
+
+func createTestOrderWithSheets(t *testing.T, s *Store, ctx context.Context, orderID, kioskID, pin string, sheets int, status contracts.JobStatus, now time.Time) {
+	t.Helper()
+	if err := s.CreateOrder(ctx, makeTestOrderWithSheets(orderID, kioskID, pin, sheets, status, now)); err != nil {
 		t.Fatalf("failed to create order %s: %v", orderID, err)
 	}
 }
@@ -63,10 +66,11 @@ func TestStore_PaperCommitments(t *testing.T) {
 	// 2. Create Order 1 (10 sheets, PENDING_PAYMENT)
 	createTestOrderWithSheets(t, s, ctx, "ord_c1", kioskID, "1001", 10, contracts.JobStatusPendingPayment, now)
 
-	// Before claim, no active session exists -> committed is still 0
+
+	// PIN issuance reserves paper even before the kiosk creates a session.
 	committed, _ = s.GetCommittedPaperSheets(ctx, kioskID, "", now)
-	if committed != 0 {
-		t.Errorf("unclaimed order committed = %d, want 0", committed)
+	if committed != 10 {
+		t.Errorf("unclaimed order committed = %d, want 10", committed)
 	}
 
 	// Claim Order 1 with 50 sheets in tray -> succeeds
@@ -115,13 +119,17 @@ func TestStore_PaperCommitments(t *testing.T) {
 		t.Errorf("total committed = %d, want 25", committed)
 	}
 
-	// 4. Session Expiry Releases Unpaid Commitment
-	// Move time past sess1 expiry (6 minutes later)
-	later := now.Add(6 * time.Minute)
+
+	// Session expiration does not release the mobile reservation.
+	afterSessionExpiry := now.Add(6 * time.Minute)
+	if got, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", afterSessionExpiry); got != 25 {
+		t.Errorf("expired session should retain PIN reservations: got %d, want 25", got)
+	}
+	// Only the unpaid PIN expiration releases it.
+	later := now.Add(31 * time.Minute)
 	committedLater, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", later)
-	// sess1 expired -> commits 0; sess2 still valid (5m from now is expired too if now+6m, so both expired)
 	if committedLater != 0 {
-		t.Errorf("expired sessions committed = %d, want 0", committedLater)
+		t.Errorf("expired unpaid PINs committed %d sheets, want 0", committedLater)
 	}
 
 	// 5. Paid Order Preserves Commitment After Session Expiry
@@ -192,55 +200,42 @@ func TestStore_PaperCommitments(t *testing.T) {
 }
 
 func TestStore_ConcurrentOvercommitmentGuard(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "concurrent_guard.db")
-	s, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
-	}
+	s, err := Open(filepath.Join(t.TempDir(), "concurrent_guard.db"))
+	if err != nil { t.Fatal(err) }
 	defer s.Close()
 
 	ctx := context.Background()
 	now := time.Now().UTC()
 	kioskID := "kiosk-race-1"
-
-	// Available stock is exactly 10 sheets
-	availableStock := 10
-
-	// Create 10 orders each requiring 6 sheets (only 1 can possibly fit in 10 sheets)
-	orderCount := 10
-	for i := 0; i < orderCount; i++ {
-		ordID := fmt.Sprintf("ord_race_%d", i)
-		pin := fmt.Sprintf("200%d", i)
-		createTestOrderWithSheets(t, s, ctx, ordID, kioskID, pin, 6, contracts.JobStatusPendingPayment, now)
-	}
+	const availableStock, orderCount = 10, 10
 
 	var wg sync.WaitGroup
-	var successCount int
-	var insufficientCount int
 	var mu sync.Mutex
-
+	var created, short, unexpected int
 	for i := 0; i < orderCount; i++ {
 		wg.Add(1)
-		ordID := fmt.Sprintf("ord_race_%d", i)
-		go func(id string) {
+		go func(i int) {
 			defer wg.Done()
-			_, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, id, availableStock, 5*time.Minute, now)
+			ord := makeTestOrderWithSheets(
+				fmt.Sprintf("ord_race_%d", i), kioskID,
+				fmt.Sprintf("%04d", 2000+i), 6, contracts.JobStatusPendingPayment, now)
+			err := s.CreateOrderWithPaperCheck(ctx, ord, availableStock)
 			mu.Lock()
 			defer mu.Unlock()
-			if err == nil {
-				successCount++
-			} else if errors.Is(err, ErrInsufficientPaper) {
-				insufficientCount++
+			switch {
+			case err == nil: created++
+			case errors.Is(err, ErrInsufficientPaper): short++
+			default:
+				unexpected++
+				t.Errorf("create reserved order: %v", err)
 			}
-		}(ordID)
+		}(i)
 	}
 	wg.Wait()
-
-	if successCount != 1 {
-		t.Fatalf("expected exactly 1 successful claim, got %d", successCount)
+	if created != 1 || short != 9 || unexpected != 0 {
+		t.Fatalf("expected 1 PIN issued, 9 stock rejections; got created=%d shortage=%d other=%d", created, short, unexpected)
 	}
-	if insufficientCount != 9 {
-		t.Fatalf("expected 9 insufficient paper rejections, got %d", insufficientCount)
+	if got, err := s.GetCommittedPaperSheets(ctx, kioskID, "", now); err != nil || got != 6 {
+		t.Fatalf("reserved sheets=%d err=%v, want 6", got, err)
 	}
 }

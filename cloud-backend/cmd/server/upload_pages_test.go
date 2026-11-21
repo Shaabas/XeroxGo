@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -69,6 +70,8 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: 200,
 		downloadSecret:     []byte("test_secret_key_1234567890"),
+		// This fixture tests PDF normalization, not live printer availability.
+		devMode:            true,
 	}
 
 	hub := ws.NewHub(s)
@@ -80,6 +83,7 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", hub.ServeHTTP)
 	mux.HandleFunc("/api/k/", app.handleUpload)
 
 	return app, mux
@@ -345,7 +349,11 @@ func TestUpload_10PagePDF_Select_2_4_6_Simplex(t *testing.T) {
 	}
 
 	orderID := resp["order_id"].(string)
-	h := sha256.Sum256([]byte(orderID))
+	order, err := app.db.GetOrder(context.Background(), orderID)
+	if err != nil || order == nil || len(order.Documents) != 1 {
+		t.Fatalf("canonical child document unavailable: order=%+v err=%v",order,err)
+	}
+	h := sha256.Sum256([]byte(order.Documents[0].JobID))
 	outputPath := filepath.Join(app.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
 	actualPages := getPDFPageCount(t, outputPath)
@@ -414,7 +422,11 @@ func TestUpload_10PagePDF_Select_2_4_6_Duplex(t *testing.T) {
 	}
 
 	orderID := resp["order_id"].(string)
-	h := sha256.Sum256([]byte(orderID))
+	order, err := app.db.GetOrder(context.Background(), orderID)
+	if err != nil || order == nil || len(order.Documents) != 1 {
+		t.Fatalf("canonical child document unavailable: order=%+v err=%v",order,err)
+	}
+	h := sha256.Sum256([]byte(order.Documents[0].JobID))
 	outputPath := filepath.Join(app.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 
 	// Padded PDF must have 4 pages per copy boundary

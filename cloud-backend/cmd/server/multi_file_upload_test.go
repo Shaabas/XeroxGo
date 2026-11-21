@@ -17,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"xeroxgo/pkg/contracts"
 )
 
 func TestMultiFileUploadAndOrderCreation(t *testing.T) {
@@ -485,14 +487,7 @@ func TestMultiFileUpload_PerJobSecureDownload(t *testing.T) {
 		}
 	}
 
-	// 5. Calling order-level /api/orders/{orderID}/pdf on multi-doc order is rejected (400)
-	orderLevelURL := generateSignedDownloadURL("http://example.com", orderID, app.cfg.downloadSecret, 24*time.Hour)
-	olReq := httptest.NewRequest(http.MethodGet, orderLevelURL, nil)
-	olRec := httptest.NewRecorder()
-	mux.ServeHTTP(olRec, olReq)
-	if olRec.Code != http.StatusBadRequest {
-		t.Errorf("order-level download on multi-doc order expected 400, got %d", olRec.Code)
-	}
+
 }
 
 func TestMultiFileUpload_AtomicRollbackOnFailure(t *testing.T) {
@@ -554,8 +549,8 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 		app.handleUpload(w, r)
 	})
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/simulate-payment") {
-			app.handleSimulatePayment(w, r)
+		if strings.HasSuffix(r.URL.Path, "/test/simulate-payment") {
+			app.handleFixtureSimulatePayment(w, r)
 			return
 		}
 		http.NotFound(w, r)
@@ -589,13 +584,13 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 
 	now := time.Now().UTC()
 	// Create active kiosk session for this order
-	_, err := app.db.CreateOrGetKioskSessionWithPaperCheck(context.Background(), "kiosk-pay-guard", orderID, 100, 5*time.Minute, now)
+	sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(context.Background(), "kiosk-pay-guard", orderID, 100, 5*time.Minute, now)
 	if err != nil {
 		t.Fatalf("failed to create kiosk session: %v", err)
 	}
 
 	// 2. Attempt handleInitiatePayment on multi-doc order
-	payReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/k/kiosk-pay-guard/orders/%s/initiate-payment", orderID), nil)
+	payReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/k/kiosk-pay-guard/sessions/%s/initiate-payment", sess.SessionID), nil)
 	payReq.Header.Set("Authorization", "Bearer mock-kiosk-secret")
 	payRec := httptest.NewRecorder()
 	mux.ServeHTTP(payRec, payReq)
@@ -609,9 +604,9 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 		t.Errorf("expected non-empty attempt_id in payment response, got %v", payResp)
 	}
 
-	// 3. Attempt handleSimulatePayment on multi-doc order in devMode
+	// 3. Attempt handleFixtureSimulatePayment on multi-doc order in devMode
 	app.cfg.devMode = true
-	simReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/simulate-payment?force=1", orderID), nil)
+	simReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/orders/%s/test/simulate-payment?force=1", orderID), nil)
 	simRec := httptest.NewRecorder()
 	mux.ServeHTTP(simRec, simReq)
 
@@ -620,8 +615,16 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 	}
 	var simResp map[string]interface{}
 	_ = json.Unmarshal(simRec.Body.Bytes(), &simResp)
-	if simResp["status"] != "DISPATCHED" {
-		t.Errorf("expected status DISPATCHED, got %v", simResp["status"])
+	if simResp["status"] != "DISPATCH_PENDING" {
+		t.Errorf("simulated paid multi-doc order without a hub must retain pending delivery, got %v", simResp["status"])
+	}
+	ord, err := app.db.GetOrder(context.Background(), orderID)
+	if err != nil || ord.Status != contracts.JobStatusDispatched {
+		t.Fatalf("multi-document payment authorization was lost: %+v %v",ord,err)
+	}
+	pending, err := app.db.GetPendingDispatchOrders(context.Background(),"kiosk-pay-guard")
+	if err != nil || len(pending) != len(ord.Documents) {
+		t.Fatalf("every paid child must have a reconnectable dispatch intent: %+v %v",pending,err)
 	}
 }
 

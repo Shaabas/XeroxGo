@@ -31,13 +31,16 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
+// customerPINValidity controls mobile-issued unpaid PINs and paid-order
+// recovery PINs. Unpaid paper reservations expire with the mobile PIN.
+const customerPINValidity = 5 * time.Minute
+
 type serverConfig struct {
 	addr               string
 	dbPath             string
 	jobsDir            string
 	pricePerSheetPaise int64
 	devMode            bool
-	demoMode           bool
 	downloadSecret     []byte
 	webhookSecret      []byte
 	kioskSecret        []byte
@@ -49,10 +52,10 @@ type appServer struct {
 	hub             *ws.Hub
 	convWake        chan struct{}
 	pinLimiter      *PINRateLimiter
-	paymentProvider payments.Provider
+	paymentProvider *payments.MockProvider
 }
 
-func (s *appServer) getPaymentProvider() payments.Provider {
+func (s *appServer) getPaymentProvider() *payments.MockProvider {
 	if s.paymentProvider != nil {
 		return s.paymentProvider
 	}
@@ -120,6 +123,11 @@ func (s *appServer) generateUniquePIN(ctx context.Context, kioskID string) (stri
 }
 
 func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Order, maxAttempts int) error {
+	return s.createOrderWithPINRetryAndPaperCheck(ctx, order, maxAttempts, -1)
+}
+
+// Mobile order finalization uses the checked variant, not the internal bypass.
+func (s *appServer) createOrderWithPINRetryAndPaperCheck(ctx context.Context, order *store.Order, maxAttempts, availableStock int) error {
 	if s.db == nil {
 		return errors.New("database not initialized")
 	}
@@ -132,7 +140,11 @@ func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Or
 			return fmt.Errorf("generate pin: %w", err)
 		}
 		order.Command.DisplayCode = pin
-		err = s.db.CreateOrder(ctx, *order)
+		if availableStock >= 0 {
+			err = s.db.CreateOrderWithPaperCheck(ctx, *order, availableStock)
+		} else {
+			err = s.db.CreateOrder(ctx, *order)
+		}
 		if err == nil {
 			return nil
 		}
@@ -142,26 +154,6 @@ func (s *appServer) createOrderWithPINRetry(ctx context.Context, order *store.Or
 		return err
 	}
 	return errors.New("unable to reserve unique PIN after maximum collision retries")
-}
-
-func generateSignedDownloadURL(baseURL, orderID string, secret []byte, ttl time.Duration) string {
-	expires := time.Now().Add(ttl).Unix()
-	msg := fmt.Sprintf("%s\n%d", orderID, expires)
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(msg))
-	sig := hex.EncodeToString(mac.Sum(nil))
-	return fmt.Sprintf("%s/api/orders/%s/pdf?expires=%d&sig=%s", baseURL, orderID, expires, sig)
-}
-
-func verifySignedDownloadURL(orderID string, expires int64, sig string, secret []byte) bool {
-	if time.Now().Unix() > expires {
-		return false
-	}
-	msg := fmt.Sprintf("%s\n%d", orderID, expires)
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(msg))
-	expected := hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expected)))
 }
 
 func generateSignedJobDownloadURL(baseURL, orderID, jobID string, secret []byte, ttl time.Duration) string {
@@ -184,32 +176,6 @@ func verifySignedJobDownloadURL(orderID, jobID string, expires int64, sig string
 	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expected)))
 }
 
-func linkOrCopyFile(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(dst)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(dst)
-		return closeErr
-	}
-	return nil
-}
-
 func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -217,10 +183,7 @@ func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	demo := false
-	if s.cfg != nil {
-		demo = s.cfg.demoMode
-	}
+	demo := true
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "ok",
 		"demo_mode": demo,
@@ -443,19 +406,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// For single-document orders, also create the order-level PDF link/file for backward compatibility with existing tests
-	if !isMultiFile && len(docs) == 1 {
-		hOrd := sha256.Sum256([]byte(orderID))
-		orderPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
-		createdJobFiles = append(createdJobFiles, orderPDFPath)
-		hJob := sha256.Sum256([]byte(docs[0].JobID))
-		jobPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
-		if err := linkOrCopyFile(jobPDFPath, orderPDFPath); err != nil {
-			http.Error(w, fmt.Sprintf("failed to create order-level artifact: %v", err), http.StatusInternalServerError)
-			return
-		}
-	}
-
 	overallDuplex := contracts.DuplexSimplex
 	if anyDuplex {
 		overallDuplex = contracts.DuplexLongEdge
@@ -471,7 +421,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pinExpiresAt := time.Now().UTC().Add(2 * time.Hour)
+	// Unpaid paper must not be held for hours when a customer abandons checkout.
+	// The mobile checkout receives this authoritative expiry in the response.
+	pinExpiresAt := time.Now().UTC().Add(customerPINValidity)
 
 	cmd := contracts.PrintJobCommand{
 		JobID:            docs[0].JobID,
@@ -504,8 +456,28 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
-	if err := s.createOrderWithPINRetry(r.Context(), &order, 25); err != nil {
-		http.Error(w, "failed to persist order", http.StatusInternalServerError)
+	// Reserve physical sheets before the PIN becomes visible on the mobile site.
+	// This checks latest kiosk telemetry; the store atomically accounts for
+	// every other active reservation while persisting the order and its PIN.
+	availableStock, condErr := s.checkPrinterCondition(kioskID)
+	if condErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(condErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": condErr.Message, "code": condErr.Code})
+		return
+	}
+	if err := s.createOrderWithPINRetryAndPaperCheck(r.Context(), &order, 25, availableStock); err != nil {
+		if errors.Is(err, store.ErrInsufficientPaper) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "not enough paper is available for this order; try a smaller order or another kiosk",
+				"code": "INSUFFICIENT_PAPER",
+			})
+			return
+		}
+		log.Printf("[UPLOAD] Failed to persist reserved order: %v", err)
+		http.Error(w, "failed to reserve paper and issue PIN", http.StatusInternalServerError)
 		return
 	}
 	success = true
@@ -614,7 +586,10 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if this is a per-job download route: /api/orders/{orderID}/jobs/{jobID}/pdf
-	if strings.Contains(trimmed, "/jobs/") {
+	if !strings.Contains(trimmed, "/jobs/") {
+		http.NotFound(w, r)
+		return
+	}
 		parts := strings.Split(trimmed, "/jobs/")
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			http.Error(w, "invalid job download path", http.StatusBadRequest)
@@ -644,57 +619,8 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 		pdfPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 		s.streamPDF(w, pdfPath, doc.SHA256Checksum)
 		return
-	}
-
-	// Order-level download route: /api/orders/{orderID}/pdf
-	orderID := strings.TrimSpace(trimmed)
-	if orderID == "" {
-		http.Error(w, "order id required", http.StatusBadRequest)
-		return
-	}
-
-	if !verifySignedDownloadURL(orderID, expires, sig, s.cfg.downloadSecret) {
-		http.Error(w, "invalid or expired download URL", http.StatusUnauthorized)
-		return
-	}
-
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusNotFound)
-		return
-	}
-
-	if len(order.Documents) > 1 {
-		http.Error(w, "multi-document order requires per-job download URL", http.StatusBadRequest)
-		return
-	}
-
-	var expectedChecksum string
-	var pdfPath string
-
-	if len(order.Documents) == 1 {
-		expectedChecksum = order.Documents[0].SHA256Checksum
-		jobID := order.Documents[0].JobID
-		hJob := sha256.Sum256([]byte(jobID))
-		candJobPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
-		if _, err := os.Stat(candJobPath); err == nil {
-			pdfPath = candJobPath
-		}
-	}
-
-	if pdfPath == "" {
-		expectedChecksum = order.Command.SHA256Checksum
-		hOrd := sha256.Sum256([]byte(orderID))
-		pdfPath = filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
-	}
-
-	s.streamPDF(w, pdfPath, expectedChecksum)
 }
 
-// handleDocumentPreview handles POST /api/documents/preview.
-// It accepts a single document and print settings, validates them, runs the canonical
-// normalization pipeline, and returns the print-ready PDF along with authoritative pricing
-// and sheet count metadata headers. If format=json is requested, it returns JSON metadata.
 func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -814,400 +740,6 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	_, _ = w.Write(pdfBytes)
 }
 
-func (s *appServer) handleSimulatePayment(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.cfg.devMode {
-		http.Error(w, "payment simulation only available in development mode", http.StatusForbidden)
-		return
-	}
-	if s.cfg.demoMode && r.URL.Query().Get("force") != "1" && r.URL.Query().Get("bypass") != "1" {
-		http.Error(w, "direct order simulation is disabled in demo mode; use secure /pay/{token} checkout (or append ?force=1 to bypass)", http.StatusForbidden)
-		return
-	}
-
-	prefix := "/api/orders/"
-	suffix := "/simulate-payment"
-	if !strings.HasPrefix(r.URL.Path, prefix) || !strings.HasSuffix(r.URL.Path, suffix) {
-		http.NotFound(w, r)
-		return
-	}
-	orderID := strings.TrimPrefix(r.URL.Path, prefix)
-	orderID = strings.TrimSuffix(orderID, suffix)
-	orderID = strings.TrimSpace(orderID)
-	if orderID == "" {
-		http.Error(w, "order id required", http.StatusBadRequest)
-		return
-	}
-
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusNotFound)
-		return
-	}
-
-	if order.Status == contracts.JobStatusCompleted ||
-		order.Status == contracts.JobStatusPrinting ||
-		order.Status == contracts.JobStatusSpooling ||
-		order.Status == contracts.JobStatusDispatched {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"order_id": orderID,
-			"status":   string(order.Status),
-		})
-		return
-	}
-
-	if order.Status == contracts.JobStatusPendingPayment && !order.PINExpiresAt.IsZero() && !time.Now().UTC().Before(order.PINExpiresAt) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"order_id": orderID,
-			"status":   "EXPIRED",
-			"error":    "order has expired",
-		})
-		return
-	}
-
-	syntheticPayload := map[string]interface{}{
-		"event": "payment.captured",
-		"payload": map[string]interface{}{
-			"payment": map[string]interface{}{
-				"entity": map[string]interface{}{
-					"id":       "pay_sim_" + orderID,
-					"order_id": orderID,
-					"notes": map[string]interface{}{
-						"order_id": orderID,
-					},
-					"status": "captured",
-					"amount": order.PricePaise,
-				},
-			},
-		},
-	}
-	rawPayload, err := json.Marshal(syntheticPayload)
-	if err != nil {
-		http.Error(w, "failed to marshal payload", http.StatusInternalServerError)
-		return
-	}
-
-	mac := hmac.New(sha256.New, s.cfg.webhookSecret)
-	mac.Write(rawPayload)
-	sig := hex.EncodeToString(mac.Sum(nil))
-
-	if !payments.VerifyWebhookSignature(rawPayload, sig, string(s.cfg.webhookSecret)) {
-		http.Error(w, "internal signature verification failed", http.StatusInternalServerError)
-		return
-	}
-
-	requireSession := r.URL.Query().Get("require_session") == "1" || r.URL.Query().Get("strict_session") == "1"
-	now := time.Now().UTC()
-
-	var simSessionID string
-	// In development simulation: if strict session is not required and no active session exists,
-	// auto-create a session so automated integration tests run end-to-end.
-	if !requireSession {
-		activeSess, _ := s.db.GetActiveKioskSession(r.Context(), order.Command.KioskID, orderID, now)
-		if activeSess == nil {
-			activeSess, _ = s.db.CreateOrGetKioskSession(r.Context(), order.Command.KioskID, orderID, 5*time.Minute, now)
-		}
-		if activeSess != nil {
-			simSessionID = activeSess.SessionID
-		}
-	} else {
-		if activeSess, _ := s.db.GetActiveKioskSession(r.Context(), order.Command.KioskID, orderID, now); activeSess != nil {
-			simSessionID = activeSess.SessionID
-		}
-	}
-	if sessParam := strings.TrimSpace(r.URL.Query().Get("session_id")); sessParam != "" {
-		simSessionID = sessParam
-	}
-
-	captureRes, err := s.db.CapturePaymentAndCheckDispatch(r.Context(), store.PaymentRecord{
-		PaymentID:   "pay_sim_" + orderID,
-		OrderID:     orderID,
-		KioskID:     order.Command.KioskID,
-		SessionID:   simSessionID,
-		AmountPaise: order.PricePaise,
-		Provider:    "simulate",
-		Status:      "captured",
-	}, now)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if captureRes.DispatchEligible {
-		if s.hub != nil {
-			if len(captureRes.Commands) > 0 {
-				for _, cmd := range captureRes.Commands {
-					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusServiceUnavailable)
-						_ = json.NewEncoder(w).Encode(map[string]interface{}{
-							"order_id": orderID,
-							"status":   string(contracts.JobStatusPaidWaiting),
-							"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
-						})
-						return
-					}
-					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
-				}
-			} else if captureRes.Command != nil {
-				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusServiceUnavailable)
-					_ = json.NewEncoder(w).Encode(map[string]interface{}{
-						"order_id": orderID,
-						"status":   string(contracts.JobStatusPaidWaiting),
-						"error":    fmt.Sprintf("kiosk offline or dispatch failed: %v", err),
-					})
-					return
-				}
-				_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"order_id": orderID,
-			"status":   string(contracts.JobStatusDispatched),
-		})
-		return
-	}
-
-	// No session or not dispatch eligible
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"order_id": orderID,
-		"status":   string(captureRes.OrderStatus),
-	})
-}
-
-func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	const maxWebhookSize = 1024 * 1024 // 1 MiB
-	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookSize)
-	rawBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read webhook body", http.StatusBadRequest)
-		return
-	}
-
-	sig := r.Header.Get("X-Razorpay-Signature")
-	prov := s.getPaymentProvider()
-	if sig == "" || !prov.VerifyWebhookSignature(rawBody, sig) {
-		http.Error(w, "invalid signature", http.StatusBadRequest)
-		return
-	}
-
-	var parsed struct {
-		Event   string `json:"event"`
-		Payload struct {
-			Payment struct {
-				Entity struct {
-					ID       string `json:"id"`
-					OrderID  string `json:"order_id"`
-					Amount   int64  `json:"amount"`
-					Currency string `json:"currency"`
-					Status   string `json:"status"`
-					Notes    struct {
-						OrderID   string `json:"order_id"`
-						SessionID string `json:"session_id"`
-						KioskID   string `json:"kiosk_id"`
-					} `json:"notes"`
-				} `json:"entity"`
-			} `json:"payment"`
-		} `json:"payload"`
-	}
-
-	if err := json.Unmarshal(rawBody, &parsed); err != nil {
-		http.Error(w, "malformed webhook json", http.StatusBadRequest)
-		return
-	}
-
-	if parsed.Event != "payment.captured" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ignored"}`))
-		return
-	}
-
-	entity := parsed.Payload.Payment.Entity
-	if entity.ID == "" {
-		http.Error(w, "payment id missing in payment entity", http.StatusBadRequest)
-		return
-	}
-	if entity.Status != "captured" {
-		http.Error(w, "payment status is not captured", http.StatusBadRequest)
-		return
-	}
-	if entity.Currency != "" && strings.ToUpper(strings.TrimSpace(entity.Currency)) != "INR" {
-		http.Error(w, "invalid currency: only INR is supported", http.StatusBadRequest)
-		return
-	}
-
-	// Stored attempt association (Requirement 7 & 8: never trust notes alone as proof of transaction ownership)
-	var attempt *store.PaymentAttempt
-	providerOrderID := strings.TrimSpace(entity.OrderID)
-	notesOrderID := strings.TrimSpace(entity.Notes.OrderID)
-	notesSessionID := strings.TrimSpace(entity.Notes.SessionID)
-
-	if providerOrderID != "" {
-		att, err := s.db.GetPaymentAttemptByProviderOrder(r.Context(), "", providerOrderID)
-		if err == nil && att != nil {
-			attempt = att
-		}
-	}
-	if attempt == nil {
-		lookupOrderID := notesOrderID
-		if lookupOrderID == "" {
-			lookupOrderID = providerOrderID
-		}
-		if lookupOrderID != "" {
-			att, err := s.db.GetPaymentAttemptByOrderAndSession(r.Context(), lookupOrderID, notesSessionID)
-			if err == nil && att != nil {
-				attempt = att
-			}
-		}
-	}
-
-	var (
-		orderID      string
-		sessionID    string
-		kioskID      string
-		amount       int64
-		providerName string
-	)
-
-	if attempt != nil {
-		// Strictly enforce attempt binding
-		if entity.Amount <= 0 {
-			http.Error(w, "payment amount must be greater than zero", http.StatusBadRequest)
-			return
-		}
-		if entity.Amount != attempt.AmountPaise {
-			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", attempt.AmountPaise, entity.Amount), http.StatusBadRequest)
-			return
-		}
-		if entity.Currency != "" && attempt.Currency != "" && !strings.EqualFold(entity.Currency, attempt.Currency) {
-			http.Error(w, "payment currency mismatch with stored attempt", http.StatusBadRequest)
-			return
-		}
-		orderID = attempt.OrderID
-		kioskID = attempt.KioskID
-		sessionID = attempt.SessionID
-		amount = attempt.AmountPaise
-		providerName = attempt.Provider
-	} else {
-		// Fallback for orders without an explicit attempt:
-		// Requirement 8: Never trust payment notes alone as proof of transaction ownership!
-		// We do NOT trust notes.SessionID to authorize physical dispatch.
-		lookupOrderID := notesOrderID
-		if lookupOrderID == "" {
-			lookupOrderID = providerOrderID
-		}
-		if lookupOrderID == "" {
-			http.Error(w, "unassociated payment: order id missing", http.StatusBadRequest)
-			return
-		}
-		order, err := s.db.GetOrder(r.Context(), lookupOrderID)
-		if err != nil || order == nil {
-			http.Error(w, "unassociated payment attempt: no matching stored attempt or order found", http.StatusBadRequest)
-			return
-		}
-		if entity.Amount <= 0 {
-			http.Error(w, "payment amount must be greater than zero", http.StatusBadRequest)
-			return
-		}
-		if entity.Amount != order.PricePaise {
-			http.Error(w, fmt.Sprintf("payment amount mismatch: expected %d paise, got %d paise", order.PricePaise, entity.Amount), http.StatusBadRequest)
-			return
-		}
-		orderID = order.OrderID
-		kioskID = order.Command.KioskID
-		now := time.Now().UTC()
-		if notesSessionID != "" {
-			sess, sErr := s.db.GetKioskSession(r.Context(), notesSessionID, now)
-			if sErr == nil && sess != nil && sess.OrderID == orderID && sess.Status == store.KioskSessionPaymentPending && sess.ExpiresAt.After(now) {
-				sessionID = sess.SessionID
-			}
-		}
-		amount = order.PricePaise
-		providerName = "razorpay"
-	}
-	if providerName == "" {
-		providerName = "razorpay"
-	}
-
-	eventID := entity.ID
-	now := time.Now().UTC()
-	captureRes, err := s.db.CapturePaymentAndCheckDispatch(r.Context(), store.PaymentRecord{
-		PaymentID:   eventID,
-		OrderID:     orderID,
-		KioskID:     kioskID,
-		SessionID:   sessionID,
-		AmountPaise: amount,
-		Provider:    providerName,
-		Status:      entity.Status,
-	}, now)
-	if err != nil {
-		if errors.Is(err, store.ErrOrderNotFound) {
-			http.Error(w, "order not found", http.StatusBadRequest)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if attempt != nil {
-		_ = s.db.MarkPaymentAttemptPaid(r.Context(), attempt.AttemptID, eventID)
-	}
-
-	if captureRes.AlreadyProcessed {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"already_processed"}`))
-		return
-	}
-
-	// PHYSICAL PRINT AUTHORIZATION GATE
-	// Only dispatch print if valid active kiosk session exists for customer presence
-	if captureRes.DispatchEligible {
-		log.Printf("[PAYMENT] Order %s authorized for print (active session %s)", orderID, captureRes.ActiveSessionID)
-		if s.hub != nil {
-			if len(captureRes.Commands) > 0 {
-				for _, cmd := range captureRes.Commands {
-					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
-						log.Printf("[PAYMENT] Failed to dispatch job %s to kiosk %s: %v", cmd.JobID, cmd.KioskID, err)
-						break
-					}
-					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
-				}
-			} else if captureRes.Command != nil {
-				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-					log.Printf("[PAYMENT] Failed to dispatch job %s to kiosk %s: %v", captureRes.Command.JobID, captureRes.KioskID, err)
-				} else {
-					_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
-				}
-			}
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"dispatched"}`))
-		return
-	}
-
-	// Late payment or absent active kiosk session: money captured in PAID_WAITING without unattended printing
-	log.Printf("[PAYMENT] Payment captured for order %s, but no active kiosk session authorizes printing. Preserving in PAID_WAITING.", orderID)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"paid_unprinted"}`))
-}
-
 func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1238,34 +770,96 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	sheetsPrinted := 0
 	currentStatus := string(order.Status)
 	errorReason := ""
+	documentsTotal := 0
+	documentsCompleted := 0
 
-	progress, err := s.db.GetJobProgress(r.Context(), order.Command.JobID)
-	if err == nil && progress != nil {
-		pagesPrinted = progress.PagesPrinted
-		sheetsPrinted = progress.SheetsPrinted
+	// The parent order, not its first child, owns completion and refund state.
+	// Read every child document in one aggregate query so the mobile client
+	// sees cumulative progress and never completes after document 1 of N.
+	progress, err := s.db.GetOrderPrintProgress(r.Context(), orderID)
+	if err != nil {
+		log.Printf("[ORDER] Cannot read order-wide progress for %s: %v", orderID, err)
+		http.Error(w, "order progress temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	documentsTotal = progress.DocumentsTotal
+	documentsCompleted = progress.DocumentsCompleted
+	if documentsTotal == 0 {
+		http.Error(w, "order has no document records", http.StatusInternalServerError)
+		return
+	}
+	pagesPrinted = progress.PagesPrinted
+	sheetsPrinted = progress.SheetsPrinted
 		errorReason = progress.ErrorReason
-		switch progress.Status {
-		case contracts.JobStatusSpooling,
-			contracts.JobStatusPrinting,
-			contracts.JobStatusCompleted,
-			contracts.JobStatusPausedError,
-			contracts.JobStatusFailedRefundable:
-			currentStatus = string(progress.Status)
+		// Child faults must outrank a completed earlier document; the parent
+		// aggregation currently propagates FAILED_REFUNDABLE but not every
+		// PAUSED_ERROR, so fail closed for either before showing print progress.
+		if progress.DocumentsFailed > 0 {
+			currentStatus = string(contracts.JobStatusFailedRefundable)
+		} else if progress.DocumentsPaused > 0 {
+			currentStatus = string(contracts.JobStatusPausedError)
+		} else if order.Status == contracts.JobStatusCompleted && documentsCompleted != documentsTotal {
+			// Fail closed on corrupt/inconsistent order state; do not tell a
+			// customer to collect papers before every child is complete.
+			log.Printf("[ORDER] Completion invariant violated for %s: %d/%d child documents", orderID, documentsCompleted, documentsTotal)
+			currentStatus = string(contracts.JobStatusDispatched)
+		} else if order.Status == contracts.JobStatusDispatched {
+			if progress.DocumentsPrinting > 0 || documentsCompleted > 0 {
+				currentStatus = string(contracts.JobStatusPrinting)
+			} else if progress.DocumentsSpooling > 0 {
+				currentStatus = string(contracts.JobStatusSpooling)
+			}
+		}
+	secondsRemaining := int64(0)
+	pinExpiry := ""
+	now := time.Now().UTC()
+	if order.Status == contracts.JobStatusPendingPayment {
+		pinExpiry = order.PINExpiresAt.Format(time.RFC3339)
+		if !now.Before(order.PINExpiresAt) {
+			currentStatus = "EXPIRED"
+		} else {
+			secondsRemaining = int64(math.Ceil(order.PINExpiresAt.Sub(now).Seconds()))
 		}
 	}
 
-	secondsRemaining := int64(0)
-	now := time.Now().UTC()
-	if !order.PINExpiresAt.IsZero() {
-		if !now.Before(order.PINExpiresAt) {
-			secondsRemaining = 0
-			if currentStatus == string(contracts.JobStatusPendingPayment) {
-				currentStatus = "EXPIRED"
-			}
-		} else {
-			rem := order.PINExpiresAt.Sub(now)
-			secondsRemaining = int64(math.Ceil(rem.Seconds()))
+	// Refund progress is distinct from print-job state and is never guessed
+	// from the FAILED_REFUNDABLE label.
+	refundStatus := ""
+	refundStopVerified := false
+	if refund, err := s.db.GetRefundRequest(r.Context(), orderID); err == nil && refund != nil {
+		refundStatus = refund.Status
+		refundStopVerified = refund.SafeStopVerified
+		switch refund.Status {
+		case store.RefundProcessed:
+			currentStatus = "REFUNDED"
+		case store.RefundPending, store.RefundRequesting:
+			currentStatus = "REFUND_PENDING"
+		case store.RefundFailed:
+			currentStatus = "REFUND_RETRYING"
+		default:
+			currentStatus = "REFUND_REQUIRED"
 		}
+	}
+	if order.Status == contracts.JobStatusCompleted && refundStatus == "" &&
+		(documentsTotal == 0 || documentsCompleted == documentsTotal) {
+		currentStatus = "COMPLETED"
+	}
+	// Dispatch intents describe transport, not physical printing. Keep that
+	// separate from the parent order lifecycle so a captured-but-offline
+	// order is not represented to the customer as already printing.
+	dispatch, dispatchErr := s.db.GetOrderDispatchSummary(r.Context(), orderID)
+	if dispatchErr != nil {
+		log.Printf("[ORDER] Cannot read dispatch summary for %s: %v", orderID, dispatchErr)
+		http.Error(w, "order dispatch temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	awaitingDelivery := dispatch.PendingCount + dispatch.SentCount
+
+	// Additional captured payments have independent refunds. Do not reveal
+	// payment IDs in this public order status response.
+	excessSummary, extraErr := s.db.GetExcessRefundSummary(r.Context(), orderID)
+	if extraErr != nil {
+		log.Printf("[PAYMENT] Excess refund summary unavailable for %s: %v", orderID, extraErr)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1273,34 +867,32 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		"order_id":          order.OrderID,
 		"display_code":      order.Command.DisplayCode,
 		"status":            currentStatus,
-		"total_pages":       order.Command.TotalPages,
-		"total_sheets":      order.Command.TotalSheets,
+		"total_pages":       order.TotalPages,
+		"total_sheets":      order.TotalSheets,
 		"copies":            order.Command.Copies,
 		"duplex":            string(order.Command.Duplex),
 		"pages_printed":     pagesPrinted,
 		"sheets_printed":    sheetsPrinted,
+		"documents_total":  documentsTotal,
+		"documents_completed": documentsCompleted,
+		"documents_awaiting_delivery": awaitingDelivery,
+		"dispatch_pending": awaitingDelivery > 0,
 		"error_reason":      errorReason,
 		"price_paise":       order.PricePaise,
-		"pin_expires_at":    order.PINExpiresAt.Format(time.RFC3339),
+		"pin_expires_at":    pinExpiry,
 		"seconds_remaining": secondsRemaining,
+		"refund_status":     refundStatus,
+		"refund_stop_verified": refundStopVerified,
+		"excess_refunds_total": excessSummary.Total,
+		"excess_refunds_processed": excessSummary.Processed,
+		"excess_refunds_unresolved": excessSummary.Unresolved,
 	})
 }
 
 func main() {
-	demoFlag := flag.Bool("demo-mode", false, "Enable demo mode with simulated QR payments")
 	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
 	flag.Parse()
 
-	demoEnv := strings.TrimSpace(os.Getenv("DEMO_MODE"))
-	if demoEnv == "" {
-		demoEnv = strings.TrimSpace(os.Getenv("XEROXGO_DEMO_MODE"))
-	}
-	demoMode := true
-	if demoEnv == "0" || strings.ToLower(demoEnv) == "false" {
-		demoMode = false
-	} else if *demoFlag {
-		demoMode = true
-	}
 
 	addr := strings.TrimSpace(*addrFlag)
 	if addr == "" {
@@ -1328,16 +920,13 @@ func main() {
 	}
 
 	devMode := os.Getenv("XEROXGO_DEV_MODE") == "1" || os.Getenv("DEV_MODE") == "1"
-	if devMode {
-		demoMode = true
-	}
 
 	dlSecretStr := os.Getenv("XEROXGO_DOWNLOAD_SECRET")
 	whSecretStr := os.Getenv("XEROXGO_WEBHOOK_SECRET")
 
 	if !devMode {
-		if len(dlSecretStr) < 16 || len(whSecretStr) < 16 {
-			log.Fatalf("Fatal: production mode requires non-empty XEROXGO_DOWNLOAD_SECRET and XEROXGO_WEBHOOK_SECRET of at least 16 characters")
+		if len(dlSecretStr) < 16 {
+			log.Fatalf("XEROXGO_DOWNLOAD_SECRET must be at least 16 characters")
 		}
 	} else {
 		if dlSecretStr == "" {
@@ -1372,28 +961,28 @@ func main() {
 		if err != nil || p <= 0 {
 			log.Fatalf("invalid XEROXGO_PRICE_PER_SHEET_PAISE: %s", priceEnv)
 		}
-		if err := storeDB.SetPricePerSheetPaise(ctx, p); err != nil {
-			log.Fatalf("failed to persist price per sheet: %v", err)
+		tariff := store.DefaultPricingConfig()
+		if err := storeDB.SetDetailedPricing(ctx, p, pricing.ComputeDuplexDiscount(p, tariff.BWDuplexPricePaise),
+			tariff.ColorSimplexPricePaise, tariff.ColorDuplexPricePaise, false); err != nil {
+			log.Fatalf("failed to save configured 4-tier pricing: %v", err)
 		}
 		pricePaise = p
-	} else {
-		p, err := storeDB.GetPricePerSheetPaise(ctx)
-		if err == nil && p > 0 {
-			pricePaise = p
-		} else if devMode {
-			pricePaise = 500
-			_ = storeDB.SetPricePerSheetPaise(ctx, pricePaise)
-		} else {
-			log.Fatalf("pricing unconfigured in production mode")
+	} else if tariff, err := storeDB.GetPricing(ctx); err == nil {
+		pricePaise = tariff.BWSimplexPricePaise
+	} else if devMode {
+		tariff := store.DefaultPricingConfig()
+		if err := storeDB.SetDetailedPricing(ctx, tariff.BWSimplexPricePaise, tariff.BWDuplexPricePaise,
+			tariff.ColorSimplexPricePaise, tariff.ColorDuplexPricePaise, tariff.ColorEnabled); err != nil {
+			log.Fatalf("failed to initialize demo pricing: %v", err)
 		}
+		pricePaise = tariff.BWSimplexPricePaise
+	} else {
+		log.Fatalf("pricing unconfigured")
 	}
 
 	// Initialize default promo ads & bootstrap admin user
 	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer bootstrapCancel()
-	if err := storeDB.SeedDefaultAds(bootstrapCtx); err != nil {
-		log.Printf("[WARN] Failed to seed default ads: %v", err)
-	}
 	adminUser := os.Getenv("XEROXGO_ADMIN_USER")
 	if adminUser == "" {
 		adminUser = "admin"
@@ -1408,7 +997,7 @@ func main() {
 
 	hub := ws.NewHub(storeDB)
 	kioskSecretStr := os.Getenv("XEROXGO_KIOSK_SECRET")
-	if kioskSecretStr == "" && demoMode {
+	if kioskSecretStr == "" && devMode {
 		kioskSecretStr = "dev_kiosk_secret_32_bytes_long_1234"
 	}
 	var kioskSecretBytes []byte
@@ -1425,35 +1014,13 @@ func main() {
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: pricePaise,
 		devMode:            devMode,
-		demoMode:           demoMode,
 		downloadSecret:     []byte(dlSecretStr),
 		webhookSecret:      []byte(whSecretStr),
 		kioskSecret:        kioskSecretBytes,
 	}
 
-	rzpKeyID := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_ID"))
-	rzpKeySecret := strings.TrimSpace(os.Getenv("RAZORPAY_KEY_SECRET"))
-	paymentProviderType := strings.ToLower(strings.TrimSpace(os.Getenv("PAYMENT_PROVIDER")))
-
-	var paymentProv payments.Provider
-	if paymentProviderType == "razorpay" || (paymentProviderType == "" && rzpKeyID != "" && rzpKeySecret != "") {
-		if rzpKeyID == "" || rzpKeySecret == "" {
-			log.Fatalf("RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be set when PAYMENT_PROVIDER=razorpay")
-		}
-		var err error
-		paymentProv, err = payments.NewRazorpayProvider(payments.RazorpayConfig{
-			KeyID:         rzpKeyID,
-			KeySecret:     rzpKeySecret,
-			WebhookSecret: whSecretStr,
-		})
-		if err != nil {
-			log.Fatalf("failed to initialize Razorpay provider: %v", err)
-		}
-		log.Printf("[PAYMENT] Initialized Razorpay payment provider (key_id=%s)", rzpKeyID)
-	} else {
-		paymentProv = payments.NewMockProvider(whSecretStr)
-		log.Printf("[PAYMENT] Initialized Mock payment provider (real payments disabled by default)")
-	}
+	paymentProv := payments.NewMockProvider(whSecretStr)
+	log.Printf("[PAYMENT] Demo-only payment system enabled")
 
 	pinLimiter := NewPINRateLimiter(storeDB, 5, 2*time.Minute, 2*time.Minute)
 	app := &appServer{
@@ -1479,6 +1046,7 @@ func main() {
 	defer stop()
 
 	go app.startConversionWorker(sigCtx)
+	go app.startRefundWorker(sigCtx)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
@@ -1515,22 +1083,24 @@ func (app *appServer) routes() *http.ServeMux {
 			app.handleUpload(w, r)
 		case strings.HasSuffix(path, "/recover"):
 			app.handleRecoverJob(w, r)
-		case strings.HasSuffix(path, "/orders/lookup"), strings.HasSuffix(path, "/pin/lookup"):
+		case strings.HasSuffix(path, "/orders/lookup"):
 			app.handlePINLookup(w, r)
-		case strings.HasSuffix(path, "/claim"), strings.HasSuffix(path, "/confirm"):
+		case strings.HasSuffix(path, "/claim"):
 			app.handleOrderClaim(w, r)
 		case strings.HasSuffix(path, "/release"):
 			app.handleOrderRelease(w, r)
 		case strings.HasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
-		case strings.HasSuffix(path, "/initiate-payment"):
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/initiate-payment"):
 			app.handleInitiatePayment(w, r)
-		case strings.Contains(path, "/sessions/") && (strings.HasSuffix(path, "/cancel") || strings.HasSuffix(path, "/cancel-session")):
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/cancel"):
 			app.handleSessionCancel(w, r)
 		case strings.Contains(path, "/sessions/"):
 			app.handleGetSession(w, r)
 		case strings.HasSuffix(path, "/refill"):
 			app.handleKioskRefill(w, r)
+		case strings.HasSuffix(path, "/restore-service"):
+			app.handleRestoreKioskService(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1547,9 +1117,7 @@ func (app *appServer) routes() *http.ServeMux {
 		switch {
 		case strings.HasSuffix(path, "/status"):
 			app.handleOrderStatus(w, r)
-		case strings.HasSuffix(path, "/simulate-payment"):
-			app.handleSimulatePayment(w, r)
-		case strings.HasSuffix(path, "/recovery-pin"):
+				case strings.HasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
 		case strings.HasSuffix(path, "/pdf"):
 			app.handleDownloadPDF(w, r)
@@ -1557,7 +1125,6 @@ func (app *appServer) routes() *http.ServeMux {
 			http.NotFound(w, r)
 		}
 	})
-	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
 	if app.hub != nil {
 		mux.HandleFunc("/ws", app.hub.ServeHTTP)
 	}
@@ -1587,6 +1154,7 @@ func (app *appServer) routes() *http.ServeMux {
 	mux.HandleFunc("/api/admin/pricing", app.handleAdminPricing)
 	mux.HandleFunc("/api/admin/analytics", app.handleAdminAnalytics)
 	mux.HandleFunc("/api/admin/orders", app.handleAdminOrders)
+	mux.HandleFunc("/api/admin/kiosks/faults", app.handleAdminKioskFaults)
 	mux.HandleFunc("/api/admin/orders/export", app.handleAdminOrdersExport)
 
 	return mux
@@ -1598,16 +1166,15 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 		// Ingress proxy secret verification for frontend-facing API routes:
 		// When XEROXGO_PROXY_SECRET is configured, requests to frontend API routes
 		// must carry the secret header injected by Vercel Edge.
-		// Excluded routes: /healthz, /ws (has kiosk auth), /api/webhooks/razorpay (has HMAC),
+		// Excluded routes: /healthz, /ws (has kiosk auth),
 		// and /api/orders/:id/pdf (has HMAC download signature).
 		if proxySecret != "" && !devMode {
 			path := r.URL.Path
 			isExempt := path == "/healthz" ||
 				path == "/ws" ||
-				path == "/api/webhooks/razorpay" ||
-				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
+				(strings.HasPrefix(path, "/api/orders/") && ((strings.Contains(path, "/jobs/") && strings.HasSuffix(path, "/pdf")) || strings.HasSuffix(path, "/recovery-pin"))) ||
 				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
-				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
+				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))

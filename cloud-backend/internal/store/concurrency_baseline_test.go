@@ -191,69 +191,42 @@ func TestConcurrencyBaseline_CompetingKiosks(t *testing.T) {
 func TestConcurrencyBaseline_PaperOvercommitment_SimultaneousOrders(t *testing.T) {
 	s, cleanup := openConcurrencyTestStore(t, "paper_overcommit")
 	defer cleanup()
-
 	ctx := context.Background()
 	now := time.Now().UTC()
 	kioskID := fmt.Sprintf("kiosk-paper-guard-%d", time.Now().UnixNano()%1000000)
-	availableStock := 15
-	sheetsPerOrder := 6
-	orderCount := 5
+	const availableStock, sheetsPerOrder, orderCount = 15, 6, 5
 
-	var orderIDs []string
-	for i := 0; i < orderCount; i++ {
-		ordID := fmt.Sprintf("ord_stock_%d_%d", time.Now().UnixNano(), i)
-		pin := fmt.Sprintf("310%d", i)
-		createTestOrderWithSheets(t, s, ctx, ordID, kioskID, pin, sheetsPerOrder, contracts.JobStatusPendingPayment, now)
-		orderIDs = append(orderIDs, ordID)
-	}
-
+	type result struct{ err error }
+	results := make([]result, orderCount)
 	var wg sync.WaitGroup
-	wg.Add(orderCount)
-
-	type claimRes struct {
-		orderID string
-		err     error
-	}
-	results := make([]claimRes, orderCount)
-
 	for i := 0; i < orderCount; i++ {
-		idx := i
-		ordID := orderIDs[i]
-		go func() {
+		wg.Add(1)
+		go func(i int) {
 			defer wg.Done()
-			_, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, availableStock, 5*time.Minute, now)
-			results[idx] = claimRes{orderID: ordID, err: err}
-		}()
+			ord := makeTestOrderWithSheets(
+				fmt.Sprintf("ord_stock_%d_%d", now.UnixNano(), i),
+				kioskID, fmt.Sprintf("%04d", 3100+i), sheetsPerOrder,
+				contracts.JobStatusPendingPayment, now)
+			results[i].err = s.CreateOrderWithPaperCheck(ctx, ord, availableStock)
+		}(i)
 	}
 	wg.Wait()
-
-	var successCount int
-	var insufficientCount int
+	var accepted, rejected int
 	for _, r := range results {
 		if r.err == nil {
-			successCount++
+			accepted++
 		} else if errors.Is(r.err, ErrInsufficientPaper) {
-			insufficientCount++
+			rejected++
 		} else {
-			t.Errorf("order %s failed with unexpected error: %v", r.orderID, r.err)
+			t.Errorf("unexpected reservation failure: %v", r.err)
 		}
 	}
-
-	if successCount != 2 {
-		t.Fatalf("expected exactly 2 successful claims for 15-sheet tray, got %d", successCount)
+	if accepted != 2 || rejected != 3 {
+		t.Fatalf("expected 2 issued PINs and 3 stock denials; got %d and %d", accepted, rejected)
 	}
-	if insufficientCount != 3 {
-		t.Fatalf("expected exactly 3 insufficient paper rejections, got %d", insufficientCount)
-	}
-
-	// Verify actual database commitments
 	committed, err := s.GetCommittedPaperSheets(ctx, kioskID, "", now)
-	if err != nil {
-		t.Fatalf("failed to query committed paper sheets: %v", err)
-	}
-	expectedCommitted := 2 * sheetsPerOrder // 12 sheets
-	if committed != expectedCommitted {
-		t.Fatalf("database committed sheets mismatch: got %d, want %d", committed, expectedCommitted)
+	if err != nil || committed != 12 {
+		t.Fatalf("reserved sheets = %d, error %v; want 12", committed, err)
 	}
 }
 
@@ -307,8 +280,8 @@ func TestConcurrencyBaseline_RepeatedClaims_Idempotency(t *testing.T) {
 }
 
 // Test 5: Expired sessions and automatic transition to EXPIRED on reclaim.
-// Invariant: When an active session expires, its paper commitment drops to 0,
-// and a subsequent claim marks the old session EXPIRED and creates a new session.
+// Invariant: Session expiry does not release the PIN's reservation; another
+// session can be claimed while the PIN is still valid.
 func TestConcurrencyBaseline_ExpiredSession_Reclaim(t *testing.T) {
 	s, cleanup := openConcurrencyTestStore(t, "expired_session")
 	defer cleanup()
@@ -336,8 +309,8 @@ func TestConcurrencyBaseline_ExpiredSession_Reclaim(t *testing.T) {
 	// At t0 + 3 min, session has expired
 	t2 := t0.Add(3 * time.Minute)
 	committedExpired, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", t2)
-	if committedExpired != 0 {
-		t.Fatalf("expired session must commit 0 sheets, got %d", committedExpired)
+	if committedExpired != 5 {
+		t.Fatalf("expired session must retain 5 reserved sheets, got %d", committedExpired)
 	}
 
 	// Reclaim order at t2
@@ -362,8 +335,7 @@ func TestConcurrencyBaseline_ExpiredSession_Reclaim(t *testing.T) {
 	}
 }
 
-// Test 6: Explicit session cancellation and paper commitment release.
-// Invariant: Canceling a session transitions it to CANCELED and immediately releases its paper commitment.
+// Test 6: Canceling the kiosk session does not release a valid mobile PIN reservation.
 func TestConcurrencyBaseline_Cancellation_Reclaim(t *testing.T) {
 	s, cleanup := openConcurrencyTestStore(t, "cancel_session")
 	defer cleanup()
@@ -390,10 +362,10 @@ func TestConcurrencyBaseline_Cancellation_Reclaim(t *testing.T) {
 		t.Fatalf("CancelKioskSession failed: %v", err)
 	}
 
-	// Paper commitment must immediately drop to 0
+	// The PIN is still valid and keeps the paper reserved.
 	committedAfter, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", now)
-	if committedAfter != 0 {
-		t.Fatalf("expected 0 committed sheets after cancellation, got %d", committedAfter)
+	if committedAfter != 7 {
+		t.Fatalf("canceled session should retain 7 reserved sheets, got %d", committedAfter)
 	}
 
 	// Verify database status is CANCELED

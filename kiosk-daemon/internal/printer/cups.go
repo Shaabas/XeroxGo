@@ -88,6 +88,29 @@ func QueryCUPSJobInfo(ctx context.Context, runner CommandRunner, queue string, c
 	return queryLPStatJobInfo(ctx, runner, queue, cupsJobID)
 }
 
+// CancelAndVerifyCUPSJob is the refund safety barrier. A successful cancel
+// command alone is insufficient: the CUPS state must confirm canceled/aborted.
+// Unknown, held, pending or processing states MUST NOT authorize a refund.
+func CancelAndVerifyCUPSJob(ctx context.Context, runner CommandRunner, queue, cupsJobID string) error {
+	if runner == nil { runner = defaultCommandRunner }
+	if ctx == nil { return errors.New("context cannot be nil") }
+	if strings.TrimSpace(cupsJobID) == "" { return errors.New("CUPS job ID required") }
+	out, cancelErr := runner(ctx, "cancel", cupsJobID)
+	if cancelErr != nil {
+		return fmt.Errorf("cancel CUPS job %s: %w (%s)", cupsJobID, cancelErr, strings.TrimSpace(string(out)))
+	}
+	info, err := QueryCUPSJobInfo(ctx, runner, queue, cupsJobID)
+	if err != nil {
+		return fmt.Errorf("verify cancellation of %s: %w", cupsJobID, err)
+	}
+	switch info.State {
+	case CUPSJobStateCanceled, CUPSJobStateAborted:
+		return nil
+	default:
+		return fmt.Errorf("CUPS job %s still %s; refund stop not confirmed", cupsJobID, info.State)
+	}
+}
+
 // HoldCUPSJob places an active or queued CUPS job on hold so it will not print unmonitored.
 func HoldCUPSJob(ctx context.Context, runner CommandRunner, cupsJobID string) error {
 	if runner == nil {

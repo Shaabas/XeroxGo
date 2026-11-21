@@ -10,11 +10,27 @@
 (function () {
   'use strict';
 
+  // Keep completion validation independent of the DOM so it can be tested
+  // without a browser. A child completion must never stop order polling.
+  function deriveCustomerOrderStatus(statusData) {
+    const totalDocs = Math.max(0, Number(statusData.documents_total) || 0);
+    const completedDocs = Math.max(0, Number(statusData.documents_completed) || 0);
+    const reportedStatus = statusData.status || '';
+    const status = reportedStatus === 'COMPLETED' &&
+      totalDocs > 0 && completedDocs !== totalDocs ? 'PRINTING' : reportedStatus;
+    return { status, totalDocs, completedDocs };
+  }
+
+  function shouldStopOrderPolling(statusData) {
+    return deriveCustomerOrderStatus(statusData).status === 'COMPLETED' &&
+      !statusData.excess_refunds_unresolved;
+  }
+
   // --- Configuration from DOM ---
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
-      module.exports = { convertDocumentOnServer };
+      module.exports = { convertDocumentOnServer, deriveCustomerOrderStatus, shouldStopOrderPolling };
     }
     return;
   }
@@ -179,6 +195,7 @@
   let activeOrderId = null;
   let activeDisplayCode = '';
   let activeRecoveryToken = '';
+  let paidPINRecoveryRequestedForOrder = '';
   let orderPollTimer = null;
   let expiryCountdownTimer = null;
 
@@ -1991,8 +2008,18 @@
       const resp = await fetch(uploadUrl, { method: 'POST', body: formData });
 
       if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(errText || 'Failed to submit order to kiosk');
+        const contentType = resp.headers.get('content-type') || '';
+        let message = 'Failed to submit order to kiosk';
+        if (contentType.includes('application/json')) {
+          const problem = await resp.json().catch(() => ({}));
+          message = problem.error || message;
+          if (problem.code === 'INSUFFICIENT_PAPER') {
+            message = 'Not enough paper is available for this order. Please reduce the sheet count or choose another kiosk.';
+          }
+        } else {
+          message = (await resp.text()).trim() || message;
+        }
+        throw new Error(message);
       }
 
       const data = await resp.json();
@@ -2041,6 +2068,9 @@
 
   function startExpiryCountdown(expiryISO) {
     if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+    // Reset on every order; a missing/invalid expiry must never reuse
+    // the previous order's countdown. The server timestamp is authoritative.
+    authoritativeExpiryMs = 0;
     if (expiryISO) {
       const parsed = Date.parse(expiryISO);
       if (!isNaN(parsed)) {
@@ -2048,7 +2078,7 @@
       }
     }
     if (!authoritativeExpiryMs) {
-      authoritativeExpiryMs = Date.now() + 2 * 60 * 60 * 1000;
+      authoritativeExpiryMs = Date.now() + 5 * 60 * 1000;
     }
 
     function tick() {
@@ -2089,13 +2119,24 @@
 
   function updateCheckoutStatus(statusData) {
     if (!statusData || !checkoutLiveStatusBox) return;
-    const st = statusData.status || '';
+    // Fail closed if the API or a stale cache reports a completed parent
+    // before every child has finished.
+    const { status: st, totalDocs, completedDocs } = deriveCustomerOrderStatus(statusData);
+    const originalPINExpired = authoritativeExpiryMs > 0 && Date.now() >= authoritativeExpiryMs;
 
-    if (statusData.pin_expires_at) {
-      const parsed = Date.parse(statusData.pin_expires_at);
-      if (!isNaN(parsed)) {
-        authoritativeExpiryMs = parsed;
+    // The five-minute clock is for UNPAID orders only. Verified payment
+    // creates a durable fulfillment/refund obligation, not another deadline.
+    if (st && st !== 'PENDING_PAYMENT' && st !== 'EXPIRED') {
+      authoritativeExpiryMs = 0;
+      if (expiryCountdownTimer) {
+        clearInterval(expiryCountdownTimer);
+        expiryCountdownTimer = null;
       }
+      if (pinExpiryText) pinExpiryText.classList.add('hidden');
+    } else if (statusData.pin_expires_at) {
+      const parsed = Date.parse(statusData.pin_expires_at);
+      if (!isNaN(parsed)) authoritativeExpiryMs = parsed;
+      if (pinExpiryText) pinExpiryText.classList.remove('hidden');
     }
 
     if (st === 'EXPIRED') {
@@ -2107,6 +2148,16 @@
 
     if (st && st !== 'PENDING_PAYMENT' && st !== 'EXPIRED') {
       checkoutLiveStatusBox.classList.remove('hidden');
+    }
+    // A delayed capture may arrive after the old PIN was released. Do not
+    // resurrect the potentially reused PIN: rotate it using the secure
+    // recovery credential, for the SAME paid order, without charging again.
+    if (st === 'PAID_WAITING' && originalPINExpired && activeOrderId &&
+        paidPINRecoveryRequestedForOrder !== activeOrderId) {
+      paidPINRecoveryRequestedForOrder = activeOrderId;
+      requestRecoveryPIN().then(result => {
+        if (!result) paidPINRecoveryRequestedForOrder = '';
+      });
     }
 
     if (checkoutStatusPill) {
@@ -2124,18 +2175,51 @@
         pct = Math.min(95, Math.max(60, Math.round((pagesPrinted / totalPages) * 100)));
       } else if (st === 'COMPLETED') {
         pct = 100;
-        if (orderPollTimer) clearInterval(orderPollTimer);
+        // A completed print can still have an additional payment refund in progress.
+        if (shouldStopOrderPolling(statusData) && orderPollTimer) {
+          clearInterval(orderPollTimer);
+          orderPollTimer = null;
+        }
       }
       checkoutProgressBar.style.width = pct + '%';
     }
 
     if (checkoutStatusMsg) {
-      if (st === 'PRINTING') {
-        checkoutStatusMsg.textContent = `Printing page ${statusData.pages_printed || 1} of ${statusData.total_pages || 1}...`;
+      if (st === 'DISPATCHED' && statusData.dispatch_pending) {
+        const waiting = Math.max(0, Number(statusData.documents_awaiting_delivery) || 0);
+        checkoutStatusMsg.textContent = waiting > 1
+          ? `Payment confirmed. Waiting for kiosk delivery of ${waiting} document commands...`
+          : 'Payment confirmed. Your print job is queued for kiosk delivery.';
+      } else if (st === 'DISPATCHED') {
+        checkoutStatusMsg.textContent = 'Payment confirmed. The kiosk is preparing your print order.';
+      } else if (st === 'PRINTING') {
+        const docProgress = totalDocs > 1 ? ` (${completedDocs}/${totalDocs} documents finished)` : '';
+        checkoutStatusMsg.textContent = `Printing: ${statusData.pages_printed || 0} of ${statusData.total_pages || 1} pages${docProgress}...`;
       } else if (st === 'COMPLETED') {
-        checkoutStatusMsg.textContent = 'Your documents have finished printing!';
+        checkoutStatusMsg.textContent = 'Printing completed. Collect your documents.';
+      } else if (st === 'REFUND_REQUIRED') {
+        checkoutStatusMsg.textContent = 'Printing failed. You may leave; the kiosk is being stopped safely before a full refund is submitted.';
+      } else if (st === 'REFUND_PENDING') {
+        checkoutStatusMsg.textContent = 'A simulated refund was requested. You may leave; its demo status will be updated.';
+      } else if (st === 'REFUND_RETRYING') {
+        checkoutStatusMsg.textContent = 'Refund processing is delayed. XeroxGo will retry automatically; your payment has not been forgotten.';
+      } else if (st === 'REFUNDED') {
+        checkoutStatusMsg.textContent = 'Your simulated refund has been processed.';
+      } else if (st === 'PAUSED_ERROR' || st === 'FAILED_REFUNDABLE') {
+        checkoutStatusMsg.textContent = 'Printing interrupted. Please leave the kiosk to the attendant; your order will be reviewed for a refund.';
       } else {
         checkoutStatusMsg.textContent = '';
+      }
+      const extraTotal = Number(statusData.excess_refunds_total) || 0;
+      const extraUnresolved = Number(statusData.excess_refunds_unresolved) || 0;
+      const extraReconciliation = Number(statusData.excess_refunds_reconciliation_required) || 0;
+      if (extraTotal > 0) {
+        const extraMessage = extraReconciliation > 0
+          ? 'An additional simulated payment requires review before further action.'
+          : extraUnresolved > 0
+            ? 'An additional payment was detected; its refund is being processed separately.'
+            : 'An additional simulated payment was refunded.';
+        checkoutStatusMsg.textContent += (checkoutStatusMsg.textContent ? ' ' : '') + extraMessage;
       }
     }
   }
@@ -2166,9 +2250,11 @@
             pinBoxes[i].textContent = activeDisplayCode[i] || '-';
           }
         }
-        if (recData.pin_expires_at) {
-          startExpiryCountdown(recData.pin_expires_at);
-        }
+        // Paid recovery PINs do not carry a customer-facing timer.
+        if (expiryCountdownTimer) clearInterval(expiryCountdownTimer);
+        expiryCountdownTimer = null;
+        authoritativeExpiryMs = 0;
+        if (pinExpiryText) pinExpiryText.classList.add('hidden');
         return recData;
       }
     } catch (_) { }
@@ -2204,6 +2290,7 @@
       activeOrderId = null;
       activeDisplayCode = '';
       activeRecoveryToken = '';
+      paidPINRecoveryRequestedForOrder = '';
       switchView('cart');
       renderCart();
     });

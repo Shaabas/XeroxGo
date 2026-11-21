@@ -32,6 +32,9 @@ var lucideLockPNGBytes []byte
 
 var (
 	assetsOnce sync.Once
+	// opentype.Face reuses a mutable glyph cache and is not safe for parallel
+	// DrawString/MeasureString. Crash/reconnect rendering can overlap.
+	fontFaceMu sync.Mutex
 
 	rawLogoImg  image.Image
 	rawGlobeImg image.Image
@@ -185,6 +188,8 @@ func drawText(dst *image.RGBA, face font.Face, text string, x, y int, col color.
 	if face == nil || len(text) == 0 {
 		return
 	}
+	fontFaceMu.Lock()
+	defer fontFaceMu.Unlock()
 	ascent := face.Metrics().Ascent.Ceil()
 	d := &font.Drawer{
 		Dst:  dst,
@@ -200,6 +205,8 @@ func measureTextWidth(face font.Face, text string) int {
 	if face == nil || len(text) == 0 {
 		return 0
 	}
+	fontFaceMu.Lock()
+	defer fontFaceMu.Unlock()
 	d := &font.Drawer{Face: face}
 	return d.MeasureString(text).Ceil()
 }

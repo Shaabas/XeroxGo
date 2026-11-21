@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -4375,3 +4376,557 @@ func TestFormatCUPSHoldOutcomeReasonDirect(t *testing.T) {
 	})
 }
 
+// WS-1 Regression Tests
+
+func TestClient_WebSocket_SecretSanitization(t *testing.T) {
+	secret := "kiosk-super-secret-auth-key-987654"
+	store, err := state.Open(filepath.Join(t.TempDir(), "test_secret.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "invalid token: "+r.URL.RawQuery, http.StatusUnauthorized)
+	}))
+	defer badServer.Close()
+	badWSURL := "ws" + strings.TrimPrefix(badServer.URL, "http")
+
+	cfg := ClientConfig{
+		CloudURL:      badWSURL,
+		KioskID:       "kiosk-001",
+		KioskSecret:   secret,
+		StateStore:    store,
+		PrinterAddr:   "127.0.0.1:9100",
+		DownloadDir:   t.TempDir(),
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    noopSink,
+		MinBackoff:    20 * time.Millisecond,
+		MaxBackoff:    50 * time.Millisecond,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// 1. SafeURL check: never include URL query parameters or authentication credentials
+	if strings.Contains(client.SafeURL(), secret) {
+		t.Fatalf("SafeURL leaked secret token: %s", client.SafeURL())
+	}
+	if strings.Contains(client.SafeURL(), "?") {
+		t.Fatalf("SafeURL must never contain URL query parameters: %s", client.SafeURL())
+	}
+
+	// 2. sanitizeError checks
+	cases := []struct {
+		name     string
+		inputErr error
+	}{
+		{"contains_normalized_url", fmt.Errorf("dial failed: %s: connection refused", client.normalizedURL)},
+		{"contains_raw_secret", fmt.Errorf("authentication rejected for secret %s", secret)},
+		{"contains_bearer_token", fmt.Errorf("Authorization header Bearer %s expired", secret)},
+		{"contains_query_token", fmt.Errorf("failed GET /ws?kiosk_id=kiosk-001&token=%s: 401", secret)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sanitized := client.sanitizeError(tc.inputErr)
+			if strings.Contains(sanitized, secret) {
+				t.Fatalf("sanitized error leaked secret %q: %s", secret, sanitized)
+			}
+			if strings.Contains(sanitized, "?") {
+				t.Fatalf("sanitized error must never contain URL query parameters: %s", sanitized)
+			}
+		})
+	}
+
+	// 3. Integration log output check during failed dial
+	var logBuf safeBuffer
+	origWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origWriter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- client.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var logOutput string
+	for time.Now().Before(deadline) {
+		logOutput = logBuf.String()
+		if strings.Contains(logOutput, "[SPOOLER] WebSocket connection to cloud failed") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	<-runErrCh
+
+	if strings.Contains(logOutput, secret) {
+		t.Fatalf("captured log output leaked secret %q:\n%s", secret, logOutput)
+	}
+	if strings.Contains(logOutput, "?") {
+		t.Fatalf("captured log output must never contain URL query parameters:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "[SPOOLER] WebSocket connection to cloud failed") {
+		t.Fatalf("expected failed connection log, got:\n%s", logOutput)
+	}
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func TestClient_PingWatchdog_UnresponsivePeer_TriggersReconnect(t *testing.T) {
+	var connCount atomic.Int32
+	conn2Established := make(chan struct{})
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := connCount.Add(1)
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+
+		if count == 1 {
+			// First connection: accept WebSocket upgrade, but do NOT read.
+			// In coder/websocket, if the peer does not read, incoming pings are never replied to with pong.
+			// Hold the connection open so the client's watchdog must detect the timeout.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+		} else {
+			// Second connection: read normally so client connection is healthy
+			select {
+			case <-conn2Established:
+			default:
+				close(conn2Established)
+			}
+			_ = c.CloseRead(r.Context())
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "test_watchdog.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	cfg := ClientConfig{
+		CloudURL:          wsURL,
+		KioskID:           "kiosk-watchdog-test",
+		KioskSecret:       "watchdog-test-token",
+		StateStore:        store,
+		PrinterAddr:       "127.0.0.1:9100",
+		DownloadDir:       t.TempDir(),
+		IdleQRContent:     "https://example.com/qr",
+		ScreenSink:        noopSink,
+		PingInterval:      30 * time.Millisecond,
+		PingTimeout:       30 * time.Millisecond,
+		HeartbeatInterval: 1 * time.Second,
+		MinBackoff:        10 * time.Millisecond,
+		MaxBackoff:        50 * time.Millisecond,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- client.Run(ctx)
+	}()
+
+	select {
+	case <-conn2Established:
+		// Reconnection succeeded because watchdog terminated unresponsive connection 1
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for client to reconnect after unresponsive peer; total connections: %d", connCount.Load())
+	}
+
+	if connCount.Load() < 2 {
+		t.Fatalf("expected at least 2 connections (initial + reconnect), got %d", connCount.Load())
+	}
+
+	cancel()
+	select {
+	case err := <-startErrCh:
+		if err != nil {
+			t.Fatalf("client.Run returned unexpected error on cancel: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("client.Run did not terminate promptly after context cancel")
+	}
+}
+
+type failWriterConn struct {
+	net.Conn
+	failWrite atomic.Bool
+}
+
+func (c *failWriterConn) Write(b []byte) (int, error) {
+	if c.failWrite.Load() {
+		return 0, errors.New("simulated network write failure")
+	}
+	return c.Conn.Write(b)
+}
+
+func TestClient_Heartbeat_WriteError_TriggersReconnect(t *testing.T) {
+	var connCount atomic.Int32
+	conn2Established := make(chan struct{})
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := connCount.Add(1)
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+
+		if count == 1 {
+			// First connection: accept and read normally without closing.
+			// The server keeps the socket open so the client's reader does NOT detect EOF.
+			go func() {
+				for {
+					var msg wireMessage
+					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+						return
+					}
+				}
+			}()
+			<-r.Context().Done()
+		} else {
+			// Second connection (recovery): read normally and signal establishment
+			select {
+			case <-conn2Established:
+			default:
+				close(conn2Established)
+			}
+			go func() {
+				for {
+					var msg wireMessage
+					if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+						return
+					}
+				}
+			}()
+			<-r.Context().Done()
+		}
+	}))
+	defer wsServer.Close()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "test_hb_err.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:          wsURL,
+		KioskID:           "kiosk-hb-err-test",
+		KioskSecret:       "hb-test-token",
+		StateStore:        store,
+		PrinterAddr:       "127.0.0.1:9100",
+		DownloadDir:       t.TempDir(),
+		IdleQRContent:     "https://example.com/qr",
+		ScreenSink:        noopSink,
+		HeartbeatInterval: 20 * time.Millisecond,
+		PingInterval:      10 * time.Second,
+		MinBackoff:        10 * time.Millisecond,
+		MaxBackoff:        50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	var logBuf safeBuffer
+	origWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origWriter)
+
+	// Dial connection 1 with failWriterConn
+	var fw1 *failWriterConn
+	dialer := &net.Dialer{}
+	dialClient1 := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				rawConn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				fw1 = &failWriterConn{Conn: rawConn}
+				return fw1, nil
+			},
+		},
+	}
+
+	conn1Ctx, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+
+	conn1, _, err := websocket.Dial(conn1Ctx, client.normalizedURL, &websocket.DialOptions{
+		HTTPClient: dialClient1,
+	})
+	if err != nil {
+		t.Fatalf("Dial connection 1 failed: %v", err)
+	}
+	defer conn1.CloseNow()
+
+	// Arm write failure on connection 1
+	fw1.failWrite.Store(true)
+
+	// Run handleConnection for connection 1
+	conn1Done := make(chan struct{})
+	go func() {
+		client.handleConnection(conn1Ctx, conn1)
+		close(conn1Done)
+	}()
+
+	// Verify connection 1 terminated via heartbeat write error handler
+	select {
+	case <-conn1Done:
+		// Connection 1 terminated cleanly via write error handler
+	case <-time.After(1 * time.Second):
+		t.Fatal("connection 1 did not terminate after heartbeat write failure")
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "[SPOOLER] Heartbeat write failed") {
+		t.Fatalf("expected '[SPOOLER] Heartbeat write failed' in log, got:\n%s", logOutput)
+	}
+
+	// Now verify recovery: client connects connection 2 and runs healthy
+	conn2Ctx, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+
+	conn2, _, err := websocket.Dial(conn2Ctx, client.normalizedURL, nil)
+	if err != nil {
+		t.Fatalf("Dial connection 2 failed: %v", err)
+	}
+	defer conn2.CloseNow()
+
+	conn2Done := make(chan struct{})
+	go func() {
+		client.handleConnection(conn2Ctx, conn2)
+		close(conn2Done)
+	}()
+
+	select {
+	case <-conn2Established:
+		// Reconnection / recovery succeeded!
+	case <-time.After(1 * time.Second):
+		t.Fatal("recovery connection 2 was not established")
+	}
+
+	cancel2()
+	<-conn2Done
+}
+
+func TestClient_PingWatchdog_CleanShutdown(t *testing.T) {
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		_ = c.CloseRead(r.Context())
+		<-r.Context().Done()
+	}))
+	defer wsServer.Close()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "test_clean_shutdown.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	cfg := ClientConfig{
+		CloudURL:          wsURL,
+		KioskID:           "kiosk-clean-shutdown-test",
+		KioskSecret:       "clean-shutdown-token",
+		StateStore:        store,
+		PrinterAddr:       "127.0.0.1:9100",
+		DownloadDir:       t.TempDir(),
+		IdleQRContent:     "https://example.com/qr",
+		ScreenSink:        noopSink,
+		PingInterval:      20 * time.Millisecond,
+		PingTimeout:       20 * time.Millisecond,
+		HeartbeatInterval: 20 * time.Millisecond,
+		MinBackoff:        10 * time.Millisecond,
+	}
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Run(ctx)
+	}()
+
+	// Let ping watchdog and heartbeat run for several iterations
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel root context
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("client.Run returned non-nil error on clean shutdown: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("client.Run did not exit within 1 second on shutdown")
+	}
+}
+
+func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		_ = c.CloseRead(r.Context())
+		<-r.Context().Done()
+	}))
+	defer wsServer.Close()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "test_sendmu.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer store.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:      wsURL,
+		KioskID:       "kiosk-sendmu-test",
+		KioskSecret:   "token-test",
+		StateStore:    store,
+		PrinterAddr:   "127.0.0.1:9100",
+		DownloadDir:   t.TempDir(),
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink:    noopSink,
+		PingInterval:  20 * time.Millisecond,
+		PingTimeout:   20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	connCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn, _, err := websocket.Dial(connCtx, client.normalizedURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// Start reader concurrently as required by coder/websocket Ping
+	go func() {
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(connCtx, conn, &msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Simulate slow writer or health poller holding sendMu
+	client.sendMu.Lock()
+	defer client.sendMu.Unlock()
+
+	// Exercise the ACTUAL pingWatchdog implementation while sendMu is locked
+	watchdogCtx, watchdogCancel := context.WithCancel(connCtx)
+	watchdogDone := make(chan struct{})
+	go func() {
+		client.pingWatchdog(watchdogCtx, cancel, conn)
+		close(watchdogDone)
+	}()
+
+	// Let the watchdog execute multiple ping iterations while sendMu is held
+	time.Sleep(70 * time.Millisecond)
+
+	// If pingWatchdog were blocked by sendMu, canceling watchdogCtx wouldn't unblock it
+	// because it would be stuck trying to acquire sendMu.
+	watchdogCancel()
+
+	select {
+	case <-watchdogDone:
+		// Successfully executed and exited without blocking on sendMu
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("pingWatchdog hung or was blocked while sendMu was locked")
+	}
+}
+
+
+
+func TestClient_SafeURL_RemovesEmbeddedUserInfoAndFragment(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "safe_url.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://account:secretpass@example.invalid/ws?token=hidden#fragmentsecret",
+		KioskID: "kiosk-safe-url",
+		StateStore: st,
+		PrinterAddr: "127.0.0.1:9100",
+		DownloadDir: t.TempDir(),
+		IdleQRContent: "https://example.com/qr",
+		ScreenSink: noopSink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	safe := client.SafeURL()
+	if safe != "ws://example.invalid/ws" {
+		t.Fatalf("unexpected sanitized URL: %q", safe)
+	}
+	got := client.sanitizeError(fmt.Errorf("dial rejected: wss://alice:secretpass@example.invalid/ws?token=hidden"))
+	for _, secret := range []string{"alice", "secretpass", "hidden", "?"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("error still contains %q: %s", secret, got)
+		}
+	}
+}

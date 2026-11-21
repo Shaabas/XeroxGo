@@ -28,12 +28,12 @@ func TestSupabaseIntegration(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Pricing test
-	if err := s.SetPricePerSheetPaise(ctx, 500); err != nil {
-		t.Fatalf("SetPricePerSheetPaise failed: %v", err)
+	if err := s.SetDetailedPricing(ctx, 500, 375, 1000, 750, false); err != nil {
+		t.Fatalf("SetDetailedPricing failed: %v", err)
 	}
-	price, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 500 {
-		t.Fatalf("GetPricePerSheetPaise failed: %v, got %d", err, price)
+	price, err := s.GetPricing(ctx)
+	if err != nil || price.BWSimplexPricePaise != 500 {
+		t.Fatalf("GetPricing failed: %v, got %+v", err, price)
 	}
 
 	// 2. Order creation test
@@ -69,17 +69,6 @@ func TestSupabaseIntegration(t *testing.T) {
 		t.Fatalf("retrieved display code mismatch: %s", retrieved.Command.DisplayCode)
 	}
 
-	// 3. Webhook idempotency test
-	webhookID := fmt.Sprintf("wh-it-%d", time.Now().Unix())
-	first, err := s.RecordWebhook(ctx, webhookID)
-	if err != nil || !first {
-		t.Fatalf("expected first RecordWebhook to succeed, got %v, err=%v", first, err)
-	}
-	second, err := s.RecordWebhook(ctx, webhookID)
-	if err != nil || second {
-		t.Fatalf("expected second RecordWebhook to return false, got %v, err=%v", second, err)
-	}
-
 	// 4. Job progress update test
 	event := contracts.JobProgressEvent{
 		JobID:         testJobID,
@@ -102,10 +91,7 @@ func TestSupabaseIntegration(t *testing.T) {
 	}
 
 	// 5. Promotional Ads Fallback Test
-	if err := s.SeedDefaultAds(ctx); err != nil {
-		t.Fatalf("SeedDefaultAds cleanup failed: %v", err)
-	}
-	allAds, err := s.GetAllAds(ctx)
+		allAds, err := s.GetAllAds(ctx)
 	if err != nil {
 		t.Fatalf("GetAllAds failed: %v", err)
 	}

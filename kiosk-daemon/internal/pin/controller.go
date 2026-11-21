@@ -252,8 +252,6 @@ func (c *Controller) handleEvent(ev input.Event) {
 		c.handlePINEntryEvent(ev)
 	case StatePINLoading:
 		c.handlePINLoadingEvent(ev)
-	case StateOrderSummary:
-		c.handleOrderSummaryEvent(ev)
 	case StatePaymentPending:
 		c.handlePaymentPendingEvent(ev)
 	}
@@ -320,20 +318,6 @@ func (c *Controller) handlePINLoadingEvent(ev input.Event) {
 	}
 }
 
-func (c *Controller) handleOrderSummaryEvent(ev input.Event) {
-	c.resetInactivityTimerLocked(c.cfg.SummaryTimeout)
-
-	switch ev.Type {
-	case input.ActionCancel:
-		c.resetToIdleLocked()
-	case input.ActionSubmit:
-		if c.isClaiming {
-			return
-		}
-		c.startClaimLocked()
-	}
-}
-
 func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 	switch ev.Type {
 	case input.ActionCancel:
@@ -364,7 +348,7 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 				}
 				if pErr != nil {
 					log.Printf("[PIN-CONTROLLER] Retry initiate payment failed: %v", pErr)
-					c.pinError = "Failed to load payment QR. Press Confirm to retry."
+					c.pinError = "Failed to load payment QR. Press Enter to retry."
 					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 					return
 				}
@@ -379,17 +363,6 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 					c.authorizeDemoPaymentLocked(token)
 				}
 			}(seq, sID)
-		} else {
-			token := ""
-			if c.currentAttempt != nil && c.currentAttempt.DemoToken != "" {
-				token = c.currentAttempt.DemoToken
-			}
-			if token != "" {
-				log.Printf("[PIN-CONTROLLER] Keypad Confirm: authorizing demo payment for %s", token)
-				c.authorizeDemoPaymentLocked(token)
-			} else {
-				log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
-			}
 		}
 	}
 }
@@ -413,7 +386,7 @@ func (c *Controller) authorizeDemoPaymentLocked(token string) {
 		}
 		if err != nil {
 			log.Printf("[PIN-CONTROLLER] Demo payment authorization failed: %v", err)
-			c.pinError = "Payment failed. Press Confirm to retry or Cancel to exit."
+			c.pinError = "Payment failed. Please retry checkout or press Cancel to exit."
 			c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 			return
 		}
@@ -431,7 +404,8 @@ func (c *Controller) startClaimLocked() {
 
 	c.isClaiming = true
 	c.pinError = ""
-	c.renderOrderSummaryLocked(int(c.cfg.SummaryTimeout.Seconds()))
+	c.state = StatePaymentPending
+	c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 
 	orderID := c.currentOrder.OrderID
 	c.stopInactivityTimerLocked()
@@ -447,7 +421,7 @@ func (c *Controller) startClaimLocked() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
-		if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StateOrderSummary {
+		if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
 			return
 		}
 		c.isClaiming = false
@@ -457,7 +431,7 @@ func (c *Controller) startClaimLocked() {
 			var userError string
 			switch {
 			case errors.Is(err, cloud.ErrInsufficientPaper):
-				userError = "Paper tray supply is low or empty. Please ask attendant to refill paper and press Confirm."
+				userError = "Paper supply has changed. Please ask an attendant to refill and retry your PIN."
 			case errors.Is(err, cloud.ErrPrinterOffline):
 				userError = "Printer is offline or disconnected. Please ask attendant for assistance."
 			case errors.Is(err, cloud.ErrPrinterError):
@@ -477,10 +451,13 @@ func (c *Controller) startClaimLocked() {
 				}
 			}
 
+			// On claim error, let the customer retry their still-reserved PIN.
+			c.state = StatePINEntry
+			c.pinBuffer = ""
+			c.currentOrder = nil
 			c.pinError = userError
-			c.renderOrderSummaryLocked(int(c.cfg.SummaryTimeout.Seconds()))
-			c.resetInactivityTimerLocked(c.cfg.SummaryTimeout)
-			c.startCountdownLocked(c.cfg.SummaryTimeout)
+			c.renderPINEntryLocked()
+			c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
 			return
 		}
 
@@ -557,7 +534,7 @@ func (c *Controller) startClaimLocked() {
 
 			if pErr != nil || attempt == nil {
 				log.Printf("[PIN-CONTROLLER] All initiate payment attempts failed for session %s: %v", sID, pErr)
-				c.pinError = "Failed to load payment QR. Press Confirm to retry."
+				c.pinError = "Failed to load payment QR. Press Enter to retry."
 				c.renderPaymentPendingLocked(tSec)
 				return
 			}
@@ -633,11 +610,9 @@ func (c *Controller) startLookupLocked() {
 			return
 		}
 
-		// Success: transition to Order Summary screen
-		c.state = StateOrderSummary
+		// The mobile order already reserved paper: no extra Confirm step.
 		c.currentOrder = order
-		c.startCountdownLocked(c.cfg.SummaryTimeout)
-		c.renderOrderSummaryLocked(int(c.cfg.SummaryTimeout.Seconds()))
+		c.startClaimLocked()
 	}(seq, pinToLookup)
 }
 
@@ -738,6 +713,7 @@ func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
 		OrderSummary:   summary,
 		SessionID:      sessID,
 		QRContent:      c.currentQRPayload,
+		PINLoading:     c.isClaiming,
 		PINError:       c.pinError,
 		TimeoutSeconds: remainingSeconds,
 		PrinterModel:   c.cfg.PrinterModel,

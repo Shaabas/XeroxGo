@@ -245,12 +245,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
     bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
         CHECK (bw_simplex_price_paise > 0),
     bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
@@ -374,6 +368,7 @@ CREATE TABLE IF NOT EXISTS kiosk_sessions (
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);
 CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';
 
 CREATE TABLE IF NOT EXISTS payments (
     payment_id TEXT PRIMARY KEY,
@@ -433,81 +428,13 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			return nil, fmt.Errorf("open store: postgres schema init: %w", err)
 		}
 
-		pgMigrations := []string{
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_simplex_price_paise BIGINT NOT NULL DEFAULT 1000;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_duplex_price_paise BIGINT NOT NULL DEFAULT 750;",
-			"ALTER TABLE pricing ADD COLUMN IF NOT EXISTS color_enabled INTEGER NOT NULL DEFAULT 0;",
-			"ALTER TABLE print_configs ADD COLUMN IF NOT EXISTS color_mode TEXT NOT NULL DEFAULT 'BW';",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS pin_expires_at_ns BIGINT NOT NULL DEFAULT 0;",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_pages INTEGER NOT NULL DEFAULT 0;",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_sheets INTEGER NOT NULL DEFAULT 0;",
-			"CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);",
-			"CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);",
-			"CREATE TABLE IF NOT EXISTS order_documents (job_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, document_index INTEGER NOT NULL CHECK (document_index >= 0), original_filename TEXT NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, total_pages INTEGER NOT NULL CHECK (total_pages > 0), total_sheets INTEGER NOT NULL CHECK (total_sheets > 0), copies INTEGER NOT NULL CHECK (copies > 0), duplex TEXT NOT NULL, color_mode TEXT NOT NULL DEFAULT 'BW', page_range TEXT NOT NULL DEFAULT '', orientation TEXT NOT NULL DEFAULT 'AUTO', pages_per_sheet INTEGER NOT NULL DEFAULT 1, price_paise BIGINT NOT NULL CHECK (price_paise >= 0), status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(order_id, document_index));",
-			"CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);",
-			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
-			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
-			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS recovery_records (recovery_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, kiosk_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, confirmed_sheets_printed INTEGER NOT NULL, remaining_pages INTEGER NOT NULL, remaining_sheets INTEGER NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(job_id, sequence_id));",
-			"CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);",
-			"CREATE TABLE IF NOT EXISTS pin_reservations (kiosk_id TEXT NOT NULL, pin TEXT NOT NULL, order_id TEXT NOT NULL, expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, PRIMARY KEY (kiosk_id, pin));",
-			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_order ON pin_reservations (order_id);",
-			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_expiry ON pin_reservations (kiosk_id, expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS pin_rate_limits (kiosk_id TEXT PRIMARY KEY, failed_attempts INTEGER NOT NULL DEFAULT 0, first_failure_ns BIGINT NOT NULL DEFAULT 0, last_failure_ns BIGINT NOT NULL DEFAULT 0, blocked_until_ns BIGINT NOT NULL DEFAULT 0, updated_at_ns BIGINT NOT NULL DEFAULT 0);",
-			"CREATE TABLE IF NOT EXISTS kiosk_sessions (session_id TEXT PRIMARY KEY, kiosk_id TEXT NOT NULL, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, status TEXT NOT NULL, price_paise BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
-			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_order_status ON kiosk_sessions (order_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_kiosk ON kiosk_sessions (kiosk_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_kiosk_sessions_expiry ON kiosk_sessions (expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS payments (payment_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, created_at_ns BIGINT NOT NULL);",
-			"CREATE INDEX IF NOT EXISTS idx_payments_order ON payments (order_id);",
-			"ALTER TABLE orders ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';",
-			"CREATE TABLE IF NOT EXISTS dispatch_intents (job_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, dispatched_at_ns BIGINT NOT NULL DEFAULT 0, acknowledged_at_ns BIGINT NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');",
-			"ALTER TABLE dispatch_intents ADD COLUMN IF NOT EXISTS acknowledged_at_ns BIGINT NOT NULL DEFAULT 0;",
-			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);",
-			"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_name = 'dispatch_intents' AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = 'job_id') THEN ALTER TABLE dispatch_intents DROP CONSTRAINT IF EXISTS dispatch_intents_pkey; ALTER TABLE dispatch_intents ADD PRIMARY KEY (job_id); END IF; END $$;",
-			"ALTER TABLE job_progress DROP CONSTRAINT IF EXISTS job_progress_job_id_fkey;",
-			"ALTER TABLE recovery_records DROP CONSTRAINT IF EXISTS recovery_records_job_id_fkey;",
-			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', demo_token TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
-			"ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS demo_token TEXT NOT NULL DEFAULT '';",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order_id);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (session_id);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);",
-			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);",
-		}
-
-		// Preflight check: detect existing duplicate active sessions before migrating.
-		// Fail closed on any database query error or if duplicate active sessions exist.
-		var dupActiveSessions int
-		if err := db.QueryRowContext(ctx, `
-SELECT COUNT(1) FROM (
-    SELECT order_id FROM kiosk_sessions 
-    WHERE status = 'PAYMENT_PENDING' 
-    GROUP BY order_id 
-    HAVING COUNT(1) > 1
-) dups;
-`).Scan(&dupActiveSessions); err != nil {
+		
+		store := &Store{db: db, dialect: "postgres"}
+		if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
 			_ = db.Close()
-			return nil, fmt.Errorf("open store: postgres migration preflight query failed: %w", err)
+			return nil, fmt.Errorf("open store: fulfillment schema: %w", err)
 		}
-		if dupActiveSessions > 0 {
-			_ = db.Close()
-			return nil, fmt.Errorf("open store: postgres migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
-		}
-
-		for _, mig := range pgMigrations {
-			if _, err := db.Exec(mig); err != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("open store: postgres migration: %w", err)
-			}
-		}
-
-		return &Store{db: db, dialect: "postgres"}, nil
+		return store, nil
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -618,12 +545,6 @@ CREATE TABLE IF NOT EXISTS print_configs (
 
 CREATE TABLE IF NOT EXISTS pricing (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    price_per_sheet_paise BIGINT NOT NULL
-        CHECK (price_per_sheet_paise > 0),
-    bw_price_per_sheet_paise BIGINT NOT NULL DEFAULT 200
-        CHECK (bw_price_per_sheet_paise > 0),
-    color_price_per_sheet_paise BIGINT NOT NULL DEFAULT 1000
-        CHECK (color_price_per_sheet_paise > 0),
     bw_simplex_price_paise BIGINT NOT NULL DEFAULT 200
         CHECK (bw_simplex_price_paise > 0),
     bw_duplex_price_paise BIGINT NOT NULL DEFAULT 150
@@ -713,185 +634,6 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
-`
-	if _, err := db.Exec(schema); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open store: create schema: %w", err)
-	}
-
-	if err := migrateSQLiteSchema(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open store: sqlite migration: %w", err)
-	}
-
-	return &Store{db: db, dialect: "sqlite"}, nil
-}
-
-func migrateSQLiteSchema(db *sql.DB) error {
-	colsPricing := make(map[string]bool)
-	rows, err := db.Query("PRAGMA table_info(pricing);")
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsPricing[name] = true
-			}
-		}
-		_ = rows.Close()
-	}
-	if !colsPricing["bw_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_price_per_sheet_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["color_price_per_sheet_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_price_per_sheet_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["bw_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_simplex_price_paise INTEGER NOT NULL DEFAULT 200;")
-	}
-	if !colsPricing["bw_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN bw_duplex_price_paise INTEGER NOT NULL DEFAULT 150;")
-	}
-	if !colsPricing["color_simplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_simplex_price_paise INTEGER NOT NULL DEFAULT 1000;")
-	}
-	if !colsPricing["color_duplex_price_paise"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_duplex_price_paise INTEGER NOT NULL DEFAULT 750;")
-	}
-	if !colsPricing["color_enabled"] {
-		_, _ = db.Exec("ALTER TABLE pricing ADD COLUMN color_enabled INTEGER NOT NULL DEFAULT 0;")
-	}
-
-	colsConfigs := make(map[string]bool)
-	rowsCfg, err := db.Query("PRAGMA table_info(print_configs);")
-	if err == nil {
-		for rowsCfg.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rowsCfg.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsConfigs[name] = true
-			}
-		}
-		_ = rowsCfg.Close()
-	}
-	if !colsConfigs["color_mode"] {
-		_, _ = db.Exec("ALTER TABLE print_configs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'BW';")
-	}
-
-	colsOrders := make(map[string]bool)
-	rowsOrd, err := db.Query("PRAGMA table_info(orders);")
-	if err == nil {
-		for rowsOrd.Next() {
-			var cid int
-			var name, ctype string
-			var notnull, pk int
-			var dflt *string
-			if err := rowsOrd.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
-				colsOrders[name] = true
-			}
-		}
-		_ = rowsOrd.Close()
-	}
-	if !colsOrders["pin_expires_at_ns"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN pin_expires_at_ns INTEGER NOT NULL DEFAULT 0;")
-	}
-	if !colsOrders["claim_token"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';")
-	}
-	if !colsOrders["total_pages"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN total_pages INTEGER NOT NULL DEFAULT 0;")
-	}
-	if !colsOrders["total_sheets"] {
-		_, _ = db.Exec("ALTER TABLE orders ADD COLUMN total_sheets INTEGER NOT NULL DEFAULT 0;")
-	}
-	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_kiosk_pin ON orders (kiosk_id, display_code, status);")
-	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_orders_job_id ON orders (job_id);")
-
-	_, _ = db.Exec(`
-CREATE TABLE IF NOT EXISTS order_documents (
-    job_id TEXT PRIMARY KEY,
-    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
-    document_index INTEGER NOT NULL CHECK (document_index >= 0),
-    original_filename TEXT NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    total_pages INTEGER NOT NULL CHECK (total_pages > 0),
-    total_sheets INTEGER NOT NULL CHECK (total_sheets > 0),
-    copies INTEGER NOT NULL CHECK (copies > 0),
-    duplex TEXT NOT NULL,
-    color_mode TEXT NOT NULL DEFAULT 'BW',
-    page_range TEXT NOT NULL DEFAULT '',
-    orientation TEXT NOT NULL DEFAULT 'AUTO',
-    pages_per_sheet INTEGER NOT NULL DEFAULT 1,
-    price_paise BIGINT NOT NULL CHECK (price_paise >= 0),
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(order_id, document_index)
-);
-CREATE INDEX IF NOT EXISTS idx_order_documents_order ON order_documents (order_id, document_index);
-`)
-
-	// Preflight check: detect existing duplicate active sessions before migrating SQLite.
-	// Must fail closed on any database query error or if duplicate active sessions exist.
-	var tableCount int
-	if err := db.QueryRow("SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='kiosk_sessions';").Scan(&tableCount); err != nil {
-		return fmt.Errorf("open store: sqlite check kiosk_sessions table: %w", err)
-	}
-	if tableCount > 0 {
-		var dupActiveSessions int
-		if err := db.QueryRow(`
-SELECT COUNT(1) FROM (
-    SELECT order_id FROM kiosk_sessions 
-    WHERE status = 'PAYMENT_PENDING' 
-    GROUP BY order_id 
-    HAVING COUNT(1) > 1
-) dups;
-`).Scan(&dupActiveSessions); err != nil {
-			return fmt.Errorf("open store: sqlite migration preflight failed: %w", err)
-		}
-		if dupActiveSessions > 0 {
-			return fmt.Errorf("open store: sqlite migration preflight failed: found %d orders with duplicate active PAYMENT_PENDING sessions; manual operator resolution required", dupActiveSessions)
-		}
-	}
-
-	_, _ = db.Exec(`
-CREATE TABLE IF NOT EXISTS conversions (
-    id TEXT PRIMARY KEY,
-    token TEXT NOT NULL,
-    original_filename TEXT NOT NULL,
-    file_size BIGINT NOT NULL,
-    status TEXT NOT NULL,
-    error_message TEXT NOT NULL DEFAULT '',
-    input_path TEXT NOT NULL,
-    output_path TEXT NOT NULL DEFAULT '',
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    expires_at_ns BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
-CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
-
-CREATE TABLE IF NOT EXISTS recovery_records (
-    recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL,
-    kiosk_id TEXT NOT NULL,
-    sequence_id INTEGER NOT NULL,
-    confirmed_sheets_printed INTEGER NOT NULL,
-    remaining_pages INTEGER NOT NULL,
-    remaining_sheets INTEGER NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(job_id, sequence_id)
-);
-CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS pin_reservations (
     kiosk_id TEXT NOT NULL,
@@ -979,133 +721,19 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_session ON payment_attempts (ses
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider, provider_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_kiosk_status ON payment_attempts (kiosk_id, status);
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (demo_token);
-`)
-
-	colsDispatch := make(map[string]bool)
-	jobIdIsPK := false
-	rowsDisp, err := db.Query("PRAGMA table_info(dispatch_intents);")
-	if err != nil {
-		return fmt.Errorf("open store: sqlite inspect dispatch_intents: %w", err)
-	}
-	for rowsDisp.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt *string
-		if err := rowsDisp.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rowsDisp.Close()
-			return fmt.Errorf("open store: sqlite scan dispatch_intents column info: %w", err)
-		}
-		colsDispatch[name] = true
-		if name == "job_id" && pk == 1 {
-			jobIdIsPK = true
-		}
-	}
-	if err := rowsDisp.Err(); err != nil {
-		_ = rowsDisp.Close()
-		return fmt.Errorf("open store: sqlite iterate dispatch_intents column info: %w", err)
-	}
-	_ = rowsDisp.Close()
-
-	if len(colsDispatch) > 0 && !jobIdIsPK {
-		var dupJobs int
-		if err := db.QueryRow("SELECT COUNT(1) FROM (SELECT job_id FROM dispatch_intents GROUP BY job_id HAVING COUNT(1) > 1);").Scan(&dupJobs); err != nil {
-			return fmt.Errorf("open store: sqlite preflight dispatch_intents duplicate check: %w", err)
-		}
-		if dupJobs > 0 {
-			return fmt.Errorf("open store: sqlite migration failed: found %d duplicate job_id records in dispatch_intents; manual resolution required", dupJobs)
-		}
-
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("open store: sqlite begin dispatch_intents migration tx: %w", err)
-		}
-		defer tx.Rollback()
-
-		migrationSQL := `
-CREATE TABLE dispatch_intents_new (
-    job_id TEXT PRIMARY KEY,
-    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
-    kiosk_id TEXT NOT NULL,
-    session_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    dispatched_at_ns BIGINT NOT NULL DEFAULT 0,
-    acknowledged_at_ns BIGINT NOT NULL DEFAULT 0,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT NOT NULL DEFAULT ''
-);
-INSERT INTO dispatch_intents_new (job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error)
-SELECT job_id, order_id, kiosk_id, session_id, status, created_at_ns, updated_at_ns, dispatched_at_ns, acknowledged_at_ns, retry_count, last_error
-FROM dispatch_intents;
-DROP TABLE dispatch_intents;
-ALTER TABLE dispatch_intents_new RENAME TO dispatch_intents;
-CREATE INDEX IF NOT EXISTS idx_dispatch_intents_kiosk_status ON dispatch_intents (kiosk_id, status);
-CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';
 `
-		if _, err := tx.Exec(migrationSQL); err != nil {
-			return fmt.Errorf("open store: sqlite execute dispatch_intents migration: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("open store: sqlite commit dispatch_intents migration: %w", err)
-		}
-		colsDispatch["acknowledged_at_ns"] = true
+	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: create schema: %w", err)
 	}
 
-	if len(colsDispatch) > 0 && !colsDispatch["acknowledged_at_ns"] {
-		if _, err := db.Exec("ALTER TABLE dispatch_intents ADD COLUMN acknowledged_at_ns INTEGER NOT NULL DEFAULT 0;"); err != nil {
-			return fmt.Errorf("open store: sqlite add acknowledged_at_ns column: %w", err)
-		}
+	store := &Store{db: db, dialect: "sqlite"}
+	if err := store.ensureFulfillmentSchema(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open store: fulfillment schema: %w", err)
 	}
-	if _, err := db.Exec("UPDATE dispatch_intents SET status = 'PENDING' WHERE status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL);"); err != nil {
-		return fmt.Errorf("open store: sqlite reset unacknowledged dispatch intents: %w", err)
-	}
-
-	colsPayAttempts := make(map[string]bool)
-	rowsPay, err := db.Query("PRAGMA table_info(payment_attempts);")
-	if err != nil {
-		return fmt.Errorf("open store: sqlite inspect payment_attempts: %w", err)
-	}
-	for rowsPay.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt *string
-		if err := rowsPay.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rowsPay.Close()
-			return fmt.Errorf("open store: sqlite scan payment_attempts column info: %w", err)
-		}
-		colsPayAttempts[name] = true
-	}
-	if err := rowsPay.Err(); err != nil {
-		_ = rowsPay.Close()
-		return fmt.Errorf("open store: sqlite iterate payment_attempts column info: %w", err)
-	}
-	_ = rowsPay.Close()
-
-	if len(colsPayAttempts) > 0 && !colsPayAttempts["demo_token"] {
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("open store: sqlite begin payment_attempts migration: %w", err)
-		}
-		defer tx.Rollback()
-		if _, err := tx.Exec("ALTER TABLE payment_attempts ADD COLUMN demo_token TEXT NOT NULL DEFAULT '';"); err != nil {
-			return fmt.Errorf("open store: sqlite add demo_token column: %w", err)
-		}
-		if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts(demo_token);"); err != nil {
-			return fmt.Errorf("open store: sqlite create idx_payment_attempts_demo_token: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("open store: sqlite commit payment_attempts migration: %w", err)
-		}
-	}
-
-	if _, err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_kiosk_sessions_active_order ON kiosk_sessions (order_id) WHERE status = 'PAYMENT_PENDING';"); err != nil {
-		return fmt.Errorf("open store: sqlite create idx_kiosk_sessions_active_order: %w", err)
-	}
-
-	return nil
+	return store, nil
 }
 
 // Close closes the underlying SQLite database connection.
@@ -1117,7 +745,22 @@ func (s *Store) Close() error {
 }
 
 // CreateOrder persists an order and its associated print configuration and child documents atomically.
+// CreateOrder persists an order without a stock check. Internal/test callers can
+// use this; the public mobile finalization path must use CreateOrderWithPaperCheck.
 func (s *Store) CreateOrder(ctx context.Context, order Order) error {
+	return s.createOrder(ctx, order, -1)
+}
+
+// CreateOrderWithPaperCheck atomically reserves the full order's sheets before
+// publishing a PIN. availableStock is the latest kiosk-reported physical stock.
+func (s *Store) CreateOrderWithPaperCheck(ctx context.Context, order Order, availableStock int) error {
+	if availableStock < 0 {
+		return fmt.Errorf("create order: available stock must be nonnegative")
+	}
+	return s.createOrder(ctx, order, availableStock)
+}
+
+func (s *Store) createOrder(ctx context.Context, order Order, availableStock int) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("create order: store is closed or nil")
 	}
@@ -1307,6 +950,23 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("create order: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Serialize competing mobile reservations and kiosk session claims per kiosk.
+	// The stock check and order/PIN insert share this transaction.
+	if availableStock >= 0 {
+		if s.dialect == "postgres" {
+			if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", order.Command.KioskID); err != nil {
+				return fmt.Errorf("create order: acquire kiosk paper lock: %w", err)
+			}
+		}
+		committed, err := s.getCommittedPaperSheetsTx(ctx, tx, order.Command.KioskID, "", createdNS)
+		if err != nil {
+			return fmt.Errorf("create order: calculate paper commitments: %w", err)
+		}
+		if availableStock-committed < order.TotalSheets {
+			return ErrInsufficientPaper
+		}
+	}
 
 	// 1. Prune expired PIN reservations on this kiosk atomically
 	_, err = tx.ExecContext(ctx, s.rebind(`
@@ -1518,13 +1178,6 @@ WHERE o.order_id = ?;
 		return nil, fmt.Errorf("get order: scan: %w", err)
 	}
 
-	if ordTotalPages <= 0 {
-		ordTotalPages = totalPages
-	}
-	if ordTotalSheets <= 0 {
-		ordTotalSheets = totalSheets
-	}
-
 	result := &Order{
 		OrderID: resOrderID,
 		Command: contracts.PrintJobCommand{
@@ -1611,16 +1264,7 @@ func (s *Store) GetOrderByJobID(ctx context.Context, jobID string) (*Order, erro
 		return nil, fmt.Errorf("get order by job id: query order_documents: %w", err)
 	}
 
-	queryOrder := `SELECT order_id FROM orders WHERE job_id = ?;`
-	err = s.db.QueryRowContext(ctx, s.rebind(queryOrder), targetJobID).Scan(&orderID)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get order by job id: query orders: %w", err)
-	}
-
-	return s.GetOrder(ctx, orderID)
+	return nil, nil
 }
 
 // GetOrderDocuments retrieves all child documents for an order, ordered by document_index.
@@ -2183,61 +1827,6 @@ WHERE order_id = ?;
 	return nil
 }
 
-// SetPricePerSheetPaise stores or replaces the singleton per-sheet pricing.
-func (s *Store) SetPricePerSheetPaise(ctx context.Context, pricePaise int64) error {
-	cfg, _ := s.GetPricing(ctx)
-	colorPrice := cfg.ColorPricePerSheetPaise
-	if colorPrice <= 0 {
-		colorPrice = 1000
-	}
-	return s.SetPricing(ctx, pricePaise, colorPrice)
-}
-
-// GetPricePerSheetPaise retrieves the configured per-sheet pricing.
-func (s *Store) GetPricePerSheetPaise(ctx context.Context) (int64, error) {
-	cfg, err := s.GetPricing(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return cfg.BWPricePerSheetPaise, nil
-}
-
-// RecordWebhook atomically attempts to record a webhook ID.
-// Returns (true, nil) if inserted for the first time, (false, nil) if already existed.
-func (s *Store) RecordWebhook(ctx context.Context, webhookID string) (bool, error) {
-	if s == nil || s.db == nil {
-		return false, fmt.Errorf("record webhook: store is closed or nil")
-	}
-	if ctx == nil {
-		return false, fmt.Errorf("record webhook: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return false, fmt.Errorf("record webhook: %w", err)
-	}
-	if strings.TrimSpace(webhookID) == "" {
-		return false, fmt.Errorf("record webhook: webhookID cannot be empty or whitespace-only")
-	}
-
-	receivedNS := time.Now().UTC().UnixNano()
-
-	query := `
-INSERT INTO payment_webhooks (webhook_id, received_at_ns)
-VALUES (?, ?)
-ON CONFLICT(webhook_id) DO NOTHING;
-`
-	res, err := s.db.ExecContext(ctx, s.rebind(query), webhookID, receivedNS)
-	if err != nil {
-		return false, fmt.Errorf("record webhook: %w", err)
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("record webhook: check rows affected: %w", err)
-	}
-
-	return rows == 1, nil
-}
-
 // UpdateJobProgress validates and atomically persists the latest progress event for a job.
 func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgressEvent) error {
 	if s == nil || s.db == nil {
@@ -2278,7 +1867,7 @@ func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgre
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Check if job is a child document in order_documents, or directly on orders, or recovery
+	// 1. Resolve the canonical child document, including active recovery jobs.
 	var (
 		orderID            string
 		orderKioskID       string
@@ -2304,48 +1893,52 @@ WHERE d.job_id = ?;
 	if err == nil {
 		isDocJob = true
 	} else if errors.Is(err, sql.ErrNoRows) {
-		// Fallback to legacy orders / recovery
-		queryOrder := `
-SELECT o.order_id, o.kiosk_id, p.total_pages, p.total_sheets
-FROM orders o
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE o.job_id = ?;
-`
-		err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderID, &orderKioskID, &totalPages, &totalSheets)
-		if err == sql.ErrNoRows {
-			if idx := strings.LastIndex(event.JobID, "-rec"); idx != -1 {
-				pJobID := event.JobID[:idx]
-				seqStr := event.JobID[idx+4:]
-				if seqID, parseErr := strconv.Atoi(seqStr); parseErr == nil && pJobID != "" {
-					queryRec := `
-SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed, r.remaining_pages, r.remaining_sheets, p.total_pages, p.total_sheets, o.order_id
-FROM recovery_records r
-JOIN orders o ON r.job_id = o.job_id
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE r.job_id = ? AND r.sequence_id = ?;
-`
-					recErr := tx.QueryRowContext(ctx, s.rebind(queryRec), pJobID, seqID).Scan(
-						&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets, &recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets, &orderID,
-					)
-					if recErr == nil {
-						isRecovery = true
-					}
-				}
-			}
-			if !isRecovery {
-				return fmt.Errorf("update job progress: job %q not found in orders or order_documents", event.JobID)
-			}
-		} else if err != nil {
-			return fmt.Errorf("update job progress: query order: %w", err)
+		// Only recovery jobs associated with a canonical child document exist.
+		idx := strings.LastIndex(event.JobID, "-rec")
+		if idx < 1 {
+			return fmt.Errorf("update job progress: unknown child document %q", event.JobID)
 		}
+		parentJob := event.JobID[:idx]
+		seqID, parseErr := strconv.Atoi(event.JobID[idx+4:])
+		if parseErr != nil {
+			return fmt.Errorf("update job progress: invalid recovery id %q", event.JobID)
+		}
+		err = tx.QueryRowContext(ctx, s.rebind(`
+SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed,
+       r.remaining_pages, r.remaining_sheets, d.total_pages, d.total_sheets, d.order_id
+FROM recovery_records r
+JOIN order_documents d ON d.job_id = r.job_id
+WHERE r.job_id = ? AND r.sequence_id = ?;`), parentJob, seqID).Scan(
+			&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets,
+			&recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets, &orderID,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("update job progress: unknown recovery job %q", event.JobID)
+		}
+		if err != nil {
+			return fmt.Errorf("update job progress: lookup recovery document: %w", err)
+		}
+		isRecovery = true
+		isDocJob = true
 	} else {
-		return fmt.Errorf("update job progress: query order_documents: %w", err)
+		return fmt.Errorf("update job progress: lookup child document: %w", err)
 	}
 
 	// 2. Verify kiosk ID matches
 	if orderKioskID != event.KioskID {
 		return fmt.Errorf("update job progress: kiosk ID mismatch: event has %q, order belongs to %q", event.KioskID, orderKioskID)
 	}
+
+	// Once all child jobs are verified stopped, ignore delayed printer
+	// progress that could resurrect the order or mark it completed while a
+	// monetary refund is in flight.
+	var refundStopped int
+	if err := tx.QueryRowContext(ctx, s.rebind(
+		"SELECT COUNT(*) FROM payment_refund_requests WHERE order_id = ? AND reason = 'FULFILLMENT_FAILED' AND (safe_stop_verified = 1 OR status = 'PROCESSED')"),
+		orderID).Scan(&refundStopped); err != nil {
+		return fmt.Errorf("update job progress: query refund safety: %w", err)
+	}
+	if refundStopped > 0 { return nil }
 
 	// 3. Verify progress bounds
 	if isRecovery {
@@ -2433,7 +2026,7 @@ WHERE recovery_id = ?;
 UPDATE order_documents
 SET status = ?, updated_at_ns = ?
 WHERE job_id = ?;
-`), string(event.Status), eventNS, event.JobID)
+`), string(event.Status), eventNS, targetJobID)
 		if err != nil {
 			return fmt.Errorf("update job progress: update order_documents status: %w", err)
 		}
@@ -2444,6 +2037,7 @@ WHERE job_id = ?;
 			totalDocs     int
 			completedDocs int
 			failedDocs    int
+			pausedDocs    int
 			printingDocs  int
 			spoolingDocs  int
 		)
@@ -2452,13 +2046,14 @@ SELECT
     COUNT(1),
     COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'FAILED_REFUNDABLE' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'PAUSED_ERROR' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'PRINTING' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'SPOOLING' THEN 1 ELSE 0 END), 0)
 FROM order_documents
 WHERE order_id = ?;
 `
 		err = tx.QueryRowContext(ctx, s.rebind(queryCounts), orderID).Scan(
-			&totalDocs, &completedDocs, &failedDocs, &printingDocs, &spoolingDocs,
+			&totalDocs, &completedDocs, &failedDocs, &pausedDocs, &printingDocs, &spoolingDocs,
 		)
 		if err != nil {
 			return fmt.Errorf("update job progress: query order document counts: %w", err)
@@ -2480,32 +2075,26 @@ UPDATE orders
 SET status = 'FAILED_REFUNDABLE', updated_at_ns = ?
 WHERE order_id = ?;
 `), eventNS, orderID)
+		} else if pausedDocs > 0 {
+			// Any paused child freezes the entire physical order. No later
+			// progress from a different child may make it printable again.
+			_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders SET status = 'PAUSED_ERROR', updated_at_ns = ?
+WHERE order_id = ? AND status NOT IN ('FAILED_REFUNDABLE', 'COMPLETED');
+`), eventNS, orderID)
+			if err != nil { return fmt.Errorf("update job progress: pause order: %w", err) }
 		} else if printingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'PRINTING', updated_at_ns = ?
-WHERE order_id = ? AND status NOT IN ('COMPLETED');
+WHERE order_id = ? AND status NOT IN ('COMPLETED','FAILED_REFUNDABLE','PAUSED_ERROR');
 `), eventNS, orderID)
 		} else if spoolingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'SPOOLING', updated_at_ns = ?
-WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED');
+WHERE order_id = ? AND status NOT IN ('PRINTING','COMPLETED','FAILED_REFUNDABLE','PAUSED_ERROR');
 `), eventNS, orderID)
-		}
-	} else {
-		// Legacy single-job orders table update
-		_, err = tx.ExecContext(ctx, s.rebind(`
-UPDATE orders
-SET status = ?, updated_at_ns = ?
-WHERE job_id = ?;
-`), string(event.Status), eventNS, targetJobID)
-		if err != nil {
-			return fmt.Errorf("update job progress: update order status: %w", err)
-		}
-
-		if event.Status == contracts.JobStatusCompleted || event.Status == contracts.JobStatusFailedRefundable {
-			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
 		}
 	}
 
@@ -2599,7 +2188,7 @@ WHERE job_id = ?;
 }
 
 // GetExpiredOrderIDs returns order IDs whose stored PDF artifacts have exceeded retention.
-// - completedThreshold applies to orders in terminal states (COMPLETED, PAUSED_ERROR, FAILED_REFUNDABLE).
+// - completedThreshold applies only to COMPLETED orders, or FAILED_REFUNDABLE orders with no captured payment or a PROCESSED refund. PAUSED_ERROR never qualifies.
 // - pendingThreshold applies to unpaid orders still in PENDING_PAYMENT.
 func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pendingThreshold time.Time) ([]string, error) {
 	if s == nil || s.db == nil {
@@ -2613,9 +2202,40 @@ func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pend
 	}
 
 	query := `
-SELECT order_id FROM orders
-WHERE (status IN ('COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE') AND updated_at_ns <= ?)
-   OR (status = 'PENDING_PAYMENT' AND created_at_ns <= ?);
+SELECT o.order_id FROM orders o
+WHERE (
+    o.updated_at_ns <= ?
+    AND (
+      (o.status = 'COMPLETED' AND NOT EXISTS (
+          SELECT 1 FROM payment_refund_requests rr
+          WHERE rr.order_id = o.order_id AND rr.status <> 'PROCESSED'
+      ))
+      OR (
+        o.status = 'FAILED_REFUNDABLE'
+        AND (
+          NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id AND p.status IN ('captured', 'CAPTURED'))
+          OR EXISTS (SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id = o.order_id AND rr.reason = 'FULFILLMENT_FAILED' AND rr.status = 'PROCESSED')
+        )
+      )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM payment_refund_requests rr
+      WHERE rr.order_id = o.order_id AND rr.status <> 'PROCESSED'
+    )
+  )
+  OR (
+    o.status = 'PENDING_PAYMENT' AND o.created_at_ns <= ?
+    -- Underpayments are captured money despite an unpaid order state.
+    -- Never lose a provider/refund obligation through unpaid-PIN cleanup.
+    AND NOT EXISTS (
+      SELECT 1 FROM payments p WHERE p.order_id = o.order_id
+      AND LOWER(p.status) IN ('captured','paid')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id = o.order_id
+      AND rr.status <> 'PROCESSED'
+    )
+  );
 `
 	rows, err := s.db.QueryContext(ctx, s.rebind(query), completedThreshold.UnixNano(), pendingThreshold.UnixNano())
 	if err != nil {
@@ -2675,7 +2295,7 @@ func generateSessionID() (string, error) {
 }
 
 // GetCommittedPaperSheets returns the total number of physical paper sheets currently committed
-// on the given kiosk by active unexpired unpaid sessions and active/in-flight paid orders,
+// on the given kiosk by unexpired unpaid PIN orders and active/in-flight paid orders,
 // optionally excluding a specific orderID (e.g. the order currently being checked).
 func (s *Store) GetCommittedPaperSheets(ctx context.Context, kioskID, excludeOrderID string, now time.Time) (int, error) {
 	if s == nil || s.db == nil {
@@ -2694,31 +2314,31 @@ func (s *Store) getCommittedPaperSheetsTx(ctx context.Context, q queryable, kios
 	query := s.rebind(`
 SELECT COALESCE(SUM(c.committed_sheets), 0)
 FROM (
-    SELECT pc.total_sheets AS committed_sheets
+    -- Every pending order with an unexpired PIN already owns its paper.
+    -- Session creation does not reserve additional sheets.
+    SELECT o.total_sheets AS committed_sheets
     FROM orders o
-    JOIN print_configs pc ON o.order_id = pc.order_id
-    JOIN kiosk_sessions ks ON o.order_id = ks.order_id
     WHERE o.kiosk_id = ?
       AND o.status = 'PENDING_PAYMENT'
-      AND ks.status = 'PAYMENT_PENDING'
-      AND ks.expires_at_ns > ?
+      AND o.pin_expires_at_ns > ?
       AND (? = '' OR o.order_id != ?)
-    GROUP BY o.order_id, pc.total_sheets
 
     UNION ALL
 
-    SELECT 
-        CASE 
-            WHEN (pc.total_sheets - COALESCE(jp.sheets_printed, 0)) > 0 
-            THEN (pc.total_sheets - COALESCE(jp.sheets_printed, 0))
-            ELSE 0 
-        END AS committed_sheets
-    FROM orders o
-    JOIN print_configs pc ON o.order_id = pc.order_id
-    LEFT JOIN job_progress jp ON o.job_id = jp.job_id
-    WHERE o.kiosk_id = ?
-      AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
-      AND (? = '' OR o.order_id != ?)
+    -- For paid/in-flight orders, subtract progress across every child document.
+    SELECT CASE WHEN paid.remaining_sheets > 0 THEN paid.remaining_sheets ELSE 0 END
+    FROM (
+        SELECT o.total_sheets - COALESCE(
+            (SELECT SUM(jp.sheets_printed)
+             FROM order_documents od
+             JOIN job_progress jp ON jp.job_id = od.job_id
+             WHERE od.order_id = o.order_id), 0
+        ) AS remaining_sheets
+        FROM orders o
+        WHERE o.kiosk_id = ?
+          AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+          AND (? = '' OR o.order_id != ?)
+    ) paid
 ) c;
 `)
 
@@ -2777,15 +2397,16 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 	var (
 		orderKioskID   string
 		statusStr      string
-		pricePaise     int64
-		pinExpiresAtNS int64
+		pricePaise       int64
+		pinExpiresAtNS   int64
+		orderTotalSheets int
 	)
 	queryOrder := s.rebind(`
-SELECT kiosk_id, status, price_paise, pin_expires_at_ns
+SELECT kiosk_id, status, price_paise, pin_expires_at_ns, total_sheets
 FROM orders
 WHERE order_id = ?;
 `)
-	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS)
+	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS, &orderTotalSheets)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrOrderNotFound
@@ -2865,17 +2486,9 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 
 	// 3. If paper checking is enabled (availableStock >= 0), verify sufficient available sheets
 	if availableStock >= 0 {
-		var totalSheets int
-		querySheets := s.rebind(`SELECT total_sheets FROM print_configs WHERE order_id = ?;`)
-		err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrOrderNotFound
-			}
-			return nil, fmt.Errorf("create kiosk session: query print config: %w", err)
-		}
-		if totalSheets <= 0 {
-			totalSheets = 1
+		// Orders own the authoritative total for all documents.
+		if orderTotalSheets <= 0 {
+			return nil, fmt.Errorf("create kiosk session: invalid order total_sheets %d", orderTotalSheets)
 		}
 
 		committedSheets, err := s.getCommittedPaperSheetsTx(ctx, tx, kioskID, orderID, nowNS)
@@ -2883,7 +2496,7 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 			return nil, fmt.Errorf("create kiosk session: check paper commitments: %w", err)
 		}
 		effectiveAvailable := availableStock - committedSheets
-		if effectiveAvailable < totalSheets {
+		if effectiveAvailable < orderTotalSheets {
 			return nil, ErrInsufficientPaper
 		}
 	}
@@ -3071,7 +2684,8 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 	if err != nil {
 		return fmt.Errorf("cancel kiosk session: %w", err)
 	}
-	rows, _ := res.RowsAffected()
+	rows, err := res.RowsAffected()
+	if err != nil { return fmt.Errorf("cancel kiosk session: rows affected: %w", err) }
 	if rows == 0 {
 		var currentStatus string
 		err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM kiosk_sessions WHERE session_id = ? AND kiosk_id = ?;`), sessionID, kioskID).Scan(&currentStatus)
@@ -3081,8 +2695,15 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 			}
 			return err
 		}
+		// After payment capture, the session is COMPLETED. A stale kiosk
+		// cancellation/timer must not revoke durable paid dispatch intents.
+		// A repeat cancel of an already-terminal session is idempotent.
+		return tx.Commit()
 	}
 
+	// Only a successfully canceled PAYMENT_PENDING session may revoke its
+	// still-unacknowledged dispatch intents. Capture completion and cancel
+	// serialize on the session row; whichever wins determines authorization.
 	// Cancel any pending or unacknowledged dispatch intents for this session
 	_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
@@ -3221,6 +2842,7 @@ type PaymentCaptureResult struct {
 	OrderStatus      contracts.JobStatus
 	DispatchEligible bool
 	AlreadyProcessed bool
+	ExcessCapture    bool
 	ActiveSessionID  string
 	PricePaise       int64
 	KioskID          string
@@ -3273,6 +2895,14 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 		return nil, fmt.Errorf("capture payment: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Serialize distinct captures per order. The funding decision, capture row,
+	// and any surplus refund obligation must commit as one transaction.
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22616, hashtext($1));", p.OrderID); err != nil {
+			return nil, fmt.Errorf("capture payment: acquire funding lock: %w", err)
+		}
+	}
 
 	// 1. Check if payment record already exists
 	var (
@@ -3348,12 +2978,72 @@ WHERE order_id = ?;
 		return nil, fmt.Errorf("capture payment: query order: %w", err)
 	}
 
-	// 3. Verify amount against authoritative price
+	// 3. A genuine capture with the wrong amount is still real money.
+	// It cannot fund printing, but must have a durable refund obligation.
 	if p.AmountPaise != pricePaise {
-		return nil, fmt.Errorf("payment amount mismatch: expected %d paise, got %d paise", pricePaise, p.AmountPaise)
+		if err := s.ensureRefundableOrderSnapshot(ctx, tx, p.OrderID); err != nil { return nil, err }
+		if err := s.recordExcessCaptureInTx(ctx, tx, p, orderKioskID, nowNS); err != nil {
+			return nil, fmt.Errorf("capture payment: refund incorrect amount: %w", err)
+		}
+		if err := tx.Commit(); err != nil { return nil, fmt.Errorf("capture payment: commit incorrect amount: %w", err) }
+		return &PaymentCaptureResult{
+			OrderStatus: contracts.JobStatus(statusStr),
+			AlreadyProcessed: true,
+			ExcessCapture: true,
+			KioskID: orderKioskID,
+			PricePaise: pricePaise,
+		}, nil
 	}
 
 	currentStatus := contracts.JobStatus(statusStr)
+
+	// Precisely one captured payment may fund a print order. Historic captures
+	// are preferred if this row has not been backfilled yet. New distinct
+	// captures on dispatched/terminal orders are always surplus.
+	var fundingPaymentID string
+	err = tx.QueryRowContext(ctx, s.rebind(
+		"SELECT payment_id FROM order_funding_payments WHERE order_id = ?"), p.OrderID).Scan(&fundingPaymentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if currentStatus == contracts.JobStatusPendingPayment || currentStatus == contracts.JobStatusPaidWaiting {
+			var earlierID string
+			err = tx.QueryRowContext(ctx, s.rebind(`
+SELECT payment_id FROM payments WHERE order_id = ?
+AND LOWER(status) IN ('captured','paid') AND amount_paise = ?
+ORDER BY created_at_ns ASC, payment_id ASC LIMIT 1;`),
+				p.OrderID, pricePaise).Scan(&earlierID)
+			if errors.Is(err, sql.ErrNoRows) {
+				earlierID = p.PaymentID
+			} else if err != nil {
+				return nil, fmt.Errorf("capture payment: find existing funding: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, s.rebind(`
+INSERT INTO order_funding_payments(order_id,payment_id,created_at_ns)
+VALUES(?,?,?) ON CONFLICT(order_id) DO NOTHING;`), p.OrderID, earlierID, nowNS)
+			if err != nil { return nil, fmt.Errorf("capture payment: allocate funding: %w", err) }
+			err = tx.QueryRowContext(ctx, s.rebind(
+				"SELECT payment_id FROM order_funding_payments WHERE order_id = ?"), p.OrderID).Scan(&fundingPaymentID)
+		}
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("capture payment: determine funding: %w", err)
+	}
+	if fundingPaymentID != p.PaymentID {
+		// Unlike webhook replay, this is different money. Never send a new job.
+		// Persist the payment and its independently refundable obligation together.
+		if err := s.ensureRefundableOrderSnapshot(ctx, tx, p.OrderID); err != nil { return nil, err }
+		if err := s.recordExcessCaptureInTx(ctx, tx, p, orderKioskID, nowNS); err != nil {
+			return nil, fmt.Errorf("capture payment: record surplus: %w", err)
+		}
+		if err := tx.Commit(); err != nil { return nil, fmt.Errorf("capture payment: commit surplus: %w", err) }
+		return &PaymentCaptureResult{
+			OrderStatus: currentStatus,
+			DispatchEligible: false,
+			AlreadyProcessed: true,
+			ExcessCapture: true,
+			PricePaise: pricePaise,
+			KioskID: orderKioskID,
+		}, nil
+	}
 
 	// 4. Check if order is already terminal or dispatched
 	if currentStatus == contracts.JobStatusCompleted ||
@@ -3491,6 +3181,13 @@ WHERE order_id = ? AND status = ?;
 		} else {
 			currentStatus = contracts.JobStatusPaidWaiting
 		}
+	}
+
+	// Capture promotes a still-valid customer PIN into a paid fulfillment
+	// entitlement. The five-minute unpaid deadline must not terminate a paid order.
+	// A genuinely expired PIN is never resurrected (it may have been reused).
+	if err := s.extendPaidPINInTx(ctx, tx, p.OrderID, nowNS); err != nil {
+		return nil, fmt.Errorf("capture payment: extend paid PIN: %w", err)
 	}
 
 	// 6. Check for active unexpired session on orderKioskID
@@ -4233,8 +3930,13 @@ ORDER BY created_at_ns ASC;
 			return nil, fmt.Errorf("get pending dispatch orders: order %s not found", cand.orderID)
 		}
 
-		// Never dispatch unpaid, canceled, expired, or unauthorized orders
-		if ord.Status != contracts.JobStatusDispatched {
+		// A funded multi-document order remains dispatch-authorized while
+		// earlier children are SPOOLING or PRINTING. Reconnect must deliver
+		// unacknowledged later children without resending acknowledged ones.
+		// Faults and completion never authorize additional delivery.
+		if ord.Status != contracts.JobStatusDispatched &&
+			ord.Status != contracts.JobStatusSpooling &&
+			ord.Status != contracts.JobStatusPrinting {
 			if ord.Status == contracts.JobStatusFailedRefundable || string(ord.Status) == "CANCELED" {
 				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
 			}
@@ -4248,13 +3950,21 @@ ORDER BY created_at_ns ASC;
 			payProvider string
 		)
 		qPay := s.rebind(`
-SELECT status, amount_paise, provider
-FROM payments
-WHERE order_id = ? AND status IN ('captured', 'paid')
-ORDER BY created_at_ns DESC
+SELECT p.status, p.amount_paise, p.provider
+FROM payments p
+LEFT JOIN order_funding_payments f ON f.order_id = p.order_id
+WHERE p.order_id = ? AND LOWER(p.status) IN ('captured', 'paid')
+AND (p.payment_id = f.payment_id OR
+     (f.payment_id IS NULL AND p.amount_paise = ?))
+ORDER BY
+    CASE WHEN p.payment_id = f.payment_id THEN 0 ELSE 1 END,
+    p.created_at_ns ASC, p.payment_id ASC
 LIMIT 1;
 `)
-		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID).Scan(&payStatus, &payAmount, &payProvider)
+		// A later surplus capture can be for a different amount. Reconnect
+		// must validate the same funding payment that authorized printing,
+		// never whichever captured payment happened most recently.
+		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID, ord.PricePaise).Scan(&payStatus, &payAmount, &payProvider)
 		if errPay != nil {
 			if errors.Is(errPay, sql.ErrNoRows) {
 				// No verified captured payment exists for this order; do not dispatch!

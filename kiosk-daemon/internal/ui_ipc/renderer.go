@@ -1102,16 +1102,16 @@ func renderError(dst *image.RGBA, state ScreenState) {
 		body  string
 	}{
 		{
-			"Automatic Refund",
-			"Any unprinted pages will be refunded automatically to your original payment method.",
+			"Refund Arrangement",
+			"If printing cannot finish, a full refund will be requested. You can leave.",
 		},
 		{
-			"Exact Accounting",
-			"Only sheets that were physically delivered to the output tray are billed.",
+			"Print Safety",
+			"The printer will remain unavailable until the fault is cleared safely.",
 		},
 		{
-			"Attendant Dispatched",
-			"The kiosk has notified service personnel of this hardware interruption.",
+			"Attendant Required",
+			"An attendant must inspect and restore this kiosk before new orders.",
 		},
 		{
 			"Need Immediate Assistance?",
@@ -1146,8 +1146,8 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
 	// Title & Subtitle at top of container
-	drawText(dst, faceBold48, "Review Order & Payment", 100, 175, colorTextPrimary)
-	drawText(dst, faceReg22, "Review your order details and total amount below", 100, 232, colorTextSecondary)
+	drawText(dst, faceBold48, "Payment & Checkout", 100, 175, colorTextPrimary)
+	drawText(dst, faceReg22, "Scan the QR code to pay for your reserved print order", 100, 232, colorTextSecondary)
 
 	summary := state.OrderSummary
 	if summary == nil {
@@ -1167,19 +1167,8 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 
 	drawText(dst, faceBold28, "Order Details", 140, topY+45, colorTextPrimary)
 
-	duplexDesc := "Single-sided (Simplex)"
-	if summary.Duplex == "long_edge" || summary.Duplex == "short_edge" {
-		duplexDesc = "Double-sided (Duplex)"
-	}
-	colorDesc := "Black & White (Mono)"
-	if strings.ToLower(summary.ColorMode) == "color" {
-		colorDesc = "Full Color"
-	}
-	copiesDesc := fmt.Sprintf("%d copy", summary.Copies)
-	if summary.Copies > 1 {
-		copiesDesc = fmt.Sprintf("%d copies", summary.Copies)
-	}
-
+	// Do not present the first document's copies, duplex or color mode
+	// as whole-order settings. Mixed-document configurations are shown on mobile.
 	specs := []struct {
 		label string
 		val   string
@@ -1187,9 +1176,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 		{"Order ID", summary.OrderID},
 		{"Total Document Pages", fmt.Sprintf("%d pages", summary.TotalPages)},
 		{"Physical Sheets to Print", fmt.Sprintf("%d sheets (A4 Plain)", summary.TotalSheets)},
-		{"Copies Requested", copiesDesc},
-		{"Print Sides", duplexDesc},
-		{"Color Mode", colorDesc},
+		{"Print Settings", "Configured per document on mobile"},
 	}
 
 	yRow := topY + 105
@@ -1234,7 +1221,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 		failLabel := "QR Unavailable"
 		fW := measureTextWidth(faceBold20, failLabel)
 		drawText(dst, faceBold20, failLabel, qrBox.Min.X+(qrBox.Dx()-fW)/2, topY+150, colorErrorRed)
-		retryLabel := "Press Confirm to retry"
+		retryLabel := "Press Enter to retry"
 		rW := measureTextWidth(faceReg18, retryLabel)
 		drawText(dst, faceReg18, retryLabel, qrBox.Min.X+(qrBox.Dx()-rW)/2, topY+185, colorTextSecondary)
 	} else if state.PINLoading {
@@ -1281,7 +1268,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	}
 
 	// Centered cancel instruction in gray text where buttons used to be
-	cancelText := "Press 'Esc' to Cancel order"
+	cancelText := "Press 'Esc' to exit payment"
 	cW := measureTextWidth(faceReg22, cancelText)
 	cancelX := (ScreenWidth - cW) / 2
 	cancelY := 935

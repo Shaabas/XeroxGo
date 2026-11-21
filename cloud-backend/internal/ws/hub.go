@@ -24,6 +24,7 @@ type wireMessage struct {
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 	Sheets   int                         `json:"sheets,omitempty"`
 	Error    string                      `json:"error,omitempty"`
+	OrderID  string                      `json:"order_id,omitempty"`
 }
 
 type kioskSession struct {
@@ -125,9 +126,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 		close(sess.closed)
 		log.Printf("[HUB] Kiosk disconnected: %q", kioskID)
-		if h.db != nil {
-			_ = h.db.ResetUnacknowledgedDispatchIntents(context.Background(), kioskID)
-		}
+		// Leave SENT intact until the next connection performs reconciliation.
+		// Resetting from the old connection's defer can race a replacement
+		// connection and downgrade intents it has just delivered.
 		_ = conn.Close(websocket.StatusNormalClosure, "session ended")
 	}()
 
@@ -137,11 +138,18 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Proactively sync active ads to newly connected kiosk
 	if h.db != nil {
 		if activeAds, err := h.db.GetActiveAds(ctx); err == nil && len(activeAds) > 0 {
+			sess.sendMu.Lock()
 			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: activeAds})
+			sess.sendMu.Unlock()
 		}
-		// Reconcile pending dispatch intents for this kiosk (crash/disconnect recovery)
-		_ = h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID)
-		if pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID); err == nil && len(pendingJobs) > 0 {
+		// Only a new authenticated Pi connection may initiate replay.
+		// ACKNOWLEDGED and COMPLETED jobs stay terminal; the Pi uses its
+		// persisted JobID state to deduplicate a previously delivered command.
+		if err := h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID); err != nil {
+			log.Printf("[HUB] Failed to reset unacknowledged intents for kiosk %s: %v", kioskID, err)
+		} else if pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID); err != nil {
+			log.Printf("[HUB] Failed to reconcile pending intents for kiosk %s: %v", kioskID, err)
+		} else if len(pendingJobs) > 0 {
 			log.Printf("[HUB] Reconciling %d pending dispatch orders for kiosk %s", len(pendingJobs), kioskID)
 			for _, jobCmd := range pendingJobs {
 				if err := h.SendJob(ctx, jobCmd); err != nil {
@@ -172,10 +180,18 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if jobID == "" && msg.Job != nil {
 				jobID = msg.Job.JobID
 			}
+			if msg.Progress != nil && msg.Progress.KioskID != kioskID {
+				continue // fail closed: acknowledgement cannot claim a different kiosk
+			}
 			if jobID != "" && h.db != nil {
-				_ = h.db.MarkDispatchIntentAcknowledged(ctx, jobID)
-				if msg.Progress != nil && msg.Progress.KioskID == kioskID && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
-					_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+				if err := h.db.MarkDispatchAcknowledgedForKiosk(ctx, kioskID, jobID); err != nil {
+					log.Printf("[HUB] Could not persist job ack %s for kiosk %s: %v", jobID, kioskID, err)
+					continue
+				}
+				if msg.Progress != nil && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
+					if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err == nil {
+						h.onProgressFault(ctx, kioskID, *msg.Progress)
+					}
 				}
 			}
 		case "progress":
@@ -190,7 +206,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if h.db != nil {
-				_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+				if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err == nil {
+					h.onProgressFault(ctx, kioskID, *msg.Progress)
+				}
 			}
 		case "health":
 			if msg.Health == nil {
@@ -206,6 +224,22 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.healthMu.Lock()
 			h.health[kioskID] = *msg.Health
 			h.healthMu.Unlock()
+			if h.db != nil && (msg.Health.PaperJam || msg.Health.CoverOpen || msg.Health.State == "ERROR" || msg.Health.OutputBinFull) {
+				if err := h.db.BlockKiosk(ctx, kioskID, "printer hardware fault requires attendant clearance"); err != nil {
+					log.Printf("[KIOSK] Failed to latch outage for %s: %v", kioskID, err)
+				}
+			}
+		case "safe_stop":
+			// Authenticated Pi attests that every CUPS job in this order has
+			// reached a cancel/abort state or was never submitted.
+			if h.db != nil && strings.TrimSpace(msg.OrderID) != "" {
+				order, err := h.db.GetOrder(ctx, msg.OrderID)
+				if err == nil && order != nil && order.Command.KioskID == kioskID {
+					if err := h.db.ConfirmRefundSafeStop(ctx, msg.OrderID); err != nil {
+						log.Printf("[REFUND] safe-stop persistence failed for %s: %v", msg.OrderID, err)
+					}
+				}
+			}
 		case "error":
 			// Operational error
 		default:
@@ -228,6 +262,18 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 
 	if strings.TrimSpace(cmd.JobID) == "" {
 		return fmt.Errorf("send job: empty job ID")
+	}
+	// This is the final dispatch safety gate, including delayed webhooks and
+	// reconnect reconciliation. Faulted/refunding orders must never be printed.
+	if h.db != nil {
+		blocked, reason, err := h.db.GetKioskBlock(ctx, cmd.KioskID)
+		if err != nil { return fmt.Errorf("send job: verify kiosk service state: %w", err) }
+		if blocked { return fmt.Errorf("send job: kiosk out of service: %s", reason) }
+		if cmd.OrderID != "" {
+			refund, err := h.db.GetRefundRequest(ctx, cmd.OrderID)
+			if err != nil { return fmt.Errorf("send job: verify refund obligation: %w", err) }
+			if refund != nil { return fmt.Errorf("send job: order %s has a pending or processed refund", cmd.OrderID) }
+		}
 	}
 	if strings.TrimSpace(cmd.KioskID) == "" {
 		return fmt.Errorf("send job: empty kiosk ID")
@@ -268,6 +314,9 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 	defer sess.sendMu.Unlock()
 
 	if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
+		// Force the broken session to exit its receive loop and reconnect.
+		// Do not retry this possibly delivered frame on the same connection.
+		_ = sess.conn.CloseNow()
 		return fmt.Errorf("send job: write to kiosk %q: %w", cmd.KioskID, err)
 	}
 
@@ -385,4 +434,21 @@ func (h *Hub) ConnectedKiosksCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.sessions)
+}
+
+// onProgressFault is intentionally fail-closed: a fault records the refund
+// obligation and blocks new orders, but DOES NOT submit a monetary refund.
+// Only a later authenticated safe_stop attestation unlocks provider processing.
+func (h *Hub) onProgressFault(ctx context.Context, kioskID string, event contracts.JobProgressEvent) {
+	if event.Status != contracts.JobStatusPausedError && event.Status != contracts.JobStatusFailedRefundable {
+		return
+	}
+	order, err := h.db.GetOrderByJobID(ctx, event.JobID)
+	if err != nil || order == nil { return }
+	if err := h.db.BlockKiosk(ctx, kioskID, event.ErrorReason); err != nil {
+		log.Printf("[KIOSK] could not latch outage for %s: %v", kioskID, err)
+	}
+	if err := h.db.RecordRefundRequired(ctx, order.OrderID); err != nil {
+		log.Printf("[REFUND] could not record obligation for %s: %v", order.OrderID, err)
+	}
 }

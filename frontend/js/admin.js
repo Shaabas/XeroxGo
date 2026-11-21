@@ -314,6 +314,7 @@
         if (tabNavOverview) tabNavOverview.classList.add('active');
         if (viewOverview) viewOverview.classList.remove('hidden');
         loadAnalytics();
+        loadKioskFaults();
       } else if (tabName === 'orders') {
         if (tabNavOrders) tabNavOrders.classList.add('active');
         if (viewOrders) viewOrders.classList.remove('hidden');
@@ -343,6 +344,33 @@
     const kpiSuccessRate = document.getElementById('kpi-success-rate');
     const kpiAov = document.getElementById('kpi-aov');
     const analyticsChartContainer = document.getElementById('analytics-chart-container');
+
+    async function loadKioskFaults() {
+      const panel = document.getElementById('kiosk-fault-alerts');
+      const list = document.getElementById('kiosk-fault-items');
+      if (!panel || !list) return;
+      try {
+        const res = await apiRequest('/api/admin/kiosks/faults');
+        if (!res.ok) throw new Error('Failed to retrieve printer service alerts');
+        const data = await parseResponseJSON(res);
+        const faults = Array.isArray(data.out_of_service_kiosks) ? data.out_of_service_kiosks : [];
+        list.replaceChildren();
+        if (faults.length === 0) {
+          panel.classList.add('hidden');
+          return;
+        }
+        panel.classList.remove('hidden');
+        faults.forEach(fault => {
+          const item = document.createElement('div');
+          item.style.marginTop = '8px';
+          item.textContent = `${fault.kiosk_id}: ${fault.reason || 'Requires attendant inspection'}`;
+          list.appendChild(item);
+        });
+      } catch (err) {
+        panel.classList.remove('hidden');
+        list.textContent = 'Unable to verify kiosk service status. Refresh or check backend connectivity.';
+      }
+    }
 
     async function loadAnalytics() {
       try {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"xeroxgo/cloud-backend/internal/payments"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/pkg/contracts"
 )
@@ -74,6 +74,19 @@ func (e *printerConditionError) Error() string {
 }
 
 func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditionError) {
+	// Faults remain sticky until an authenticated operator restores service.
+	// Hardware returning to healthy does not automatically re-enable payments.
+	if s.db != nil {
+		blocked, reason, err := s.db.GetKioskBlock(context.Background(), kioskID)
+		if err != nil {
+			return 0, &printerConditionError{StatusCode: http.StatusServiceUnavailable,
+				Code: "SERVICE_STATE_UNAVAILABLE", Message: "cannot verify kiosk service state"}
+		}
+		if blocked {
+			return 0, &printerConditionError{StatusCode: http.StatusConflict,
+				Code: "KIOSK_OUT_OF_SERVICE", Message: "kiosk out of service: " + reason}
+		}
+	}
 	if s.hub == nil {
 		if s.cfg != nil && s.cfg.devMode {
 			return 250, nil
@@ -159,8 +172,8 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 	return health.EstimatedSheets, nil
 }
 
-// handleOrderClaim creates or retrieves an active transaction session for a kiosk order.
-// POST /api/k/{kiosk_id}/orders/{order_id}/claim (or /confirm)
+// handleOrderClaim creates or retrieves a transaction session.
+// POST /api/k/{kiosk_id}/orders/{order_id}/claim
 func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -170,11 +183,7 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	suffix := "/claim"
-	if strings.HasSuffix(r.URL.Path, "/confirm") {
-		suffix = "/confirm"
-	}
-	kioskID, orderID, err := parseKioskAndOrder(r.URL.Path, suffix)
+	kioskID, orderID, err := parseKioskAndOrder(r.URL.Path, "/claim")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -258,7 +267,6 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 
 // handleSessionCancel cancels an active transaction session.
 // POST /api/k/{kiosk_id}/sessions/{session_id}/cancel
-// POST /api/k/{kiosk_id}/orders/{order_id}/cancel-session
 func (s *appServer) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -269,21 +277,7 @@ func (s *appServer) handleSessionCancel(w http.ResponseWriter, r *http.Request) 
 	}
 
 	now := time.Now().UTC()
-	var kioskID, sessionID string
-	var err error
-
-	if strings.Contains(r.URL.Path, "/sessions/") {
-		kioskID, sessionID, err = parseKioskAndSession(r.URL.Path, "/cancel")
-	} else if strings.HasSuffix(r.URL.Path, "/cancel-session") {
-		var orderID string
-		kioskID, orderID, err = parseKioskAndOrder(r.URL.Path, "/cancel-session")
-		if err == nil {
-			activeSess, _ := s.db.GetActiveKioskSession(r.Context(), kioskID, orderID, now)
-			if activeSess != nil {
-				sessionID = activeSess.SessionID
-			}
-		}
-	}
+	kioskID, sessionID, err := parseKioskAndSession(r.URL.Path, "/cancel")
 	if err != nil || sessionID == "" {
 		http.Error(w, "invalid cancel path or session not found", http.StatusBadRequest)
 		return
@@ -358,7 +352,6 @@ func (s *appServer) handleGetSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleInitiatePayment verifies that an active transaction session exists before initiating payment.
-// POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment
 // POST /api/k/{kiosk_id}/sessions/{session_id}/initiate-payment
 func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -370,32 +363,32 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 	}
 
 	now := time.Now().UTC()
-	var kioskID, orderID string
-	var err error
-
-	if strings.Contains(r.URL.Path, "/sessions/") {
-		var sessionID string
-		kioskID, sessionID, err = parseKioskAndSession(r.URL.Path, "/initiate-payment")
-		if err == nil {
-			sess, sErr := s.db.GetKioskSession(r.Context(), sessionID, now)
-			if sErr == nil && sess != nil {
-				orderID = sess.OrderID
-			}
-		}
-	} else {
-		kioskID, orderID, err = parseKioskAndOrder(r.URL.Path, "/initiate-payment")
-	}
-	if err != nil || orderID == "" {
-		http.Error(w, "invalid initiate payment path or order not found", http.StatusBadRequest)
+	kioskID, sessionID, err := parseKioskAndSession(r.URL.Path, "/initiate-payment")
+	if err != nil {
+		http.Error(w, "invalid session payment path", http.StatusBadRequest)
 		return
 	}
+	requested, err := s.db.GetKioskSession(r.Context(), sessionID, now)
+	if errors.Is(err, store.ErrSessionNotFound) {
+		http.Error(w, "payment session not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "unable to resolve checkout session", http.StatusInternalServerError)
+		return
+	}
+	if requested == nil || requested.KioskID != kioskID {
+		http.Error(w, "payment session not found", http.StatusNotFound)
+		return
+	}
+	orderID := requested.OrderID
 
 	sess, err := s.db.GetActiveKioskSession(r.Context(), kioskID, orderID, now)
 	if err != nil {
 		http.Error(w, "failed to check active session", http.StatusInternalServerError)
 		return
 	}
-	if sess == nil || sess.Status != store.KioskSessionPaymentPending {
+	if sess == nil || sess.SessionID != sessionID || sess.Status != store.KioskSessionPaymentPending {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -423,25 +416,26 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Verify paper supply against other commitments
+	// Revalidate the existing reservation against live stock, but do not
+	// allocate additional paper when opening checkout.
 	committedSheets, cErr := s.db.GetCommittedPaperSheets(r.Context(), kioskID, orderID, now)
-	if cErr == nil {
-		reqSheets := ord.TotalSheets
-		if reqSheets <= 0 {
-			reqSheets = ord.Command.TotalSheets
-		}
-		if reqSheets <= 0 {
-			reqSheets = 1
-		}
-		if (stock - committedSheets) < reqSheets {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "insufficient paper in kiosk tray to fulfill order",
-				"code":  "INSUFFICIENT_PAPER",
-			})
-			return
-		}
+	if cErr != nil {
+		log.Printf("[PAYMENT] Unable to verify paper commitments: %v", cErr)
+		http.Error(w, "unable to verify reserved paper", http.StatusServiceUnavailable)
+		return
+	}
+	if ord.TotalSheets <= 0 {
+		http.Error(w, "invalid order sheet count", http.StatusInternalServerError)
+		return
+	}
+	if stock-committedSheets < ord.TotalSheets {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "insufficient paper in kiosk tray to fulfill order",
+			"code": "INSUFFICIENT_PAPER",
+		})
+		return
 	}
 
 	// Idempotency: check if an active, unexpired payment attempt already exists for this session
@@ -477,48 +471,16 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		attemptExpiresAt = maxExp
 	}
 
-	prov := s.getPaymentProvider()
-	createReq := payments.CreatePaymentRequest{
-		OrderID:     sess.OrderID,
-		KioskID:     sess.KioskID,
-		SessionID:   sess.SessionID,
-		AmountPaise: sess.PricePaise,
-		Currency:    "INR",
-		ExpiresAt:   attemptExpiresAt,
-		Notes: map[string]string{
-			"order_id":   sess.OrderID,
-			"kiosk_id":   sess.KioskID,
-			"session_id": sess.SessionID,
-		},
-	}
-
-	res, err := prov.CreatePayment(r.Context(), createReq)
+	// One checkout path: generate an unpredictable demo token and encode
+	// its XeroxGo-hosted confirmation URL in the kiosk QR. No UPI intent
+	// and no external payment provider are involved.
+	tokenHex, err := randomHex(24)
 	if err != nil {
-		log.Printf("[PAYMENT] CreatePayment provider error for order %s: %v", sess.OrderID, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": "failed to initiate payment with provider",
-		})
+		http.Error(w, "failed to create demo payment token", http.StatusInternalServerError)
 		return
 	}
-
-	var demoToken string
-	if s.cfg != nil && (s.cfg.demoMode || prov.Name() == "mock") {
-		tokenHex, err := randomHex(24)
-		if err != nil {
-			log.Printf("[DEMO-MODE] Failed to generate secure random token: %v", err)
-			http.Error(w, "internal server error generating demo token", http.StatusInternalServerError)
-			return
-		}
-		demoToken = "dmo_" + tokenHex
-
-		baseURL := s.getBaseURL(r)
-		checkoutURL := fmt.Sprintf("%s/pay/%s", baseURL, demoToken)
-		if s.cfg.demoMode {
-			res.QRPayload = checkoutURL
-		}
-	}
+	demoToken := "dmo_" + tokenHex
+	checkoutURL := fmt.Sprintf("%s/pay/%s", s.getBaseURL(r), demoToken)
 
 	attemptID := fmt.Sprintf("att_%s_%d", sess.OrderID, now.UnixNano())
 	newAttempt := store.PaymentAttempt{
@@ -526,14 +488,14 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		OrderID:           sess.OrderID,
 		KioskID:           sess.KioskID,
 		SessionID:         sess.SessionID,
-		Provider:          prov.Name(),
-		ProviderOrderID:   res.ProviderOrderID,
+		Provider:          "mock",
+		ProviderOrderID:   demoToken, // Internal checkout correlation; never an external provider order.
 		ProviderPaymentID: "",
 		AmountPaise:       sess.PricePaise,
 		Currency:          "INR",
 		Status:            "CREATED",
-		QRPayload:         res.QRPayload,
-		QRImageURL:        res.QRImageURL,
+		QRPayload:         checkoutURL,
+		QRImageURL:        "",
 		DemoToken:         demoToken,
 		ExpiresAt:         attemptExpiresAt,
 	}
@@ -654,24 +616,27 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dispatch job to kiosk physical printer
-	if s.hub != nil {
-		if len(order.Documents) > 0 {
-			for _, doc := range order.Documents {
-				jobCmd := doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
-				if err := s.hub.SendJob(r.Context(), jobCmd); err != nil {
-					log.Printf("[RELEASE] Warning: failed to send child job %s to kiosk %s: %v", doc.JobID, kioskID, err)
-					break
-				}
-				_ = s.db.MarkDispatchIntentSent(r.Context(), doc.JobID)
-			}
-		} else {
-			if err := s.hub.SendJob(r.Context(), order.Command); err != nil {
-				log.Printf("[RELEASE] Warning: failed to send job %s to kiosk %s: %v", order.Command.JobID, kioskID, err)
-			} else {
-				_ = s.db.MarkDispatchIntentSent(r.Context(), order.Command.JobID)
-			}
+	// ReleasePaidOrder has atomically persisted the paid authorization and
+	// every child dispatch intent. Send failures are transport uncertainty,
+	// not printer faults; keep the intents for the next authenticated Pi reconnect.
+	commands := make([]contracts.PrintJobCommand, 0, len(order.Documents))
+	if len(order.Documents) > 0 {
+		for _, doc := range order.Documents {
+			commands = append(commands, doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents)))
 		}
+	} else {
+		commands = append(commands, order.Command)
+	}
+	if err := s.deliverAuthorizedJobs(r.Context(), orderID, commands); err != nil {
+		log.Printf("[RELEASE] Paid order %s authorized, but delivery unresolved; preserving intents: %v", orderID, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"order_id": orderID,
+			"kiosk_id": kioskID,
+			"status":   "DISPATCH_PENDING",
+		})
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -769,7 +734,9 @@ func (s *appServer) handleRecoveryPIN(w http.ResponseWriter, r *http.Request) {
 	// Generate fresh 4-digit PIN with collision retry
 	const maxRetries = 25
 	var newPIN string
-	newExpiry := time.Now().UTC().Add(15 * time.Minute)
+	// Recovery is only for an already-paid PAID_WAITING order. It must not
+	// introduce a new five-minute deadline after payment.
+	newExpiry := store.PaidPINExpiry()
 	renewed := false
 
 	for attempt := 0; attempt < maxRetries; attempt++ {

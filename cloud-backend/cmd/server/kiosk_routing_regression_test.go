@@ -19,7 +19,7 @@ import (
 )
 
 // setupRoutingRegressionServer starts an httptest server with the exact routing logic from main.go.
-func setupRoutingRegressionServer(t *testing.T, demoMode bool) (*appServer, *httptest.Server, *store.Store, string, func()) {
+func setupRoutingRegressionServer(t *testing.T) (*appServer, *httptest.Server, *store.Store, string, func()) {
 	t.Helper()
 	tempDir, err := os.MkdirTemp("", "xeroxgo_routing_test_*")
 	if err != nil {
@@ -43,7 +43,6 @@ func setupRoutingRegressionServer(t *testing.T, demoMode bool) (*appServer, *htt
 		jobsDir:            filepath.Join(tempDir, "jobs"),
 		pricePerSheetPaise: 500,
 		devMode:            true,
-		demoMode:           demoMode,
 		downloadSecret:     []byte("dev_secret_download_1234567890"),
 		webhookSecret:      []byte("dev_secret_webhook_1234567890"),
 		kioskSecret:        []byte(kioskSecret),
@@ -139,7 +138,7 @@ func createRoutingTestOrder(t *testing.T, st *store.Store, kioskID, orderID, pin
 // POST /api/k/{kiosk_id}/sessions/{session_id}/initiate-payment
 // It strictly verifies that the endpoint does NOT return HTTP 405 Method Not Allowed.
 func TestKioskRouting_InitiatePaymentExactPINClientURL(t *testing.T) {
-	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t, true)
+	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-route-test"
@@ -219,47 +218,9 @@ func TestKioskRouting_InitiatePaymentExactPINClientURL(t *testing.T) {
 	}
 }
 
-// TestKioskRouting_OrderInitiatePaymentBackwardCompatibility verifies that
-// POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment remains functional and does not return 405.
-func TestKioskRouting_OrderInitiatePaymentBackwardCompatibility(t *testing.T) {
-	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t, true)
-	defer cleanup()
-
-	kioskID := "kiosk-compat-test"
-	orderID := "ord_compat_001"
-	pin := "5678"
-
-	createRoutingTestOrder(t, st, kioskID, orderID, pin, 1, 500)
-
-	// Claim order
-	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
-	claimReq.Header.Set("Authorization", "Bearer "+kioskSecret)
-	claimResp, _ := http.DefaultClient.Do(claimReq)
-	claimResp.Body.Close()
-
-	// Call /orders/{order_id}/initiate-payment
-	compatURL := fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID)
-	req, _ := http.NewRequest(http.MethodPost, compatURL, nil)
-	req.Header.Set("Authorization", "Bearer "+kioskSecret)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("compat request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusMethodNotAllowed {
-		t.Fatalf("expected 200 OK, got 405 Method Not Allowed on %s", compatURL)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(body))
-	}
-}
-
 // TestKioskRouting_InvalidExpiredCanceledSessions asserts that non-200 responses return 409 or 400, never 405.
 func TestKioskRouting_InvalidExpiredCanceledSessions(t *testing.T) {
-	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t, true)
+	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-invalid-test"
@@ -274,10 +235,10 @@ func TestKioskRouting_InvalidExpiredCanceledSessions(t *testing.T) {
 	}
 	resp1.Body.Close()
 	if resp1.StatusCode == http.StatusMethodNotAllowed {
-		t.Errorf("invalid session returned 405 Method Not Allowed, want 400 or 409")
+		t.Errorf("invalid session returned 405 Method Not Allowed, want 404")
 	}
-	if resp1.StatusCode != http.StatusBadRequest && resp1.StatusCode != http.StatusConflict {
-		t.Errorf("invalid session returned %d, want 400 or 409", resp1.StatusCode)
+	if resp1.StatusCode != http.StatusNotFound {
+		t.Errorf("invalid session returned %d, want 404", resp1.StatusCode)
 	}
 
 	// 2. Canceled Session
@@ -346,7 +307,7 @@ func TestKioskRouting_InvalidExpiredCanceledSessions(t *testing.T) {
 // TestKioskRouting_PINClientExactURLPattern tests the exact URL patterns and payloads executed by
 // kiosk-daemon/internal/cloud/pin_client.go to verify zero HTTP 405 errors and full round-trip fidelity.
 func TestKioskRouting_PINClientExactURLPattern(t *testing.T) {
-	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t, true)
+	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-pattern-test"

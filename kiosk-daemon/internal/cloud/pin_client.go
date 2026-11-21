@@ -380,7 +380,9 @@ func (c *HTTPPINClient) ReleaseOrder(ctx context.Context, orderID string) error 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
+	// HTTP 202 means payment and durable dispatch intents were accepted, but
+	// WebSocket delivery is pending. The cloud/Pi reconnect loop handles it.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
 		return nil
 	}
 

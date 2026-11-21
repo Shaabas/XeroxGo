@@ -29,11 +29,6 @@ func (s *appServer) handleDemoPayRoutes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if s.cfg == nil || !s.cfg.demoMode {
-		http.NotFound(w, r)
-		return
-	}
-
 	token := strings.TrimPrefix(r.URL.Path, "/pay/")
 	token = strings.TrimSpace(token)
 	if token == "" || strings.Contains(token, "/") {
@@ -516,7 +511,7 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 		KioskID:     att.KioskID,
 		SessionID:   att.SessionID,
 		AmountPaise: att.AmountPaise,
-		Provider:    "mock_demo",
+		Provider:    "mock",
 		Status:      "captured",
 	}, now)
 	if err != nil {
@@ -531,7 +526,24 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	_ = s.db.MarkPaymentAttemptPaid(r.Context(), att.AttemptID, "pay_demo_"+att.AttemptID)
+	// Distinct captured money that is surplus to an order creates an
+	// independent refund obligation, never an additional print entitlement.
+	// It must not mark the original checkout attempt as a funding success.
+	if captureRes.ExcessCapture {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "excess_payment_refund_required",
+				"ok": true, "order_id": att.OrderID, "kiosk_id": att.KioskID,
+			})
+			return
+		}
+		s.renderDemoSuccessPage(w, att, order, "excess_payment_refund_required")
+		return
+	}
+	if err := s.db.MarkPaymentAttemptPaid(r.Context(), att.AttemptID, "pay_demo_"+att.AttemptID); err != nil {
+		log.Printf("[DEMO-PAY] Cannot mark funding attempt for %s paid: %v", att.AttemptID, err)
+	}
 
 	if captureRes.AlreadyProcessed {
 		if isJSONRequest(r) {
@@ -549,39 +561,27 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Physical Print Authorization Gate
+	// Use the same durable delivery path as real captured payments and
+	// kiosk release: transport failure is not a printer fault or refund.
 	if captureRes.DispatchEligible {
-		log.Printf("[DEMO-PAY] Order %s authorized for printing (session %s)", att.OrderID, captureRes.ActiveSessionID)
-		if s.hub != nil {
-			if len(captureRes.Commands) > 0 {
-				for _, cmd := range captureRes.Commands {
-					if err := s.hub.SendJob(r.Context(), cmd); err != nil {
-						log.Printf("[DEMO-PAY] Failed to send print job to hub for kiosk %s: %v", cmd.KioskID, err)
-						break
-					}
-					_ = s.db.MarkDispatchIntentSent(r.Context(), cmd.JobID)
-				}
-			} else if captureRes.Command != nil {
-				if err := s.hub.SendJob(r.Context(), *captureRes.Command); err != nil {
-					log.Printf("[DEMO-PAY] Failed to send print job to hub for kiosk %s: %v", captureRes.KioskID, err)
-				} else {
-					_ = s.db.MarkDispatchIntentSent(r.Context(), captureRes.Command.JobID)
-				}
-			}
+		commands := captureRes.Commands
+		if len(commands) == 0 && captureRes.Command != nil {
+			commands = []contracts.PrintJobCommand{*captureRes.Command}
 		}
-
+		deliveryStatus := "dispatched"
+		if err := s.deliverAuthorizedJobs(r.Context(), att.OrderID, commands); err != nil {
+			log.Printf("[DEMO-PAY] Paid order %s queued for reconnect after delivery uncertainty: %v", att.OrderID, err)
+			deliveryStatus = "dispatch_pending"
+		}
 		if isJSONRequest(r) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"status":   "dispatched",
-				"ok":       true,
-				"order_id": att.OrderID,
-				"kiosk_id": att.KioskID,
+				"status": deliveryStatus,
+				"ok": true, "order_id": att.OrderID, "kiosk_id": att.KioskID,
 			})
 			return
 		}
-		s.renderDemoSuccessPage(w, att, order, "dispatched")
+		s.renderDemoSuccessPage(w, att, order, deliveryStatus)
 		return
 	}
 
@@ -612,7 +612,19 @@ func (s *appServer) renderDemoSuccessPage(w http.ResponseWriter, att *store.Paym
 	badgeColor := "#065F46"
 	badgeBg := "#ECFDF5"
 
-	if status == "paid_unprinted" {
+	if status == "dispatch_pending" {
+		headline = "Payment Captured"
+		msg = "Your payment is confirmed. The print order is safely queued and will be delivered when the kiosk reconnects."
+		badge = "PAID - WAITING FOR KIOSK"
+		badgeColor = "#92400E"
+		badgeBg = "#FEF3C7"
+	} else if status == "excess_payment_refund_required" {
+		headline = "Additional Payment Detected"
+		msg = "An additional captured payment has been recorded for refund. Your existing print order will not be submitted again."
+		badge = "REFUND REQUEST RECORDED"
+		badgeColor = "#92400E"
+		badgeBg = "#FEF3C7"
+	} else if status == "paid_unprinted" {
 		headline = "Payment Captured"
 		msg = fmt.Sprintf("Your payment of <strong>₹%.2f</strong> was captured, but the kiosk session timed out. Please enter your PIN at Kiosk <strong>%s</strong> to release the print job.", amountRupees, html.EscapeString(att.KioskID))
 		badge = "PAID - AWAITING KIOSK CLAIM"

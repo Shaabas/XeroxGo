@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type wireMessage struct {
 	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
 	Sheets   int                         `json:"sheets,omitempty"`
 	Error    string                      `json:"error,omitempty"`
+	OrderID  string                      `json:"order_id,omitempty"`
 	Ads      []contracts.AdItem          `json:"ads,omitempty"`
 }
 
@@ -103,6 +105,11 @@ type ClientConfig struct {
 	MockSNMPHealth           func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth
 	MockIPPState             func(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error)
 	JobQueueCapacity         int
+	PingInterval             time.Duration
+	PingTimeout              time.Duration
+	HeartbeatInterval        time.Duration
+	MinBackoff               time.Duration
+	MaxBackoff               time.Duration
 }
 
 // Client connects to the cloud WebSocket hub, handles heartbeats, downloads and verifies PDFs,
@@ -110,6 +117,7 @@ type ClientConfig struct {
 type Client struct {
 	cfg           ClientConfig
 	normalizedURL string
+	safeURL       string
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -118,6 +126,9 @@ type Client struct {
 	jobQueue   chan contracts.PrintJobCommand
 	activeMu   sync.Mutex
 	activeJobs map[string]bool
+	// Local stop barrier prevents already-queued sibling documents from
+	// starting after a print failure, independent of cloud connectivity.
+	blockedPrintOrders sync.Map
 
 	deferredMu   sync.Mutex
 	deferredJobs []contracts.PrintJobCommand
@@ -134,6 +145,8 @@ type Client struct {
 	minBackoff        time.Duration
 	maxBackoff        time.Duration
 	heartbeatInterval time.Duration
+	pingInterval      time.Duration
+	pingTimeout       time.Duration
 	maxDownloadBytes  int64
 
 	lastRenderErrMu sync.Mutex
@@ -219,6 +232,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	u.RawQuery = q.Encode()
 	normalizedURL := u.String()
+
+	// Remove credentials, query strings and fragments from every logged URL.
+	safeU := *u
+	safeU.User = nil
+	safeU.RawQuery = ""
+	safeU.Fragment = ""
+	safeURL := safeU.String()
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -343,19 +363,43 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		queueCap = 16
 	}
 
+	minBackoff := cfg.MinBackoff
+	if minBackoff <= 0 {
+		minBackoff = 1 * time.Second
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+	hbInterval := cfg.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = 15 * time.Second
+	}
+	pingInterval := cfg.PingInterval
+	if pingInterval <= 0 {
+		pingInterval = 30 * time.Second
+	}
+	pingTimeout := cfg.PingTimeout
+	if pingTimeout <= 0 {
+		pingTimeout = 10 * time.Second
+	}
+
 	runCtx, runCancel := context.WithCancel(context.Background())
 	client := &Client{
 		cfg:                   cfg,
 		normalizedURL:         normalizedURL,
+		safeURL:               safeURL,
 		jobQueue:              make(chan contracts.PrintJobCommand, queueCap),
 		activeJobs:            make(map[string]bool),
 		deferredJobs:          make([]contracts.PrintJobCommand, 0),
 		pendingQueue:          make([]contracts.PrintJobCommand, 0),
 		runCtx:                runCtx,
 		runCancel:             runCancel,
-		minBackoff:            1 * time.Second,
-		maxBackoff:            30 * time.Second,
-		heartbeatInterval:     15 * time.Second,
+		minBackoff:            minBackoff,
+		maxBackoff:            maxBackoff,
+		heartbeatInterval:     hbInterval,
+		pingInterval:          pingInterval,
+		pingTimeout:           pingTimeout,
 		maxDownloadBytes:      250 * 1024 * 1024,
 		healthPoller:          poller,
 		snmpPoller:            cfg.SNMPPoller,
@@ -401,6 +445,41 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 // PINController returns the active PIN controller instance, or nil if keypad input is not configured.
 func (c *Client) PINController() *pin.Controller {
 	return c.pinController
+}
+
+var (
+	bearerAuthRegex = regexp.MustCompile(`(?i)(bearer\s+)[^\s"',;]+`)
+	urlUserInfoRegex = regexp.MustCompile(`(?i)(wss?://|https?://)[^/\s@]+@`)
+	urlQueryRegex   = regexp.MustCompile(`\?[^\s"',;` + "`" + `]+`)
+)
+
+// SafeURL returns the cloud WebSocket URL without any query parameters or authentication credentials.
+func (c *Client) SafeURL() string {
+	return c.safeURL
+}
+
+func sanitizeErrorMessage(msg string, secret string, rawURL string, safeURL string) string {
+	if msg == "" {
+		return ""
+	}
+	if rawURL != "" && safeURL != "" {
+		msg = strings.ReplaceAll(msg, rawURL, safeURL)
+	}
+	trimmedSecret := strings.TrimSpace(secret)
+	if trimmedSecret != "" {
+		msg = strings.ReplaceAll(msg, trimmedSecret, "[REDACTED]")
+	}
+	msg = bearerAuthRegex.ReplaceAllString(msg, "${1}[REDACTED]")
+	msg = urlUserInfoRegex.ReplaceAllString(msg, "${1}")
+	msg = urlQueryRegex.ReplaceAllString(msg, "")
+	return msg
+}
+
+func (c *Client) sanitizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sanitizeErrorMessage(err.Error(), c.cfg.KioskSecret, c.normalizedURL, c.safeURL)
 }
 
 // RenderHistory returns a copy of the screen states recorded during client execution.
@@ -962,7 +1041,7 @@ func (c *Client) Run(ctx context.Context) error {
 
 		conn, _, err := websocket.Dial(ctx, c.normalizedURL, dialOpts)
 		if err != nil {
-			log.Printf("[SPOOLER] WebSocket connection to cloud failed (%v); retrying in %v...", err, delay)
+			log.Printf("[SPOOLER] WebSocket connection to cloud failed (%s); retrying in %v...", c.sanitizeError(err), delay)
 			select {
 			case <-ctx.Done():
 				wg.Wait()
@@ -976,7 +1055,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 		}
 
-		log.Printf("[SPOOLER] Connected to cloud WebSocket hub at %s", c.normalizedURL)
+		log.Printf("[SPOOLER] Connected to cloud WebSocket hub at %s", c.safeURL)
 		// Connected successfully: reset backoff delay
 		delay = c.minBackoff
 		c.handleConnection(ctx, conn)
@@ -1000,19 +1079,28 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 			c.conn = nil
 		}
 		c.connMu.Unlock()
-		_ = conn.Close(websocket.StatusNormalClosure, "disconnecting")
 	}()
 
+	var connWg sync.WaitGroup
+
 	// Start heartbeat and telemetry loop
-	var hbWg sync.WaitGroup
-	hbWg.Add(1)
+	connWg.Add(1)
 	go func() {
-		defer hbWg.Done()
-		c.heartbeatLoop(connCtx, conn)
+		defer connWg.Done()
+		c.heartbeatLoop(connCtx, cancel, conn)
+	}()
+
+	// Start independent ping watchdog loop
+	connWg.Add(1)
+	go func() {
+		defer connWg.Done()
+		c.pingWatchdog(connCtx, cancel, conn)
 	}()
 
 	// Synchronize any paused/error job states with the cloud upon connection
+	connWg.Add(1)
 	go func() {
+		defer connWg.Done()
 		incList, err := c.cfg.StateStore.GetIncompleteJobs(connCtx)
 		if err == nil {
 			for _, inc := range incList {
@@ -1030,6 +1118,14 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 				}
 			}
 		}
+	}()
+
+	// PR #18: retain one safe-stop reconciliation worker per connection.
+	// It reuses persisted SQLite jobs; no parallel recovery queue is created.
+	connWg.Add(1)
+	go func() {
+		defer connWg.Done()
+		c.refundSafeStopRetryLoop(connCtx)
 	}()
 
 	// Reader loop
@@ -1061,10 +1157,11 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 	}
 
 	cancel()
-	hbWg.Wait()
+	_ = conn.CloseNow()
+	connWg.Wait()
 }
 
-func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
+func (c *Client) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()
 
@@ -1074,7 +1171,15 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			return
 		case <-ticker.C:
 			// Send heartbeat
-			_ = c.sendWire(ctx, conn, wireMessage{Type: "heartbeat"})
+			if err := c.sendWire(ctx, conn, wireMessage{Type: "heartbeat"}); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[SPOOLER] Heartbeat write failed (%s); terminating connection", c.sanitizeError(err))
+				cancel()
+				_ = conn.CloseNow()
+				return
+			}
 
 			// Relay printer health
 			sheets, isCalibrated, err := c.cfg.StateStore.GetPaperSupply(ctx)
@@ -1086,7 +1191,40 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			if !isCalibrated {
 				h.PaperTrayStatus = "UNKNOWN"
 			}
-			_ = c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h})
+			if err := c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h}); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[SPOOLER] Health telemetry write failed (%s); terminating connection", c.sanitizeError(err))
+				cancel()
+				_ = conn.CloseNow()
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) pingWatchdog(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, pingCancel := context.WithTimeout(ctx, c.pingTimeout)
+			err := conn.Ping(pingCtx)
+			pingCancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[SPOOLER] WebSocket ping watchdog failed (%s); terminating connection", c.sanitizeError(err))
+				cancel()
+				_ = conn.CloseNow()
+				return
+			}
 		}
 	}
 }
@@ -1107,18 +1245,27 @@ func (c *Client) sendWire(ctx context.Context, conn *websocket.Conn, msg wireMes
 }
 
 func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEvent) {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-
 	c.connMu.Lock()
 	conn := c.conn
 	c.connMu.Unlock()
-
-	if conn == nil {
-		return
+	if conn != nil {
+		_ = c.sendWire(ctx, conn, wireMessage{Type: "progress", Progress: &event})
 	}
 
-	_ = wsjson.Write(ctx, conn, wireMessage{Type: "progress", Progress: &event})
+	// An error alone cannot release money: cancel every queued CUPS child
+	// and prove it is safe before attesting the stop to the cloud.
+	if event.Status == contracts.JobStatusPausedError || event.Status == contracts.JobStatusFailedRefundable {
+		if c.cfg.StateStore != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if job, err := c.cfg.StateStore.GetJob(ctx, event.JobID); err == nil && job != nil {
+				if orderID := strings.TrimSpace(job.Command.OrderID); orderID != "" {
+					c.blockedPrintOrders.Store(orderID, true)
+				}
+			}
+			cancel()
+		}
+		go c.tryConfirmRefundSafeStop(event.JobID)
+	}
 }
 
 func (c *Client) sendJobAck(ctx context.Context, event contracts.JobProgressEvent) {
@@ -2058,6 +2205,30 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 	if strings.TrimSpace(cmd.OrderID) == "" {
 		cmd.OrderID = cmd.JobID
+	}
+	if _, blocked := c.blockedPrintOrders.Load(cmd.OrderID); blocked {
+		// The in-memory stop barrier prevents another CUPS submission, but
+		// every queued sibling also needs a durable terminal/paused state.
+		// Otherwise it remains SPOOLING after a hardware fault, including
+		// across process restarts and in the customer's order status.
+		existing, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			log.Printf("[SPOOLER] Cannot persist blocked sibling %s: %v", cmd.JobID, err)
+			return
+		}
+		if existing != nil && (existing.Status == contracts.JobStatusCompleted ||
+			existing.Status == contracts.JobStatusPausedError ||
+			existing.Status == contracts.JobStatusFailedRefundable) {
+			return // Preserve already completed or previously stopped jobs.
+		}
+		pages, sheets := 0, 0
+		if existing != nil {
+			pages, sheets = existing.PagesPrinted, existing.SheetsPrinted
+		}
+		log.Printf("[SPOOLER] Pausing queued document %s: order %s is faulted", cmd.JobID, cmd.OrderID)
+		c.handleJobError(ctx, cmd, pages, sheets,
+			"order paused due to error in sibling document; no further printing permitted")
+		return
 	}
 
 	if c.pinController != nil && c.pinController.HasActiveTransaction() {
@@ -3326,6 +3497,13 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 
 	isFault := c.isHardwareFaultActive()
 
+	// Printer health polling and the CUPS worker may discover the same
+	// interruption independently. Keep one stable error screen until the
+	// operator clears the fault rather than re-rendering it twice.
+	if state.Mode == ui_ipc.ModeError && currentMode == ui_ipc.ModeError {
+		return nil
+	}
+
 	// Prevent printing/downloading progress updates from overwriting an active hardware fault screen or existing error
 	if (state.Mode == ui_ipc.ModePrinting || state.Mode == ui_ipc.ModeDownloading) && (isFault || currentMode == ui_ipc.ModeError) {
 		log.Printf("[SPOOLER] Suppressing %s render: hardware fault active or screen already in ModeError (%s)", state.Mode, c.getFaultReason())
@@ -3688,3 +3866,114 @@ func (c *Client) cloudKeepAliveLoop(ctx context.Context, healthURL string) {
 	}
 }
 
+
+// refundSafeStopRetryLoop rebuilds work exclusively from persisted paused
+// jobs, avoiding an additional queue or second recovery state machine.
+// It runs immediately on authenticated reconnect and retries if a previous
+// attempt could not reach the cloud or safely classify a CUPS job.
+func (c *Client) refundSafeStopRetryLoop(ctx context.Context) {
+	if c.cfg.StateStore == nil {
+		return
+	}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		c.reconcilePausedOrderSafeStops(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Client) reconcilePausedOrderSafeStops(ctx context.Context) {
+	jobs, err := c.cfg.StateStore.GetIncompleteJobs(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("[REFUND] Cannot read persisted paused jobs: %v", err)
+		}
+		return
+	}
+	seenOrders := make(map[string]bool)
+	for _, job := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		if job.Status != contracts.JobStatusPausedError &&
+			job.Status != contracts.JobStatusFailedRefundable {
+			continue
+		}
+		orderID := strings.TrimSpace(job.Command.OrderID)
+		if orderID == "" || seenOrders[orderID] {
+			continue
+		}
+		seenOrders[orderID] = true
+		// The stop barrier is rebuilt before any retry; existing sibling
+		// state checks in processJob also protect after a process restart.
+		c.blockedPrintOrders.Store(orderID, true)
+		c.tryConfirmRefundSafeStop(job.Command.JobID)
+	}
+}
+
+// tryConfirmRefundSafeStop must run outside sendMu. It is deliberately
+// conservative: ambiguous submission/CUPS state never unlocks a refund.
+// The attendant may then investigate and resolve the uncertainty manually.
+func (c *Client) tryConfirmRefundSafeStop(failedJobID string) {
+	if c.cfg.StateStore == nil { return }
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	job, err := c.cfg.StateStore.GetJob(ctx, failedJobID)
+	if err != nil || job == nil || strings.TrimSpace(job.Command.OrderID) == "" { return }
+	orderID := job.Command.OrderID
+	jobs, err := c.cfg.StateStore.GetJobsByOrderID(ctx, orderID)
+	if err != nil || len(jobs) == 0 { return }
+	expected := jobs[0].Command.TotalDocuments
+	if expected > 0 && len(jobs) != expected {
+		log.Printf("[REFUND] Holding refund safe-stop: order %s missing child jobs", orderID)
+		return
+	}
+	for _, child := range jobs {
+		// Wait for the currently executing worker to finish its fault path;
+		// otherwise it could still submit another print job.
+		for tries := 0; tries < 10; tries++ {
+			c.activeMu.Lock()
+			active := c.activeJobs[child.Command.JobID]
+			c.activeMu.Unlock()
+			if !active { break }
+			select {
+			case <-ctx.Done(): return
+			case <-time.After(250*time.Millisecond):
+			}
+		}
+		c.activeMu.Lock()
+		stillActive := c.activeJobs[child.Command.JobID]
+		c.activeMu.Unlock()
+		if stillActive { return }
+
+		if child.Status == contracts.JobStatusCompleted {
+			continue
+		}
+		if child.CUPSJobID == "" {
+			if child.SubmittedToPrinter {
+				log.Printf("[REFUND] Order %s has ambiguous CUPS submission for %s", orderID, child.Command.JobID)
+				return
+			}
+			continue // Persisted pre-submission state; no printer job exists.
+		}
+		if err := printer.CancelAndVerifyCUPSJob(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, child.CUPSJobID); err != nil {
+			log.Printf("[REFUND] Safe cancellation not confirmed for %s: %v", child.CUPSJobID, err)
+			return
+		}
+	}
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn == nil { return }
+	if err := c.sendWire(ctx, conn, wireMessage{Type:"safe_stop", OrderID:orderID}); err != nil {
+		log.Printf("[REFUND] Could not report safe stop for %s: %v", orderID, err)
+	}
+}

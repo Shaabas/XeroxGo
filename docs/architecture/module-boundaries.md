@@ -51,7 +51,7 @@ flowchart TD
 
     DOC -->|Normalized PDF & Sheets| ORD
     PRI -->|Resolve Unit & Total Price| ORD
-    PAY -->|Authorize & Webhook Capture| ORD
+    PAY -->|Authorize Demo Capture| ORD
     ORD -->|Persist Order & Sessions| Storage
     ORD -->|Trigger Dispatch Intent| DIS
 
@@ -81,7 +81,7 @@ flowchart TD
 - **Primary Responsibility:** User-facing mobile and desktop web portal, PWA install prompts, document preview, client-side print customization (color, duplex, copies, page range), dynamic pricing estimation, and admin management UI.
 - **Components & Files:**
   - Customer Portal: [`frontend/index.html`](file:///home/shabas/Projects/XeroxGo/frontend/index.html), [`frontend/css/portal.css`](file:///home/shabas/Projects/XeroxGo/frontend/css/portal.css), [`frontend/js/portal.js`](file:///home/shabas/Projects/XeroxGo/frontend/js/portal.js)
-  - Mobile Payment Checkout: [`frontend/payment.html`](file:///home/shabas/Projects/XeroxGo/frontend/payment.html)
+  - Demo Payment Checkout: `cloud-backend/cmd/server/demo_pay_handler.go` (served directly by cloud at `/pay/{token}`)
   - Admin Portal: [`frontend/admin.html`](file:///home/shabas/Projects/XeroxGo/frontend/admin.html), [`frontend/css/admin.css`](file:///home/shabas/Projects/XeroxGo/frontend/css/admin.css), [`frontend/js/admin.js`](file:///home/shabas/Projects/XeroxGo/frontend/js/admin.js)
   - Static Assets & Vendor Libraries: [`frontend/vendor/pdf.min.mjs`](file:///home/shabas/Projects/XeroxGo/frontend/vendor/pdf.min.mjs), [`frontend/vendor/pdf-lib.min.js`](file:///home/shabas/Projects/XeroxGo/frontend/vendor/pdf-lib.min.js), [`frontend/manifest.webmanifest`](file:///home/shabas/Projects/XeroxGo/frontend/manifest.webmanifest), [`frontend/vercel.json`](file:///home/shabas/Projects/XeroxGo/frontend/vercel.json)
 - **External Dependencies:** Mozilla PDF.js, PDF-Lib.
@@ -124,16 +124,15 @@ flowchart TD
   - Kiosk sessions enforce mutual exclusion: only one active transaction can claim an order at any given time ([`session_handler.go:164-260`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/session_handler.go#L164-L260)).
 
 ### 2.5 Payments Module
-- **Primary Responsibility:** Dynamic UPI payment generation, Razorpay Orders/Payments integration, mock provider emulation for dev/demo modes, webhook signature verification, payment attempt tracking, and holding states for expired sessions.
+- **Primary Responsibility:** Single XeroxGo demo checkout, simulated payment confirmation, immutable attempts, idempotent capture and simulated refund accounting.
 - **Components & Files:**
   - Provider Abstraction: [`cloud-backend/internal/payments/provider.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/provider.go)
-  - Razorpay Implementation: [`cloud-backend/internal/payments/razorpay.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/razorpay.go), [`razorpay_client.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/razorpay_client.go)
   - Mock Provider: [`cloud-backend/internal/payments/mock.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/payments/mock.go)
   - Demo Checkout: [`cloud-backend/cmd/server/demo_pay_handler.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/demo_pay_handler.go)
-  - Webhook Handler: [`cloud-backend/cmd/server/main.go:1417-1630`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1417-L1630)
+  - Demo Checkout: [`cloud-backend/cmd/server/demo_pay_handler.go`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1417-L1630)
 - **Invariants:**
-  - Every payment webhook must verify cryptographic HMAC signatures before processing ([`main.go:1432-1445`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1432-L1445)).
-  - Duplicate webhooks are rejected idempotently via database primary key constraints on `payment_webhooks` ([`db.go:1733-1766`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L1733-L1766)).
+  - Every demo checkout confirmation must be bound to the stored payment attempt before processing ([`main.go:1432-1445`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1432-L1445)).
+  - Duplicate simulated captures are rejected idempotently by the payment ledger ([`db.go:1733-1766`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/store/db.go#L1733-L1766)).
   - If a payment arrives after a kiosk session expires, the order transitions to `PAID_WAITING` instead of auto-dispatching, allowing the customer to release or re-claim it ([`main.go:1537-1560`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/main.go#L1537-L1560)).
 
 ### 2.6 Dispatch Module

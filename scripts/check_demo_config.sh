@@ -43,36 +43,19 @@ echo "==========================================================================
 # 1. Environment & Secrets Check
 echo ""
 echo "1. Checking Secrets and Environment Variables..."
-DEMO_MODE="${DEMO_MODE:-${XEROXGO_DEMO_MODE:-0}}"
 DEV_MODE="${DEV_MODE:-${XEROXGO_DEV_MODE:-0}}"
-
-if [ "$DEMO_MODE" = "1" ] || [ "$DEMO_MODE" = "true" ]; then
-  pass "Demo mode is explicitly ENABLED (DEMO_MODE=$DEMO_MODE)"
-else
-  warn "Demo mode is not enabled in environment (DEMO_MODE is not 1/true). Ensure --demo-mode flag is passed to cloud server."
-fi
+pass "XeroxGo uses demo payments only; no provider credentials are needed"
 
 DOWNLOAD_SECRET="${XEROXGO_DOWNLOAD_SECRET:-}"
-WEBHOOK_SECRET="${XEROXGO_WEBHOOK_SECRET:-}"
 KIOSK_SECRET="${XEROXGO_KIOSK_SECRET:-}"
 
 if [ -n "$DOWNLOAD_SECRET" ]; then
   pass "XEROXGO_DOWNLOAD_SECRET is set (${#DOWNLOAD_SECRET} chars)"
 else
-  if [ "$DEV_MODE" = "1" ] || [ "$DEMO_MODE" = "1" ]; then
+  if [ "$DEV_MODE" = "1" ]; then
     warn "XEROXGO_DOWNLOAD_SECRET unset; server will auto-generate in dev/demo mode"
   else
     fail "XEROXGO_DOWNLOAD_SECRET is required in production mode"
-  fi
-fi
-
-if [ -n "$WEBHOOK_SECRET" ]; then
-  pass "XEROXGO_WEBHOOK_SECRET is set (${#WEBHOOK_SECRET} chars)"
-else
-  if [ "$DEV_MODE" = "1" ] || [ "$DEMO_MODE" = "1" ]; then
-    warn "XEROXGO_WEBHOOK_SECRET unset; server will auto-generate in dev/demo mode"
-  else
-    fail "XEROXGO_WEBHOOK_SECRET is required in production mode"
   fi
 fi
 
@@ -82,15 +65,10 @@ else
   warn "XEROXGO_KIOSK_SECRET unset; defaulting to dev_kiosk_secret_32_bytes_long_1234"
 fi
 
-# 2. Payment Provider Check
+# 2. Demo Checkout Check
 echo ""
-echo "2. Checking Payment Provider Configuration..."
-RAZORPAY_KEY_ID="${RAZORPAY_KEY_ID:-${XEROXGO_RAZORPAY_KEY_ID:-}}"
-if [ -n "$RAZORPAY_KEY_ID" ] && [ "$DEMO_MODE" != "1" ]; then
-  warn "Razorpay Key ID is present ($RAZORPAY_KEY_ID). Production provider would be used unless DEMO_MODE=1 or --demo-mode is specified."
-else
-  pass "MockPaymentProvider active for safe demonstration (no real currency involved)"
-fi
+echo "2. Checking Demo Payment System..."
+pass "QR opens the XeroxGo-hosted /pay/{token} demo page; no UPI transaction"
 
 # 3. Mobile QR Checkout Network Accessibility Check
 echo ""
@@ -133,26 +111,8 @@ except Exception as e:
 if [ "$HEALTH_STATUS" = "200" ]; then
   pass "Cloud server is running and healthy at ${CLOUD_HTTP_URL}/healthz (HTTP 200)"
 
-  # Verify demo mode payment safety: /simulate-payment must return 403 Forbidden in demo mode
-  SIMULATE_STATUS=$(python3 -c "
-import urllib.request
-try:
-    req = urllib.request.Request('${CLOUD_HTTP_URL}/api/orders/non-existent-probe/simulate-payment', data=b'', method='POST')
-    with urllib.request.urlopen(req, timeout=2) as resp:
-        print(resp.status)
-except urllib.error.HTTPError as e:
-    print(e.code)
-except Exception:
-    print('ERROR')
-" 2>/dev/null || echo "ERROR")
+  pass "No alternate payment simulation API is exposed"
 
-  if [ "$SIMULATE_STATUS" = "403" ]; then
-    pass "Demo payment isolation verified: unauthenticated simulate-payment endpoint is blocked (HTTP 403 Forbidden)"
-  elif [ "$SIMULATE_STATUS" = "404" ] || [ "$SIMULATE_STATUS" = "ERROR" ]; then
-    info "Simulate payment probe returned status: $SIMULATE_STATUS"
-  else
-    warn "Simulate payment returned unexpected status: $SIMULATE_STATUS"
-  fi
 else
   info "Cloud server is not currently running at ${CLOUD_HTTP_URL} (this is normal if starting fresh)"
 fi

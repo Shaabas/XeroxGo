@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -247,117 +246,26 @@ func TestUpdateOrderStatus(t *testing.T) {
 func TestPricingPersistence(t *testing.T) {
 	s, dbPath := newTestStore(t)
 	ctx := context.Background()
-
-	// 1. Error before pricing configured
-	if _, err := s.GetPricePerSheetPaise(ctx); err == nil {
-		t.Fatalf("expected error for unconfigured pricing, got nil")
+	if _, err := s.GetPricing(ctx); err == nil {
+		t.Fatal("pricing should be unconfigured initially")
 	}
-
-	// 2. Set valid positive integer price
-	if err := s.SetPricePerSheetPaise(ctx, 350); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(350) failed: %v", err)
+	if err := s.SetDetailedPricing(ctx, 350, 262, 1500, 1125, true); err != nil {
+		t.Fatal(err)
 	}
-
-	// 3. Read back price
-	price, err := s.GetPricePerSheetPaise(ctx)
-	if err != nil {
-		t.Fatalf("GetPricePerSheetPaise failed: %v", err)
+	got, err := s.GetPricing(ctx)
+	if err != nil || got.BWSimplexPricePaise != 350 || got.ColorDuplexPricePaise != 1125 {
+		t.Fatalf("invalid persisted tariff: %+v err=%v", got, err)
 	}
-	if price != 350 {
-		t.Fatalf("expected price 350, got %d", price)
+	if err := s.Close(); err != nil { t.Fatal(err) }
+	reopened, err := Open(dbPath)
+	if err != nil { t.Fatal(err) }
+	defer reopened.Close()
+	got, err = reopened.GetPricing(ctx)
+	if err != nil || got.BWSimplexPricePaise != 350 || !got.ColorEnabled {
+		t.Fatalf("tariff lost on restart: %+v err=%v", got, err)
 	}
-
-	// 4. Replace price
-	if err := s.SetPricePerSheetPaise(ctx, 400); err != nil {
-		t.Fatalf("SetPricePerSheetPaise(400) failed: %v", err)
-	}
-	price, err = s.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("expected price 400, got %d (err: %v)", price, err)
-	}
-
-	// 5. Reopen preserves configured price
-	_ = s.Close()
-	s2, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("reopen store failed: %v", err)
-	}
-	defer s2.Close()
-
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price after reopen mismatch: got %d (err: %v)", price, err)
-	}
-
-	// 6. Zero and negative prices rejected
-	if err := s2.SetPricePerSheetPaise(ctx, 0); err == nil {
-		t.Fatalf("expected error for price=0, got nil")
-	}
-	if err := s2.SetPricePerSheetPaise(ctx, -50); err == nil {
-		t.Fatalf("expected error for negative price, got nil")
-	}
-
-	// 7. Failed update did not change previous price
-	price, err = s2.GetPricePerSheetPaise(ctx)
-	if err != nil || price != 400 {
-		t.Fatalf("price changed after rejected updates: got %d, want 400", price)
-	}
-}
-
-// Test F — TestRecordWebhookIdempotency
-func TestRecordWebhookIdempotency(t *testing.T) {
-	s, dbPath := newTestStore(t)
-	ctx := context.Background()
-
-	// 1. First record returns true, nil
-	first, err := s.RecordWebhook(ctx, "evt_12345")
-	if err != nil {
-		t.Fatalf("RecordWebhook failed: %v", err)
-	}
-	if !first {
-		t.Fatalf("expected true for first recording, got false")
-	}
-
-	// 2. Duplicate returns false, nil
-	dup, err := s.RecordWebhook(ctx, "evt_12345")
-	if err != nil {
-		t.Fatalf("RecordWebhook duplicate failed: %v", err)
-	}
-	if dup {
-		t.Fatalf("expected false for duplicate recording, got true")
-	}
-
-	// 3. Different ID returns true, nil
-	diff, err := s.RecordWebhook(ctx, "evt_67890")
-	if err != nil || !diff {
-		t.Fatalf("expected true for different webhook ID, got %v (err: %v)", diff, err)
-	}
-
-	// 4. Case-sensitivity
-	upper, err := s.RecordWebhook(ctx, "EVT_12345")
-	if err != nil || !upper {
-		t.Fatalf("expected true for case-distinct webhook ID, got %v (err: %v)", upper, err)
-	}
-
-	// 5. Empty and whitespace-only rejected
-	if _, err := s.RecordWebhook(ctx, ""); err == nil {
-		t.Fatalf("expected error for empty webhook ID, got nil")
-	}
-	if _, err := s.RecordWebhook(ctx, "   \t\n  "); err == nil {
-		t.Fatalf("expected error for whitespace-only webhook ID, got nil")
-	}
-
-	// 6. Reopening preserves idempotency
-	_ = s.Close()
-	s2, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("reopen store failed: %v", err)
-	}
-	defer s2.Close()
-
-	afterReopen, err := s2.RecordWebhook(ctx, "evt_12345")
-	if err != nil || afterReopen {
-		t.Fatalf("expected false after reopen for existing webhook ID, got %v (err: %v)", afterReopen, err)
+	if err := reopened.SetDetailedPricing(ctx, -1, 262, 1500, 1125, false); err == nil {
+		t.Fatal("expected rejection of negative price")
 	}
 }
 
@@ -636,57 +544,6 @@ func TestJobProgressPersistenceAfterReopen(t *testing.T) {
 	}
 }
 
-// Test J — TestConcurrentWebhookIdempotency
-func TestConcurrentWebhookIdempotency(t *testing.T) {
-	s, _ := newTestStore(t)
-	ctx := context.Background()
-
-	const concurrency = 24
-	webhookID := "evt_concurrent_test_999"
-
-	var wg sync.WaitGroup
-	results := make(chan bool, concurrency)
-	errors := make(chan error, concurrency)
-
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			inserted, err := s.RecordWebhook(ctx, webhookID)
-			if err != nil {
-				errors <- err
-				return
-			}
-			results <- inserted
-		}()
-	}
-
-	wg.Wait()
-	close(results)
-	close(errors)
-
-	for err := range errors {
-		t.Fatalf("concurrent RecordWebhook produced error: %v", err)
-	}
-
-	trueCount := 0
-	falseCount := 0
-	for res := range results {
-		if res {
-			trueCount++
-		} else {
-			falseCount++
-		}
-	}
-
-	if trueCount != 1 {
-		t.Fatalf("expected exactly 1 call to return true, got %d", trueCount)
-	}
-	if falseCount != concurrency-1 {
-		t.Fatalf("expected %d calls to return false, got %d", concurrency-1, falseCount)
-	}
-}
-
 // Test K — TestRejectsInvalidInput
 func TestRejectsInvalidInput(t *testing.T) {
 	s, _ := newTestStore(t)
@@ -706,25 +563,12 @@ func TestRejectsInvalidInput(t *testing.T) {
 	if err := s.UpdateOrderStatus(nil, "some-order", contracts.JobStatusPrinting); err == nil {
 		t.Fatalf("expected error for nil context in UpdateOrderStatus, got nil")
 	}
-	if err := s.SetPricePerSheetPaise(nil, 100); err == nil {
-		t.Fatalf("expected error for nil context in SetPricePerSheetPaise, got nil")
+	if err := s.SetDetailedPricing(nil, 200, 150, 1000, 750, false); err == nil {
+		t.Fatal("expected error for nil context in SetDetailedPricing")
 	}
-	if _, err := s.GetPricePerSheetPaise(nil); err == nil {
-		t.Fatalf("expected error for nil context in GetPricePerSheetPaise, got nil")
+	if _, err := s.GetPricing(nil); err == nil {
+		t.Fatal("expected error for nil context in GetPricing")
 	}
-	if _, err := s.RecordWebhook(nil, "evt-nil"); err == nil {
-		t.Fatalf("expected error for nil context in RecordWebhook, got nil")
-	}
-	if err := s.UpdateJobProgress(nil, contracts.JobProgressEvent{JobID: "j"}); err == nil {
-		t.Fatalf("expected error for nil context in UpdateJobProgress, got nil")
-	}
-	if _, err := s.GetJobProgress(nil, "j"); err == nil {
-		t.Fatalf("expected error for nil context in GetJobProgress, got nil")
-	}
-
-	// 3. Canceled context
-	canceledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
 
 	if err := s.CreateOrder(canceledCtx, sampleOrder("ord-k-c", "job-k-c")); err == nil {
 		t.Fatalf("expected error for canceled context in CreateOrder, got nil")

@@ -191,7 +191,7 @@ func TestTransactionSession_RequireActiveSessionForPaymentInitiation(t *testing.
 	now := time.Now().UTC()
 	_, secret, ts := setupTestAppWithOrder(t, "kiosk-pay-01", "ord_pay_01", "7788", contracts.JobStatusPendingPayment, 2500, now.Add(10*time.Minute))
 
-	payURL := ts.URL + "/api/k/kiosk-pay-01/orders/ord_pay_01/initiate-payment"
+	payURL := ts.URL + "/api/k/kiosk-pay-01/sessions/missing/initiate-payment"
 
 	// 1. Attempt payment initiation BEFORE claiming session -> must fail with 409 Conflict!
 	req, _ := http.NewRequest(http.MethodPost, payURL, nil)
@@ -200,8 +200,8 @@ func TestTransactionSession_RequireActiveSessionForPaymentInitiation(t *testing.
 	if err != nil {
 		t.Fatalf("initiate payment request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("expected 409 Conflict without active session, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found for unknown session, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 
@@ -213,7 +213,10 @@ func TestTransactionSession_RequireActiveSessionForPaymentInitiation(t *testing.
 	if err != nil || claimResp.StatusCode != http.StatusOK {
 		t.Fatalf("claim failed: %v", err)
 	}
+	var claimed struct{ SessionID string `json:"session_id"` }
+	if err := json.NewDecoder(claimResp.Body).Decode(&claimed); err != nil { t.Fatal(err) }
 	claimResp.Body.Close()
+	payURL = ts.URL + "/api/k/kiosk-pay-01/sessions/"+claimed.SessionID+"/initiate-payment"
 
 	// 3. Attempt payment initiation AFTER claiming session -> succeeds with 200 OK!
 	reqAfter, _ := http.NewRequest(http.MethodPost, payURL, nil)
@@ -265,7 +268,7 @@ func TestTransactionSession_CancellationFlow(t *testing.T) {
 	canResp.Body.Close()
 
 	// Payment initiation must now fail because session was cancelled!
-	payURL := ts.URL + "/api/k/kiosk-can-01/orders/ord_can_01/initiate-payment"
+	payURL := ts.URL + "/api/k/kiosk-can-01/sessions/" + sess.SessionID + "/initiate-payment"
 	payReq, _ := http.NewRequest(http.MethodPost, payURL, nil)
 	payReq.Header.Set("Authorization", "Bearer "+secret)
 	payResp, _ := http.DefaultClient.Do(payReq)
