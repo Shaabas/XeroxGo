@@ -82,6 +82,7 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", hub.ServeHTTP)
 	mux.HandleFunc("/api/k/", app.handleUpload)
 
 	return app, mux
