@@ -2075,7 +2075,27 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		cmd.OrderID = cmd.JobID
 	}
 	if _, blocked := c.blockedPrintOrders.Load(cmd.OrderID); blocked {
-		log.Printf("[SPOOLER] Refusing to print queued document %s: order %s is faulted", cmd.JobID, cmd.OrderID)
+		// The in-memory stop barrier prevents another CUPS submission, but
+		// every queued sibling also needs a durable terminal/paused state.
+		// Otherwise it remains SPOOLING after a hardware fault, including
+		// across process restarts and in the customer's order status.
+		existing, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID)
+		if err != nil {
+			log.Printf("[SPOOLER] Cannot persist blocked sibling %s: %v", cmd.JobID, err)
+			return
+		}
+		if existing != nil && (existing.Status == contracts.JobStatusCompleted ||
+			existing.Status == contracts.JobStatusPausedError ||
+			existing.Status == contracts.JobStatusFailedRefundable) {
+			return // Preserve already completed or previously stopped jobs.
+		}
+		pages, sheets := 0, 0
+		if existing != nil {
+			pages, sheets = existing.PagesPrinted, existing.SheetsPrinted
+		}
+		log.Printf("[SPOOLER] Pausing queued document %s: order %s is faulted", cmd.JobID, cmd.OrderID)
+		c.handleJobError(ctx, cmd, pages, sheets,
+			"order paused due to error in sibling document; no further printing permitted")
 		return
 	}
 
