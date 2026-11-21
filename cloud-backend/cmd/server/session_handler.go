@@ -485,7 +485,7 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		KioskID:           sess.KioskID,
 		SessionID:         sess.SessionID,
 		Provider:          "mock",
-		ProviderOrderID:   "",
+		ProviderOrderID:   demoToken, // Internal checkout correlation; never an external provider order.
 		ProviderPaymentID: "",
 		AmountPaise:       sess.PricePaise,
 		Currency:          "INR",

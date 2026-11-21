@@ -39,7 +39,7 @@ func (s *appServer) processRefundsOnce(ctx context.Context) error {
 	pending, err := s.db.ListPendingRefunds(ctx, retryCutoff)
 	if err != nil { return err }
 	for _, item := range pending {
-		if item.Provider != provider.Name() && !(provider.Name() == "mock" && item.Provider == "mock_demo") {
+		if item.Provider != provider.Name() {
 			log.Printf("[REFUND] provider mismatch for %s: record=%s active=%s", item.OrderID, item.Provider, provider.Name())
 			continue
 		}
@@ -65,7 +65,7 @@ func (s *appServer) processRefundsOnce(ctx context.Context) error {
 	ready, err := s.db.ListActionableRefunds(ctx, retryCutoff)
 	if err != nil { return err }
 	for _, item := range ready {
-		if item.Provider != provider.Name() && !(provider.Name() == "mock" && item.Provider == "mock_demo") {
+		if item.Provider != provider.Name() {
 			log.Printf("[REFUND] provider mismatch for %s: record=%s active=%s", item.OrderID, item.Provider, provider.Name())
 			continue
 		}

@@ -35,9 +35,9 @@ func TestDispatchDelivery_OfflinePaymentReconnectsWithoutRefundOrDoublePrint(t *
 	body, signature := generateSignedWebhookPayload(orderID, "pay_dispatch_outage", session.SessionID, kioskID, 400, webhookSecret)
 	sendWebhook := func() string {
 		t.Helper()
-		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/test/capture", bytes.NewReader(body))
 		if err != nil { t.Fatal(err) }
-		req.Header.Set("X-Razorpay-Signature", signature)
+		req.Header.Set("X-Fixture-Signature", signature)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil { t.Fatal(err) }
 		defer resp.Body.Close()

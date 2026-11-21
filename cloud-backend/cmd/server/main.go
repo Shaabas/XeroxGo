@@ -793,7 +793,7 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pagesPrinted = progress.PagesPrinted
-		sheetsPrinted = progress.SheetsPrinted
+	sheetsPrinted = progress.SheetsPrinted
 		errorReason = progress.ErrorReason
 		// Child faults must outrank a completed earlier document; the parent
 		// aggregation currently propagates FAILED_REFUNDABLE but not every

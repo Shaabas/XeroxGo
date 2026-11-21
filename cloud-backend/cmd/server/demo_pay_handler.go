@@ -516,7 +516,7 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 		KioskID:     att.KioskID,
 		SessionID:   att.SessionID,
 		AmountPaise: att.AmountPaise,
-		Provider:    "mock_demo",
+		Provider:    "mock",
 		Status:      "captured",
 	}, now)
 	if err != nil {

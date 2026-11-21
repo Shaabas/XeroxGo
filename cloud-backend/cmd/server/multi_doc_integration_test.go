@@ -717,7 +717,7 @@ func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 	}
 
 	// 1. Customer initiate-payment: must succeed with HTTP 200 and return payment attempt details
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, err := http.DefaultClient.Do(initReq)
 	if err != nil || initResp.StatusCode != http.StatusOK {
@@ -748,17 +748,21 @@ func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 	}
 	defer wsConn.CloseNow()
 
-	// 3. Simulate-payment: must succeed with HTTP 200 and transition order to DISPATCHED
-	simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/%s/test/simulate-payment?session_id=%s&force=1", ts.URL, orderID, sess.SessionID), nil)
-	simResp, err := http.DefaultClient.Do(simReq)
-	if err != nil || simResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK for simulate-payment, got %d (err=%v)", simResp.StatusCode, err)
+	// 3. Confirm payment through the real demo checkout endpoint.
+	token, _ := initData["demo_token"].(string)
+	if !strings.HasPrefix(token,"dmo_") { t.Fatalf("missing demo token: %+v",initData) }
+	demoReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/pay/"+token, nil)
+	demoReq.Header.Set("Accept", "application/json")
+	demoResp, err := http.DefaultClient.Do(demoReq)
+	if err != nil { t.Fatal(err) }
+	defer demoResp.Body.Close()
+	if demoResp.StatusCode != http.StatusOK {
+		t.Fatalf("demo checkout confirmation HTTP %d",demoResp.StatusCode)
 	}
-	var simData map[string]interface{}
-	_ = json.NewDecoder(simResp.Body).Decode(&simData)
-	simResp.Body.Close()
-	if simData["status"] != "DISPATCHED" {
-		t.Errorf("simulate-payment status = %v, want DISPATCHED", simData["status"])
+	var demoState map[string]interface{}
+	if err := json.NewDecoder(demoResp.Body).Decode(&demoState); err != nil { t.Fatal(err) }
+	if demoState["status"] != "dispatched" {
+		t.Fatalf("demo checkout did not authorize both documents: %+v",demoState)
 	}
 
 	// 4. Verify the 2 PrintJobCommands are received over WebSocket

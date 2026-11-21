@@ -122,78 +122,29 @@ func createTestOrderAndSession(t *testing.T, st *store.Store, kioskID, orderID, 
 	return sess
 }
 
-func TestDemoMode_FlagAndEnvGating(t *testing.T) {
-	// Case 1: Demo mode disabled (default)
-	_, tsDisabled, stDisabled, cleanup1 := setupDemoTestServer(t, false)
-	defer cleanup1()
-
-	kioskID := "kiosk-demo-gate"
-	orderID := "ord_gate_001"
-	sess := createTestOrderAndSession(t, stDisabled, kioskID, orderID, "1111", 2, 1000)
-
-	// Initiate payment when demoMode == false
-	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", tsDisabled.URL, kioskID, sess.SessionID)
-	req, _ := http.NewRequest(http.MethodPost, initURL, nil)
+func TestDemoCheckoutAlwaysUsesXeroxGoPage(t *testing.T) {
+	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	defer cleanup()
+	const kioskID, orderID = "kiosk-demo-only", "ord_demo_only"
+	sess := createTestOrderAndSession(t, st, kioskID, orderID, "1111", 2, 1000)
+	req, _ := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID), nil)
 	req.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
-
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("initiate payment request failed: %v", err)
-	}
+	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK { t.Fatalf("demo initiation: HTTP %d",resp.StatusCode) }
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil { t.Fatal(err) }
+	token, _ := result["demo_token"].(string)
+	qr, _ := result["qr_payload"].(string)
+	if !strings.HasPrefix(token,"dmo_") || qr != ts.URL+"/pay/"+token {
+		t.Fatalf("QR must link to the sole demo checkout: token=%s qr=%s",token,qr)
 	}
-
-	var initResp map[string]interface{}
-	_ = json.NewDecoder(resp.Body).Decode(&initResp)
-
-	qrPayload, _ := initResp["qr_payload"].(string)
-	if !strings.HasPrefix(qrPayload, "upi://") {
-		t.Errorf("expected standard UPI payload when demoMode=false, got: %s", qrPayload)
-	}
-
-	// GET /pay/any_token should return 404 when demoMode=false
-	payURL := tsDisabled.URL + "/pay/dmo_123456"
-	payResp, err := http.Get(payURL)
-	if err != nil {
-		t.Fatalf("GET /pay/ failed: %v", err)
-	}
-	defer payResp.Body.Close()
-	if payResp.StatusCode != http.StatusNotFound {
-		t.Errorf("expected HTTP 404 for /pay/ when demoMode=false, got %d", payResp.StatusCode)
-	}
-
-	// Case 2: Demo mode enabled
-	_, tsEnabled, stEnabled, cleanup2 := setupDemoTestServer(t, true)
-	defer cleanup2()
-
-	orderID2 := "ord_gate_002"
-	sess2 := createTestOrderAndSession(t, stEnabled, kioskID, orderID2, "2222", 2, 1000)
-
-	initURL2 := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", tsEnabled.URL, kioskID, sess2.SessionID)
-	req2, _ := http.NewRequest(http.MethodPost, initURL2, nil)
-	req2.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
-
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatalf("initiate payment request failed: %v", err)
-	}
-	defer resp2.Body.Close()
-
-	var initResp2 map[string]interface{}
-	_ = json.NewDecoder(resp2.Body).Decode(&initResp2)
-
-	qrPayload2, _ := initResp2["qr_payload"].(string)
-	demoToken, _ := initResp2["demo_token"].(string)
-
-	if !strings.HasPrefix(demoToken, "dmo_") {
-		t.Errorf("expected demo_token starting with 'dmo_', got: %s", demoToken)
-	}
-	if !strings.Contains(qrPayload2, "/pay/"+demoToken) {
-		t.Errorf("expected qr_payload to contain /pay/%s, got: %s", demoToken, qrPayload2)
-	}
+	page, err := http.Get(qr)
+	if err != nil { t.Fatal(err) }
+	defer page.Body.Close()
+	if page.StatusCode != http.StatusOK { t.Fatalf("demo checkout not reachable: HTTP %d",page.StatusCode) }
 }
 
 func TestDemoCheckoutPage_Rendering(t *testing.T) {

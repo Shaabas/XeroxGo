@@ -103,14 +103,14 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 		}
 	})
 
-	t.Run("Retired capture endpoint does not bypass proxy auth", func(t *testing.T) {
+	t.Run("Health endpoint remains accessible", func(t *testing.T) {
 		h := createIngressHandler(dummyMux, secret, false)
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("expected 404 Not Found for /healthz, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for /healthz, got %d", rec.Code)
 		}
 	})
 
@@ -120,8 +120,8 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for /api/test/capture, got %d", rec.Code)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for /api/test/capture without proxy secret, got %d", rec.Code)
 		}
 	})
 
