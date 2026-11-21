@@ -2694,7 +2694,19 @@ WHERE (
       WHERE rr.order_id = o.order_id AND rr.status <> 'PROCESSED'
     )
   )
-  OR (o.status = 'PENDING_PAYMENT' AND o.created_at_ns <= ?);
+  OR (
+    o.status = 'PENDING_PAYMENT' AND o.created_at_ns <= ?
+    -- Underpayments are captured money despite an unpaid order state.
+    -- Never lose a provider/refund obligation through unpaid-PIN cleanup.
+    AND NOT EXISTS (
+      SELECT 1 FROM payments p WHERE p.order_id = o.order_id
+      AND LOWER(p.status) IN ('captured','paid')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM payment_refund_requests rr WHERE rr.order_id = o.order_id
+      AND rr.status <> 'PROCESSED'
+    )
+  );
 `
 	rows, err := s.db.QueryContext(ctx, s.rebind(query), completedThreshold.UnixNano(), pendingThreshold.UnixNano())
 	if err != nil {
