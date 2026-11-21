@@ -3525,6 +3525,13 @@ WHERE order_id = ? AND status = ?;
 		}
 	}
 
+	// Capture promotes a still-valid customer PIN into a paid fulfillment
+	// entitlement. The five-minute unpaid deadline must not terminate a paid order.
+	// A genuinely expired PIN is never resurrected (it may have been reused).
+	if err := s.extendPaidPINInTx(ctx, tx, p.OrderID, nowNS); err != nil {
+		return nil, fmt.Errorf("capture payment: extend paid PIN: %w", err)
+	}
+
 	// 6. Check for active unexpired session on orderKioskID
 	querySession := s.rebind(`
 SELECT session_id, kiosk_id, status, expires_at_ns
