@@ -4385,13 +4385,21 @@ ORDER BY created_at_ns ASC;
 			payProvider string
 		)
 		qPay := s.rebind(`
-SELECT status, amount_paise, provider
-FROM payments
-WHERE order_id = ? AND status IN ('captured', 'paid')
-ORDER BY created_at_ns DESC
+SELECT p.status, p.amount_paise, p.provider
+FROM payments p
+LEFT JOIN order_funding_payments f ON f.order_id = p.order_id
+WHERE p.order_id = ? AND LOWER(p.status) IN ('captured', 'paid')
+AND (p.payment_id = f.payment_id OR
+     (f.payment_id IS NULL AND p.amount_paise = ?))
+ORDER BY
+    CASE WHEN p.payment_id = f.payment_id THEN 0 ELSE 1 END,
+    p.created_at_ns ASC, p.payment_id ASC
 LIMIT 1;
 `)
-		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID).Scan(&payStatus, &payAmount, &payProvider)
+		// A later surplus capture can be for a different amount. Reconnect
+		// must validate the same funding payment that authorized printing,
+		// never whichever captured payment happened most recently.
+		errPay := s.db.QueryRowContext(ctx, qPay, cand.orderID, ord.PricePaise).Scan(&payStatus, &payAmount, &payProvider)
 		if errPay != nil {
 			if errors.Is(errPay, sql.ErrNoRows) {
 				// No verified captured payment exists for this order; do not dispatch!
