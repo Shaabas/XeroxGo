@@ -925,16 +925,13 @@ func main() {
 	}
 
 	devMode := os.Getenv("XEROXGO_DEV_MODE") == "1" || os.Getenv("DEV_MODE") == "1"
-	if devMode {
-		demoMode = true
-	}
 
 	dlSecretStr := os.Getenv("XEROXGO_DOWNLOAD_SECRET")
 	whSecretStr := os.Getenv("XEROXGO_WEBHOOK_SECRET")
 
 	if !devMode {
-		if len(dlSecretStr) < 16 || len(whSecretStr) < 16 {
-			log.Fatalf("Fatal: production mode requires non-empty XEROXGO_DOWNLOAD_SECRET and XEROXGO_WEBHOOK_SECRET of at least 16 characters")
+		if len(dlSecretStr) < 16 {
+			log.Fatalf("XEROXGO_DOWNLOAD_SECRET must be at least 16 characters")
 		}
 	} else {
 		if dlSecretStr == "" {
@@ -1181,7 +1178,7 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 			path := r.URL.Path
 			isExempt := path == "/healthz" ||
 				path == "/ws" ||
-				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
+				(strings.HasPrefix(path, "/api/orders/") && ((strings.Contains(path, "/jobs/") && strings.HasSuffix(path, "/pdf")) || strings.HasSuffix(path, "/recovery-pin"))) ||
 				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
 				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
 

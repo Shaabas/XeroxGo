@@ -47,7 +47,6 @@ DEV_MODE="${DEV_MODE:-${XEROXGO_DEV_MODE:-0}}"
 pass "XeroxGo uses demo payments only; no provider credentials are needed"
 
 DOWNLOAD_SECRET="${XEROXGO_DOWNLOAD_SECRET:-}"
-WEBHOOK_SECRET="${XEROXGO_WEBHOOK_SECRET:-}"
 KIOSK_SECRET="${XEROXGO_KIOSK_SECRET:-}"
 
 if [ -n "$DOWNLOAD_SECRET" ]; then
@@ -57,16 +56,6 @@ else
     warn "XEROXGO_DOWNLOAD_SECRET unset; server will auto-generate in dev/demo mode"
   else
     fail "XEROXGO_DOWNLOAD_SECRET is required in production mode"
-  fi
-fi
-
-if [ -n "$WEBHOOK_SECRET" ]; then
-  pass "XEROXGO_WEBHOOK_SECRET is set (${#WEBHOOK_SECRET} chars)"
-else
-  if [ "$DEV_MODE" = "1" ]; then
-    warn "XEROXGO_WEBHOOK_SECRET unset; server will auto-generate in dev/demo mode"
-  else
-    fail "XEROXGO_WEBHOOK_SECRET is required in production mode"
   fi
 fi
 
