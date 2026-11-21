@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -426,26 +425,6 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Public multi-document checkout remains disabled for real payment providers
-	// until physical multi-document printing is verified and explicitly enabled.
-	// Never treat development or demo mode alone as permission to charge money.
-	prov := s.getPaymentProvider()
-	documentCount := len(ord.Documents)
-	if ord.Command.TotalDocuments > documentCount {
-		documentCount = ord.Command.TotalDocuments
-	}
-	if documentCount > 1 &&
-		prov.Name() != "mock" &&
-		os.Getenv("XEROXGO_ENABLE_PUBLIC_MULTIDOC_PAYMENTS") != "true" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"code":  "MULTIDOC_PAYMENTS_DISABLED",
-			"error": "multi-document payments are not available yet; please place separate single-document orders",
-		})
-		return
-	}
-
 	// Revalidate printer condition and fresh stock before initiating payment
 	stock, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
@@ -513,6 +492,7 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		attemptExpiresAt = maxExp
 	}
 
+	prov := s.getPaymentProvider()
 	createReq := payments.CreatePaymentRequest{
 		OrderID:     sess.OrderID,
 		KioskID:     sess.KioskID,
