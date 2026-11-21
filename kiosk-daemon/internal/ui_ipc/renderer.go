@@ -1167,19 +1167,8 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 
 	drawText(dst, faceBold28, "Order Details", 140, topY+45, colorTextPrimary)
 
-	duplexDesc := "Single-sided (Simplex)"
-	if summary.Duplex == "long_edge" || summary.Duplex == "short_edge" {
-		duplexDesc = "Double-sided (Duplex)"
-	}
-	colorDesc := "Black & White (Mono)"
-	if strings.ToLower(summary.ColorMode) == "color" {
-		colorDesc = "Full Color"
-	}
-	copiesDesc := fmt.Sprintf("%d copy", summary.Copies)
-	if summary.Copies > 1 {
-		copiesDesc = fmt.Sprintf("%d copies", summary.Copies)
-	}
-
+	// Do not present the first document's copies, duplex or color mode
+	// as whole-order settings. Mixed-document configurations are shown on mobile.
 	specs := []struct {
 		label string
 		val   string
@@ -1187,9 +1176,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 		{"Order ID", summary.OrderID},
 		{"Total Document Pages", fmt.Sprintf("%d pages", summary.TotalPages)},
 		{"Physical Sheets to Print", fmt.Sprintf("%d sheets (A4 Plain)", summary.TotalSheets)},
-		{"Copies Requested", copiesDesc},
-		{"Print Sides", duplexDesc},
-		{"Color Mode", colorDesc},
+		{"Print Settings", "Configured per document on mobile"},
 	}
 
 	yRow := topY + 105
