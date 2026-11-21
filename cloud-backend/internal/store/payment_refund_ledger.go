@@ -172,3 +172,22 @@ AND status NOT IN ('COMPLETED','FAILED_REFUNDABLE');`),now,orderID)
 	}
 	return tx.Commit()
 }
+
+
+// Public checkout exposes only aggregate refund counts; payment IDs and
+// provider credentials never appear in the unauthenticated order-status API.
+type ExcessRefundSummary struct {
+	Total int
+	Processed int
+	Unresolved int
+}
+
+func (s *Store) GetExcessRefundSummary(ctx context.Context, orderID string) (ExcessRefundSummary, error) {
+	var out ExcessRefundSummary
+	err := s.db.QueryRowContext(ctx, s.rebind(`
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='PROCESSED' THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN status <> 'PROCESSED' THEN 1 ELSE 0 END),0)
+FROM payment_refund_requests WHERE order_id=? AND reason='EXCESS_CAPTURE';`),
+		orderID).Scan(&out.Total,&out.Processed,&out.Unresolved)
+	return out, err
+}
