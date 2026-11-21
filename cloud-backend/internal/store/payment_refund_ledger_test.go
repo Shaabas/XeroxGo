@@ -56,6 +56,10 @@ func TestPaymentLedger_DistinctCapturesOnlyFundOneOrder(t *testing.T) {
 	if primary, err := s.GetRefundRequest(ctx, id); err != nil || primary != nil {
 		t.Fatalf("excess refund must not block printing: %+v %v", primary, err)
 	}
+	summary, err := s.GetExcessRefundSummary(ctx, id)
+	if err != nil || summary.Total != 1 || summary.Unresolved != 1 || summary.Processed != 0 {
+		t.Fatalf("new surplus refund summary incorrect: %+v %v", summary, err)
+	}
 	ready, err := s.ListActionableRefunds(ctx, now.Add(time.Hour))
 	if err != nil || len(ready) != 1 || ready[0].PaymentID != "pay_surplus_2" ||
 		ready[0].Reason != RefundReasonExcess || !ready[0].SafeStopVerified {
@@ -65,6 +69,10 @@ func TestPaymentLedger_DistinctCapturesOnlyFundOneOrder(t *testing.T) {
 	if err != nil || !claimed { t.Fatalf("claim surplus refund: %v %v", claimed, err) }
 	if err := s.RecordRefundResultForPayment(ctx, "pay_surplus_2", "rfnd_surplus", RefundProcessed, ""); err != nil {
 		t.Fatal(err)
+	}
+	summary, err = s.GetExcessRefundSummary(ctx, id)
+	if err != nil || summary.Processed != 1 || summary.Unresolved != 0 {
+		t.Fatalf("processed refund summary incorrect: %+v %v", summary, err)
 	}
 	ord, err := s.GetOrder(ctx, id)
 	if err != nil || ord.Status != contracts.JobStatusDispatched {
