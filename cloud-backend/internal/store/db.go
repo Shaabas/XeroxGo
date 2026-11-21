@@ -3419,9 +3419,20 @@ WHERE order_id = ?;
 		return nil, fmt.Errorf("capture payment: query order: %w", err)
 	}
 
-	// 3. Verify amount against authoritative price
+	// 3. A genuine capture with the wrong amount is still real money.
+	// It cannot fund printing, but must have a durable refund obligation.
 	if p.AmountPaise != pricePaise {
-		return nil, fmt.Errorf("payment amount mismatch: expected %d paise, got %d paise", pricePaise, p.AmountPaise)
+		if err := s.recordExcessCaptureInTx(ctx, tx, p, orderKioskID, nowNS); err != nil {
+			return nil, fmt.Errorf("capture payment: refund incorrect amount: %w", err)
+		}
+		if err := tx.Commit(); err != nil { return nil, fmt.Errorf("capture payment: commit incorrect amount: %w", err) }
+		return &PaymentCaptureResult{
+			OrderStatus: contracts.JobStatus(statusStr),
+			AlreadyProcessed: true,
+			ExcessCapture: true,
+			KioskID: orderKioskID,
+			PricePaise: pricePaise,
+		}, nil
 	}
 
 	currentStatus := contracts.JobStatus(statusStr)
