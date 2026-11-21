@@ -2103,7 +2103,14 @@
 
   function updateCheckoutStatus(statusData) {
     if (!statusData || !checkoutLiveStatusBox) return;
-    const st = statusData.status || '';
+    // A child job finishing is not a completed multi-document order.
+    // Fail closed even against a stale/incorrect API response: do not
+    // show 100% or stop polling unless every child is completed.
+    const totalDocs = Math.max(0, Number(statusData.documents_total) || 0);
+    const completedDocs = Math.max(0, Number(statusData.documents_completed) || 0);
+    const reportedStatus = statusData.status || '';
+    const st = reportedStatus === 'COMPLETED' &&
+      totalDocs > 0 && completedDocs !== totalDocs ? 'PRINTING' : reportedStatus;
     const originalPINExpired = authoritativeExpiryMs > 0 && Date.now() >= authoritativeExpiryMs;
 
     // The five-minute clock is for UNPAID orders only. Verified payment
@@ -2158,14 +2165,18 @@
       } else if (st === 'COMPLETED') {
         pct = 100;
         // A completed print can still have an additional payment refund in progress.
-        if (!statusData.excess_refunds_unresolved && orderPollTimer) clearInterval(orderPollTimer);
+        if (!statusData.excess_refunds_unresolved && orderPollTimer) {
+          clearInterval(orderPollTimer);
+          orderPollTimer = null;
+        }
       }
       checkoutProgressBar.style.width = pct + '%';
     }
 
     if (checkoutStatusMsg) {
       if (st === 'PRINTING') {
-        checkoutStatusMsg.textContent = `Printing page ${statusData.pages_printed || 1} of ${statusData.total_pages || 1}...`;
+        const docProgress = totalDocs > 1 ? ` (${completedDocs}/${totalDocs} documents finished)` : '';
+        checkoutStatusMsg.textContent = `Printing: ${statusData.pages_printed || 0} of ${statusData.total_pages || 1} pages${docProgress}...`;
       } else if (st === 'COMPLETED') {
         checkoutStatusMsg.textContent = 'Printing completed. Collect your documents.';
       } else if (st === 'REFUND_REQUIRED') {
