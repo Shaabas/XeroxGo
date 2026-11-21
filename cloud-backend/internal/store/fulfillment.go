@@ -259,3 +259,60 @@ WHERE o.kiosk_id = ? AND rr.safe_stop_verified = 0
 AND rr.status <> 'PROCESSED';`), kioskID).Scan(&n)
 	return n > 0, err
 }
+
+// ListPaidWithoutDispatch returns captured orders with no active kiosk checkout,
+// no durable CUPS dispatch intent and no refund obligation. These are provably
+// never dispatched by XeroxGo, unlike jobs with an uncertain SENT intent.
+func (s *Store) ListPaidWithoutDispatch(ctx context.Context, cutoff time.Time, now time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.rebind(`
+SELECT o.order_id FROM orders o
+WHERE o.status = 'PAID_WAITING'
+AND EXISTS (SELECT 1 FROM payments p
+            WHERE p.order_id = o.order_id AND p.status IN ('captured','CAPTURED')
+            AND p.created_at_ns < ?)
+AND NOT EXISTS (SELECT 1 FROM dispatch_intents di WHERE di.order_id = o.order_id)
+AND NOT EXISTS (SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id = o.order_id
+                AND ks.status = 'PAYMENT_PENDING' AND ks.expires_at_ns > ?)
+AND NOT EXISTS (SELECT 1 FROM refund_requests rr WHERE rr.order_id = o.order_id)
+ORDER BY o.created_at_ns ASC LIMIT 30;`), cutoff.UnixNano(), now.UnixNano())
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var ids []string
+	for rows.Next() { var id string; if err := rows.Scan(&id); err != nil { return nil, err }; ids = append(ids,id) }
+	return ids, rows.Err()
+}
+
+// FailNeverDispatchedPaidOrder atomically transitions a paid order to a refund
+// obligation only if no job was ever scheduled for physical dispatch. This is
+// safe to auto-refund even if the Pi is offline, since no dispatch intent exists.
+func (s *Store) FailNeverDispatchedPaidOrder(ctx context.Context, orderID string, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil { return false, err }
+	defer tx.Rollback()
+	nowNS := now.UTC().UnixNano()
+	// This conditional update is the serialization point against a concurrent
+	// PAID_WAITING -> DISPATCHED transition.
+	res, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE orders SET status = 'PAUSED_ERROR', updated_at_ns = ?
+WHERE order_id = ? AND status = 'PAID_WAITING'
+AND NOT EXISTS(SELECT 1 FROM dispatch_intents di WHERE di.order_id = orders.order_id)
+AND NOT EXISTS(SELECT 1 FROM kiosk_sessions ks WHERE ks.order_id = orders.order_id
+AND ks.status = 'PAYMENT_PENDING' AND ks.expires_at_ns > ?)
+AND EXISTS(SELECT 1 FROM payments p WHERE p.order_id = orders.order_id AND p.status IN ('captured','CAPTURED'))
+AND NOT EXISTS(SELECT 1 FROM refund_requests rr WHERE rr.order_id = orders.order_id);`), nowNS, orderID, nowNS)
+	if err != nil { return false, err }
+	affected, err := res.RowsAffected()
+	if err != nil { return false, err }
+	if affected == 0 { return false, nil }
+	_, err = tx.ExecContext(ctx, s.rebind(`
+INSERT INTO refund_requests(order_id, payment_id, provider, amount_paise, status,
+ idempotency_key, safe_stop_verified, created_at_ns, updated_at_ns)
+SELECT ?, p.payment_id, p.provider, p.amount_paise, 'REQUIRED',
+ ?, 1, ?, ? FROM payments p
+WHERE p.order_id = ? AND p.status IN ('captured','CAPTURED')
+ORDER BY p.created_at_ns ASC LIMIT 1;`),
+		orderID, "xeroxgo_refund_"+orderID, nowNS, nowNS, orderID)
+	if err != nil { return false, err }
+	if err := tx.Commit(); err != nil { return false, err }
+	return true, nil
+}
