@@ -406,8 +406,8 @@ func TestDemoPaymentSubmit_DispatchedAndIdempotency(t *testing.T) {
 	var submitData map[string]interface{}
 	_ = json.NewDecoder(payResp.Body).Decode(&submitData)
 
-	if submitData["status"] != "dispatched" {
-		t.Errorf("expected status 'dispatched', got: %v", submitData["status"])
+	if submitData["status"] != "dispatch_pending" {
+		t.Errorf("without a connected Pi, payment must queue durable delivery; got: %v", submitData["status"])
 	}
 
 	// Verify database state: order should be DISPATCHED, attempt PAID
