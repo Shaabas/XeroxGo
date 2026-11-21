@@ -1023,3 +1023,556 @@ func TestSNMPEmulator_ActualBinaryProcess(t *testing.T) {
 		}
 	})
 }
+
+// -----------------------------------------------------------------------------
+// Helper to start the compiled snmp_responder daemon process for live UDP tests
+// -----------------------------------------------------------------------------
+func startTestSNMPProcess(t *testing.T) (string, int, string, func()) {
+	t.Helper()
+	binPath := buildOrFindSNMPResponder(t)
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "snmp_state.json")
+	pidFile := filepath.Join(tempDir, "snmp_responder.pid")
+	portFile := filepath.Join(tempDir, "snmp_responder.port")
+
+	cmd := exec.Command(binPath, "serve",
+		"-host", "127.0.0.1",
+		"-port", "0",
+		"-community", "public",
+		"-state", stateFile,
+		"-pid", pidFile,
+		"-port-file", portFile,
+	)
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start snmp_responder process: %v", err)
+	}
+
+	stop := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				_ = cmd.Process.Kill()
+			}
+		}
+	}
+
+	var boundPort int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(portFile); err == nil && len(data) > 0 {
+			pStr := strings.TrimSpace(string(data))
+			if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+				boundPort = p
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if boundPort <= 0 {
+		stop()
+		t.Fatalf("snmp_responder process did not write bound port within timeout")
+	}
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      boundPort,
+		Community: "public",
+		Timeout:   1 * time.Second,
+		Retries:   0,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ready := false
+	for time.Now().Before(deadline) {
+		sess, err := NewRealDynamicSNMPSession(ctx, cfg)
+		if err == nil {
+			if pkt, err := sess.Get([]string{oidSysDescr}); err == nil && pkt != nil && len(pkt.Variables) > 0 {
+				_ = sess.Close()
+				ready = true
+				break
+			}
+			_ = sess.Close()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ready {
+		stop()
+		t.Fatalf("snmp_responder on port %d was not ready within timeout", boundPort)
+	}
+
+	return binPath, boundPort, stateFile, stop
+}
+
+// -----------------------------------------------------------------------------
+// Test 9: Dynamic Table Walk Discovery over real UDP
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_DynamicWalk_Discovery(t *testing.T) {
+	_, port, _, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+
+	ctx := context.Background()
+	session, err := NewRealDynamicSNMPSession(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create real dynamic session: %v", err)
+	}
+	defer session.Close()
+
+	res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+	}
+
+	if res.DiscoveryMode != "SNMP_TABLE_WALK" {
+		t.Fatalf("expected DiscoveryMode='SNMP_TABLE_WALK', got %q", res.DiscoveryMode)
+	}
+	if len(res.Printers) != 1 {
+		t.Fatalf("expected 1 printer, got %d", len(res.Printers))
+	}
+	if res.Printers[0].Index != "1" || res.Printers[0].Status != 3 {
+		t.Errorf("unexpected printer: %+v", res.Printers[0])
+	}
+	if len(res.Covers) != 1 || res.Covers[0].Status != 4 {
+		t.Errorf("unexpected cover: %+v", res.Covers)
+	}
+	if len(res.Markers) != 1 {
+		t.Fatalf("expected 1 marker, got %d", len(res.Markers))
+	}
+	marker := res.Markers[0]
+	if marker.Index != "1.1" || marker.CounterUnit != 8 || !marker.IsPageCounter || marker.LifeCount != 1000 {
+		t.Errorf("unexpected marker: %+v", marker)
+	}
+	if len(res.Supplies) != 2 {
+		t.Fatalf("expected 2 supplies, got %d", len(res.Supplies))
+	}
+	if res.Supplies[0].Type != 3 || res.Supplies[0].Level != 85 {
+		t.Errorf("unexpected toner supply: %+v", res.Supplies[0])
+	}
+	if res.Supplies[1].Type != 15 || res.Supplies[1].Level != 95 {
+		t.Errorf("unexpected drum supply: %+v", res.Supplies[1])
+	}
+	if res.SysDescr == "" {
+		t.Errorf("expected non-empty sysDescr")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 10: Alternate Indexes & Task 1 Fingerprint Discovery
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_AlternateIndexes_FingerprintDiscovery(t *testing.T) {
+	binPath, port, stateFile, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	// Configure alternate printer index 2, marker index 2.3, supply indexes 2.1 and 2.2
+	setCmd := exec.Command(binPath, "set",
+		"-state", stateFile,
+		"-printer-index", "2",
+		"-marker-index", "2.3",
+		"-supply-index", "2.1",
+		"-drum-index", "2.2",
+	)
+	if out, err := setCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to set alternate indexes: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	ctx := context.Background()
+
+	// 1. Verify that fixed-index .1.1 queries fail on alternate index configuration
+	life := PollMarkerLifeCount(ctx, cfg)
+	if life != -1 {
+		t.Errorf("expected PollMarkerLifeCount=-1 for fixed index .1.1 when device is at .2.3, got %d", life)
+	}
+
+	// 2. Verify that dynamic table walk discovers the alternate indexes
+	session, err := NewRealDynamicSNMPSession(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create real dynamic session: %v", err)
+	}
+	defer session.Close()
+
+	res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+	}
+
+	if res.DiscoveryMode != "SNMP_TABLE_WALK" {
+		t.Fatalf("expected DiscoveryMode='SNMP_TABLE_WALK', got %q", res.DiscoveryMode)
+	}
+	if len(res.Printers) != 1 || res.Printers[0].Index != "2" {
+		t.Fatalf("expected discovered printer index '2', got %+v", res.Printers)
+	}
+	if len(res.Markers) != 1 || res.Markers[0].Index != "2.3" {
+		t.Fatalf("expected discovered marker index '2.3', got %+v", res.Markers)
+	}
+	if res.Markers[0].LifeCount != 1000 || !res.Markers[0].IsPageCounter {
+		t.Errorf("unexpected marker: %+v", res.Markers[0])
+	}
+	if len(res.Supplies) != 2 || res.Supplies[0].Index != "2.1" || res.Supplies[1].Index != "2.2" {
+		t.Fatalf("expected supplies at 2.1 and 2.2, got %+v", res.Supplies)
+	}
+
+	// 3. Verify that Task 1 RunFingerprint discovers alternate indexes dynamically over real UDP
+	realFactory := func(snmpCfg SNMPConfig) (DynamicSNMPSession, error) {
+		return NewRealDynamicSNMPSession(context.Background(), snmpCfg)
+	}
+	fpCfg := FingerprintConfig{
+		SNMPHost:      "127.0.0.1",
+		SNMPPort:      port,
+		SNMPCommunity: "public",
+		SNMPTimeout:   2 * time.Second,
+		Redact:        false,
+	}
+
+	rep, err := RunFingerprint(ctx, nil, realFactory, fpCfg)
+	if err != nil {
+		t.Fatalf("RunFingerprint failed: %v", err)
+	}
+	if rep.SNMP == nil || rep.SNMP.DiscoveryMode != "SNMP_TABLE_WALK" {
+		t.Fatalf("expected SNMP_TABLE_WALK in report, got %+v", rep.SNMP)
+	}
+	if len(rep.SNMP.Markers) != 1 || rep.SNMP.Markers[0].Index != "2.3" {
+		t.Fatalf("expected fingerprint report to discover alternate marker index 2.3, got %+v", rep.SNMP.Markers)
+	}
+	if !rep.Telemetry.HasSNMPMarkerCounter || rep.Telemetry.SNMPMarkerLifeCount != 1000 {
+		t.Errorf("expected HasSNMPMarkerCounter=true and lifeCount=1000, got %+v", rep.Telemetry)
+	}
+	if rep.Telemetry.SNMPMarkerCounterUnit != "sheets" {
+		t.Errorf("expected SNMPMarkerCounterUnit='sheets', got %q", rep.Telemetry.SNMPMarkerCounterUnit)
+	}
+	// Verify Requirement 11: available counter is NEVER verified physical ejection
+	if rep.Telemetry.PhysicalEjectionVerified || rep.Telemetry.SafeForPhysicalCompletion {
+		t.Errorf("expected PhysicalEjectionVerified=false and SafeForPhysicalCompletion=false for read-only capability fingerprint")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 11: Counter Units (sheets=8 vs impressions=7 vs hours=11 vs feet=16)
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_CounterUnits(t *testing.T) {
+	binPath, port, stateFile, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	ctx := context.Background()
+
+	cases := []struct {
+		name          string
+		unitArg       string
+		wantUnit      int64
+		wantUnitName  string
+		wantIsPage    bool
+	}{
+		{"impressions(7)", "7", 7, "impressions", true},
+		{"hours(11)", "11", 11, "hours", false},
+		{"feet(16)", "16", 16, "feet", false},
+		{"sheets(8)", "8", 8, "sheets", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setCmd := exec.Command(binPath, "set", "-state", stateFile, "-marker-unit", tc.unitArg)
+			if out, err := setCmd.CombinedOutput(); err != nil {
+				t.Fatalf("failed to set marker unit: %v (output: %s)", err, string(out))
+			}
+			time.Sleep(50 * time.Millisecond)
+
+			session, err := NewRealDynamicSNMPSession(ctx, cfg)
+			if err != nil {
+				t.Fatalf("failed to create session: %v", err)
+			}
+			defer session.Close()
+
+			res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+			if err != nil {
+				t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+			}
+			if len(res.Markers) == 0 {
+				t.Fatalf("no markers discovered")
+			}
+			m := res.Markers[0]
+			if m.CounterUnit != tc.wantUnit {
+				t.Errorf("CounterUnit: got %d, want %d", m.CounterUnit, tc.wantUnit)
+			}
+			if m.CounterUnitName != tc.wantUnitName {
+				t.Errorf("CounterUnitName: got %q, want %q", m.CounterUnitName, tc.wantUnitName)
+			}
+			if m.IsPageCounter != tc.wantIsPage {
+				t.Errorf("IsPageCounter: got %v, want %v", m.IsPageCounter, tc.wantIsPage)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 12: Absent Lifetime Counts
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_AbsentLifetimeCounts(t *testing.T) {
+	binPath, port, stateFile, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	ctx := context.Background()
+
+	// 1. Omit marker life count OID
+	setCmd := exec.Command(binPath, "set", "-state", stateFile, "-marker-omit-life", "true")
+	if out, err := setCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to omit marker life: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	session, err := NewRealDynamicSNMPSession(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+	}
+	if len(res.Markers) == 0 {
+		t.Fatalf("expected marker row to still be discovered for unit")
+	}
+	if res.Markers[0].HasLifeCount {
+		t.Errorf("expected HasLifeCount=false when life count OID is omitted")
+	}
+	if res.Markers[0].LifeCount != -1 {
+		t.Errorf("expected LifeCount=-1 when life count OID is omitted, got %d", res.Markers[0].LifeCount)
+	}
+
+	// 2. Restore marker life count
+	setCmd2 := exec.Command(binPath, "set", "-state", stateFile, "-marker-omit-life", "false")
+	if out, err := setCmd2.CombinedOutput(); err != nil {
+		t.Fatalf("failed to restore marker life: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	res2, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed on second check: %v", err)
+	}
+	if !res2.Markers[0].HasLifeCount || res2.Markers[0].LifeCount != 1000 {
+		t.Errorf("expected HasLifeCount=true and LifeCount=1000 after restore, got %+v", res2.Markers[0])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 13: Missing Supplies
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_MissingSupplies(t *testing.T) {
+	binPath, port, stateFile, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	ctx := context.Background()
+
+	// 1. Clear supplies to simulate printer with no readable supply tables
+	setCmd := exec.Command(binPath, "set", "-state", stateFile, "-clear-supplies")
+	if out, err := setCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to clear supplies: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	session, err := NewRealDynamicSNMPSession(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+	}
+	if len(res.Supplies) != 0 {
+		t.Errorf("expected 0 supplies after clear-supplies, got %d", len(res.Supplies))
+	}
+	// Printer status is still healthy/idle and table walk succeeded
+	if res.DiscoveryMode != "SNMP_TABLE_WALK" {
+		t.Errorf("expected DiscoveryMode='SNMP_TABLE_WALK', got %q", res.DiscoveryMode)
+	}
+
+	// 2. Verify independent health polling works when supplies are missing
+	health := PollHealthConfig(ctx, cfg, 100)
+	if !health.Online || health.State != "IDLE" {
+		t.Errorf("expected printer to remain Online and IDLE, got Online=%v State=%q", health.Online, health.State)
+	}
+
+	// 3. Restore supplies
+	setCmd2 := exec.Command(binPath, "set", "-state", stateFile, "-restore-supplies")
+	if out, err := setCmd2.CombinedOutput(); err != nil {
+		t.Fatalf("failed to restore supplies: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	res2, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed on restore: %v", err)
+	}
+	if len(res2.Supplies) != 2 {
+		t.Errorf("expected 2 supplies after restore, got %d", len(res2.Supplies))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 14: Printer Restart and Hardware Faults
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_RestartAndHardwareFaults(t *testing.T) {
+	binPath, port, stateFile, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	cfg := SNMPConfig{
+		Target:    "127.0.0.1",
+		Port:      port,
+		Community: "public",
+		Timeout:   2 * time.Second,
+		Retries:   0,
+	}
+	ctx := context.Background()
+
+	// 1. Simulate printer restart with counter update
+	setCmd := exec.Command(binPath, "set", "-state", stateFile, "-restart", "-counter", "500")
+	if out, err := setCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to simulate restart: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	session, err := NewRealDynamicSNMPSession(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	res, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed: %v", err)
+	}
+	if len(res.Markers) == 0 || res.Markers[0].LifeCount != 500 {
+		t.Errorf("expected marker life count 500 after reset, got %+v", res.Markers)
+	}
+	if res.SysUpTime == "" {
+		t.Errorf("expected sysUpTime to be reported after restart")
+	}
+
+	// 2. Simulate hardware fault: paper jam + door open
+	setCmd2 := exec.Command(binPath, "set", "-state", stateFile, "-set-error", "jammed,door_open")
+	if out, err := setCmd2.CombinedOutput(); err != nil {
+		t.Fatalf("failed to set faults: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	res2, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed on fault query: %v", err)
+	}
+	if len(res2.Printers) == 0 {
+		t.Fatalf("no printer discovered")
+	}
+	flags := res2.Printers[0].ErrorFlags
+	if !flags.Jammed || !flags.DoorOpen {
+		t.Errorf("expected Jammed=true and DoorOpen=true, got Jammed=%v Door=%v", flags.Jammed, flags.DoorOpen)
+	}
+	if len(res2.Covers) > 0 && res2.Covers[0].Status != 3 {
+		t.Errorf("expected cover status=3 (open), got %d", res2.Covers[0].Status)
+	}
+
+	// 3. Clear faults
+	setCmd3 := exec.Command(binPath, "set", "-state", stateFile, "-clear-all-errors")
+	if out, err := setCmd3.CombinedOutput(); err != nil {
+		t.Fatalf("failed to clear errors: %v (output: %s)", err, string(out))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	res3, err := DiscoverSNMPDynamic(ctx, session, "127.0.0.1", port)
+	if err != nil {
+		t.Fatalf("DiscoverSNMPDynamic failed after error clear: %v", err)
+	}
+	if res3.Printers[0].ErrorFlags.Jammed || res3.Printers[0].ErrorFlags.DoorOpen {
+		t.Errorf("expected all error flags cleared, got %+v", res3.Printers[0].ErrorFlags)
+	}
+	if len(res3.Covers) > 0 && res3.Covers[0].Status != 4 {
+		t.Errorf("expected cover status=4 (closed), got %d", res3.Covers[0].Status)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 15: Synthetic Fixture Labeling & Physical Ejection Proof Prohibition
+// -----------------------------------------------------------------------------
+func TestSNMPEmulator_SyntheticLabeling_NoEjectionProof(t *testing.T) {
+	_, port, _, stop := startTestSNMPProcess(t)
+	defer stop()
+
+	ctx := context.Background()
+
+	realFactory := func(snmpCfg SNMPConfig) (DynamicSNMPSession, error) {
+		return NewRealDynamicSNMPSession(context.Background(), snmpCfg)
+	}
+	fpCfg := FingerprintConfig{
+		SNMPHost:      "127.0.0.1",
+		SNMPPort:      port,
+		SNMPCommunity: "public",
+		SNMPTimeout:   2 * time.Second,
+		Redact:        false,
+	}
+
+	rep, err := RunFingerprint(ctx, nil, realFactory, fpCfg)
+	if err != nil {
+		t.Fatalf("RunFingerprint failed: %v", err)
+	}
+
+	// Requirement 11:
+	// Verify that available telemetry does not assert physical ejection verification
+	if rep.Telemetry.PhysicalEjectionVerified || rep.Telemetry.SafeForPhysicalCompletion {
+		t.Errorf("safety violation: synthetic marker availability must never claim PhysicalEjectionVerified=true or SafeForPhysicalCompletion=true")
+	}
+	if rep.Telemetry.Rating == "Physical Completion Verified" {
+		t.Errorf("safety violation: capability fingerprint must not claim Physical Completion Verified")
+	}
+
+	// Verify that human readable output contains sanitized and non-misleading status
+	human := FormatHumanReadable(rep)
+	if strings.Contains(human, "PHYSICAL COMPLETION VERIFIED") {
+		t.Errorf("human output incorrectly claims physical completion verified")
+	}
+	if !strings.Contains(human, "TELEMETRY EVALUATION") {
+		t.Errorf("human output missing telemetry evaluation section")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,8 @@ import (
 // Supported MIB OIDs matching XeroxGo queries
 const (
 	oidSysDescr                    = "1.3.6.1.2.1.1.1.0"
+	oidSysObjectID                 = "1.3.6.1.2.1.1.2.0"
+	oidSysUpTime                   = "1.3.6.1.2.1.1.3.0"
 	oidHrPrinterStatus             = "1.3.6.1.2.1.25.3.5.1.1.1"
 	oidHrPrinterDetectedErrorState = "1.3.6.1.2.1.25.3.5.1.2.1"
 	oidPrtMarkerLifeCount          = "1.3.6.1.2.1.43.10.2.1.4.1.1"
@@ -29,6 +32,16 @@ const (
 	oidPrtMarkerSuppliesMax1       = "1.3.6.1.2.1.43.11.1.1.8.1.1"
 	oidPrtMarkerSuppliesLevel2     = "1.3.6.1.2.1.43.11.1.1.9.1.2"
 	oidPrtMarkerSuppliesMax2       = "1.3.6.1.2.1.43.11.1.1.8.1.2"
+)
+
+// Standard MIB Table Subtree Roots (RFC 1213, RFC 2790, RFC 3805)
+const (
+	oidSubtreeHRPrinter   = "1.3.6.1.2.1.25.3.5.1"
+	oidSubtreePrtGeneral  = "1.3.6.1.2.1.43.5.1.1"
+	oidSubtreePrtCover    = "1.3.6.1.2.1.43.6.1.1"
+	oidSubtreePrtMarker   = "1.3.6.1.2.1.43.10.2.1"
+	oidSubtreePrtSupplies = "1.3.6.1.2.1.43.11.1.1"
+	oidSubtreePrtAlert    = "1.3.6.1.2.1.43.18.1.1"
 )
 
 // RFC 2790 hrPrinterDetectedErrorState bitmasks
@@ -55,25 +68,89 @@ const (
 	FlagOverduePreventMaint byte = 0x02
 )
 
+// RFC 3805 PrtMarkerCounterUnitTC
+const (
+	MarkerUnitTenThousandthsOfInches = 3
+	MarkerUnitMicrometers            = 4
+	MarkerUnitCharacters             = 5
+	MarkerUnitLines                  = 6
+	MarkerUnitImpressions            = 7
+	MarkerUnitSheets                 = 8
+	MarkerUnitDotRow                 = 9
+	MarkerUnitHours                  = 11
+	MarkerUnitFeet                   = 16
+)
+
+// MarkerState represents an RFC 3805 prtMarkerTable row entry.
+type MarkerState struct {
+	Index         string `json:"index"` // hrDeviceIndex.markerIndex, e.g. "1.1" or "2.3"
+	CounterUnit   int    `json:"counter_unit"`
+	LifeCount     uint32 `json:"life_count"`
+	PowerOnCount  uint32 `json:"power_on_count,omitempty"`
+	OmitLifeCount bool   `json:"omit_life_count,omitempty"`
+}
+
+// SupplyState represents an RFC 3805 prtMarkerSuppliesTable row entry.
+type SupplyState struct {
+	Index       string `json:"index"` // hrDeviceIndex.supplyIndex, e.g. "1.1" or "2.1"
+	Description string `json:"description"`
+	Type        int    `json:"type"`        // 3 = toner, 15 = opc/drum
+	Class       int    `json:"class"`       // 3 = supplyThatIsConsumed, 4 = receptacleThatIsFilled
+	Unit        int    `json:"unit"`        // 15 = percent, 8 = sheets, 19 = items
+	MaxCapacity int    `json:"max_capacity"`
+	Level       int    `json:"level"`
+}
+
+// CoverState represents an RFC 3805 prtCoverTable row entry.
+type CoverState struct {
+	Index       string `json:"index"` // hrDeviceIndex.coverIndex, e.g. "1.1" or "2.1"
+	Description string `json:"description"`
+	Status      int    `json:"status"` // 3 = coverOpen, 4 = coverClosed, 5 = interlockOpen, 6 = interlockClosed
+}
+
+// AlertState represents an RFC 3805 prtAlertTable row entry.
+type AlertState struct {
+	Index       string `json:"index"` // hrDeviceIndex.alertIndex, e.g. "1.1"
+	Severity    int    `json:"severity"`
+	Training    int    `json:"training"`
+	Group       int    `json:"group"`
+	Code        int    `json:"code"`
+	Description string `json:"description"`
+	Time        uint32 `json:"time"`
+}
+
 // SNMPState encapsulates the simulated printer telemetry state.
 type SNMPState struct {
-	SysDescr        string   `json:"sys_descr"`
-	HrPrinterStatus int      `json:"hr_printer_status"`
-	ErrorByte0      byte     `json:"error_byte_0"`
-	ErrorByte1      byte     `json:"error_byte_1"`
-	MarkerLifeCount uint32   `json:"marker_life_count"`
-	TonerLevel      int      `json:"toner_level"`
-	TonerMax        int      `json:"toner_max"`
-	DrumLevel       int      `json:"drum_level"`
-	DrumMax         int      `json:"drum_max"`
-	OmittedOIDs     []string `json:"omitted_oids,omitempty"`
-	Offline         bool     `json:"offline,omitempty"`
+	SysDescr        string        `json:"sys_descr"`
+	SysObjectID     string        `json:"sys_object_id,omitempty"`
+	SysUpTime       uint32        `json:"sys_uptime,omitempty"`
+	PrinterName     string        `json:"printer_name,omitempty"`
+	PrinterIndex    string        `json:"printer_index,omitempty"`
+	HrPrinterStatus int           `json:"hr_printer_status"`
+	ErrorByte0      byte          `json:"error_byte_0"`
+	ErrorByte1      byte          `json:"error_byte_1"`
+	MarkerLifeCount uint32        `json:"marker_life_count"`
+	TonerLevel      int           `json:"toner_level"`
+	TonerMax        int           `json:"toner_max"`
+	DrumLevel       int           `json:"drum_level"`
+	DrumMax         int           `json:"drum_max"`
+	Markers         []MarkerState `json:"markers,omitempty"`
+	Supplies        []SupplyState `json:"supplies,omitempty"`
+	SuppliesCleared bool          `json:"supplies_cleared,omitempty"`
+	Covers          []CoverState  `json:"covers,omitempty"`
+	Alerts          []AlertState  `json:"alerts,omitempty"`
+	OmittedOIDs     []string      `json:"omitted_oids,omitempty"`
+	Offline         bool          `json:"offline,omitempty"`
 }
 
 // DefaultState returns healthy/idle default state.
 func DefaultState() SNMPState {
 	return SNMPState{
 		SysDescr:        "Xerox WorkCentre 3025 (Local Emulator)",
+		SysObjectID:     "1.3.6.1.4.1.2699.1",
+		SysUpTime:       360000, // 3600 seconds in 10ms ticks
+		PrinterName:     "Xerox WorkCentre 3025 (Local Emulator)",
+		PrinterIndex:    "1",
 		HrPrinterStatus: 3, // idle
 		ErrorByte0:      0x00,
 		ErrorByte1:      0x00,
@@ -82,8 +159,44 @@ func DefaultState() SNMPState {
 		TonerMax:        100,
 		DrumLevel:       95,
 		DrumMax:         100,
+		Markers: []MarkerState{
+			{
+				Index:       "1.1",
+				CounterUnit: MarkerUnitSheets, // sheets(8)
+				LifeCount:   1000,
+			},
+		},
+		Supplies: []SupplyState{
+			{
+				Index:       "1.1",
+				Description: "Black Toner Cartridge (Synthetic Test Fixture)",
+				Type:        3,  // toner
+				Class:       3,  // supplyThatIsConsumed
+				Unit:        15, // percent
+				MaxCapacity: 100,
+				Level:       85,
+			},
+			{
+				Index:       "1.2",
+				Description: "OPC Drum Unit (Synthetic Test Fixture)",
+				Type:        15, // opc / drum
+				Class:       3,  // supplyThatIsConsumed
+				Unit:        15, // percent
+				MaxCapacity: 100,
+				Level:       95,
+			},
+		},
+		Covers: []CoverState{
+			{
+				Index:       "1.1",
+				Description: "Front Cover",
+				Status:      4, // coverClosed
+			},
+		},
+		Alerts:          nil,
 		OmittedOIDs:     nil,
 		Offline:         false,
+		SuppliesCleared: false,
 	}
 }
 
@@ -101,6 +214,346 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(h)
 	return ip != nil && ip.IsLoopback()
+}
+
+// parseOIDParts parses an OID string into a slice of unsigned 32-bit integers.
+func parseOIDParts(oid string) ([]uint32, error) {
+	clean := strings.TrimPrefix(strings.TrimSpace(oid), ".")
+	if clean == "" {
+		return nil, nil
+	}
+	parts := strings.Split(clean, ".")
+	res := make([]uint32, len(parts))
+	for i, p := range parts {
+		v, err := strconv.ParseUint(p, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		res[i] = uint32(v)
+	}
+	return res, nil
+}
+
+// compareOIDs performs standard RFC 1157 / RFC 1905 lexicographical numeric OID comparison.
+// Returns -1 if oidA < oidB, 1 if oidA > oidB, 0 if oidA == oidB.
+func compareOIDs(oidA, oidB string) int {
+	partsA, errA := parseOIDParts(oidA)
+	partsB, errB := parseOIDParts(oidB)
+	if errA != nil || errB != nil {
+		return strings.Compare(normalizeOID(oidA), normalizeOID(oidB))
+	}
+	minLen := len(partsA)
+	if len(partsB) < minLen {
+		minLen = len(partsB)
+	}
+	for i := 0; i < minLen; i++ {
+		if partsA[i] < partsB[i] {
+			return -1
+		}
+		if partsA[i] > partsB[i] {
+			return 1
+		}
+	}
+	if len(partsA) < len(partsB) {
+		return -1
+	}
+	if len(partsA) > len(partsB) {
+		return 1
+	}
+	return 0
+}
+
+// Sync ensures synchronization between legacy flat fields and structured table slices.
+func (s *SNMPState) Sync() {
+	if s.PrinterIndex == "" {
+		s.PrinterIndex = "1"
+	}
+	if s.SysObjectID == "" {
+		s.SysObjectID = "1.3.6.1.4.1.2699.1"
+	}
+	if s.SysUpTime == 0 {
+		s.SysUpTime = 360000
+	}
+	if s.PrinterName == "" {
+		s.PrinterName = s.SysDescr
+	}
+
+	// Markers synchronization
+	if len(s.Markers) == 0 {
+		mIdx := s.PrinterIndex + ".1"
+		s.Markers = []MarkerState{
+			{
+				Index:       mIdx,
+				CounterUnit: MarkerUnitSheets,
+				LifeCount:   s.MarkerLifeCount,
+			},
+		}
+	} else {
+		// If legacy MarkerLifeCount was changed, sync to primary marker
+		if s.MarkerLifeCount != s.Markers[0].LifeCount {
+			s.Markers[0].LifeCount = s.MarkerLifeCount
+		}
+	}
+
+	// Supplies synchronization
+	if len(s.Supplies) == 0 && !s.SuppliesCleared {
+		tIdx := s.PrinterIndex + ".1"
+		dIdx := s.PrinterIndex + ".2"
+		s.Supplies = []SupplyState{
+			{
+				Index:       tIdx,
+				Description: "Black Toner Cartridge (Synthetic Test Fixture)",
+				Type:        3,  // toner
+				Class:       3,  // consumed
+				Unit:        15, // percent
+				MaxCapacity: s.TonerMax,
+				Level:       s.TonerLevel,
+			},
+			{
+				Index:       dIdx,
+				Description: "OPC Drum Unit (Synthetic Test Fixture)",
+				Type:        15, // drum
+				Class:       3,  // consumed
+				Unit:        15, // percent
+				MaxCapacity: s.DrumMax,
+				Level:       s.DrumLevel,
+			},
+		}
+	} else if len(s.Supplies) > 0 {
+		for i := range s.Supplies {
+			if s.Supplies[i].Type == 3 {
+				if s.TonerMax > 0 && s.TonerLevel >= -2 {
+					s.Supplies[i].MaxCapacity = s.TonerMax
+					s.Supplies[i].Level = s.TonerLevel
+				}
+			} else if s.Supplies[i].Type == 15 {
+				if s.DrumMax > 0 && s.DrumLevel >= -2 {
+					s.Supplies[i].MaxCapacity = s.DrumMax
+					s.Supplies[i].Level = s.DrumLevel
+				}
+			}
+		}
+	}
+
+	// Covers synchronization with error flags
+	if len(s.Covers) == 0 {
+		cIdx := s.PrinterIndex + ".1"
+		cStatus := 4 // coverClosed
+		if s.ErrorByte0&FlagDoorOpen != 0 {
+			cStatus = 3 // coverOpen
+		}
+		s.Covers = []CoverState{
+			{
+				Index:       cIdx,
+				Description: "Front Access Cover",
+				Status:      cStatus,
+			},
+		}
+	} else {
+		if s.ErrorByte0&FlagDoorOpen != 0 {
+			s.Covers[0].Status = 3 // coverOpen
+		} else if s.Covers[0].Status == 3 {
+			s.Covers[0].Status = 4 // coverClosed
+		}
+	}
+}
+
+// buildActiveMIB compiles all scalar and RFC table variable bindings into a numerically sorted PDU slice.
+func (s *SNMPState) buildActiveMIB() []gosnmp.SnmpPDU {
+	s.Sync()
+	var pdus []gosnmp.SnmpPDU
+
+	// RFC 1213 / SNMPv2-MIB scalars
+	pdus = append(pdus,
+		gosnmp.SnmpPDU{
+			Name:  "." + normalizeOID(oidSysDescr),
+			Type:  gosnmp.OctetString,
+			Value: []byte(s.SysDescr),
+		},
+		gosnmp.SnmpPDU{
+			Name:  "." + normalizeOID(oidSysObjectID),
+			Type:  gosnmp.ObjectIdentifier,
+			Value: "." + normalizeOID(s.SysObjectID),
+		},
+		gosnmp.SnmpPDU{
+			Name:  "." + normalizeOID(oidSysUpTime),
+			Type:  gosnmp.TimeTicks,
+			Value: s.SysUpTime,
+		},
+	)
+
+	pIdx := s.PrinterIndex
+	if pIdx == "" {
+		pIdx = "1"
+	}
+
+	// RFC 2790 hrPrinterTable: 1.3.6.1.2.1.25.3.5.1
+	// Col 1: hrPrinterStatus
+	pdus = append(pdus, gosnmp.SnmpPDU{
+		Name:  fmt.Sprintf(".1.3.6.1.2.1.25.3.5.1.1.%s", pIdx),
+		Type:  gosnmp.Integer,
+		Value: s.HrPrinterStatus,
+	})
+	// Col 2: hrPrinterDetectedErrorState
+	pdus = append(pdus, gosnmp.SnmpPDU{
+		Name:  fmt.Sprintf(".1.3.6.1.2.1.25.3.5.1.2.%s", pIdx),
+		Type:  gosnmp.OctetString,
+		Value: []byte{s.ErrorByte0, s.ErrorByte1},
+	})
+
+	// RFC 3805 prtGeneralTable: 1.3.6.1.2.1.43.5.1.1
+	// Col 16: prtGeneralPrinterName
+	prtName := s.PrinterName
+	if prtName == "" {
+		prtName = s.SysDescr
+	}
+	pdus = append(pdus, gosnmp.SnmpPDU{
+		Name:  fmt.Sprintf(".1.3.6.1.2.1.43.5.1.1.16.%s", pIdx),
+		Type:  gosnmp.OctetString,
+		Value: []byte(prtName),
+	})
+
+	// RFC 3805 prtCoverTable: 1.3.6.1.2.1.43.6.1.1
+	// Col 2: prtCoverDescription
+	// Col 3: prtCoverStatus
+	for _, cov := range s.Covers {
+		pdus = append(pdus,
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.6.1.1.2.%s", cov.Index),
+				Type:  gosnmp.OctetString,
+				Value: []byte(cov.Description),
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.6.1.1.3.%s", cov.Index),
+				Type:  gosnmp.Integer,
+				Value: cov.Status,
+			},
+		)
+	}
+
+	// RFC 3805 prtMarkerTable: 1.3.6.1.2.1.43.10.2.1
+	// Col 3: prtMarkerCounterUnit
+	// Col 4: prtMarkerLifeCount
+	// Col 5: prtMarkerPowerOnCount
+	for _, m := range s.Markers {
+		pdus = append(pdus, gosnmp.SnmpPDU{
+			Name:  fmt.Sprintf(".1.3.6.1.2.1.43.10.2.1.3.%s", m.Index),
+			Type:  gosnmp.Integer,
+			Value: m.CounterUnit,
+		})
+		if !m.OmitLifeCount {
+			pdus = append(pdus, gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.10.2.1.4.%s", m.Index),
+				Type:  gosnmp.Counter32,
+				Value: m.LifeCount,
+			})
+		}
+		if m.PowerOnCount > 0 {
+			pdus = append(pdus, gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.10.2.1.5.%s", m.Index),
+				Type:  gosnmp.Counter32,
+				Value: m.PowerOnCount,
+			})
+		}
+	}
+
+	// RFC 3805 prtMarkerSuppliesTable: 1.3.6.1.2.1.43.11.1.1
+	// Col 4: prtMarkerSuppliesClass
+	// Col 5: prtMarkerSuppliesType
+	// Col 6: prtMarkerSuppliesDescription
+	// Col 7: prtMarkerSuppliesSupplyUnit
+	// Col 8: prtMarkerSuppliesMaxCapacity
+	// Col 9: prtMarkerSuppliesLevel
+	for _, sup := range s.Supplies {
+		pdus = append(pdus,
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.4.%s", sup.Index),
+				Type:  gosnmp.Integer,
+				Value: sup.Class,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.5.%s", sup.Index),
+				Type:  gosnmp.Integer,
+				Value: sup.Type,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.6.%s", sup.Index),
+				Type:  gosnmp.OctetString,
+				Value: []byte(sup.Description),
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.7.%s", sup.Index),
+				Type:  gosnmp.Integer,
+				Value: sup.Unit,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.8.%s", sup.Index),
+				Type:  gosnmp.Integer,
+				Value: sup.MaxCapacity,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.11.1.1.9.%s", sup.Index),
+				Type:  gosnmp.Integer,
+				Value: sup.Level,
+			},
+		)
+	}
+
+	// RFC 3805 prtAlertTable: 1.3.6.1.2.1.43.18.1.1
+	for _, alt := range s.Alerts {
+		pdus = append(pdus,
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.2.%s", alt.Index),
+				Type:  gosnmp.Integer,
+				Value: alt.Severity,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.3.%s", alt.Index),
+				Type:  gosnmp.Integer,
+				Value: alt.Training,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.4.%s", alt.Index),
+				Type:  gosnmp.Integer,
+				Value: alt.Group,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.7.%s", alt.Index),
+				Type:  gosnmp.Integer,
+				Value: alt.Code,
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.8.%s", alt.Index),
+				Type:  gosnmp.OctetString,
+				Value: []byte(alt.Description),
+			},
+			gosnmp.SnmpPDU{
+				Name:  fmt.Sprintf(".1.3.6.1.2.1.43.18.1.1.9.%s", alt.Index),
+				Type:  gosnmp.TimeTicks,
+				Value: alt.Time,
+			},
+		)
+	}
+
+	// Filter out OmittedOIDs
+	omittedSet := make(map[string]bool)
+	for _, o := range s.OmittedOIDs {
+		omittedSet[normalizeOID(o)] = true
+	}
+
+	var filtered []gosnmp.SnmpPDU
+	for _, p := range pdus {
+		if !omittedSet[normalizeOID(p.Name)] {
+			filtered = append(filtered, p)
+		}
+	}
+
+	// Sort numerically by OID
+	sort.Slice(filtered, func(i, j int) bool {
+		return compareOIDs(filtered[i].Name, filtered[j].Name) < 0
+	})
+
+	return filtered
 }
 
 // StateStore manages state loading, saving, and thread-safe dynamic reloads.
@@ -146,6 +599,7 @@ func (s *StateStore) loadOrInit() error {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("invalid json in state file %s: %w", s.filePath, err)
 	}
+	state.Sync()
 	s.state = state
 	s.lastMtime = info.ModTime()
 	return nil
@@ -167,6 +621,7 @@ func (s *StateStore) ReloadIfChanged() {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return
 	}
+	state.Sync()
 	s.mu.Lock()
 	s.state = state
 	s.lastMtime = info.ModTime()
@@ -183,6 +638,7 @@ func (s *StateStore) UpdateState(fn func(*SNMPState)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fn(&s.state)
+	s.state.Sync()
 	return s.saveLocked()
 }
 
@@ -326,9 +782,17 @@ func (srv *Server) listenLoop() {
 			continue
 		}
 
-		if packet.PDUType != gosnmp.GetRequest {
-			// SNMPv2c GetNext / Bulk not queried by XeroxGo, ignore
+		if packet.PDUType != gosnmp.GetRequest &&
+			packet.PDUType != gosnmp.GetNextRequest &&
+			packet.PDUType != gosnmp.GetBulkRequest {
 			continue
+		}
+
+		activeMIB := state.buildActiveMIB()
+
+		omittedSet := make(map[string]bool)
+		for _, o := range state.OmittedOIDs {
+			omittedSet[normalizeOID(o)] = true
 		}
 
 		resp := &gosnmp.SnmpPacket{
@@ -340,82 +804,144 @@ func (srv *Server) listenLoop() {
 			Variables: make([]gosnmp.SnmpPDU, 0, len(packet.Variables)),
 		}
 
-		for _, pdu := range packet.Variables {
-			normOID := normalizeOID(pdu.Name)
+		switch packet.PDUType {
+		case gosnmp.GetRequest:
+			for _, pdu := range packet.Variables {
+				normReqOID := normalizeOID(pdu.Name)
 
-			// Check if OID is explicitly omitted
-			omitted := false
-			for _, o := range state.OmittedOIDs {
-				if normalizeOID(o) == normOID {
-					omitted = true
-					break
+				if omittedSet[normReqOID] {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  gosnmp.NoSuchInstance,
+						Value: nil,
+					})
+					continue
+				}
+
+				var found *gosnmp.SnmpPDU
+				for i := range activeMIB {
+					if normalizeOID(activeMIB[i].Name) == normReqOID {
+						found = &activeMIB[i]
+						break
+					}
+				}
+
+				if found != nil {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  found.Type,
+						Value: found.Value,
+					})
+				} else {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  gosnmp.NoSuchInstance,
+						Value: nil,
+					})
 				}
 			}
 
-			if omitted {
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.NoSuchInstance,
-					Value: nil,
-				})
-				continue
+		case gosnmp.GetNextRequest:
+			for _, pdu := range packet.Variables {
+				normReqOID := normalizeOID(pdu.Name)
+				var successor *gosnmp.SnmpPDU
+				for i := range activeMIB {
+					if compareOIDs(normalizeOID(activeMIB[i].Name), normReqOID) > 0 {
+						successor = &activeMIB[i]
+						break
+					}
+				}
+
+				if successor != nil {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  successor.Name,
+						Type:  successor.Type,
+						Value: successor.Value,
+					})
+				} else {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  gosnmp.EndOfMibView,
+						Value: nil,
+					})
+				}
 			}
 
-			switch normOID {
-			case normalizeOID(oidSysDescr):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.OctetString,
-					Value: []byte(state.SysDescr),
-				})
-			case normalizeOID(oidHrPrinterStatus):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.HrPrinterStatus,
-				})
-			case normalizeOID(oidHrPrinterDetectedErrorState):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.OctetString,
-					Value: []byte{state.ErrorByte0, state.ErrorByte1},
-				})
-			case normalizeOID(oidPrtMarkerLifeCount):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Counter32,
-					Value: state.MarkerLifeCount,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesLevel1):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.TonerLevel,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesMax1):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.TonerMax,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesLevel2):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.DrumLevel,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesMax2):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.DrumMax,
-				})
-			default:
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.NoSuchInstance,
-					Value: nil,
-				})
+		case gosnmp.GetBulkRequest:
+			nonRepeaters := int(packet.NonRepeaters)
+			if nonRepeaters < 0 {
+				nonRepeaters = 0
+			}
+			maxRepetitions := int(packet.MaxRepetitions)
+			if maxRepetitions < 0 {
+				maxRepetitions = 0
+			}
+			numVars := len(packet.Variables)
+			nr := nonRepeaters
+			if nr > numVars {
+				nr = numVars
+			}
+
+			// Handle non-repeaters (1 successor each)
+			for i := 0; i < nr; i++ {
+				pdu := packet.Variables[i]
+				normReqOID := normalizeOID(pdu.Name)
+				var successor *gosnmp.SnmpPDU
+				for j := range activeMIB {
+					if compareOIDs(normalizeOID(activeMIB[j].Name), normReqOID) > 0 {
+						successor = &activeMIB[j]
+						break
+					}
+				}
+				if successor != nil {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  successor.Name,
+						Type:  successor.Type,
+						Value: successor.Value,
+					})
+				} else {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  gosnmp.EndOfMibView,
+						Value: nil,
+					})
+				}
+			}
+
+			// Handle repeaters (up to maxRepetitions successors for remaining variables)
+			repeatersCount := numVars - nr
+			if repeatersCount > 0 && maxRepetitions > 0 {
+				lastOIDs := make([]string, repeatersCount)
+				for i := 0; i < repeatersCount; i++ {
+					lastOIDs[i] = normalizeOID(packet.Variables[nr+i].Name)
+				}
+
+				for r := 0; r < maxRepetitions; r++ {
+					for i := 0; i < repeatersCount; i++ {
+						currentOID := lastOIDs[i]
+						var successor *gosnmp.SnmpPDU
+						for j := range activeMIB {
+							if compareOIDs(normalizeOID(activeMIB[j].Name), currentOID) > 0 {
+								successor = &activeMIB[j]
+								break
+							}
+						}
+						if successor != nil {
+							resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+								Name:  successor.Name,
+								Type:  successor.Type,
+								Value: successor.Value,
+							})
+							lastOIDs[i] = normalizeOID(successor.Name)
+						} else {
+							resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+								Name:  packet.Variables[nr+i].Name,
+								Type:  gosnmp.EndOfMibView,
+								Value: nil,
+							})
+						}
+					}
+				}
 			}
 		}
 
@@ -504,9 +1030,39 @@ func parseStatusString(s string) (int, error) {
 	}
 }
 
+func formatMarkerUnitName(unit int) string {
+	switch unit {
+	case MarkerUnitTenThousandthsOfInches:
+		return "tenThousandthsOfInches(3)"
+	case MarkerUnitMicrometers:
+		return "micrometers(4)"
+	case MarkerUnitCharacters:
+		return "characters(5)"
+	case MarkerUnitLines:
+		return "lines(6)"
+	case MarkerUnitImpressions:
+		return "impressions(7)"
+	case MarkerUnitSheets:
+		return "sheets(8)"
+	case MarkerUnitDotRow:
+		return "dotRow(9)"
+	case MarkerUnitHours:
+		return "hours(11)"
+	case MarkerUnitFeet:
+		return "feet(16)"
+	default:
+		return fmt.Sprintf("custom(%d)", unit)
+	}
+}
+
 func printState(state SNMPState, w io.Writer) {
-	fmt.Fprintf(w, "SNMP Emulator State:\n")
+	fmt.Fprintf(w, "SNMP Emulator State (Synthetic Test Fixture - Not Real Hardware Measurement):\n")
 	fmt.Fprintf(w, "  sysDescr:              %s\n", state.SysDescr)
+	fmt.Fprintf(w, "  sysObjectID:           %s\n", state.SysObjectID)
+	fmt.Fprintf(w, "  sysUpTime:             %d (10ms ticks)\n", state.SysUpTime)
+	fmt.Fprintf(w, "  prtGeneralPrinterName: %s\n", state.PrinterName)
+	fmt.Fprintf(w, "  printerIndex:          %s\n", state.PrinterIndex)
+
 	statusStr := "UNKNOWN"
 	switch state.HrPrinterStatus {
 	case 1:
@@ -581,17 +1137,42 @@ func printState(state SNMPState, w io.Writer) {
 		fmt.Fprintf(w, "  Active Error Flags:    %s\n", strings.Join(activeFlags, ", "))
 	}
 
-	fmt.Fprintf(w, "  prtMarkerLifeCount:    %d\n", state.MarkerLifeCount)
-	tonerPct := 0
-	if state.TonerMax > 0 && state.TonerLevel >= 0 {
-		tonerPct = (state.TonerLevel * 100) / state.TonerMax
+	fmt.Fprintf(w, "  Markers (%d configured):\n", len(state.Markers))
+	for _, m := range state.Markers {
+		lifeStr := fmt.Sprintf("%d", m.LifeCount)
+		if m.OmitLifeCount {
+			lifeStr = "OMITTED (OID not served)"
+		}
+		fmt.Fprintf(w, "    - Index %s: unit=%s, lifeCount=%s, powerOn=%d\n",
+			m.Index, formatMarkerUnitName(m.CounterUnit), lifeStr, m.PowerOnCount)
 	}
-	fmt.Fprintf(w, "  Toner (Supply 1):      %d / %d (%d%%)\n", state.TonerLevel, state.TonerMax, tonerPct)
-	drumPct := 0
-	if state.DrumMax > 0 && state.DrumLevel >= 0 {
-		drumPct = (state.DrumLevel * 100) / state.DrumMax
+
+	fmt.Fprintf(w, "  Supplies (%d configured):\n", len(state.Supplies))
+	if len(state.Supplies) == 0 {
+		if state.SuppliesCleared {
+			fmt.Fprintf(w, "    (Supplies cleared - simulating missing supplies)\n")
+		} else {
+			fmt.Fprintf(w, "    (No supplies configured)\n")
+		}
 	}
-	fmt.Fprintf(w, "  Drum (Supply 2):       %d / %d (%d%%)\n", state.DrumLevel, state.DrumMax, drumPct)
+	for _, sup := range state.Supplies {
+		pct := 0
+		if sup.MaxCapacity > 0 && sup.Level >= 0 {
+			pct = (sup.Level * 100) / sup.MaxCapacity
+		}
+		fmt.Fprintf(w, "    - Index %s (%s): %d / %d (%d%%) [type=%d, unit=%d]\n",
+			sup.Index, sup.Description, sup.Level, sup.MaxCapacity, pct, sup.Type, sup.Unit)
+	}
+
+	fmt.Fprintf(w, "  Covers (%d configured):\n", len(state.Covers))
+	for _, cov := range state.Covers {
+		statusStr := "closed(4)"
+		if cov.Status == 3 {
+			statusStr = "open(3)"
+		}
+		fmt.Fprintf(w, "    - Index %s (%s): %s\n", cov.Index, cov.Description, statusStr)
+	}
+
 	if len(state.OmittedOIDs) > 0 {
 		fmt.Fprintf(w, "  Omitted OIDs:          %s\n", strings.Join(state.OmittedOIDs, ", "))
 	}
@@ -708,6 +1289,20 @@ func cmdSet(args []string) {
 	unomitOID := fs.String("unomit-oid", "", "OID to restore if previously omitted")
 	clearOmitted := fs.Bool("clear-omitted", false, "Clear all omitted OIDs")
 	sysDescr := fs.String("sys-descr", "", "Set sysDescr value")
+	sysObjectID := fs.String("sys-object-id", "", "Set sysObjectID value")
+	printerName := fs.String("printer-name", "", "Set prtGeneralPrinterName value")
+	printerIndex := fs.String("printer-index", "", "Set printer / hrDeviceIndex (e.g. 1 or 2)")
+	markerIndex := fs.String("marker-index", "", "Set primary marker index (e.g. 1.1 or 2.1)")
+	markerUnit := fs.Int("marker-unit", -1, "Set primary marker counter unit (8=sheets, 7=impressions, 11=hours, 16=feet)")
+	markerOmitLife := fs.String("marker-omit-life", "", "Omit marker life count OID (true/false)")
+	supplyIndex := fs.String("supply-index", "", "Set primary toner supply index (e.g. 1.1 or 2.1)")
+	drumIndex := fs.String("drum-index", "", "Set secondary drum supply index (e.g. 1.2 or 2.2)")
+	clearSupplies := fs.Bool("clear-supplies", false, "Clear all supplies (simulate missing supplies)")
+	restoreSupplies := fs.Bool("restore-supplies", false, "Restore default supplies")
+	coverIndex := fs.String("cover-index", "", "Set cover index (e.g. 1.1)")
+	coverStatus := fs.Int("cover-status", -1, "Set cover status (3=coverOpen, 4=coverClosed)")
+	uptime := fs.Int64("uptime", -1, "Set sysUpTime in 10ms ticks")
+	restart := fs.Bool("restart", false, "Simulate printer restart (resets uptime to 100 ticks)")
 	offline := fs.String("offline", "", "Simulate communication loss (true/false)")
 	_ = fs.Parse(args)
 
@@ -778,9 +1373,15 @@ func cmdSet(args []string) {
 		}
 		if *counter >= 0 {
 			s.MarkerLifeCount = uint32(*counter)
+			if len(s.Markers) > 0 {
+				s.Markers[0].LifeCount = uint32(*counter)
+			}
 		}
 		if *counterInc > 0 {
 			s.MarkerLifeCount += uint32(*counterInc)
+			if len(s.Markers) > 0 {
+				s.Markers[0].LifeCount = s.MarkerLifeCount
+			}
 		}
 		if *tonerLevel != -999 {
 			s.TonerLevel = *tonerLevel
@@ -822,6 +1423,77 @@ func cmdSet(args []string) {
 		}
 		if *sysDescr != "" {
 			s.SysDescr = *sysDescr
+		}
+		if *sysObjectID != "" {
+			s.SysObjectID = *sysObjectID
+		}
+		if *printerName != "" {
+			s.PrinterName = *printerName
+		}
+		if *printerIndex != "" {
+			s.PrinterIndex = *printerIndex
+		}
+		if *markerIndex != "" {
+			if len(s.Markers) == 0 {
+				s.Markers = append(s.Markers, MarkerState{Index: *markerIndex, CounterUnit: MarkerUnitSheets, LifeCount: s.MarkerLifeCount})
+			} else {
+				s.Markers[0].Index = *markerIndex
+			}
+		}
+		if *markerUnit >= 0 {
+			if len(s.Markers) == 0 {
+				s.Markers = append(s.Markers, MarkerState{Index: s.PrinterIndex + ".1", CounterUnit: *markerUnit, LifeCount: s.MarkerLifeCount})
+			} else {
+				s.Markers[0].CounterUnit = *markerUnit
+			}
+		}
+		if *markerOmitLife != "" {
+			omit := strings.EqualFold(*markerOmitLife, "true") || *markerOmitLife == "1"
+			if len(s.Markers) == 0 {
+				s.Markers = append(s.Markers, MarkerState{Index: s.PrinterIndex + ".1", CounterUnit: MarkerUnitSheets, LifeCount: s.MarkerLifeCount, OmitLifeCount: omit})
+			} else {
+				s.Markers[0].OmitLifeCount = omit
+			}
+		}
+		if *clearSupplies {
+			s.SuppliesCleared = true
+			s.Supplies = nil
+		}
+		if *restoreSupplies {
+			s.SuppliesCleared = false
+			s.Supplies = nil
+		}
+		if *supplyIndex != "" {
+			if len(s.Supplies) == 0 {
+				s.Supplies = append(s.Supplies, SupplyState{Index: *supplyIndex, Description: "Black Toner Cartridge (Synthetic Test Fixture)", Type: 3, Class: 3, Unit: 15, MaxCapacity: s.TonerMax, Level: s.TonerLevel})
+			} else {
+				s.Supplies[0].Index = *supplyIndex
+			}
+		}
+		if *drumIndex != "" {
+			if len(s.Supplies) > 1 {
+				s.Supplies[1].Index = *drumIndex
+			}
+		}
+		if *coverIndex != "" {
+			if len(s.Covers) == 0 {
+				s.Covers = append(s.Covers, CoverState{Index: *coverIndex, Description: "Front Cover", Status: 4})
+			} else {
+				s.Covers[0].Index = *coverIndex
+			}
+		}
+		if *coverStatus >= 0 {
+			if len(s.Covers) == 0 {
+				s.Covers = append(s.Covers, CoverState{Index: s.PrinterIndex + ".1", Description: "Front Cover", Status: *coverStatus})
+			} else {
+				s.Covers[0].Status = *coverStatus
+			}
+		}
+		if *uptime >= 0 {
+			s.SysUpTime = uint32(*uptime)
+		}
+		if *restart {
+			s.SysUpTime = 100 // 1 second
 		}
 		if *offline != "" {
 			s.Offline = strings.EqualFold(*offline, "true") || *offline == "1"
