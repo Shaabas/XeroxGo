@@ -255,50 +255,33 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 	// Subtest 2: Competing orders on same kiosk with limited stock (Advisory Lock Serialization)
 	t.Run("Postgres_PaperOvercommitment_AdvisoryLock", func(t *testing.T) {
 		kioskStock := fmt.Sprintf("kiosk-pg-stock-%d", time.Now().UnixNano()%100000)
-		availableStock := 15
-		sheetsPerOrder := 6
-		orderCount := 4 // Total needed = 24 sheets > 15 available. Exactly 2 should succeed, 2 should fail.
-
-		var orderIDs []string
-		for i := 0; i < orderCount; i++ {
-			ordID := fmt.Sprintf("ord_pg_stock_%d_%d", time.Now().UnixNano(), i)
-			pin := fmt.Sprintf("51%02d", i)
-			createTestOrderWithSheets(t, s, ctx, ordID, kioskStock, pin, sheetsPerOrder, contracts.JobStatusPendingPayment, now)
-			orderIDs = append(orderIDs, ordID)
-		}
-
+		const availableStock, sheetsPerOrder, orderCount = 15, 6, 4
 		var wg sync.WaitGroup
-		wg.Add(orderCount)
-		errorsList := make([]error, orderCount)
-
+		results := make([]error, orderCount)
 		for i := 0; i < orderCount; i++ {
-			idx := i
-			ordID := orderIDs[i]
-			go func() {
+			wg.Add(1)
+			go func(i int) {
 				defer wg.Done()
-				_, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskStock, ordID, availableStock, 5*time.Minute, now)
-				errorsList[idx] = err
-			}()
+				ord := makeTestOrderWithSheets(
+					fmt.Sprintf("ord_pg_stock_%d_%d", now.UnixNano(), i),
+					kioskStock, fmt.Sprintf("%04d", 5100+i),
+					sheetsPerOrder, contracts.JobStatusPendingPayment, now)
+				results[i] = s.CreateOrderWithPaperCheck(ctx, ord, availableStock)
+			}(i)
 		}
 		wg.Wait()
-
-		var successCount int
-		var insufficientCount int
-		for _, err := range errorsList {
+		var successCount, insufficientCount int
+		for _, err := range results {
 			if err == nil {
 				successCount++
 			} else if errors.Is(err, ErrInsufficientPaper) {
 				insufficientCount++
 			} else {
-				t.Errorf("unexpected error: %v", err)
+				t.Errorf("unexpected PIN reservation error: %v", err)
 			}
 		}
-
-		if successCount != 2 {
-			t.Fatalf("expected 2 successful claims, got %d", successCount)
-		}
-		if insufficientCount != 2 {
-			t.Fatalf("expected 2 insufficient paper rejections, got %d", insufficientCount)
+		if successCount != 2 || insufficientCount != 2 {
+			t.Fatalf("expected 2 PINs issued and 2 rejected for insufficient paper, got %d and %d", successCount, insufficientCount)
 		}
 	})
 
@@ -323,7 +306,7 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 		}
 	})
 
-	// Subtest 4: Explicit Cancellation and Paper Stock Release in PostgreSQL
+	// Subtest 4: Kiosk session cancellation retains the mobile PIN reservation.
 	t.Run("Postgres_CancellationAndReclaim", func(t *testing.T) {
 		kioskCancel := fmt.Sprintf("kiosk-pg-cancel-%d", time.Now().UnixNano()%100000)
 		orderID := fmt.Sprintf("ord_pg_cancel_%d", time.Now().UnixNano())
@@ -344,10 +327,10 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 			t.Fatalf("CancelKioskSession failed: %v", err)
 		}
 
-		// Paper commitment must immediately drop to 0
+		// The issued PIN still owns the paper despite kiosk cancel.
 		committedAfter, _ := s.GetCommittedPaperSheets(ctx, kioskCancel, "", now)
-		if committedAfter != 0 {
-			t.Fatalf("expected 0 committed sheets after cancel, got %d", committedAfter)
+		if committedAfter != 5 {
+			t.Fatalf("canceled session lost PIN reservation: got %d, want 5", committedAfter)
 		}
 
 		// Re-claim order
@@ -375,8 +358,8 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 		// At t0 + 3 min, session has expired
 		tExpired := t0.Add(3 * time.Minute)
 		committedExpired, _ := s.GetCommittedPaperSheets(ctx, kioskExp, "", tExpired)
-		if committedExpired != 0 {
-			t.Fatalf("expired session must commit 0 sheets, got %d", committedExpired)
+		if committedExpired != 4 {
+			t.Fatalf("expired session must retain 4 PIN-reserved sheets, got %d", committedExpired)
 		}
 
 		// Re-claim order at tExpired
