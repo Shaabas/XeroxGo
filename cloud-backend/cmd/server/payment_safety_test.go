@@ -274,6 +274,7 @@ func TestPaymentSafety_ConcurrentWebhooks_AtomicSingleDispatch(t *testing.T) {
 
 	var dispatchedCount int32
 	var duplicateOrProcessedCount int32
+	var excessRefundCount int32
 
 	for i := 0; i < concurrency; i++ {
 		eventID := fmt.Sprintf("evt_conc_%d", i) // distinct event IDs to test database-level transition safety
@@ -292,8 +293,12 @@ func TestPaymentSafety_ConcurrentWebhooks_AtomicSingleDispatch(t *testing.T) {
 
 			var m map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&m)
-			if m["status"] == "dispatched" {
+			if m["status"] == "dispatched" || m["status"] == "dispatch_pending" {
+				// This test has no connected WebSocket; exactly one capture may
+				// create durable dispatch authorization, not physical printing.
 				atomic.AddInt32(&dispatchedCount, 1)
+			} else if m["status"] == "excess_payment_refund_required" {
+				atomic.AddInt32(&excessRefundCount, 1)
 			} else if m["status"] == "already_processed" || m["status"] == "duplicate" {
 				atomic.AddInt32(&duplicateOrProcessedCount, 1)
 			}
@@ -303,8 +308,12 @@ func TestPaymentSafety_ConcurrentWebhooks_AtomicSingleDispatch(t *testing.T) {
 	wg.Wait()
 
 	// Exactly ONE webhook can authorize dispatch!
-	if dispatchedCount != 1 {
-		t.Fatalf("expected exactly 1 dispatched webhook, got %d (concurrent duplicates=%d)", dispatchedCount, duplicateOrProcessedCount)
+	if dispatchedCount != 1 || excessRefundCount != concurrency-1 {
+		t.Fatalf("expected one durable dispatch and %d independent surplus refunds, got dispatch=%d excess=%d (duplicates=%d)",
+			concurrency-1, dispatchedCount, excessRefundCount, duplicateOrProcessedCount)
+	}
+	if refund, err := st.GetRefundRequest(context.Background(), orderID); err != nil || refund != nil {
+		t.Fatalf("offline transport wrongly created fulfillment refund: %+v %v", refund, err)
 	}
 
 	// Order status must be DISPATCHED
@@ -344,8 +353,8 @@ func TestPaymentSafety_DuplicateWebhooks_Idempotent(t *testing.T) {
 	var res1 map[string]string
 	_ = json.NewDecoder(resp1.Body).Decode(&res1)
 	resp1.Body.Close()
-	if res1["status"] != "dispatched" {
-		t.Fatalf("expected first request dispatched, got %v", res1)
+	if res1["status"] != "dispatch_pending" {
+		t.Fatalf("without a WebSocket the first capture must queue durable delivery, got %v", res1)
 	}
 
 	// 2nd identical request
@@ -2320,8 +2329,8 @@ func TestPaymentSafety_CaptureFailure_RetrySucceedsWithoutBeingIgnored(t *testin
 	}
 	var res2 map[string]string
 	_ = json.NewDecoder(whResp2.Body).Decode(&res2)
-	if res2["status"] != "dispatched" {
-		t.Fatalf("expected retry status 'dispatched', got %q", res2["status"])
+	if res2["status"] != "dispatch_pending" {
+		t.Fatalf("captured payment retry must retain durable authorization without a WebSocket, got %q", res2["status"])
 	}
 
 	// Verify order is now DISPATCHED
@@ -2380,8 +2389,8 @@ func TestPaymentSafety_DuplicateCallbacks_StrictSingleDispatch(t *testing.T) {
 	var res1 map[string]string
 	_ = json.NewDecoder(r1.Body).Decode(&res1)
 	r1.Body.Close()
-	if res1["status"] != "dispatched" {
-		t.Fatalf("expected first callback status dispatched, got %v", res1)
+	if res1["status"] != "dispatch_pending" {
+		t.Fatalf("first callback must authorize pending durable delivery without WebSocket, got %v", res1)
 	}
 
 	// 2nd callback: returns already_processed
@@ -2463,7 +2472,7 @@ func TestPaymentSafety_ConcurrentDuplicateCallbacks_SamePaymentID(t *testing.T) 
 
 			var m map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&m)
-			if m["status"] == "dispatched" {
+			if m["status"] == "dispatched" || m["status"] == "dispatch_pending" {
 				atomic.AddInt32(&dispatchedCount, 1)
 			} else if m["status"] == "already_processed" || m["status"] == "duplicate" {
 				atomic.AddInt32(&alreadyProcessedCount, 1)
