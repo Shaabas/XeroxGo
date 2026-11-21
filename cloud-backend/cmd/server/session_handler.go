@@ -426,14 +426,12 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 	// Verify paper supply against other commitments
 	committedSheets, cErr := s.db.GetCommittedPaperSheets(r.Context(), kioskID, orderID, now)
 	if cErr == nil {
-		reqSheets := ord.TotalSheets
-		if reqSheets <= 0 {
-			reqSheets = ord.Command.TotalSheets
+		// The order-level total is authoritative; do not assume a single sheet.
+		if ord.TotalSheets <= 0 {
+			http.Error(w, "invalid order sheet count", http.StatusInternalServerError)
+			return
 		}
-		if reqSheets <= 0 {
-			reqSheets = 1
-		}
-		if (stock - committedSheets) < reqSheets {
+		if (stock - committedSheets) < ord.TotalSheets {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]string{
