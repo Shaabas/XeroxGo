@@ -26,7 +26,7 @@
 - Unpaid PINs issued by mobile upload currently expire after **5 minutes**; their stock commitment ends at that timestamp.
 - Kiosk checkout/session cancellation, inactivity, or session expiration does **not** abandon the still-valid mobile reservation. The customer may re-enter their PIN until it expires.
 - Paid/queued/printing jobs remain committed until their outstanding sheet requirement has been consumed or they reach an appropriate terminal state.
-- Recovery PINs for paid, unprinted orders also expire after **5 minutes**; that timeout does not release their paid-order paper commitment.
+- Recovery PINs for paid, unprinted orders are **not subject to the five-minute unpaid timeout**. The backend currently holds these paid PINs with a far-future internal lease, and revokes them on fulfillment closure. Paid entitlements and short unpaid reservations are distinct.
 - Kiosk "Esc" exits the checkout session; it is not a command to delete the customer's pending mobile order.
 - There is no legacy paper-count fallback or automatic migration of historic development records with missing totals.
 
