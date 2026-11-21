@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strings"
 	"time"
 
-	"xeroxgo/cloud-backend/internal/payments"
 	"xeroxgo/cloud-backend/internal/store"
 )
 
@@ -30,8 +28,7 @@ func (s *appServer) startRefundWorker(ctx context.Context) {
 func (s *appServer) processRefundsOnce(ctx context.Context) error {
 	if s.db == nil { return nil }
 	provider := s.getPaymentProvider()
-	refunder, ok := provider.(payments.RefundProvider)
-	if !ok { return fmt.Errorf("payment provider %s does not support refunds", provider.Name()) }
+	refunder := provider
 
 	// A captured payment establishes a durable fulfillment entitlement.
 	// An expired/missing kiosk session or absent dispatch intent is NOT proof

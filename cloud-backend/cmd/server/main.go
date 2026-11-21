@@ -53,10 +53,10 @@ type appServer struct {
 	hub             *ws.Hub
 	convWake        chan struct{}
 	pinLimiter      *PINRateLimiter
-	paymentProvider payments.Provider
+	paymentProvider *payments.MockProvider
 }
 
-func (s *appServer) getPaymentProvider() payments.Provider {
+func (s *appServer) getPaymentProvider() *payments.MockProvider {
 	if s.paymentProvider != nil {
 		return s.paymentProvider
 	}

@@ -1,13 +1,6 @@
 package payments
 
-import "context"
-
-// RefundProvider is implemented by the sole demo payment simulator.
-type RefundProvider interface {
-	Refund(ctx context.Context, paymentID string, amountPaise int64, idempotencyKey string) (RefundResult, error)
-	GetRefund(ctx context.Context, refundID string) (RefundResult, error)
-}
-
+// RefundResult describes the outcome of a simulated refund. No funds move.
 type RefundResult struct {
 	ID        string
 	PaymentID string
