@@ -31,6 +31,10 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
+// customerPINValidity controls mobile-issued unpaid PINs and paid-order
+// recovery PINs. Unpaid paper reservations expire with the mobile PIN.
+const customerPINValidity = 5 * time.Minute
+
 type serverConfig struct {
 	addr               string
 	dbPath             string
@@ -481,8 +485,8 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Unpaid paper must not be held for hours when a customer abandons checkout.
-	// The mobile checkout already communicates a 15-minute PIN lifetime.
-	pinExpiresAt := time.Now().UTC().Add(15 * time.Minute)
+	// The mobile checkout receives this authoritative expiry in the response.
+	pinExpiresAt := time.Now().UTC().Add(customerPINValidity)
 
 	cmd := contracts.PrintJobCommand{
 		JobID:            docs[0].JobID,
