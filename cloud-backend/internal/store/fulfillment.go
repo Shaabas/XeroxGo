@@ -105,19 +105,27 @@ func (s *Store) ClearKioskBlock(ctx context.Context, kioskID string) error {
 // recovery rotation after capture.
 func (s *Store) extendPaidPINInTx(ctx context.Context, tx *sql.Tx, orderID string, nowNS int64) error {
 	until := paidPINDeadline.UnixNano()
+	// Keep a paid PIN only if it is still reserved for THIS order. Extending
+	// orders.display_code without a live matching reservation could revive a
+	// code already recycled for a different customer.
 	res, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE pin_reservations SET expires_at_ns = ?
+WHERE order_id = ? AND expires_at_ns > ?
+AND kiosk_id = (SELECT kiosk_id FROM orders WHERE order_id = ?)
+AND pin = (SELECT display_code FROM orders WHERE order_id = ?);`),
+		until, orderID, nowNS, orderID, orderID)
+	if err != nil { return fmt.Errorf("promote paid pin reservation: %w", err) }
+	n, err := res.RowsAffected()
+	if err != nil { return err }
+	if n != 1 {
+		// Late capture is still valid payment, but must use secure recovery
+		// token rotation instead of resurrecting the old PIN.
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders SET pin_expires_at_ns = ?, updated_at_ns = ?
 WHERE order_id = ? AND display_code <> '' AND pin_expires_at_ns > ?;`),
 		until, nowNS, orderID, nowNS)
-	if err != nil { return fmt.Errorf("promote paid pin: %w", err) }
-	affected, err := res.RowsAffected()
-	if err != nil { return err }
-	if affected == 0 { return nil }
-	// Guard against a PIN that has already been independently released or
-	// reused: do not overwrite another customer's reservation.
-	_, err = tx.ExecContext(ctx, s.rebind(`
-UPDATE pin_reservations SET expires_at_ns = ?
-WHERE order_id = ? AND expires_at_ns > ?;`), until, orderID, nowNS)
 	return err
 }
 
