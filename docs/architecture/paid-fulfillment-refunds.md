@@ -49,6 +49,9 @@ is necessary for the refund worker to run.
 
 - Exactly one verified captured payment may fund an order and authorize printing.
   The binding is serialized per order and persisted in `order_funding_payments`.
+- A provider-signed capture matched to a persisted attempt but carrying an
+  incorrect amount is recorded as refund-only, never applied to printing.
+  Unassociated captures still require secure provider/order reconciliation.
 - Every additional distinct captured payment is persisted atomically with a
   separate `payment_refund_requests` obligation, even if the order has already
   completed. Repeated callbacks for the same payment ID do not duplicate money.
