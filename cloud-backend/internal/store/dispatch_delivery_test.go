@@ -152,3 +152,31 @@ func TestDispatchDelivery_LateSessionCancelCannotErasePaidDispatchIntents(t *tes
 		t.Fatalf("paid dispatch lost its reconnect path: %+v %v",pending,err)
 	}
 }
+
+func TestDispatchDelivery_OnlyOwningKioskCanAcknowledgeJob(t *testing.T) {
+	s,err:=Open(filepath.Join(t.TempDir(),"kiosk_acks.db"))
+	if err!=nil{t.Fatal(err)}
+	defer s.Close()
+	ctx:=context.Background()
+	now:=time.Now().UTC()
+	const orderID,kioskID="ord_ack_ownership","kiosk_ack_owner"
+	createTestOrderWithSheets(t,s,ctx,orderID,kioskID,"2853",2,contracts.JobStatusPendingPayment,now)
+	session,err:=s.CreateOrGetKioskSession(ctx,kioskID,orderID,5*time.Minute,now)
+	if err!=nil{t.Fatal(err)}
+	paid,err:=s.CapturePaymentAndCheckDispatch(ctx,PaymentRecord{
+		PaymentID:"pay_ack_ownership",OrderID:orderID,KioskID:kioskID,
+		SessionID:session.SessionID,AmountPaise:400,Provider:"mock",Status:"captured",
+	},now)
+	if err!=nil||!paid.DispatchEligible{t.Fatalf("missing authorized job: %+v %v",paid,err)}
+	jobID:="job_"+orderID
+	if err:=s.MarkDispatchAcknowledgedForKiosk(ctx,"kiosk_other",jobID);err!=nil{t.Fatal(err)}
+	status,_,err:=s.GetJobDispatchIntentStatus(ctx,jobID)
+	if err!=nil||status!="PENDING"{
+		t.Fatalf("foreign kiosk ack suppressed valid replay: %q %v",status,err)
+	}
+	if err:=s.MarkDispatchAcknowledgedForKiosk(ctx,kioskID,jobID);err!=nil{t.Fatal(err)}
+	status,_,err=s.GetJobDispatchIntentStatus(ctx,jobID)
+	if err!=nil||status!="ACKNOWLEDGED"{
+		t.Fatalf("owning kiosk could not ack: %q %v",status,err)
+	}
+}
