@@ -1102,16 +1102,16 @@ func renderError(dst *image.RGBA, state ScreenState) {
 		body  string
 	}{
 		{
-			"Automatic Refund",
-			"Any unprinted pages will be refunded automatically to your original payment method.",
+			"Refund Arrangement",
+			"If printing cannot finish, a full refund will be requested. You can leave.",
 		},
 		{
-			"Exact Accounting",
-			"Only sheets that were physically delivered to the output tray are billed.",
+			"Print Safety",
+			"The printer will remain unavailable until the fault is cleared safely.",
 		},
 		{
-			"Attendant Dispatched",
-			"The kiosk has notified service personnel of this hardware interruption.",
+			"Attendant Required",
+			"An attendant must inspect and restore this kiosk before new orders.",
 		},
 		{
 			"Need Immediate Assistance?",
