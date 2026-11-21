@@ -708,10 +708,20 @@ func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
 		t.Fatal("expected job to be in PAUSED_ERROR state")
 	}
 
-	client.currentModeMu.Lock()
-	mode := client.currentMode
-	client.currentModeMu.Unlock()
-
+	// Durable job progress is committed before the UI is rendered. Under
+	// -race, the test can observe PAUSED_ERROR before the rendering goroutine
+	// acquires renderMu. Wait for the screen transition, not an arbitrary delay.
+	modeDeadline := time.Now().Add(2 * time.Second)
+	var mode ui_ipc.ScreenMode
+	for time.Now().Before(modeDeadline) {
+		client.currentModeMu.Lock()
+		mode = client.currentMode
+		client.currentModeMu.Unlock()
+		if mode == ui_ipc.ModeError {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if mode != ui_ipc.ModeError {
 		t.Fatalf("expected currentMode to be ModeError, got %s", mode)
 	}
@@ -832,7 +842,24 @@ func TestHealthScreen_DuplicateErrorHandling_ExactlyOnce(t *testing.T) {
 		t.Fatal("expected job to be in PAUSED_ERROR state")
 	}
 
+	// Wait for the asynchronous screen render after the SQLite commit,
+	// then ensure concurrent health and CUPS errors did not duplicate it.
+	renderDeadline := time.Now().Add(2 * time.Second)
 	errorRenderCount := 0
+	for time.Now().Before(renderDeadline) {
+		errorRenderCount = 0
+		for _, st := range client.RenderHistory() {
+			if st.Mode == ui_ipc.ModeError {
+				errorRenderCount++
+			}
+		}
+		if errorRenderCount > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	errorRenderCount = 0
 	for _, st := range client.RenderHistory() {
 		if st.Mode == ui_ipc.ModeError {
 			errorRenderCount++
