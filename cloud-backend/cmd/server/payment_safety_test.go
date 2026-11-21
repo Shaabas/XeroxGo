@@ -1039,7 +1039,7 @@ func TestPaymentSafety_ReleaseRequiresExplicitSessionID(t *testing.T) {
 	}
 }
 
-func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
+func TestPaymentSafety_ReconnectRetainsPaidJobAfterStaleSessionCancel(t *testing.T) {
 	kioskID := "kiosk-cancel-reconn-1"
 	orderID := "ord_cancel_reconn_001"
 	pin := "1234"
@@ -1071,7 +1071,8 @@ func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
-	// Customer cancels the kiosk session before kiosk reconnects
+	// A late cancel from a stale kiosk UI cannot revoke a session that
+	// payment capture already completed, nor erase its authorized print intents.
 	cancelReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/cancel", ts.URL, kioskID, sessID), nil)
 	cancelReq.Header.Set("Authorization", "Bearer "+kSec)
 	canResp, err := http.DefaultClient.Do(cancelReq)
@@ -1099,24 +1100,29 @@ func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
 	}
 	defer wsConn.CloseNow()
 
-	// Give the hub a moment to run reconciliation
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify that the order was NOT dispatched, intent was CANCELED, and order is in PAID_WAITING
+	// A resumed authenticated kiosk must receive the unchanged print
+	// command even if the old payment screen sent a delayed session cancel.
+	var msg wireMsg
+	for {
+		if err := wsjson.Read(ctx, wsConn, &msg); err != nil {
+			t.Fatalf("reconnected paid dispatch missing: %v", err)
+		}
+		if msg.Type != "sync_ads" { break }
+	}
+	if msg.Type != "job" || msg.Job == nil || msg.Job.JobID != "job_"+orderID {
+		t.Fatalf("paid command not preserved across stale cancel: %+v", msg)
+	}
+	sess, err := st.GetKioskSession(context.Background(), sessID, time.Now().UTC())
+	if err != nil || sess.Status != store.KioskSessionCompleted {
+		t.Fatalf("paid session erroneously canceled: %+v %v", sess, err)
+	}
 	ord, err := st.GetOrder(context.Background(), orderID)
-	if err != nil {
-		t.Fatalf("GetOrder failed: %v", err)
+	if err != nil || ord.Status != contracts.JobStatusDispatched {
+		t.Fatalf("late cancel revoked paid dispatch: %+v %v", ord, err)
 	}
-	if ord.Status != contracts.JobStatusPaidWaiting {
-		t.Fatalf("expected order status PAID_WAITING after reconnect with canceled session, got %s", ord.Status)
-	}
-
 	pending, err := st.GetPendingDispatchOrders(context.Background(), kioskID)
-	if err != nil {
-		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("expected 0 pending dispatch orders, got %d", len(pending))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("reconnected job should be SENT, not repeatedly pending: %+v %v", pending, err)
 	}
 }
 
