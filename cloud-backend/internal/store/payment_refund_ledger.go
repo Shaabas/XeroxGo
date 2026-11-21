@@ -210,3 +210,33 @@ FROM payment_refund_requests WHERE order_id=? AND reason='EXCESS_CAPTURE';`),
 		orderID).Scan(&out.Total,&out.Processed,&out.Unresolved)
 	return out, err
 }
+
+
+// HistoricalCaptureReview is a captured payment imported from a prior
+// deployment without verified evidence of whether a refund was issued.
+// It is never picked up by the automatic refund worker.
+type HistoricalCaptureReview struct {
+	OrderID     string `json:"order_id"`
+	PaymentID   string `json:"payment_id"`
+	Provider    string `json:"provider"`
+	AmountPaise int64  `json:"amount_paise"`
+	CreatedAtNS int64  `json:"created_at_ns"`
+}
+
+func (s *Store) ListHistoricalCaptureReviews(ctx context.Context) ([]HistoricalCaptureReview, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT order_id, payment_id, provider, amount_paise, created_at_ns
+FROM payment_refund_requests
+WHERE reason='EXCESS_CAPTURE' AND status='RECONCILIATION_REQUIRED'
+ORDER BY created_at_ns ASC LIMIT 200;`)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var out []HistoricalCaptureReview
+	for rows.Next() {
+		var review HistoricalCaptureReview
+		if err := rows.Scan(&review.OrderID, &review.PaymentID, &review.Provider,
+			&review.AmountPaise, &review.CreatedAtNS); err != nil { return nil, err }
+		out = append(out, review)
+	}
+	return out, rows.Err()
+}
