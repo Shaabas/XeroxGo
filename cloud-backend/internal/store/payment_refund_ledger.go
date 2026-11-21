@@ -23,6 +23,9 @@ func refundIdempotencyKey(paymentID string) string {
 
 // Additive, idempotent migration. Preserve the old order-scoped refund table
 // for audit and copy all in-flight statuses, refund IDs and idempotency keys.
+// Historic surplus captures may already have been manually refunded outside
+// XeroxGo. Backfill them as RECONCILIATION_REQUIRED (not worker-actionable);
+// an operator must compare with provider records before any new refund.
 func (s *Store) migratePaymentRefundSchema(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil { return err }
@@ -105,7 +108,7 @@ AND (f.payment_id IS NULL OR p.payment_id <> f.payment_id);`)
 INSERT INTO payment_refund_requests(
 	payment_id,order_id,provider,amount_paise,reason,status,idempotency_key,
 	safe_stop_verified,created_at_ns,updated_at_ns)
-VALUES (?,?,?,?,'EXCESS_CAPTURE','REQUIRED',?,1,?,?)
+VALUES (?,?,?,?,'EXCESS_CAPTURE','RECONCILIATION_REQUIRED',?,0,?,?)
 ON CONFLICT(payment_id) DO NOTHING;`),
 			x.id,x.orderID,x.provider,x.amount,refundIdempotencyKey(x.id),x.at,x.at)
 		if err != nil { return fmt.Errorf("backfill excess payment %s: %w",x.id,err) }
