@@ -2212,10 +2212,13 @@
       }
       const extraTotal = Number(statusData.excess_refunds_total) || 0;
       const extraUnresolved = Number(statusData.excess_refunds_unresolved) || 0;
+      const extraReconciliation = Number(statusData.excess_refunds_reconciliation_required) || 0;
       if (extraTotal > 0) {
-        const extraMessage = extraUnresolved > 0
-          ? 'An additional payment was detected; its refund is being processed separately.'
-          : 'An additional payment was refunded by the payment provider.';
+        const extraMessage = extraReconciliation > 0
+          ? 'An additional payment requires provider reconciliation before any further refund can be requested.'
+          : extraUnresolved > 0
+            ? 'An additional payment was detected; its refund is being processed separately.'
+            : 'An additional payment was refunded by the payment provider.';
         checkoutStatusMsg.textContent += (checkoutStatusMsg.textContent ? ' ' : '') + extraMessage;
       }
     }
