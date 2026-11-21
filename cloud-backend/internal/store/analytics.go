@@ -38,12 +38,11 @@ func (s *Store) GetPricing(ctx context.Context) (PricingConfig, error) {
 		return PricingConfig{}, fmt.Errorf("get pricing: %w", err)
 	}
 
-	var legacyPrice, bwPrice, colorPrice, bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
+	var bwSimplex, bwDuplex, colorSimplex, colorDuplex int64
 	var colorEnabledInt int
 	var updatedNS int64
-	query := "SELECT price_per_sheet_paise, bw_price_per_sheet_paise, color_price_per_sheet_paise, bw_simplex_price_paise, bw_duplex_price_paise, color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns FROM pricing WHERE id = 1;"
+	query := "SELECT bw_simplex_price_paise, bw_duplex_price_paise, color_simplex_price_paise, color_duplex_price_paise, color_enabled, updated_at_ns FROM pricing WHERE id = 1;"
 	err := s.db.QueryRowContext(ctx, query).Scan(
-		&legacyPrice, &bwPrice, &colorPrice,
 		&bwSimplex, &bwDuplex,
 		&colorSimplex, &colorDuplex,
 		&colorEnabledInt, &updatedNS,

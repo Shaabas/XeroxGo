@@ -148,12 +148,6 @@
     let activePreviewTab = 'mobile';
     let isEditingInModal = false;
 
-    let currentBWSimplexPaise = 200;
-    let currentBWDuplexPaise = 150;
-    let currentColorSimplexPaise = 1000;
-    let currentColorDuplexPaise = 750;
-    let currentColorEnabled = false;
-
     let ordersFilter = {
       page: 0,
       limit: 25,

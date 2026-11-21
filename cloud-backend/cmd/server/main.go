@@ -1272,10 +1272,10 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 
 // initPricing ensures database has pricing configured before serving traffic.
 // Default tariff seeding is strictly restricted to an explicitly unconfigured,
-// newly created local SQLite database in dev mode.
-// PostgreSQL databases, existing databases, database connectivity failures,
-// and invalid existing rows MUST fail closed and never seed or rewrite tariffs automatically.
-func initPricing(ctx context.Context, s *store.Store, isPostgres bool, devMode bool) error {
+// genuinely new local SQLite database in dev mode.
+// PostgreSQL databases, existing databases (even with zero orders), database connectivity failures,
+// query errors, and invalid existing rows MUST fail closed and never seed or rewrite tariffs automatically.
+func initPricing(ctx context.Context, s *store.Store, isPostgres bool, devMode bool, isNewSQLite bool) error {
 	if s == nil {
 		return fmt.Errorf("pricing initialization: store is nil")
 	}
@@ -1301,6 +1301,11 @@ func initPricing(ctx context.Context, s *store.Store, isPostgres bool, devMode b
 		return fmt.Errorf("pricing unconfigured in production SQLite database: %w", err)
 	}
 
+	// An existing unconfigured SQLite database must fail closed, even if it contains no orders.
+	if !isNewSQLite {
+		return fmt.Errorf("pricing unconfigured in existing SQLite database: manual configuration required (%w)", err)
+	}
+
 	// Allow default seeding only for an explicitly unconfigured, newly created local SQLite database.
 	// Verify pricing table has 0 rows and orders table has 0 rows.
 	var pricingRows int
@@ -1311,9 +1316,13 @@ func initPricing(ctx context.Context, s *store.Store, isPostgres bool, devMode b
 		return fmt.Errorf("pricing table has %d rows but GetPricing failed: failing closed", pricingRows)
 	}
 
+	// An error from SELECT COUNT(1) FROM orders must cause immediate failure, not be ignored.
 	var orderRows int
-	if orderErr := s.DB().QueryRowContext(ctx, "SELECT COUNT(1) FROM orders;").Scan(&orderRows); orderErr == nil && orderRows > 0 {
-		return fmt.Errorf("pricing missing in existing SQLite database with %d orders: failing closed", orderRows)
+	if orderErr := s.DB().QueryRowContext(ctx, "SELECT COUNT(1) FROM orders;").Scan(&orderRows); orderErr != nil {
+		return fmt.Errorf("failed to check orders table row count: %w", orderErr)
+	}
+	if orderRows > 0 {
+		return fmt.Errorf("pricing missing in SQLite database with %d orders: failing closed", orderRows)
 	}
 
 	def := pricing.DefaultTariff()
@@ -1387,9 +1396,13 @@ func main() {
 	}
 
 	isPostgres := strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://")
+	isNewSQLite := false
 	if !isPostgres {
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
 			log.Fatalf("failed to create db directory: %v", err)
+		}
+		if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+			isNewSQLite = true
 		}
 	}
 	if err := os.MkdirAll(jobsDir, 0700); err != nil {
@@ -1403,7 +1416,7 @@ func main() {
 	defer storeDB.Close()
 
 	ctx := context.Background()
-	if err := initPricing(ctx, storeDB, isPostgres, devMode); err != nil {
+	if err := initPricing(ctx, storeDB, isPostgres, devMode, isNewSQLite); err != nil {
 		log.Fatalf("failed to initialize pricing: %v", err)
 	}
 

@@ -352,8 +352,8 @@ func TestInitPricing_PostgresNeverSeedsEvenInDevMode(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	// Even with devMode = true, PostgreSQL connection must NEVER seed default tariffs
-	err = initPricing(ctx, s, true /* isPostgres */, true /* devMode */)
+	// Even with devMode = true and isNewSQLite = true, PostgreSQL connection must NEVER seed default tariffs
+	err = initPricing(ctx, s, true /* isPostgres */, true /* devMode */, true /* isNewSQLite */)
 	if err == nil {
 		t.Fatalf("expected error from initPricing on Postgres, got nil")
 	}
@@ -392,7 +392,7 @@ PRAGMA ignore_check_constraints = OFF;
 	}
 
 	// initPricing must fail closed on invalid existing rows and never overwrite with defaults
-	err = initPricing(ctx, s, false /* isPostgres */, true /* devMode */)
+	err = initPricing(ctx, s, false /* isPostgres */, true /* devMode */, false /* isNewSQLite */)
 	if err == nil {
 		t.Fatalf("expected initPricing to fail closed on invalid existing rows, got nil")
 	}
@@ -418,14 +418,14 @@ func TestInitPricing_FailsClosedOnDatabaseReadError(t *testing.T) {
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = initPricing(canceledCtx, s, false /* isPostgres */, true /* devMode */)
+	err = initPricing(canceledCtx, s, false /* isPostgres */, true /* devMode */, true /* isNewSQLite */)
 	if err == nil {
 		t.Fatalf("expected initPricing to fail closed on canceled context, got nil")
 	}
 
 	_ = s.Close()
 	// Calling with closed database must also fail closed
-	err = initPricing(context.Background(), s, false, true)
+	err = initPricing(context.Background(), s, false, true, true)
 	if err == nil {
 		t.Fatalf("expected initPricing to fail closed on closed database, got nil")
 	}
@@ -446,8 +446,8 @@ func TestInitPricing_PreservesExistingTariffsAndColorEnabled(t *testing.T) {
 		t.Fatalf("SetDetailedPricing failed: %v", err)
 	}
 
-	// Run initPricing with devMode = true
-	if err := initPricing(ctx, s, false /* isPostgres */, true /* devMode */); err != nil {
+	// Run initPricing with devMode = true (isNewSQLite = false because DB already existed)
+	if err := initPricing(ctx, s, false /* isPostgres */, true /* devMode */, false /* isNewSQLite */); err != nil {
 		t.Fatalf("initPricing returned unexpected error: %v", err)
 	}
 
@@ -474,13 +474,13 @@ func TestInitPricing_SeedsOnlyForNewlyCreatedDevSQLite(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1. In production mode (devMode = false), missing pricing must fail closed
-	if err := initPricing(ctx, s, false /* isPostgres */, false /* devMode */); err == nil {
+	// 1. In production mode (devMode = false), missing pricing must fail closed even if new SQLite
+	if err := initPricing(ctx, s, false /* isPostgres */, false /* devMode */, true /* isNewSQLite */); err == nil {
 		t.Fatalf("expected error in production mode for unconfigured pricing, got nil")
 	}
 
-	// 2. In dev mode with newly created database, seeding succeeds
-	if err := initPricing(ctx, s, false /* isPostgres */, true /* devMode */); err != nil {
+	// 2. In dev mode with genuinely new database (isNewSQLite = true), seeding succeeds
+	if err := initPricing(ctx, s, false /* isPostgres */, true /* devMode */, true /* isNewSQLite */); err != nil {
 		t.Fatalf("expected successful seeding in dev mode, got: %v", err)
 	}
 
@@ -513,7 +513,64 @@ VALUES ('ord-test-1', 'job-test-1', 'kiosk-1', '1234', 'COMPLETED', 500, 1000, 1
 	}
 
 	// Attempt initPricing on existing database missing pricing
-	if err := initPricing(ctx, s2, false, true); err == nil {
+	if err := initPricing(ctx, s2, false, true, false /* isNewSQLite */); err == nil {
 		t.Fatalf("expected initPricing to fail closed on existing SQLite database with orders, got nil")
+	}
+}
+
+func TestInitPricing_FailsClosedOnExistingUnconfiguredSQLiteWithoutOrders(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "existing_empty.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Existing database (isNewSQLite = false) with zero orders must fail closed
+	err = initPricing(ctx, s, false /* isPostgres */, true /* devMode */, false /* isNewSQLite */)
+	if err == nil {
+		t.Fatalf("expected initPricing to fail closed on existing unconfigured SQLite without orders, got nil")
+	}
+
+	var count int
+	if err := s.DB().QueryRow("SELECT COUNT(1) FROM pricing;").Scan(&count); err != nil {
+		t.Fatalf("failed to check pricing count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 rows in pricing, got %d", count)
+	}
+}
+
+func TestInitPricing_FailsClosedOnOrdersQueryError(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "orders_err.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Simulate an error on SELECT COUNT(1) FROM orders by dropping the orders table
+	if _, err := s.DB().Exec("DROP TABLE orders;"); err != nil {
+		t.Fatalf("failed to drop orders table: %v", err)
+	}
+
+	// initPricing must immediately fail closed upon error scanning orders count
+	err = initPricing(ctx, s, false /* isPostgres */, true /* devMode */, true /* isNewSQLite */)
+	if err == nil {
+		t.Fatalf("expected initPricing to fail closed when orders query fails, got nil")
+	}
+
+	var count int
+	if err := s.DB().QueryRow("SELECT COUNT(1) FROM pricing;").Scan(&count); err != nil {
+		t.Fatalf("failed to check pricing count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("pricing must not be seeded on orders query error, got %d rows", count)
 	}
 }
