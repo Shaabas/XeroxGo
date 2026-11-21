@@ -172,8 +172,8 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 	return health.EstimatedSheets, nil
 }
 
-// handleOrderClaim creates or retrieves an active transaction session for a kiosk order.
-// POST /api/k/{kiosk_id}/orders/{order_id}/claim (or /confirm)
+// handleOrderClaim creates or retrieves a transaction session.
+// POST /api/k/{kiosk_id}/orders/{order_id}/claim
 func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -183,11 +183,7 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	suffix := "/claim"
-	if strings.HasSuffix(r.URL.Path, "/confirm") {
-		suffix = "/confirm"
-	}
-	kioskID, orderID, err := parseKioskAndOrder(r.URL.Path, suffix)
+	kioskID, orderID, err := parseKioskAndOrder(r.URL.Path, "/claim")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -271,7 +267,6 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 
 // handleSessionCancel cancels an active transaction session.
 // POST /api/k/{kiosk_id}/sessions/{session_id}/cancel
-// POST /api/k/{kiosk_id}/orders/{order_id}/cancel-session
 func (s *appServer) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -282,21 +277,7 @@ func (s *appServer) handleSessionCancel(w http.ResponseWriter, r *http.Request) 
 	}
 
 	now := time.Now().UTC()
-	var kioskID, sessionID string
-	var err error
-
-	if strings.Contains(r.URL.Path, "/sessions/") {
-		kioskID, sessionID, err = parseKioskAndSession(r.URL.Path, "/cancel")
-	} else if strings.HasSuffix(r.URL.Path, "/cancel-session") {
-		var orderID string
-		kioskID, orderID, err = parseKioskAndOrder(r.URL.Path, "/cancel-session")
-		if err == nil {
-			activeSess, _ := s.db.GetActiveKioskSession(r.Context(), kioskID, orderID, now)
-			if activeSess != nil {
-				sessionID = activeSess.SessionID
-			}
-		}
-	}
+	kioskID, sessionID, err := parseKioskAndSession(r.URL.Path, "/cancel")
 	if err != nil || sessionID == "" {
 		http.Error(w, "invalid cancel path or session not found", http.StatusBadRequest)
 		return
@@ -371,7 +352,6 @@ func (s *appServer) handleGetSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleInitiatePayment verifies that an active transaction session exists before initiating payment.
-// POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment
 // POST /api/k/{kiosk_id}/sessions/{session_id}/initiate-payment
 func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -383,32 +363,28 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 	}
 
 	now := time.Now().UTC()
-	var kioskID, orderID string
-	var err error
-
-	if strings.Contains(r.URL.Path, "/sessions/") {
-		var sessionID string
-		kioskID, sessionID, err = parseKioskAndSession(r.URL.Path, "/initiate-payment")
-		if err == nil {
-			sess, sErr := s.db.GetKioskSession(r.Context(), sessionID, now)
-			if sErr == nil && sess != nil {
-				orderID = sess.OrderID
-			}
-		}
-	} else {
-		kioskID, orderID, err = parseKioskAndOrder(r.URL.Path, "/initiate-payment")
-	}
-	if err != nil || orderID == "" {
-		http.Error(w, "invalid initiate payment path or order not found", http.StatusBadRequest)
+	kioskID, sessionID, err := parseKioskAndSession(r.URL.Path, "/initiate-payment")
+	if err != nil {
+		http.Error(w, "invalid session payment path", http.StatusBadRequest)
 		return
 	}
+	requested, err := s.db.GetKioskSession(r.Context(), sessionID, now)
+	if err != nil {
+		http.Error(w, "unable to resolve checkout session", http.StatusInternalServerError)
+		return
+	}
+	if requested == nil || requested.KioskID != kioskID {
+		http.Error(w, "payment session not found", http.StatusNotFound)
+		return
+	}
+	orderID := requested.OrderID
 
 	sess, err := s.db.GetActiveKioskSession(r.Context(), kioskID, orderID, now)
 	if err != nil {
 		http.Error(w, "failed to check active session", http.StatusInternalServerError)
 		return
 	}
-	if sess == nil || sess.Status != store.KioskSessionPaymentPending {
+	if sess == nil || sess.SessionID != sessionID || sess.Status != store.KioskSessionPaymentPending {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{

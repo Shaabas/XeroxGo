@@ -157,26 +157,6 @@ func (s *appServer) createOrderWithPINRetryAndPaperCheck(ctx context.Context, or
 	return errors.New("unable to reserve unique PIN after maximum collision retries")
 }
 
-func generateSignedDownloadURL(baseURL, orderID string, secret []byte, ttl time.Duration) string {
-	expires := time.Now().Add(ttl).Unix()
-	msg := fmt.Sprintf("%s\n%d", orderID, expires)
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(msg))
-	sig := hex.EncodeToString(mac.Sum(nil))
-	return fmt.Sprintf("%s/api/orders/%s/pdf?expires=%d&sig=%s", baseURL, orderID, expires, sig)
-}
-
-func verifySignedDownloadURL(orderID string, expires int64, sig string, secret []byte) bool {
-	if time.Now().Unix() > expires {
-		return false
-	}
-	msg := fmt.Sprintf("%s\n%d", orderID, expires)
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(msg))
-	expected := hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expected)))
-}
-
 func generateSignedJobDownloadURL(baseURL, orderID, jobID string, secret []byte, ttl time.Duration) string {
 	expires := time.Now().Add(ttl).Unix()
 	msg := fmt.Sprintf("%s\n%s\n%d", orderID, jobID, expires)
@@ -195,32 +175,6 @@ func verifySignedJobDownloadURL(orderID, jobID string, expires int64, sig string
 	mac.Write([]byte(msg))
 	expected := hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(strings.ToLower(sig)), []byte(strings.ToLower(expected)))
-}
-
-func linkOrCopyFile(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(dst)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(dst)
-		return closeErr
-	}
-	return nil
 }
 
 func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -456,19 +410,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// For single-document orders, also create the order-level PDF link/file for backward compatibility with existing tests
-	if !isMultiFile && len(docs) == 1 {
-		hOrd := sha256.Sum256([]byte(orderID))
-		orderPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
-		createdJobFiles = append(createdJobFiles, orderPDFPath)
-		hJob := sha256.Sum256([]byte(docs[0].JobID))
-		jobPDFPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
-		if err := linkOrCopyFile(jobPDFPath, orderPDFPath); err != nil {
-			http.Error(w, fmt.Sprintf("failed to create order-level artifact: %v", err), http.StatusInternalServerError)
-			return
-		}
-	}
-
 	overallDuplex := contracts.DuplexSimplex
 	if anyDuplex {
 		overallDuplex = contracts.DuplexLongEdge
@@ -649,7 +590,10 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if this is a per-job download route: /api/orders/{orderID}/jobs/{jobID}/pdf
-	if strings.Contains(trimmed, "/jobs/") {
+	if !strings.Contains(trimmed, "/jobs/") {
+		http.NotFound(w, r)
+		return
+	}
 		parts := strings.Split(trimmed, "/jobs/")
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			http.Error(w, "invalid job download path", http.StatusBadRequest)
@@ -679,57 +623,8 @@ func (s *appServer) handleDownloadPDF(w http.ResponseWriter, r *http.Request) {
 		pdfPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(h[:])+".pdf")
 		s.streamPDF(w, pdfPath, doc.SHA256Checksum)
 		return
-	}
-
-	// Order-level download route: /api/orders/{orderID}/pdf
-	orderID := strings.TrimSpace(trimmed)
-	if orderID == "" {
-		http.Error(w, "order id required", http.StatusBadRequest)
-		return
-	}
-
-	if !verifySignedDownloadURL(orderID, expires, sig, s.cfg.downloadSecret) {
-		http.Error(w, "invalid or expired download URL", http.StatusUnauthorized)
-		return
-	}
-
-	order, err := s.db.GetOrder(r.Context(), orderID)
-	if err != nil || order == nil {
-		http.Error(w, "order not found", http.StatusNotFound)
-		return
-	}
-
-	if len(order.Documents) > 1 {
-		http.Error(w, "multi-document order requires per-job download URL", http.StatusBadRequest)
-		return
-	}
-
-	var expectedChecksum string
-	var pdfPath string
-
-	if len(order.Documents) == 1 {
-		expectedChecksum = order.Documents[0].SHA256Checksum
-		jobID := order.Documents[0].JobID
-		hJob := sha256.Sum256([]byte(jobID))
-		candJobPath := filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hJob[:])+".pdf")
-		if _, err := os.Stat(candJobPath); err == nil {
-			pdfPath = candJobPath
-		}
-	}
-
-	if pdfPath == "" {
-		expectedChecksum = order.Command.SHA256Checksum
-		hOrd := sha256.Sum256([]byte(orderID))
-		pdfPath = filepath.Join(s.cfg.jobsDir, hex.EncodeToString(hOrd[:])+".pdf")
-	}
-
-	s.streamPDF(w, pdfPath, expectedChecksum)
 }
 
-// handleDocumentPreview handles POST /api/documents/preview.
-// It accepts a single document and print settings, validates them, runs the canonical
-// normalization pipeline, and returns the print-ready PDF along with authoritative pricing
-// and sheet count metadata headers. If format=json is requested, it returns JSON metadata.
 func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -893,8 +788,11 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	documentsTotal = progress.DocumentsTotal
 	documentsCompleted = progress.DocumentsCompleted
-	if documentsTotal > 0 {
-		pagesPrinted = progress.PagesPrinted
+	if documentsTotal == 0 {
+		http.Error(w, "order has no document records", http.StatusInternalServerError)
+		return
+	}
+	pagesPrinted = progress.PagesPrinted
 		sheetsPrinted = progress.SheetsPrinted
 		errorReason = progress.ErrorReason
 		// Child faults must outrank a completed earlier document; the parent
@@ -916,23 +814,6 @@ func (s *appServer) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 				currentStatus = string(contracts.JobStatusSpooling)
 			}
 		}
-	} else {
-		// Historical single-job orders have no order_documents rows.
-		// Preserve their progress counters, but not a potentially stale
-		// child status override; the parent order is authoritative.
-		legacy, err := s.db.GetJobProgress(r.Context(), order.Command.JobID)
-		if err != nil {
-			log.Printf("[ORDER] Cannot read legacy job progress for %s: %v", orderID, err)
-			http.Error(w, "order progress temporarily unavailable", http.StatusInternalServerError)
-			return
-		}
-		if legacy != nil {
-			pagesPrinted = legacy.PagesPrinted
-			sheetsPrinted = legacy.SheetsPrinted
-			errorReason = legacy.ErrorReason
-		}
-	}
-
 	secondsRemaining := int64(0)
 	pinExpiry := ""
 	now := time.Now().UTC()
@@ -1211,17 +1092,17 @@ func (app *appServer) routes() *http.ServeMux {
 			app.handleUpload(w, r)
 		case strings.HasSuffix(path, "/recover"):
 			app.handleRecoverJob(w, r)
-		case strings.HasSuffix(path, "/orders/lookup"), strings.HasSuffix(path, "/pin/lookup"):
+		case strings.HasSuffix(path, "/orders/lookup"):
 			app.handlePINLookup(w, r)
-		case strings.HasSuffix(path, "/claim"), strings.HasSuffix(path, "/confirm"):
+		case strings.HasSuffix(path, "/claim"):
 			app.handleOrderClaim(w, r)
 		case strings.HasSuffix(path, "/release"):
 			app.handleOrderRelease(w, r)
 		case strings.HasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
-		case strings.HasSuffix(path, "/initiate-payment"):
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/initiate-payment"):
 			app.handleInitiatePayment(w, r)
-		case strings.Contains(path, "/sessions/") && (strings.HasSuffix(path, "/cancel") || strings.HasSuffix(path, "/cancel-session")):
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/cancel"):
 			app.handleSessionCancel(w, r)
 		case strings.Contains(path, "/sessions/"):
 			app.handleGetSession(w, r)
@@ -1302,7 +1183,7 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 				path == "/ws" ||
 				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
 				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
-				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
+				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))

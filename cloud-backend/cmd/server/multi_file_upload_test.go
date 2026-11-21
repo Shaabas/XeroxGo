@@ -487,14 +487,7 @@ func TestMultiFileUpload_PerJobSecureDownload(t *testing.T) {
 		}
 	}
 
-	// 5. Calling order-level /api/orders/{orderID}/pdf on multi-doc order is rejected (400)
-	orderLevelURL := generateSignedDownloadURL("http://example.com", orderID, app.cfg.downloadSecret, 24*time.Hour)
-	olReq := httptest.NewRequest(http.MethodGet, orderLevelURL, nil)
-	olRec := httptest.NewRecorder()
-	mux.ServeHTTP(olRec, olReq)
-	if olRec.Code != http.StatusBadRequest {
-		t.Errorf("order-level download on multi-doc order expected 400, got %d", olRec.Code)
-	}
+
 }
 
 func TestMultiFileUpload_AtomicRollbackOnFailure(t *testing.T) {
