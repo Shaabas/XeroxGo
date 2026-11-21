@@ -1647,6 +1647,7 @@ func (app *appServer) routes() *http.ServeMux {
 	mux.HandleFunc("/api/admin/pricing", app.handleAdminPricing)
 	mux.HandleFunc("/api/admin/analytics", app.handleAdminAnalytics)
 	mux.HandleFunc("/api/admin/orders", app.handleAdminOrders)
+	mux.HandleFunc("/api/admin/kiosks/faults", app.handleAdminKioskFaults)
 	mux.HandleFunc("/api/admin/orders/export", app.handleAdminOrdersExport)
 
 	return mux
