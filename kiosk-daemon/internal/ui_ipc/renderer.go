@@ -1146,8 +1146,8 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	strokeRoundedRect(dst, card, 24, 2, colorBorder)
 
 	// Title & Subtitle at top of container
-	drawText(dst, faceBold48, "Review Order & Payment", 100, 175, colorTextPrimary)
-	drawText(dst, faceReg22, "Review your order details and total amount below", 100, 232, colorTextSecondary)
+	drawText(dst, faceBold48, "Payment & Checkout", 100, 175, colorTextPrimary)
+	drawText(dst, faceReg22, "Scan the QR code to pay for your reserved print order", 100, 232, colorTextSecondary)
 
 	summary := state.OrderSummary
 	if summary == nil {
@@ -1234,7 +1234,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 		failLabel := "QR Unavailable"
 		fW := measureTextWidth(faceBold20, failLabel)
 		drawText(dst, faceBold20, failLabel, qrBox.Min.X+(qrBox.Dx()-fW)/2, topY+150, colorErrorRed)
-		retryLabel := "Press Confirm to retry"
+		retryLabel := "Press Enter to retry"
 		rW := measureTextWidth(faceReg18, retryLabel)
 		drawText(dst, faceReg18, retryLabel, qrBox.Min.X+(qrBox.Dx()-rW)/2, topY+185, colorTextSecondary)
 	} else if state.PINLoading {
@@ -1281,7 +1281,7 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	}
 
 	// Centered cancel instruction in gray text where buttons used to be
-	cancelText := "Press 'Esc' to Cancel order"
+	cancelText := "Press 'Esc' to exit payment"
 	cW := measureTextWidth(faceReg22, cancelText)
 	cancelX := (ScreenWidth - cW) / 2
 	cancelY := 935
