@@ -75,6 +75,22 @@ func TestDispatchDelivery_MultiDocumentPartialTransportFailureReplaysSafely(t *t
 		}
 	}
 	if err:=s.MarkDispatchIntentAcknowledged(ctx,docs[0].JobID);err!=nil{t.Fatal(err)}
+	// The first document can already be physically printing when the cloud
+	// drops its connection to the Pi. Pending siblings must remain replayable.
+	if err:=s.UpdateJobProgress(ctx,contracts.JobProgressEvent{
+		JobID:docs[0].JobID,KioskID:kioskID,
+		Status:contracts.JobStatusPrinting,Timestamp:now.Add(time.Second),
+	});err!=nil{t.Fatal(err)}
+	printing,err:=s.GetOrder(ctx,orderID)
+	if err!=nil||printing.Status!=contracts.JobStatusPrinting{
+		t.Fatalf("first child did not transition parent to PRINTING: %+v %v",printing,err)
+	}
+	whilePrinting,err:=s.GetPendingDispatchOrders(ctx,kioskID)
+	if err!=nil||len(whilePrinting)!=2||
+		whilePrinting[0].JobID!=docs[1].JobID||
+		whilePrinting[1].JobID!=docs[2].JobID{
+		t.Fatalf("printing parent stranded undelivered child commands: %+v %v",whilePrinting,err)
+	}
 	if err:=s.MarkDispatchIntentSent(ctx,docs[1].JobID);err!=nil{t.Fatal(err)}
 	if err:=s.ResetUnacknowledgedDispatchIntents(ctx,kioskID);err!=nil{t.Fatal(err)}
 	remaining,err:=s.GetPendingDispatchOrders(ctx,kioskID)
