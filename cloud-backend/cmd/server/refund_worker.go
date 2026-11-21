@@ -66,9 +66,9 @@ func (s *appServer) processRefundsOnce(ctx context.Context) error {
 		}
 		switch result.Status {
 		case "processed":
-			_ = s.db.RecordRefundResult(ctx, item.OrderID, result.ID, store.RefundProcessed, "")
+			_ = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, result.ID, store.RefundProcessed, "")
 		case "failed":
-			_ = s.db.RecordRefundResult(ctx, item.OrderID, result.ID, store.RefundFailed, "provider reported failed")
+			_ = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, result.ID, store.RefundFailed, "provider reported failed")
 		}
 	}
 
@@ -81,26 +81,31 @@ func (s *appServer) processRefundsOnce(ctx context.Context) error {
 		}
 		order, err := s.db.GetOrder(ctx, item.OrderID)
 		if err != nil || order == nil { continue }
-		if order.Status == "COMPLETED" {
+		if item.Reason == store.RefundReasonFulfillment && order.Status == "COMPLETED" {
 			log.Printf("[REFUND] completion/refund conflict for %s: operator review required", item.OrderID)
 			continue
 		}
-		claimed, err := s.db.ClaimRefund(ctx, item.OrderID, retryCutoff)
+		claimed, err := s.db.ClaimRefundPayment(ctx, item.PaymentID, retryCutoff)
 		if err != nil || !claimed { continue }
 		subCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		result, err := refunder.Refund(subCtx, item.PaymentID, item.AmountPaise, item.IdempotencyKey)
 		cancel()
 		if err != nil {
-			_ = s.db.RecordRefundResult(ctx, item.OrderID, item.ProviderRefundID, store.RefundFailed, truncateRefundError(err.Error()))
+			_ = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, item.ProviderRefundID, store.RefundFailed, truncateRefundError(err.Error()))
+			continue
+		}
+		if result.ID == "" || result.PaymentID != item.PaymentID || result.Amount != item.AmountPaise {
+			log.Printf("[REFUND] Provider response does not match payment %s; operator review required", item.PaymentID)
+			_ = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, item.ProviderRefundID, store.RefundFailed, "provider refund identity mismatch")
 			continue
 		}
 		switch result.Status {
 		case "processed":
-			err = s.db.RecordRefundResult(ctx, item.OrderID, result.ID, store.RefundProcessed, "")
+			err = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, result.ID, store.RefundProcessed, "")
 		case "pending":
-			err = s.db.RecordRefundResult(ctx, item.OrderID, result.ID, store.RefundPending, "")
+			err = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, result.ID, store.RefundPending, "")
 		default:
-			err = s.db.RecordRefundResult(ctx, item.OrderID, result.ID, store.RefundFailed, "provider refund failed")
+			err = s.db.RecordRefundResultForPayment(ctx, item.PaymentID, result.ID, store.RefundFailed, "provider refund failed")
 		}
 		if err != nil { log.Printf("[REFUND] persistence error for %s: %v", item.OrderID, err) }
 	}
