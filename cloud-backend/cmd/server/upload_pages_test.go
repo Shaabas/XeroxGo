@@ -69,6 +69,8 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		jobsDir:            jobsDir,
 		pricePerSheetPaise: 200,
 		downloadSecret:     []byte("test_secret_key_1234567890"),
+		// This fixture tests PDF normalization, not live printer availability.
+		devMode:            true,
 	}
 
 	hub := ws.NewHub(s)
