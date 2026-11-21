@@ -1185,7 +1185,9 @@ func (s *appServer) handleRazorpayWebhook(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if attempt != nil {
+	if attempt != nil && !captureRes.ExcessCapture {
+		// A refund-only capture (wrong amount or additional payment) must
+		// never mark the original checkout attempt as the funding payment.
 		_ = s.db.MarkPaymentAttemptPaid(r.Context(), attempt.AttemptID, eventID)
 	}
 
