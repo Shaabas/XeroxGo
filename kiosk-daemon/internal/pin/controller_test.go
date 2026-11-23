@@ -1127,24 +1127,18 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
 	}
 
-	// Press Submit (Confirm/Enter) on keypad to demo pay
+	// Press Submit (Confirm/Enter) on keypad - must NOT authorize payment!
 	sim.EmitSubmit()
 
 	select {
 	case tok := <-authChan:
-		if tok != "dmo_keypad_confirm_token_999" {
-			t.Errorf("expected authorized token %q, got %q", "dmo_keypad_confirm_token_999", tok)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("expected AuthorizeDemoPayment to be called on keypad confirm")
+		t.Fatalf("unexpected AuthorizeDemoPayment call on keypad confirm for token %q (must be absent)", tok)
+	case <-time.After(500 * time.Millisecond):
+		// Expected: no authorization on keypad Confirm
 	}
 
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateIdle {
-		t.Errorf("expected controller to reset to IDLE after demo payment, got %s", ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Errorf("expected controller to remain in StatePaymentPending, got %s", ctrl.GetState())
 	}
 }
 

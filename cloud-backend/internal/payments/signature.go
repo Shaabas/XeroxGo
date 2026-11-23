@@ -6,8 +6,8 @@ import (
 	"encoding/hex"
 )
 
-// VerifyWebhookSignature verifies the HMAC-SHA256 signature of the raw webhook payload
-// using constant-time comparison. It returns true if and only if the signature is valid.
+// VerifyWebhookSignature verifies test-fixture HMAC signatures only. There is
+// no network webhook endpoint or real payment provider in the demo application.
 func VerifyWebhookSignature(payload []byte, signature string, secret string) bool {
 	if len(secret) == 0 {
 		return false

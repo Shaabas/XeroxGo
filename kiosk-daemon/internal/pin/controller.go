@@ -157,6 +157,10 @@ func (c *Controller) HasActiveTransaction() bool {
 func (c *Controller) ActiveOrderID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.activeOrderIDLocked()
+}
+
+func (c *Controller) activeOrderIDLocked() string {
 	if c.currentOrder != nil {
 		return c.currentOrder.OrderID
 	}
@@ -380,16 +384,7 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 				}
 			}(seq, sID)
 		} else {
-			token := ""
-			if c.currentAttempt != nil && c.currentAttempt.DemoToken != "" {
-				token = c.currentAttempt.DemoToken
-			}
-			if token != "" {
-				log.Printf("[PIN-CONTROLLER] Keypad Confirm: authorizing demo payment for %s", token)
-				c.authorizeDemoPaymentLocked(token)
-			} else {
-				log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
-			}
+			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored on payment QR screen for order %s (scan QR code to pay)", c.activeOrderIDLocked())
 		}
 	}
 }

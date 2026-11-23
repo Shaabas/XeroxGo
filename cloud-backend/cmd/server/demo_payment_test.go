@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 )
 
 // setupDemoTestServer initializes an isolated in-memory/temp-file cloud server with mock hub.
-func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Server, *store.Store, func()) {
+func setupDemoTestServer(t *testing.T) (*appServer, *httptest.Server, *store.Store, func()) {
 	t.Helper()
 	tempDir, err := os.MkdirTemp("", "xeroxgo_demo_test_*")
 	if err != nil {
@@ -41,7 +42,7 @@ func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Ser
 		dbPath:         dbPath,
 		jobsDir:        filepath.Join(tempDir, "jobs"),
 		devMode:        true,
-		demoMode:       demoMode,
+		demoMode:       true,
 		downloadSecret: []byte("dev_secret_download_1234567890"),
 		webhookSecret:  []byte("dev_secret_webhook_1234567890"),
 		kioskSecret:    []byte("dev_secret_kiosk_1234567890"),
@@ -55,24 +56,7 @@ func setupDemoTestServer(t *testing.T, demoMode bool) (*appServer, *httptest.Ser
 		pinLimiter: pinLimiter,
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		switch {
-		case strings.HasSuffix(path, "/orders/lookup"):
-			app.handlePINLookup(w, r)
-		case strings.HasSuffix(path, "/claim"):
-			app.handleOrderClaim(w, r)
-		case strings.HasSuffix(path, "/initiate-payment"):
-			app.handleInitiatePayment(w, r)
-		default:
-			http.NotFound(w, r)
-		}
-	})
-	mux.HandleFunc("/pay/", app.handleDemoPayRoutes)
-	mux.HandleFunc("/ws", hub.ServeHTTP)
-
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(app.routes())
 
 	cleanup := func() {
 		ts.Close()
@@ -121,17 +105,15 @@ func createTestOrderAndSession(t *testing.T, st *store.Store, kioskID, orderID, 
 	return sess
 }
 
-func TestDemoMode_FlagAndEnvGating(t *testing.T) {
-	// Case 1: Demo mode disabled (default)
-	_, tsDisabled, stDisabled, cleanup1 := setupDemoTestServer(t, false)
-	defer cleanup1()
+func TestDemoCheckoutAlwaysUsesXeroxGoPage(t *testing.T) {
+	_, ts, st, cleanup := setupDemoTestServer(t)
+	defer cleanup()
 
 	kioskID := "kiosk-demo-gate"
 	orderID := "ord_gate_001"
-	sess := createTestOrderAndSession(t, stDisabled, kioskID, orderID, "1111", 2, 1000)
+	sess := createTestOrderAndSession(t, st, kioskID, orderID, "1111", 2, 1000)
 
-	// Initiate payment when demoMode == false
-	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", tsDisabled.URL, kioskID, sess.SessionID)
+	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID)
 	req, _ := http.NewRequest(http.MethodPost, initURL, nil)
 	req.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
 
@@ -149,54 +131,18 @@ func TestDemoMode_FlagAndEnvGating(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&initResp)
 
 	qrPayload, _ := initResp["qr_payload"].(string)
-	if !strings.HasPrefix(qrPayload, "upi://") {
-		t.Errorf("expected standard UPI payload when demoMode=false, got: %s", qrPayload)
-	}
-
-	// GET /pay/any_token should return 404 when demoMode=false
-	payURL := tsDisabled.URL + "/pay/dmo_123456"
-	payResp, err := http.Get(payURL)
-	if err != nil {
-		t.Fatalf("GET /pay/ failed: %v", err)
-	}
-	defer payResp.Body.Close()
-	if payResp.StatusCode != http.StatusNotFound {
-		t.Errorf("expected HTTP 404 for /pay/ when demoMode=false, got %d", payResp.StatusCode)
-	}
-
-	// Case 2: Demo mode enabled
-	_, tsEnabled, stEnabled, cleanup2 := setupDemoTestServer(t, true)
-	defer cleanup2()
-
-	orderID2 := "ord_gate_002"
-	sess2 := createTestOrderAndSession(t, stEnabled, kioskID, orderID2, "2222", 2, 1000)
-
-	initURL2 := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", tsEnabled.URL, kioskID, sess2.SessionID)
-	req2, _ := http.NewRequest(http.MethodPost, initURL2, nil)
-	req2.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
-
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatalf("initiate payment request failed: %v", err)
-	}
-	defer resp2.Body.Close()
-
-	var initResp2 map[string]interface{}
-	_ = json.NewDecoder(resp2.Body).Decode(&initResp2)
-
-	qrPayload2, _ := initResp2["qr_payload"].(string)
-	demoToken, _ := initResp2["demo_token"].(string)
+	demoToken, _ := initResp["demo_token"].(string)
 
 	if !strings.HasPrefix(demoToken, "dmo_") {
 		t.Errorf("expected demo_token starting with 'dmo_', got: %s", demoToken)
 	}
-	if !strings.Contains(qrPayload2, "/pay/"+demoToken) {
-		t.Errorf("expected qr_payload to contain /pay/%s, got: %s", demoToken, qrPayload2)
+	if !strings.Contains(qrPayload, "/pay/"+demoToken) {
+		t.Errorf("expected qr_payload to contain /pay/%s, got: %s", demoToken, qrPayload)
 	}
 }
 
 func TestDemoCheckoutPage_Rendering(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-render-test"
@@ -257,7 +203,7 @@ func TestDemoCheckoutPage_Rendering(t *testing.T) {
 }
 
 func TestDemoCheckoutPage_JSONEndpoint(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-json-test"
@@ -300,7 +246,7 @@ func TestDemoCheckoutPage_JSONEndpoint(t *testing.T) {
 }
 
 func TestDemoCheckoutPage_ExpiredAndAlreadyPaid(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-status-test"
@@ -349,7 +295,7 @@ func TestDemoCheckoutPage_ExpiredAndAlreadyPaid(t *testing.T) {
 		KioskID:     kioskID,
 		SessionID:   sess2.SessionID,
 		AmountPaise: 900,
-		Provider:    "mock_demo",
+		Provider:    "mock",
 		Status:      "captured",
 	}, time.Now().UTC())
 	_ = st.MarkPaymentAttemptPaid(context.Background(), initResp2["attempt_id"].(string), "pay_test_002")
@@ -371,7 +317,7 @@ func TestDemoCheckoutPage_ExpiredAndAlreadyPaid(t *testing.T) {
 }
 
 func TestDemoPaymentSubmit_DispatchedAndIdempotency(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-dispatch-test"
@@ -453,7 +399,7 @@ func TestDemoPaymentSubmit_DispatchedAndIdempotency(t *testing.T) {
 }
 
 func TestDemoPaymentSubmit_AbsentOrExpiredSession_Holding(t *testing.T) {
-	_, ts, st, cleanup := setupDemoTestServer(t, true)
+	_, ts, st, cleanup := setupDemoTestServer(t)
 	defer cleanup()
 
 	kioskID := "kiosk-hold-test"
@@ -502,5 +448,212 @@ func TestDemoPaymentSubmit_AbsentOrExpiredSession_Holding(t *testing.T) {
 	}
 	if ord.Status != contracts.JobStatusPaidWaiting {
 		t.Errorf("expected order status PAID_WAITING, got: %s", ord.Status)
+	}
+}
+
+func TestAcceptance_StrictTokenLookup(t *testing.T) {
+	_, ts, st, cleanup := setupDemoTestServer(t)
+	defer cleanup()
+
+	kioskID := "kiosk-strict-token"
+	orderID := "ord_strict_001"
+	sess := createTestOrderAndSession(t, st, kioskID, orderID, "1234", 2, 800)
+
+	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID)
+	req, _ := http.NewRequest(http.MethodPost, initURL, nil)
+	req.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("initiate payment failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var initResp map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&initResp)
+	demoToken := initResp["demo_token"].(string)
+	attemptID := initResp["attempt_id"].(string)
+
+	// 1. Valid lookup strictly by demo_token
+	att, err := st.GetPaymentAttemptByToken(context.Background(), demoToken)
+	if err != nil || att == nil || att.AttemptID != attemptID {
+		t.Fatalf("expected GetPaymentAttemptByToken with demo_token to succeed: %v", err)
+	}
+
+	// 2. Lookup with session_id MUST return nil
+	attBySess, err := st.GetPaymentAttemptByToken(context.Background(), sess.SessionID)
+	if err != nil || attBySess != nil {
+		t.Fatalf("expected GetPaymentAttemptByToken with session_id to return nil, got: %v, err: %v", attBySess, err)
+	}
+
+	// 3. Lookup with attempt_id MUST return nil
+	attByAtt, err := st.GetPaymentAttemptByToken(context.Background(), attemptID)
+	if err != nil || attByAtt != nil {
+		t.Fatalf("expected GetPaymentAttemptByToken with attempt_id to return nil, got: %v, err: %v", attByAtt, err)
+	}
+
+	// 4. HTTP GET /pay/{session_id} and /pay/{attempt_id} must return 404
+	for _, invalidID := range []string{sess.SessionID, attemptID, "non_existent_token"} {
+		chkReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/pay/%s", ts.URL, invalidID), nil)
+		chkResp, err := http.DefaultClient.Do(chkReq)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		if chkResp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for invalid token %q, got %d", invalidID, chkResp.StatusCode)
+		}
+		chkResp.Body.Close()
+
+		postReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/pay/%s", ts.URL, invalidID), nil)
+		postReq.Header.Set("Accept", "application/json")
+		postResp, err := http.DefaultClient.Do(postReq)
+		if err != nil {
+			t.Fatalf("post request failed: %v", err)
+		}
+		if postResp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 on post for invalid token %q, got %d", invalidID, postResp.StatusCode)
+		}
+		postResp.Body.Close()
+	}
+}
+
+func TestAcceptance_RemovedRoutes_Return404(t *testing.T) {
+	_, ts, _, cleanup := setupDemoTestServer(t)
+	defer cleanup()
+
+	// 1. /api/orders/{id}/simulate-payment must return 404
+	simReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/ord_123/simulate-payment", ts.URL), nil)
+	simResp, err := http.DefaultClient.Do(simReq)
+	if err != nil {
+		t.Fatalf("simulate payment request failed: %v", err)
+	}
+	defer simResp.Body.Close()
+	if simResp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for removed /api/orders/{id}/simulate-payment, got %d", simResp.StatusCode)
+	}
+
+	// With query parameters ?force=1 or ?bypass=1 it must STILL return 404
+	for _, query := range []string{"?force=1", "?bypass=1", "?force=1&bypass=1"} {
+		qReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/orders/ord_123/simulate-payment%s", ts.URL, query), nil)
+		qResp, err := http.DefaultClient.Do(qReq)
+		if err != nil {
+			t.Fatalf("simulate payment query request failed: %v", err)
+		}
+		if qResp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for removed /api/orders/{id}/simulate-payment with query %s, got %d", query, qResp.StatusCode)
+		}
+		qResp.Body.Close()
+	}
+
+	// 2. /api/webhooks/razorpay must return 404
+	whReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/webhooks/razorpay", ts.URL), nil)
+	whResp, err := http.DefaultClient.Do(whReq)
+	if err != nil {
+		t.Fatalf("razorpay webhook request failed: %v", err)
+	}
+	defer whResp.Body.Close()
+	if whResp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for removed /api/webhooks/razorpay, got %d", whResp.StatusCode)
+	}
+}
+
+func TestAcceptance_InvalidAndExpiredTokens(t *testing.T) {
+	_, ts, st, cleanup := setupDemoTestServer(t)
+	defer cleanup()
+
+	kioskID := "kiosk-tokens-test"
+	orderID := "ord_tokens_001"
+	sess := createTestOrderAndSession(t, st, kioskID, orderID, "9876", 1, 500)
+
+	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID)
+	req, _ := http.NewRequest(http.MethodPost, initURL, nil)
+	req.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
+	resp, _ := http.DefaultClient.Do(req)
+	var initResp map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&initResp)
+	resp.Body.Close()
+	demoToken := initResp["demo_token"].(string)
+
+	// Set expires_at to the past
+	past := time.Now().UTC().Add(-1 * time.Hour)
+	_, err := st.DB().ExecContext(context.Background(), "UPDATE payment_attempts SET expires_at_ns = ? WHERE demo_token = ?", past.UnixNano(), demoToken)
+	if err != nil {
+		t.Fatalf("failed to expire attempt: %v", err)
+	}
+
+	// GET on expired token -> 410 Gone
+	getReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/pay/%s", ts.URL, demoToken), nil)
+	getReq.Header.Set("Accept", "application/json")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("get expired failed: %v", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusGone {
+		t.Errorf("expected 410 Gone for expired token on GET, got %d", getResp.StatusCode)
+	}
+
+	// POST on expired token -> 410 Gone
+	postReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/pay/%s", ts.URL, demoToken), nil)
+	postReq.Header.Set("Accept", "application/json")
+	postResp, err := http.DefaultClient.Do(postReq)
+	if err != nil {
+		t.Fatalf("post expired failed: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != http.StatusGone {
+		t.Errorf("expected 410 Gone for expired token on POST, got %d", postResp.StatusCode)
+	}
+}
+
+func TestAcceptance_ConcurrentSubmissions_SingleDispatch(t *testing.T) {
+	_, ts, st, cleanup := setupDemoTestServer(t)
+	defer cleanup()
+
+	kioskID := "kiosk-concurrent-test"
+	orderID := "ord_conc_001"
+	sess := createTestOrderAndSession(t, st, kioskID, orderID, "4321", 2, 1000)
+
+	initURL := fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sess.SessionID)
+	req, _ := http.NewRequest(http.MethodPost, initURL, nil)
+	req.Header.Set("Authorization", "Bearer dev_secret_kiosk_1234567890")
+	resp, _ := http.DefaultClient.Do(req)
+	var initResp map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&initResp)
+	resp.Body.Close()
+	demoToken := initResp["demo_token"].(string)
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	var dispatchedCount int32
+	var alreadyProcessedCount int32
+
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			pReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/pay/%s", ts.URL, demoToken), nil)
+			pReq.Header.Set("Accept", "application/json")
+			pResp, err := http.DefaultClient.Do(pReq)
+			if err != nil {
+				return
+			}
+			defer pResp.Body.Close()
+			var data map[string]interface{}
+			_ = json.NewDecoder(pResp.Body).Decode(&data)
+			if data["status"] == "dispatched" {
+				atomic.AddInt32(&dispatchedCount, 1)
+			} else if data["status"] == "already_processed" {
+				atomic.AddInt32(&alreadyProcessedCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if dispatchedCount != 1 {
+		t.Fatalf("expected exactly 1 dispatch, got %d (alreadyProcessed=%d)", dispatchedCount, alreadyProcessedCount)
+	}
+	if alreadyProcessedCount != concurrency-1 {
+		t.Fatalf("expected %d already_processed responses, got %d", concurrency-1, alreadyProcessedCount)
 	}
 }

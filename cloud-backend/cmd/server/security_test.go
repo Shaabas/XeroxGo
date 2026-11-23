@@ -114,14 +114,14 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 		}
 	})
 
-	t.Run("Production mode exempts razorpay webhook without secret", func(t *testing.T) {
+	t.Run("Production mode blocks removed razorpay webhook without proxy secret", func(t *testing.T) {
 		h := createIngressHandler(dummyMux, secret, false)
 		req := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for /api/webhooks/razorpay, got %d", rec.Code)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for /api/webhooks/razorpay, got %d", rec.Code)
 		}
 	})
 

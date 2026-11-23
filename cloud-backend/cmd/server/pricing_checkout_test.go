@@ -57,7 +57,7 @@ func setupPricingTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/k/", app.handleUpload)
 	mux.HandleFunc("/api/pricing", app.handlePublicPricing)
-	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
+	mux.HandleFunc("/api/test/capture", app.handleFixtureCapture)
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path[len(r.URL.Path)-7:] == "/status" {
 			app.handleOrderStatus(w, r)
@@ -69,7 +69,7 @@ func setupPricingTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
 	return app, mux, string(webhookSecret)
 }
 
-func signRazorpayPayload(payload []byte, secret string) string {
+func signDemoFixturePayload(payload []byte, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write(payload)
 	return hex.EncodeToString(mac.Sum(nil))
@@ -349,9 +349,9 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 		}
 	}`, orderID, orderID))
 
-	sigMismatch := signRazorpayPayload(mismatchPayload, webhookSecret)
-	reqMismatch := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", bytes.NewReader(mismatchPayload))
-	reqMismatch.Header.Set("X-Razorpay-Signature", sigMismatch)
+	sigMismatch := signDemoFixturePayload(mismatchPayload, webhookSecret)
+	reqMismatch := httptest.NewRequest(http.MethodPost, "/api/test/capture", bytes.NewReader(mismatchPayload))
+	reqMismatch.Header.Set("X-Fixture-Signature", sigMismatch)
 	rrMismatch := httptest.NewRecorder()
 	mux.ServeHTTP(rrMismatch, reqMismatch)
 
@@ -365,7 +365,7 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 		t.Errorf("order status after underpaid webhook = %v, want %v", order.Status, contracts.JobStatusPendingPayment)
 	}
 
-	// Scenario B: Razorpay webhook with EXACT matching amount (600 paise)
+	// Scenario B: DemoFixture webhook with EXACT matching amount (600 paise)
 	exactPayload := []byte(fmt.Sprintf(`{
 		"event": "payment.captured",
 		"payload": {
@@ -381,9 +381,9 @@ func TestPricing_RazorpayWebhookAmountVerification(t *testing.T) {
 		}
 	}`, orderID, orderID))
 
-	sigExact := signRazorpayPayload(exactPayload, webhookSecret)
-	reqExact := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", bytes.NewReader(exactPayload))
-	reqExact.Header.Set("X-Razorpay-Signature", sigExact)
+	sigExact := signDemoFixturePayload(exactPayload, webhookSecret)
+	reqExact := httptest.NewRequest(http.MethodPost, "/api/test/capture", bytes.NewReader(exactPayload))
+	reqExact.Header.Set("X-Fixture-Signature", sigExact)
 	rrExact := httptest.NewRecorder()
 	mux.ServeHTTP(rrExact, reqExact)
 

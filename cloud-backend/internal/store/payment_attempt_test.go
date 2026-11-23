@@ -120,18 +120,18 @@ func TestPaymentAttempt_StoreLifecycle(t *testing.T) {
 		t.Errorf("expected attempt_id %s, got %s", attemptID, byOrdSess.AttemptID)
 	}
 
-	// 5b. Retrieve by demo token, session ID, or attempt ID
+	// 5b. Retrieve strictly by demo token (session ID and attempt ID must not resolve)
 	byTok, err := st.GetPaymentAttemptByToken(ctx, "dmo_test_attempt_123")
 	if err != nil || byTok == nil || byTok.AttemptID != attemptID {
 		t.Errorf("failed to retrieve attempt by demo_token: %v", err)
 	}
 	bySessTok, err := st.GetPaymentAttemptByToken(ctx, sessID)
-	if err != nil || bySessTok == nil || bySessTok.AttemptID != attemptID {
-		t.Errorf("failed to retrieve attempt by session_id: %v", err)
+	if err != nil || bySessTok != nil {
+		t.Errorf("expected GetPaymentAttemptByToken with session_id to return nil, got: %v, err: %v", bySessTok, err)
 	}
 	byAttTok, err := st.GetPaymentAttemptByToken(ctx, attemptID)
-	if err != nil || byAttTok == nil || byAttTok.AttemptID != attemptID {
-		t.Errorf("failed to retrieve attempt by attempt_id: %v", err)
+	if err != nil || byAttTok != nil {
+		t.Errorf("expected GetPaymentAttemptByToken with attempt_id to return nil, got: %v, err: %v", byAttTok, err)
 	}
 
 	// 6. Transition to PAID

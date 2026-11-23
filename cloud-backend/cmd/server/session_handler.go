@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"xeroxgo/cloud-backend/internal/payments"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/pkg/contracts"
 )
@@ -477,48 +476,17 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		attemptExpiresAt = maxExp
 	}
 
-	prov := s.getPaymentProvider()
-	createReq := payments.CreatePaymentRequest{
-		OrderID:     sess.OrderID,
-		KioskID:     sess.KioskID,
-		SessionID:   sess.SessionID,
-		AmountPaise: sess.PricePaise,
-		Currency:    "INR",
-		ExpiresAt:   attemptExpiresAt,
-		Notes: map[string]string{
-			"order_id":   sess.OrderID,
-			"kiosk_id":   sess.KioskID,
-			"session_id": sess.SessionID,
-		},
-	}
-
-	res, err := prov.CreatePayment(r.Context(), createReq)
+	// One checkout path: generate an unpredictable demo token and encode
+	// its XeroxGo-hosted confirmation URL in the kiosk QR. No UPI intent
+	// and no external payment provider are involved.
+	tokenHex, err := randomHex(24)
 	if err != nil {
-		log.Printf("[PAYMENT] CreatePayment provider error for order %s: %v", sess.OrderID, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": "failed to initiate payment with provider",
-		})
+		log.Printf("[PAYMENT] Failed to generate secure random demo token: %v", err)
+		http.Error(w, "internal server error generating demo token", http.StatusInternalServerError)
 		return
 	}
-
-	var demoToken string
-	if s.cfg != nil && (s.cfg.demoMode || prov.Name() == "mock") {
-		tokenHex, err := randomHex(24)
-		if err != nil {
-			log.Printf("[DEMO-MODE] Failed to generate secure random token: %v", err)
-			http.Error(w, "internal server error generating demo token", http.StatusInternalServerError)
-			return
-		}
-		demoToken = "dmo_" + tokenHex
-
-		baseURL := s.getBaseURL(r)
-		checkoutURL := fmt.Sprintf("%s/pay/%s", baseURL, demoToken)
-		if s.cfg.demoMode {
-			res.QRPayload = checkoutURL
-		}
-	}
+	demoToken := "dmo_" + tokenHex
+	checkoutURL := fmt.Sprintf("%s/pay/%s", s.getBaseURL(r), demoToken)
 
 	attemptID := fmt.Sprintf("att_%s_%d", sess.OrderID, now.UnixNano())
 	newAttempt := store.PaymentAttempt{
@@ -526,14 +494,14 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		OrderID:           sess.OrderID,
 		KioskID:           sess.KioskID,
 		SessionID:         sess.SessionID,
-		Provider:          prov.Name(),
-		ProviderOrderID:   res.ProviderOrderID,
+		Provider:          "mock",
+		ProviderOrderID:   demoToken,
 		ProviderPaymentID: "",
 		AmountPaise:       sess.PricePaise,
 		Currency:          "INR",
 		Status:            "CREATED",
-		QRPayload:         res.QRPayload,
-		QRImageURL:        res.QRImageURL,
+		QRPayload:         checkoutURL,
+		QRImageURL:        "",
 		DemoToken:         demoToken,
 		ExpiresAt:         attemptExpiresAt,
 	}
