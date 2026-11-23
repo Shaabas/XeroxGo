@@ -365,15 +365,25 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 				if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
 					return
 				}
-				if pErr != nil {
+				if pErr != nil || attempt == nil {
 					log.Printf("[PIN-CONTROLLER] Retry initiate payment failed: %v", pErr)
 					c.pinError = "Failed to load payment QR. Press Confirm to retry."
 					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 					return
 				}
+				qrPayload := c.resolvePaymentQRPayload(attempt)
+				if qrPayload == "" {
+					log.Printf("[PIN-CONTROLLER] Retry initiate payment returned missing or invalid demo token for session %s", sessionID)
+					c.currentAttempt = attempt
+					c.currentQRPayload = ""
+					c.pinError = "Failed to load payment QR. Press Confirm to retry."
+					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+					return
+				}
 				c.currentAttempt = attempt
-				c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
+				c.currentQRPayload = qrPayload
 				c.pinError = ""
+				log.Printf("[PAYMENT] Demo checkout QR displayed for order %s", c.activeOrderIDLocked())
 				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 			}(seq, sID)
 		} else {
@@ -521,8 +531,18 @@ func (c *Controller) startClaimLocked() {
 				return
 			}
 
+			qrPayload := c.resolvePaymentQRPayload(attempt)
+			if qrPayload == "" {
+				log.Printf("[PIN-CONTROLLER] Missing or invalid demo payment token for session %s (order %s)", sID, c.activeOrderIDLocked())
+				c.currentAttempt = attempt
+				c.currentQRPayload = ""
+				c.pinError = "Failed to load payment QR. Press Confirm to retry."
+				c.renderPaymentPendingLocked(tSec)
+				return
+			}
+
 			c.currentAttempt = attempt
-			c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
+			c.currentQRPayload = qrPayload
 			c.pinError = ""
 			log.Printf("[PAYMENT] Demo checkout QR displayed for order %s", c.activeOrderIDLocked())
 			c.renderPaymentPendingLocked(tSec)
@@ -639,29 +659,26 @@ func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetail
 	if attempt == nil {
 		return ""
 	}
+	token := strings.TrimSpace(attempt.DemoToken)
+	if token == "" || strings.ContainsAny(token, " \t\r\n/?#") {
+		return ""
+	}
 	urlBase := strings.TrimRight(strings.TrimSpace(c.cfg.PaymentURLBase), "/")
 	if urlBase != "" {
-		token := strings.TrimSpace(attempt.DemoToken)
-		if token == "" && strings.HasPrefix(attempt.QRPayload, "http") {
-			parts := strings.Split(strings.TrimRight(attempt.QRPayload, "/"), "/")
-			if len(parts) > 0 {
-				last := parts[len(parts)-1]
-				if strings.HasPrefix(last, "dmo_") || strings.HasPrefix(last, "tok_") {
-					token = last
-				}
+		if !strings.HasSuffix(urlBase, "/pay") {
+			urlBase += "/pay"
+		}
+	} else {
+		if strings.HasPrefix(attempt.QRPayload, "http://") || strings.HasPrefix(attempt.QRPayload, "https://") {
+			if idx := strings.Index(attempt.QRPayload, "/pay/"); idx != -1 {
+				urlBase = strings.TrimRight(attempt.QRPayload[:idx+4], "/")
 			}
 		}
-		if token == "" {
-			token = strings.TrimSpace(attempt.SessionID)
-		}
-		if token == "" {
-			token = strings.TrimSpace(attempt.AttemptID)
-		}
-		if token != "" {
-			return fmt.Sprintf("%s/%s", urlBase, token)
+		if urlBase == "" {
+			urlBase = "https://xeroxgo.vercel.app/pay"
 		}
 	}
-	return attempt.QRPayload
+	return fmt.Sprintf("%s/%s", urlBase, token)
 }
 
 func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
