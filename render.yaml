@@ -19,11 +19,7 @@ services:
         value: 10000
       - key: XEROXGO_DEV_MODE
         value: "1"
-      - key: DEMO_MODE
-        value: "true"
       - key: XEROXGO_DOWNLOAD_SECRET
-        generateValue: true
-      - key: XEROXGO_WEBHOOK_SECRET
         generateValue: true
       - key: XEROXGO_KIOSK_SECRET
         sync: false

@@ -35,9 +35,7 @@ type serverConfig struct {
 	dbPath         string
 	jobsDir        string
 	devMode        bool
-	demoMode       bool
 	downloadSecret []byte
-	webhookSecret  []byte
 	kioskSecret    []byte
 }
 
@@ -203,13 +201,8 @@ func (s *appServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	demo := false
-	if s.cfg != nil {
-		demo = s.cfg.demoMode
-	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "ok",
-		"demo_mode": demo,
+		"status": "ok",
 	})
 }
 
@@ -926,21 +919,32 @@ func initPricing(ctx context.Context, s *store.Store, isPostgres bool, devMode b
 	return nil
 }
 
+func resolveDownloadSecret(dlSecretEnv string, devMode bool) ([]byte, error) {
+	if !devMode {
+		if len(dlSecretEnv) < 16 {
+			return nil, errors.New("production mode requires non-empty XEROXGO_DOWNLOAD_SECRET of at least 16 characters")
+		}
+		return []byte(dlSecretEnv), nil
+	}
+	if dlSecretEnv == "" {
+		return []byte("dev_download_secret_32_bytes_long_123"), nil
+	}
+	return []byte(dlSecretEnv), nil
+}
+
+func resolveKioskSecret(kioskSecretEnv string, devMode bool) ([]byte, error) {
+	if kioskSecretEnv == "" {
+		if devMode {
+			return []byte("dev_kiosk_secret_32_bytes_long_1234"), nil
+		}
+		return nil, errors.New("XEROXGO_KIOSK_SECRET required in production mode")
+	}
+	return []byte(kioskSecretEnv), nil
+}
+
 func main() {
-	demoFlag := flag.Bool("demo-mode", false, "Enable demo mode with simulated QR payments")
 	addrFlag := flag.String("addr", "", "Server listen address (overrides XEROXGO_CLOUD_ADDR / PORT)")
 	flag.Parse()
-
-	demoEnv := strings.TrimSpace(os.Getenv("DEMO_MODE"))
-	if demoEnv == "" {
-		demoEnv = strings.TrimSpace(os.Getenv("XEROXGO_DEMO_MODE"))
-	}
-	demoMode := true
-	if demoEnv == "0" || strings.ToLower(demoEnv) == "false" {
-		demoMode = false
-	} else if *demoFlag {
-		demoMode = true
-	}
 
 	addr := strings.TrimSpace(*addrFlag)
 	if addr == "" {
@@ -968,24 +972,10 @@ func main() {
 	}
 
 	devMode := os.Getenv("XEROXGO_DEV_MODE") == "1" || os.Getenv("DEV_MODE") == "1"
-	if devMode {
-		demoMode = true
-	}
 
-	dlSecretStr := os.Getenv("XEROXGO_DOWNLOAD_SECRET")
-	whSecretStr := os.Getenv("XEROXGO_WEBHOOK_SECRET")
-
-	if !devMode {
-		if len(dlSecretStr) < 16 || len(whSecretStr) < 16 {
-			log.Fatalf("Fatal: production mode requires non-empty XEROXGO_DOWNLOAD_SECRET and XEROXGO_WEBHOOK_SECRET of at least 16 characters")
-		}
-	} else {
-		if dlSecretStr == "" {
-			dlSecretStr = "dev_download_secret_32_bytes_long_123"
-		}
-		if whSecretStr == "" {
-			whSecretStr = "dev_webhook_secret_32_bytes_long_123"
-		}
+	dlSecretBytes, err := resolveDownloadSecret(os.Getenv("XEROXGO_DOWNLOAD_SECRET"), devMode)
+	if err != nil {
+		log.Fatalf("Fatal: %v", err)
 	}
 
 	isPostgres := strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://")
@@ -1032,16 +1022,12 @@ func main() {
 	}
 
 	hub := ws.NewHub(storeDB)
-	kioskSecretStr := os.Getenv("XEROXGO_KIOSK_SECRET")
-	if kioskSecretStr == "" && demoMode {
-		kioskSecretStr = "dev_kiosk_secret_32_bytes_long_1234"
+	kioskSecretBytes, err := resolveKioskSecret(os.Getenv("XEROXGO_KIOSK_SECRET"), devMode)
+	if err != nil {
+		log.Fatalf("Fatal: %v", err)
 	}
-	var kioskSecretBytes []byte
-	if kioskSecretStr != "" {
-		kioskSecretBytes = []byte(kioskSecretStr)
+	if len(kioskSecretBytes) > 0 {
 		hub.SetKioskSecret(kioskSecretBytes)
-	} else if !devMode {
-		log.Fatalf("XEROXGO_KIOSK_SECRET required in production mode")
 	}
 
 	cfg := &serverConfig{
@@ -1049,9 +1035,7 @@ func main() {
 		dbPath:         dbPath,
 		jobsDir:        jobsDir,
 		devMode:        devMode,
-		demoMode:       demoMode,
-		downloadSecret: []byte(dlSecretStr),
-		webhookSecret:  []byte(whSecretStr),
+		downloadSecret: dlSecretBytes,
 		kioskSecret:    kioskSecretBytes,
 	}
 

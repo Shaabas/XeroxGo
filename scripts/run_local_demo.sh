@@ -27,7 +27,6 @@ mkdir -p "${CLOUD_JOBS}" "${KIOSK_JOBS}"
 
 # 4. Generate random development secrets & configuration
 DOWNLOAD_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-WEBHOOK_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 KIOSK_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 
@@ -36,7 +35,6 @@ export XEROXGO_CLOUD_DB="${CLOUD_DB}"
 export XEROXGO_JOBS_DIR="${CLOUD_JOBS}"
 export XEROXGO_DEV_MODE=1
 export XEROXGO_DOWNLOAD_SECRET="${DOWNLOAD_SECRET}"
-export XEROXGO_WEBHOOK_SECRET="${WEBHOOK_SECRET}"
 export XEROXGO_KIOSK_SECRET="${KIOSK_SECRET}"
 
 KIOSK_ID="kiosk-demo"

@@ -43,43 +43,35 @@ echo "==========================================================================
 # 1. Environment & Secrets Check
 echo ""
 echo "1. Checking Secrets and Environment Variables..."
-DEMO_MODE="${DEMO_MODE:-${XEROXGO_DEMO_MODE:-0}}"
 DEV_MODE="${DEV_MODE:-${XEROXGO_DEV_MODE:-0}}"
 
-if [ "$DEMO_MODE" = "1" ] || [ "$DEMO_MODE" = "true" ]; then
-  pass "Demo mode is explicitly ENABLED (DEMO_MODE=$DEMO_MODE)"
+if [ "$DEV_MODE" = "1" ] || [ "$DEV_MODE" = "true" ]; then
+  pass "Development mode is ENABLED (DEV_MODE=$DEV_MODE)"
 else
-  warn "Demo mode is not enabled in environment (DEMO_MODE is not 1/true). Ensure --demo-mode flag is passed to cloud server."
+  info "Running in production mode (DEV_MODE is not 1/true)"
 fi
 
 DOWNLOAD_SECRET="${XEROXGO_DOWNLOAD_SECRET:-}"
-WEBHOOK_SECRET="${XEROXGO_WEBHOOK_SECRET:-}"
 KIOSK_SECRET="${XEROXGO_KIOSK_SECRET:-}"
 
 if [ -n "$DOWNLOAD_SECRET" ]; then
   pass "XEROXGO_DOWNLOAD_SECRET is set (${#DOWNLOAD_SECRET} chars)"
 else
-  if [ "$DEV_MODE" = "1" ] || [ "$DEMO_MODE" = "1" ]; then
-    warn "XEROXGO_DOWNLOAD_SECRET unset; server will auto-generate in dev/demo mode"
+  if [ "$DEV_MODE" = "1" ] || [ "$DEV_MODE" = "true" ]; then
+    warn "XEROXGO_DOWNLOAD_SECRET unset; server will auto-generate in dev mode"
   else
     fail "XEROXGO_DOWNLOAD_SECRET is required in production mode"
-  fi
-fi
-
-if [ -n "$WEBHOOK_SECRET" ]; then
-  pass "XEROXGO_WEBHOOK_SECRET is set (${#WEBHOOK_SECRET} chars)"
-else
-  if [ "$DEV_MODE" = "1" ] || [ "$DEMO_MODE" = "1" ]; then
-    warn "XEROXGO_WEBHOOK_SECRET unset; server will auto-generate in dev/demo mode"
-  else
-    fail "XEROXGO_WEBHOOK_SECRET is required in production mode"
   fi
 fi
 
 if [ -n "$KIOSK_SECRET" ]; then
   pass "XEROXGO_KIOSK_SECRET is set (${#KIOSK_SECRET} chars)"
 else
-  warn "XEROXGO_KIOSK_SECRET unset; defaulting to dev_kiosk_secret_32_bytes_long_1234"
+  if [ "$DEV_MODE" = "1" ] || [ "$DEV_MODE" = "true" ]; then
+    warn "XEROXGO_KIOSK_SECRET unset; defaulting to dev_kiosk_secret_32_bytes_long_1234 in dev mode"
+  else
+    fail "XEROXGO_KIOSK_SECRET is required in production mode"
+  fi
 fi
 
 # 2. Demo Checkout Check

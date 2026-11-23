@@ -79,9 +79,8 @@ func setupPaperTestServer(t *testing.T) (*appServer, *httptest.Server, *store.St
 	hub := ws.NewHub(st)
 	app := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(secret),
-			webhookSecret: []byte("whsec_paper"),
-			devMode:       false, // Production mode: enforces strict health and presence checks!
+			kioskSecret: []byte(secret),
+			devMode:     false, // Production mode: enforces strict health and presence checks!
 		},
 		db:  st,
 		hub: hub,

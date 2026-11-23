@@ -62,9 +62,8 @@ func setupSafetyTestApp(t *testing.T, kioskID, orderID, pin string, status contr
 	webhookSecret := "whsec_safety_test_32_bytes_long"
 	app := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(kioskSecret),
-			webhookSecret: []byte(webhookSecret),
-			devMode:       true,
+			kioskSecret: []byte(kioskSecret),
+			devMode:     true,
 		},
 		db: st,
 	}
@@ -557,9 +556,8 @@ func TestPaymentSafety_RestartPreservationAndReconciliation(t *testing.T) {
 
 	app1 := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(kioskSecret),
-			webhookSecret: []byte(whSecret),
-			devMode:       true,
+			kioskSecret: []byte(kioskSecret),
+			devMode:     true,
 		},
 		db: st1,
 	}
@@ -591,9 +589,8 @@ func TestPaymentSafety_RestartPreservationAndReconciliation(t *testing.T) {
 
 	app2 := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(kioskSecret),
-			webhookSecret: []byte(whSecret),
-			devMode:       true,
+			kioskSecret: []byte(kioskSecret),
+			devMode:     true,
 		},
 		db: st2,
 	}

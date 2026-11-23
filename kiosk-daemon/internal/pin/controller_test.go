@@ -22,7 +22,6 @@ type mockLookupClient struct {
 	cancelFn     func(ctx context.Context, sessionID string) error
 	getFn        func(ctx context.Context, sessionID string) (*cloud.SessionDetails, error)
 	initiateFn   func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error)
-	authorizeFn  func(ctx context.Context, token string) error
 	calls        int
 	cancelCalls  int
 	releaseCalls int
@@ -120,16 +119,6 @@ func (m *mockLookupClient) InitiatePayment(ctx context.Context, sessionID string
 		QRPayload:     "https://test.local/pay/dmo_mock123",
 		AmountPaise:   1800,
 	}, nil
-}
-
-func (m *mockLookupClient) AuthorizeDemoPayment(ctx context.Context, token string) error {
-	m.mu.Lock()
-	fn := m.authorizeFn
-	m.mu.Unlock()
-	if fn != nil {
-		return fn(ctx, token)
-	}
-	return nil
 }
 
 type mockRenderer struct {
@@ -934,7 +923,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 	rnd := &mockRenderer{}
 
 	expectedDemoToken := "dmo_test_randomizer_777"
-	expectedWrappedURL := "https://xeroxgo.vercel.app/payment/" + expectedDemoToken
+	expectedWrappedURL := "https://xeroxgo.vercel.app/pay/" + expectedDemoToken
 
 	mockClient := &mockLookupClient{
 		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
@@ -964,7 +953,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 				AttemptID:     "att_wrap_201",
 				SessionID:     sessionID,
 				DemoToken:     expectedDemoToken,
-				QRPayload:     "upi://pay?pa=mock@upi&am=4.00",
+				QRPayload:     "https://test.local/pay/" + expectedDemoToken,
 				AmountPaise:   400,
 				Status:        "PAYMENT_PENDING",
 				AttemptStatus: "CREATED",
@@ -978,7 +967,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
-		PaymentURLBase:    "https://xeroxgo.vercel.app/payment",
+		PaymentURLBase:    "https://xeroxgo.vercel.app/pay",
 		IdleQRContent:     "https://xeroxgo.vercel.app",
 		PrinterModel:      "Brother HL-L5210DN",
 	}
@@ -1046,7 +1035,6 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 	defer sim.Close()
 
 	rnd := &mockRenderer{}
-	authChan := make(chan string, 1)
 
 	mockClient := &mockLookupClient{
 		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
@@ -1074,13 +1062,6 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 				DemoToken: "dmo_keypad_confirm_token_999",
 				QRPayload: "https://xeroxgo.vercel.app/pay/dmo_keypad_confirm_token_999",
 			}, nil
-		},
-		authorizeFn: func(ctx context.Context, token string) error {
-			select {
-			case authChan <- token:
-			default:
-			}
-			return nil
 		},
 	}
 
@@ -1130,108 +1111,10 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 	// Press Submit (Confirm/Enter) on keypad - must NOT authorize payment!
 	sim.EmitSubmit()
 
-	select {
-	case tok := <-authChan:
-		t.Fatalf("unexpected AuthorizeDemoPayment call on keypad confirm for token %q (must be absent)", tok)
-	case <-time.After(500 * time.Millisecond):
-		// Expected: no authorization on keypad Confirm
-	}
+	time.Sleep(300 * time.Millisecond)
 
 	if ctrl.GetState() != StatePaymentPending {
 		t.Errorf("expected controller to remain in StatePaymentPending, got %s", ctrl.GetState())
-	}
-}
-
-func TestController_BypassPayment_AutoAuthorize(t *testing.T) {
-	sim := input.NewSimulatedSource(32)
-	defer sim.Close()
-
-	rnd := &mockRenderer{}
-	authChan := make(chan string, 1)
-
-	mockClient := &mockLookupClient{
-		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
-			return &cloud.OrderDetails{
-				OrderID:         "ord_auto_bypass_1",
-				TotalPricePaise: 400,
-				TotalPages:      2,
-				TotalSheets:     2,
-				Copies:          1,
-				Duplex:          "simplex",
-				ColorMode:       "bw",
-			}, nil
-		},
-		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
-			return &cloud.SessionDetails{
-				SessionID: "sess_auto_bypass_1",
-				OrderID:   orderID,
-				Status:    "PAYMENT_PENDING",
-			}, nil
-		},
-		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
-			return &cloud.PaymentAttemptDetails{
-				AttemptID: "att_auto_bypass_1",
-				SessionID: sessionID,
-				DemoToken: "dmo_auto_bypass_tok_777",
-				QRPayload: "https://xeroxgo.vercel.app/pay/dmo_auto_bypass_tok_777",
-			}, nil
-		},
-		authorizeFn: func(ctx context.Context, token string) error {
-			select {
-			case authChan <- token:
-			default:
-			}
-			return nil
-		},
-	}
-
-	cfg := Config{
-		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
-		PaymentTimeout:    10 * time.Second,
-		RenderScreen:      rnd.Render,
-		LookupClient:      mockClient,
-		BypassPayment:     true, // auto-authorize enabled!
-	}
-
-	ctrl, err := NewController(cfg, sim)
-	if err != nil {
-		t.Fatalf("failed to create controller: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctrl.Start(ctx)
-	defer ctrl.Stop()
-
-	// Enter PIN and confirm summary
-	sim.EmitDigit('5')
-	sim.EmitDigit('6')
-	sim.EmitDigit('7')
-	sim.EmitDigit('8')
-	sim.EmitSubmit()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit() // Confirm order summary
-
-	// Without any more user input, bypass payment should automatically authorize and return to IDLE
-	select {
-	case tok := <-authChan:
-		if tok != "dmo_auto_bypass_tok_777" {
-			t.Errorf("expected authorized token %q, got %q", "dmo_auto_bypass_tok_777", tok)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("expected AuthorizeDemoPayment to be automatically called with BypassPayment=true")
-	}
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateIdle {
-		t.Errorf("expected controller to reset to IDLE after auto demo payment, got %s", ctrl.GetState())
 	}
 }
 

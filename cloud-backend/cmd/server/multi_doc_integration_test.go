@@ -57,7 +57,6 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 		dbPath:         dbPath,
 		jobsDir:        jobsDir,
 		kioskSecret:    []byte(kioskSecret),
-		webhookSecret:  []byte(webhookSecret),
 		downloadSecret: downloadSecret,
 		devMode:        true,
 	}

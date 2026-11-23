@@ -42,7 +42,6 @@ func setupPricingTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
 		dbPath:         dbPath,
 		jobsDir:        jobsDir,
 		downloadSecret: []byte("test_secret_key_1234567890"),
-		webhookSecret:  webhookSecret,
 		devMode:        true,
 	}
 

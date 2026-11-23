@@ -42,9 +42,7 @@ func setupRoutingRegressionServer(t *testing.T) (*appServer, *httptest.Server, *
 		dbPath:         dbPath,
 		jobsDir:        filepath.Join(tempDir, "jobs"),
 		devMode:        true,
-		demoMode:       true,
 		downloadSecret: []byte("dev_secret_download_1234567890"),
-		webhookSecret:  []byte("dev_secret_webhook_1234567890"),
 		kioskSecret:    []byte(kioskSecret),
 	}
 

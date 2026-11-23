@@ -543,7 +543,6 @@ func TestMultiFileUpload_PaymentInitiationSupported(t *testing.T) {
 	app, _ := setupUploadTestServer(t)
 	app.cfg.devMode = true
 	app.hub = nil
-	app.cfg.webhookSecret = []byte("whsec_test_secret_32_bytes_long_ok")
 	mux := http.NewServeMux()
 	app.cfg.kioskSecret = []byte("mock-kiosk-secret")
 	mux.HandleFunc("/api/k/", func(w http.ResponseWriter, r *http.Request) {
