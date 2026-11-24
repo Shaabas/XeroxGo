@@ -46,8 +46,10 @@ type Config struct {
 }
 
 type cancelTracker struct {
-	done chan struct{}
-	err  error
+	done      chan struct{}
+	err       error
+	attempts  int
+	createdAt time.Time
 }
 
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
@@ -202,6 +204,13 @@ func (c *Controller) GetCurrentSession() *cloud.SessionDetails {
 	return c.currentSession
 }
 
+// PendingCancelCount returns the current number of tracked in-flight or unresolved cancellations.
+func (c *Controller) PendingCancelCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pendingCancels)
+}
+
 // ResetToIdle resets the controller to StateIdle and re-renders the idle screen.
 func (c *Controller) ResetToIdle() {
 	c.mu.Lock()
@@ -210,6 +219,7 @@ func (c *Controller) ResetToIdle() {
 }
 
 func (c *Controller) resetToIdleLocked() {
+	c.pruneCompletedTrackersLocked()
 	c.stopInactivityTimerLocked()
 	c.stopCountdownLocked()
 	c.stopErrorTimerLocked()
@@ -351,17 +361,63 @@ func (c *Controller) handleOrderSummaryEvent(ev input.Event) {
 	}
 }
 
+func (c *Controller) pruneCompletedTrackersLocked() {
+	now := time.Now()
+	for id, tr := range c.pendingCancels {
+		select {
+		case <-tr.done:
+			if tr.err == nil || now.Sub(tr.createdAt) > 30*time.Second {
+				delete(c.pendingCancels, id)
+			}
+		default:
+			if now.Sub(tr.createdAt) > 30*time.Second {
+				delete(c.pendingCancels, id)
+			}
+		}
+	}
+	const maxTrackers = 32
+	if len(c.pendingCancels) > maxTrackers {
+		for id := range c.pendingCancels {
+			delete(c.pendingCancels, id)
+			if len(c.pendingCancels) <= maxTrackers {
+				break
+			}
+		}
+	}
+}
+
 func (c *Controller) cancelSessionAsyncLocked(sessID string) {
 	if sessID == "" {
 		return
 	}
-	tracker := &cancelTracker{done: make(chan struct{})}
+	c.pruneCompletedTrackersLocked()
+
+	if existing, ok := c.pendingCancels[sessID]; ok {
+		select {
+		case <-existing.done:
+			// Existing tracker completed previously; allow re-attempt
+		default:
+			// In-flight cancellation is already running for this session
+			return
+		}
+	}
+
+	tracker := &cancelTracker{
+		done:      make(chan struct{}),
+		createdAt: time.Now(),
+	}
 	c.pendingCancels[sessID] = tracker
 	go func(sID string, tr *cancelTracker) {
 		defer close(tr.done)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		tr.err = c.cfg.LookupClient.CancelSession(ctx, sID)
+		err := c.cfg.LookupClient.CancelSession(ctx, sID)
+		c.mu.Lock()
+		tr.err = err
+		if err == nil {
+			delete(c.pendingCancels, sID)
+		}
+		c.mu.Unlock()
 	}(sessID, tracker)
 }
 
@@ -446,6 +502,7 @@ func (c *Controller) startClaimLocked() {
 
 		if err == nil && session != nil {
 			c.mu.Lock()
+			c.pruneCompletedTrackersLocked()
 			tracker, hasPending := c.pendingCancels[session.SessionID]
 			c.mu.Unlock()
 			if hasPending {
@@ -456,12 +513,63 @@ func (c *Controller) startClaimLocked() {
 				waitTimer := time.NewTimer(waitDuration)
 				defer waitTimer.Stop()
 
+				var cancelCompleted bool
 				select {
 				case <-tracker.done:
+					cancelCompleted = true
+				case <-waitTimer.C:
+					log.Printf("[PIN-CONTROLLER] Cancellation timed out for session %s", session.SessionID)
+					tracker.attempts++
+					err = errors.New("previous session cancellation timed out; please try again")
+					session = nil
+				case <-ctx.Done():
+					log.Printf("[PIN-CONTROLLER] Context expired while waiting for session %s cancellation", session.SessionID)
+					tracker.attempts++
+					err = errors.New("previous session cancellation timed out; please try again")
+					session = nil
+				}
+
+				if cancelCompleted {
 					if tracker.err != nil {
-						log.Printf("[PIN-CONTROLLER] Cancellation failed for session %s: %v", session.SessionID, tracker.err)
-						err = errors.New("previous session cancellation failed; please try again")
-						session = nil
+						// Previous cancellation failed. If customer is retrying (tracker.attempts > 0),
+						// safely reattempt cancellation after connectivity recovers.
+						if tracker.attempts > 0 {
+							log.Printf("[PIN-CONTROLLER] Customer retry: reattempting cancellation for session %s", session.SessionID)
+							retryCtx, retryCancel := context.WithTimeout(ctx, waitDuration)
+							retryErr := c.cfg.LookupClient.CancelSession(retryCtx, session.SessionID)
+							retryCancel()
+							if retryErr != nil {
+								log.Printf("[PIN-CONTROLLER] Cancellation reattempt failed for session %s: %v", session.SessionID, retryErr)
+								tracker.err = retryErr
+								err = errors.New("previous session cancellation failed; please try again")
+								session = nil
+							} else {
+								log.Printf("[PIN-CONTROLLER] Cancellation reattempt succeeded for session %s", session.SessionID)
+								tracker.err = nil
+								c.mu.Lock()
+								delete(c.pendingCancels, session.SessionID)
+								c.mu.Unlock()
+
+								reclaimCtx, reclaimCancel := context.WithTimeout(ctx, 10*time.Second)
+								session, err = c.cfg.LookupClient.ClaimOrder(reclaimCtx, ordID)
+								reclaimCancel()
+
+								if err == nil && session != nil {
+									c.mu.Lock()
+									_, stillPending := c.pendingCancels[session.SessionID]
+									c.mu.Unlock()
+									if stillPending {
+										err = errors.New("received unresolved session; please try again")
+										session = nil
+									}
+								}
+							}
+						} else {
+							tracker.attempts++
+							log.Printf("[PIN-CONTROLLER] Cancellation failed for session %s: %v", session.SessionID, tracker.err)
+							err = errors.New("previous session cancellation failed; please try again")
+							session = nil
+						}
 					} else {
 						c.mu.Lock()
 						delete(c.pendingCancels, session.SessionID)
@@ -481,14 +589,6 @@ func (c *Controller) startClaimLocked() {
 							}
 						}
 					}
-				case <-waitTimer.C:
-					log.Printf("[PIN-CONTROLLER] Cancellation timed out for session %s", session.SessionID)
-					err = errors.New("previous session cancellation timed out; please try again")
-					session = nil
-				case <-ctx.Done():
-					log.Printf("[PIN-CONTROLLER] Context expired while waiting for session %s cancellation", session.SessionID)
-					err = errors.New("previous session cancellation timed out; please try again")
-					session = nil
 				}
 			}
 		}
