@@ -114,14 +114,14 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 		}
 	})
 
-	t.Run("Production mode exempts razorpay webhook without secret", func(t *testing.T) {
+	t.Run("Production mode blocks removed razorpay webhook without proxy secret", func(t *testing.T) {
 		h := createIngressHandler(dummyMux, secret, false)
 		req := httptest.NewRequest(http.MethodPost, "/api/webhooks/razorpay", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for /api/webhooks/razorpay, got %d", rec.Code)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for /api/webhooks/razorpay, got %d", rec.Code)
 		}
 	})
 
@@ -175,5 +175,58 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 			t.Fatalf("expected 200 OK when secret is unconfigured, got %d", rec.Code)
 		}
 	})
+}
+
+func TestResolveKioskSecret_ProductionFailsClosed(t *testing.T) {
+	// 1. Production mode with empty secret must fail closed
+	_, err := resolveKioskSecret("", false)
+	if err == nil {
+		t.Fatal("expected error when XEROXGO_KIOSK_SECRET is empty in production mode, got nil")
+	}
+
+	// 2. Production mode with explicit secret succeeds
+	sec, err := resolveKioskSecret("prod_kiosk_secret_super_secret_12345", false)
+	if err != nil {
+		t.Fatalf("unexpected error in production mode with valid secret: %v", err)
+	}
+	if string(sec) != "prod_kiosk_secret_super_secret_12345" {
+		t.Fatalf("expected secret 'prod_kiosk_secret_super_secret_12345', got %q", string(sec))
+	}
+
+	// 3. Dev mode with empty secret defaults to dev secret
+	devSec, err := resolveKioskSecret("", true)
+	if err != nil {
+		t.Fatalf("unexpected error in dev mode with empty secret: %v", err)
+	}
+	if string(devSec) != "dev_kiosk_secret_32_bytes_long_1234" {
+		t.Fatalf("expected dev secret in dev mode, got %q", string(devSec))
+	}
+
+	// 4. Dev mode with explicit secret uses the explicit secret
+	devCustom, err := resolveKioskSecret("custom_dev_secret", true)
+	if err != nil {
+		t.Fatalf("unexpected error in dev mode with explicit secret: %v", err)
+	}
+	if string(devCustom) != "custom_dev_secret" {
+		t.Fatalf("expected 'custom_dev_secret', got %q", string(devCustom))
+	}
+}
+
+func TestResolveDownloadSecret_ProductionValidation(t *testing.T) {
+	// Production mode requires at least 16 chars
+	if _, err := resolveDownloadSecret("", false); err == nil {
+		t.Fatal("expected error for empty download secret in production mode")
+	}
+	if _, err := resolveDownloadSecret("short", false); err == nil {
+		t.Fatal("expected error for short download secret (<16 chars) in production mode")
+	}
+	if sec, err := resolveDownloadSecret("valid_download_secret_16chars", false); err != nil || string(sec) != "valid_download_secret_16chars" {
+		t.Fatalf("expected valid secret in production, got sec=%q err=%v", string(sec), err)
+	}
+
+	// Dev mode defaults when empty
+	if sec, err := resolveDownloadSecret("", true); err != nil || string(sec) != "dev_download_secret_32_bytes_long_123" {
+		t.Fatalf("expected default dev download secret, got sec=%q err=%v", string(sec), err)
+	}
 }
 

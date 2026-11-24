@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,7 +42,6 @@ type Config struct {
 	KioskID           string
 	PrinterModel      string
 	OnTransactionEnd  func()
-	BypassPayment     bool
 }
 
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
@@ -157,6 +157,10 @@ func (c *Controller) HasActiveTransaction() bool {
 func (c *Controller) ActiveOrderID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.activeOrderIDLocked()
+}
+
+func (c *Controller) activeOrderIDLocked() string {
 	if c.currentOrder != nil {
 		return c.currentOrder.OrderID
 	}
@@ -362,65 +366,31 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 				if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
 					return
 				}
-				if pErr != nil {
+				if pErr != nil || attempt == nil {
 					log.Printf("[PIN-CONTROLLER] Retry initiate payment failed: %v", pErr)
 					c.pinError = "Failed to load payment QR. Press Confirm to retry."
 					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 					return
 				}
-				c.currentAttempt = attempt
-				c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
-				c.pinError = ""
-				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
-
-				token := attempt.DemoToken
-				if c.cfg.BypassPayment && token != "" {
-					log.Printf("[PIN-CONTROLLER] BypassPayment enabled: auto-authorizing demo payment for %s", token)
-					c.authorizeDemoPaymentLocked(token)
+				qrPayload := c.resolvePaymentQRPayload(attempt)
+				if qrPayload == "" {
+					log.Printf("[PIN-CONTROLLER] Retry initiate payment returned missing or invalid demo token for session %s", sessionID)
+					c.currentAttempt = attempt
+					c.currentQRPayload = ""
+					c.pinError = "Failed to load payment QR. Press Confirm to retry."
+					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+					return
 				}
+				c.currentAttempt = attempt
+				c.currentQRPayload = qrPayload
+				c.pinError = ""
+				log.Printf("[PAYMENT] Demo checkout QR displayed for order %s", c.activeOrderIDLocked())
+				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
 			}(seq, sID)
 		} else {
-			token := ""
-			if c.currentAttempt != nil && c.currentAttempt.DemoToken != "" {
-				token = c.currentAttempt.DemoToken
-			}
-			if token != "" {
-				log.Printf("[PIN-CONTROLLER] Keypad Confirm: authorizing demo payment for %s", token)
-				c.authorizeDemoPaymentLocked(token)
-			} else {
-				log.Printf("[PIN-CONTROLLER] User acknowledged payment screen for order %s", c.ActiveOrderID())
-			}
+			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored on payment QR screen for order %s (scan QR code to pay)", c.activeOrderIDLocked())
 		}
 	}
-}
-
-func (c *Controller) authorizeDemoPaymentLocked(token string) {
-	if token == "" || c.cfg.LookupClient == nil {
-		return
-	}
-	c.pinError = "Authorizing payment & preparing print..."
-	c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
-
-	seq := atomic.AddUint64(&c.lookupSeq, 1)
-	go func(targetSeq uint64, demoTok string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer cancel()
-		err := c.cfg.LookupClient.AuthorizeDemoPayment(ctx, demoTok)
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
-			return
-		}
-		if err != nil {
-			log.Printf("[PIN-CONTROLLER] Demo payment authorization failed: %v", err)
-			c.pinError = "Payment failed. Press Confirm to retry or Cancel to exit."
-			c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
-			return
-		}
-		log.Printf("[PIN-CONTROLLER] Demo payment authorized successfully for %s! Waiting for spooler dispatch.", demoTok)
-		c.pinError = ""
-		c.resetToIdleLocked()
-	}(seq, token)
 }
 
 func (c *Controller) startClaimLocked() {
@@ -562,17 +532,21 @@ func (c *Controller) startClaimLocked() {
 				return
 			}
 
-			c.currentAttempt = attempt
-			c.currentQRPayload = c.resolvePaymentQRPayload(attempt)
-			c.pinError = ""
-			log.Printf("[PAYMENT] Demo checkout link: %s", c.currentQRPayload)
-			c.renderPaymentPendingLocked(tSec)
-
-			token := attempt.DemoToken
-			if c.cfg.BypassPayment && token != "" {
-				log.Printf("[PIN-CONTROLLER] BypassPayment enabled: auto-authorizing demo payment for %s", token)
-				c.authorizeDemoPaymentLocked(token)
+			qrPayload := c.resolvePaymentQRPayload(attempt)
+			if qrPayload == "" {
+				log.Printf("[PIN-CONTROLLER] Missing or invalid demo payment token for session %s (order %s)", sID, c.activeOrderIDLocked())
+				c.currentAttempt = attempt
+				c.currentQRPayload = ""
+				c.pinError = "Failed to load payment QR. Press Confirm to retry."
+				c.renderPaymentPendingLocked(tSec)
+				return
 			}
+
+			c.currentAttempt = attempt
+			c.currentQRPayload = qrPayload
+			c.pinError = ""
+			log.Printf("[PAYMENT] Demo checkout QR displayed for order %s", c.activeOrderIDLocked())
+			c.renderPaymentPendingLocked(tSec)
 		}(targetSeq, sessID, timeoutSec)
 	}(seq, orderID)
 }
@@ -682,33 +656,59 @@ func (c *Controller) renderOrderSummaryLocked(remainingSeconds int) {
 	})
 }
 
+func isValidDemoToken(token string) bool {
+	if len(token) != 52 || !strings.HasPrefix(token, "dmo_") {
+		return false
+	}
+	hexPart := token[4:]
+	for i := 0; i < len(hexPart); i++ {
+		c := hexPart[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetails) string {
 	if attempt == nil {
 		return ""
 	}
-	urlBase := strings.TrimRight(strings.TrimSpace(c.cfg.PaymentURLBase), "/")
-	if urlBase != "" {
-		token := strings.TrimSpace(attempt.DemoToken)
-		if token == "" && strings.HasPrefix(attempt.QRPayload, "http") {
-			parts := strings.Split(strings.TrimRight(attempt.QRPayload, "/"), "/")
-			if len(parts) > 0 {
-				last := parts[len(parts)-1]
-				if strings.HasPrefix(last, "dmo_") || strings.HasPrefix(last, "tok_") {
-					token = last
-				}
-			}
-		}
-		if token == "" {
-			token = strings.TrimSpace(attempt.SessionID)
-		}
-		if token == "" {
-			token = strings.TrimSpace(attempt.AttemptID)
-		}
-		if token != "" {
-			return fmt.Sprintf("%s/%s", urlBase, token)
-		}
+	token := strings.TrimSpace(attempt.DemoToken)
+	if !isValidDemoToken(token) {
+		return ""
 	}
-	return attempt.QRPayload
+
+	rawBase := strings.TrimSpace(c.cfg.PaymentURLBase)
+	if rawBase != "" {
+		parsedBase, err := url.Parse(rawBase)
+		if err != nil || (parsedBase.Scheme != "http" && parsedBase.Scheme != "https") || parsedBase.Host == "" {
+			return ""
+		}
+		if strings.TrimRight(parsedBase.Path, "/") != "/pay" {
+			return ""
+		}
+		if parsedBase.RawQuery != "" || parsedBase.Fragment != "" {
+			return ""
+		}
+		return fmt.Sprintf("%s/%s", strings.TrimRight(rawBase, "/"), token)
+	}
+
+	rawCheckout := strings.TrimSpace(attempt.QRPayload)
+	if rawCheckout == "" {
+		return ""
+	}
+	parsedCheckout, err := url.Parse(rawCheckout)
+	if err != nil || (parsedCheckout.Scheme != "http" && parsedCheckout.Scheme != "https") || parsedCheckout.Host == "" {
+		return ""
+	}
+	if parsedCheckout.Path != "/pay/"+token {
+		return ""
+	}
+	if parsedCheckout.RawQuery != "" || parsedCheckout.Fragment != "" {
+		return ""
+	}
+	return rawCheckout
 }
 
 func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {

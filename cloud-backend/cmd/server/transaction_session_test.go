@@ -49,9 +49,8 @@ func setupTestAppWithOrder(t *testing.T, kioskID, orderID, pin string, status co
 	secret := "test-secret-4321"
 	app := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(secret),
-			webhookSecret: []byte("whsec_test"),
-			devMode:       true,
+			kioskSecret: []byte(secret),
+			devMode:     true,
 		},
 		db: st,
 	}

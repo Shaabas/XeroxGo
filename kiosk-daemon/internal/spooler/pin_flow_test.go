@@ -571,8 +571,8 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 				"provider":     "mock",
 				"amount_paise": 1500,
 				"status":       "INITIATED",
-				"qr_payload":   "https://xeroxgo.demo/pay/tok_dynamic_qr",
-				"demo_token":   "tok_dynamic_qr",
+				"qr_payload":   "https://xeroxgo.demo/pay/dmo_7777888899990000aaaa111122223333bbbb444455556666",
+				"demo_token":   "dmo_7777888899990000aaaa111122223333bbbb444455556666",
 			})
 		case strings.HasPrefix(r.URL.Path, "/api/k/kiosk-qr/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel"):
 			w.WriteHeader(http.StatusOK)
@@ -644,7 +644,7 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 			return false
 		}
 		last := hist[len(hist)-1]
-		return last.Mode == ui_ipc.ModePaymentPending && last.QRContent == "https://xeroxgo.demo/pay/tok_dynamic_qr"
+		return last.Mode == ui_ipc.ModePaymentPending && last.QRContent == "https://xeroxgo.demo/pay/dmo_7777888899990000aaaa111122223333bbbb444455556666"
 	}) {
 		hist := client.RenderHistory()
 		last := hist[len(hist)-1]

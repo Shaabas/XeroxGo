@@ -62,9 +62,8 @@ func setupSafetyTestApp(t *testing.T, kioskID, orderID, pin string, status contr
 	webhookSecret := "whsec_safety_test_32_bytes_long"
 	app := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(kioskSecret),
-			webhookSecret: []byte(webhookSecret),
-			devMode:       true,
+			kioskSecret: []byte(kioskSecret),
+			devMode:     true,
 		},
 		db: st,
 	}
@@ -96,15 +95,15 @@ func setupSafetyTestApp(t *testing.T, kioskID, orderID, pin string, status contr
 		switch {
 		case stringsHasSuffix(path, "/status"):
 			app.handleOrderStatus(w, r)
-		case stringsHasSuffix(path, "/simulate-payment"):
-			app.handleSimulatePayment(w, r)
+		case stringsHasSuffix(path, "/test/simulate-payment"):
+			app.handleFixtureSimulatePayment(w, r)
 		case stringsHasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
 		default:
 			http.NotFound(w, r)
 		}
 	})
-	mux.HandleFunc("/api/webhooks/razorpay", app.handleRazorpayWebhook)
+	mux.HandleFunc("/api/test/capture", app.handleFixtureCapture)
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if app.hub != nil {
 			app.hub.ServeHTTP(w, r)
@@ -160,9 +159,9 @@ func TestPaymentSafety_LatePaymentNoSession_PreservesPaidWaitingNoDispatch(t *te
 
 	// User never visited kiosk or session expired. Payment webhook arrives.
 	body, sig := generateSignedWebhookPayload(orderID, "pay_late_123", "", kioskID, pricePaise, whSec)
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Razorpay-Signature", sig)
+	req.Header.Set("X-Fixture-Signature", sig)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -223,9 +222,9 @@ func TestPaymentSafety_CanceledSession_NoGhostPrinting(t *testing.T) {
 
 	// 3. Delayed payment webhook arrives
 	body, sig := generateSignedWebhookPayload(orderID, "pay_after_cancel", sessID, kioskID, pricePaise, whSec)
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Razorpay-Signature", sig)
+	req.Header.Set("X-Fixture-Signature", sig)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -280,9 +279,9 @@ func TestPaymentSafety_ConcurrentWebhooks_AtomicSingleDispatch(t *testing.T) {
 		go func(eID string) {
 			defer wg.Done()
 			body, sig := generateSignedWebhookPayload(orderID, eID, sessID, kioskID, pricePaise, whSec)
-			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Razorpay-Signature", sig)
+			req.Header.Set("X-Fixture-Signature", sig)
 
 			r, reqErr := http.DefaultClient.Do(req)
 			if reqErr != nil {
@@ -337,9 +336,9 @@ func TestPaymentSafety_DuplicateWebhooks_Idempotent(t *testing.T) {
 	body, sig := generateSignedWebhookPayload(orderID, eventID, sessID, kioskID, pricePaise, whSec)
 
 	// 1st request
-	req1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req1.Header.Set("Content-Type", "application/json")
-	req1.Header.Set("X-Razorpay-Signature", sig)
+	req1.Header.Set("X-Fixture-Signature", sig)
 	resp1, _ := http.DefaultClient.Do(req1)
 	var res1 map[string]string
 	_ = json.NewDecoder(resp1.Body).Decode(&res1)
@@ -349,9 +348,9 @@ func TestPaymentSafety_DuplicateWebhooks_Idempotent(t *testing.T) {
 	}
 
 	// 2nd identical request
-	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-Razorpay-Signature", sig)
+	req2.Header.Set("X-Fixture-Signature", sig)
 	resp2, _ := http.DefaultClient.Do(req2)
 	var res2 map[string]string
 	_ = json.NewDecoder(resp2.Body).Decode(&res2)
@@ -374,9 +373,9 @@ func TestPaymentSafety_ExpiredPIN_RecoveryAndRelease(t *testing.T) {
 
 	// User paid late (payment captures despite expired PIN)
 	body, sig := generateSignedWebhookPayload(orderID, "pay_late_exp_pin", "", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -483,9 +482,9 @@ func TestPaymentSafety_MismatchedSessionNotes_Prevented(t *testing.T) {
 
 	// Webhook arrives with a fraudulent or stale session_id in notes
 	body, sig := generateSignedWebhookPayload(orderID, "pay_spoofed_session", "sess_stale_or_spoofed_999", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 
 	var res map[string]string
@@ -557,22 +556,21 @@ func TestPaymentSafety_RestartPreservationAndReconciliation(t *testing.T) {
 
 	app1 := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(kioskSecret),
-			webhookSecret: []byte(whSecret),
-			devMode:       true,
+			kioskSecret: []byte(kioskSecret),
+			devMode:     true,
 		},
 		db: st1,
 	}
 
 	mux1 := http.NewServeMux()
-	mux1.HandleFunc("/api/webhooks/razorpay", app1.handleRazorpayWebhook)
+	mux1.HandleFunc("/api/test/capture", app1.handleFixtureCapture)
 	ts1 := httptest.NewServer(mux1)
 
 	// Payment clears before customer reaches kiosk (or while kiosk was down)
 	body, sig := generateSignedWebhookPayload(orderID, "pay_restart_evt", "", kioskID, pricePaise, whSecret)
-	whReq, _ := http.NewRequest(http.MethodPost, ts1.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts1.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -591,9 +589,8 @@ func TestPaymentSafety_RestartPreservationAndReconciliation(t *testing.T) {
 
 	app2 := &appServer{
 		cfg: &serverConfig{
-			kioskSecret:   []byte(kioskSecret),
-			webhookSecret: []byte(whSecret),
-			devMode:       true,
+			kioskSecret: []byte(kioskSecret),
+			devMode:     true,
 		},
 		db: st2,
 	}
@@ -671,9 +668,9 @@ func TestPaymentSafety_RecoveryPIN_RequiresValidCredential(t *testing.T) {
 
 	// Capture payment into PAID_WAITING
 	body, sig := generateSignedWebhookPayload(orderID, "pay_cred_test", "", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -748,9 +745,9 @@ func TestPaymentSafety_MissingSessionBinding_RejectsDispatch(t *testing.T) {
 
 	// Webhook arrives with empty session_id in notes
 	body, sig := generateSignedWebhookPayload(orderID, "pay_empty_sess", "", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 
 	var res map[string]string
@@ -784,9 +781,9 @@ func TestPaymentSafety_ReleaseRequiresConnectedKioskPresence(t *testing.T) {
 
 	// Payment is captured into PAID_WAITING
 	body, sig := generateSignedWebhookPayload(orderID, "pay_pres_test", "", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -850,9 +847,9 @@ func TestPaymentSafety_DispatchIntentReconciliation_OnKioskReconnect(t *testing.
 	// Payment captured with valid session note, but kiosk is currently offline.
 	// Order moves to DISPATCHED, intent is recorded as PENDING in dispatch_intents table.
 	body, sig := generateSignedWebhookPayload(orderID, "pay_recon_evt", sessID, kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -932,9 +929,9 @@ func TestPaymentSafety_RecoveryPIN_QueryParamRejected(t *testing.T) {
 
 	// Now pay the order so recovery PIN can be issued
 	body, sig := generateSignedWebhookPayload(orderID, "pay_qp_evt", "", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -983,9 +980,9 @@ func TestPaymentSafety_ReleaseRequiresExplicitSessionID(t *testing.T) {
 
 	// Pay the order (moves to PAID_WAITING since no kiosk session exists)
 	body, sig := generateSignedWebhookPayload(orderID, "pay_rel_sess_evt", "", kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -1051,9 +1048,9 @@ func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
 
 	// Payment arrives while kiosk is offline -> records dispatch intent in PENDING
 	body, sig := generateSignedWebhookPayload(orderID, "pay_cancel_reconn_evt", sessID, kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -1151,9 +1148,9 @@ func TestPaymentSafety_KioskAckTransitionsIntentToAcknowledged(t *testing.T) {
 
 	// Pay order -> job is dispatched to connected kiosk
 	body, sig := generateSignedWebhookPayload(orderID, "pay_ack_evt", sessID, kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, _ := http.DefaultClient.Do(whReq)
 	whResp.Body.Close()
 
@@ -1280,9 +1277,9 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	// 4. Payment Captured via Signed Razorpay Webhook
 	paymentID := "pay_e2e_evt_999"
 	whBody, sig := generateSignedWebhookPayload(orderID, paymentID, sessID, kioskID, pricePaise, whSec)
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(whBody))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(whBody))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil || whResp.StatusCode != http.StatusOK {
 		t.Fatalf("webhook failed: err=%v, code=%d", err, whResp.StatusCode)
@@ -1349,9 +1346,9 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	}
 
 	// 8. Duplicate Webhook arrives while in progress -> MUST be ignored idempotently
-	whReqDup, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(whBody))
+	whReqDup, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(whBody))
 	whReqDup.Header.Set("Content-Type", "application/json")
-	whReqDup.Header.Set("X-Razorpay-Signature", sig)
+	whReqDup.Header.Set("X-Fixture-Signature", sig)
 	whRespDup, err := http.DefaultClient.Do(whReqDup)
 	if err != nil || whRespDup.StatusCode != http.StatusOK {
 		t.Fatalf("duplicate webhook failed: err=%v, code=%d", err, whRespDup.StatusCode)
@@ -1501,8 +1498,8 @@ func TestPaymentPhase1_InitiatePayment_SuccessAndIdempotency(t *testing.T) {
 	if !strings.HasPrefix(attemptID1, "att_") {
 		t.Fatalf("expected attempt_id to start with att_, got %s", attemptID1)
 	}
-	if !strings.HasPrefix(qrPayload1, "upi://pay?") {
-		t.Fatalf("expected qr_payload to be UPI URI, got %s", qrPayload1)
+	if !strings.Contains(qrPayload1, "/pay/dmo_") {
+		t.Fatalf("expected qr_payload to contain /pay/dmo_, got %s", qrPayload1)
 	}
 	if amountPaise1 != pricePaise {
 		t.Fatalf("expected amount %d, got %d", pricePaise, amountPaise1)
@@ -1642,9 +1639,9 @@ func TestPaymentPhase1_Webhook_MismatchedAmount_Rejected(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Razorpay-Signature", sig)
+	req.Header.Set("X-Fixture-Signature", sig)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -1705,9 +1702,9 @@ func TestPaymentPhase1_Webhook_InvalidCurrency_Rejected(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Razorpay-Signature", sig)
+	req.Header.Set("X-Fixture-Signature", sig)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -1744,9 +1741,9 @@ func TestPaymentPhase1_Webhook_InvalidSignature_Rejected(t *testing.T) {
 	}
 	rawBytes, _ := json.Marshal(payload)
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Razorpay-Signature", "forged_invalid_signature_hex_1234567890abcdef")
+	req.Header.Set("X-Fixture-Signature", "forged_invalid_signature_hex_1234567890abcdef")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -1790,9 +1787,9 @@ func TestPaymentPhase1_Webhook_UnassociatedPayment_Rejected(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Razorpay-Signature", sig)
+	req.Header.Set("X-Fixture-Signature", sig)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -1889,9 +1886,9 @@ func TestPaymentPhase1_Webhook_FullLifecycleAndDispatch(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil {
 		t.Fatalf("webhook failed: %v", err)
@@ -1994,9 +1991,9 @@ func TestPaymentSafety_Webhook_AuthorizedEvent_Ignored(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil {
 		t.Fatalf("webhook request failed: %v", err)
@@ -2077,9 +2074,9 @@ func TestPaymentSafety_Webhook_CapturedEvent_AuthorizedStatus_Rejected(t *testin
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil {
 		t.Fatalf("webhook request failed: %v", err)
@@ -2140,9 +2137,9 @@ func TestPaymentSafety_Webhook_FailedEvent_Ignored(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil {
 		t.Fatalf("webhook request failed: %v", err)
@@ -2207,9 +2204,9 @@ func TestPaymentSafety_Webhook_InvalidAmount_Rejected(t *testing.T) {
 	mac.Write(rawBytes)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil {
 		t.Fatalf("webhook request failed: %v", err)
@@ -2279,9 +2276,9 @@ func TestPaymentSafety_CaptureFailure_RetrySucceedsWithoutBeingIgnored(t *testin
 	}
 
 	// First webhook attempt: capture MUST fail
-	whReq1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq1.Header.Set("Content-Type", "application/json")
-	whReq1.Header.Set("X-Razorpay-Signature", sig)
+	whReq1.Header.Set("X-Fixture-Signature", sig)
 	whResp1, err := http.DefaultClient.Do(whReq1)
 	if err != nil {
 		t.Fatalf("webhook request 1 failed: %v", err)
@@ -2306,9 +2303,9 @@ func TestPaymentSafety_CaptureFailure_RetrySucceedsWithoutBeingIgnored(t *testin
 	}
 
 	// Second webhook attempt (Razorpay retry with the EXACT same payload & event ID): MUST SUCCEED!
-	whReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(rawBytes))
+	whReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(rawBytes))
 	whReq2.Header.Set("Content-Type", "application/json")
-	whReq2.Header.Set("X-Razorpay-Signature", sig)
+	whReq2.Header.Set("X-Fixture-Signature", sig)
 	whResp2, err := http.DefaultClient.Do(whReq2)
 	if err != nil {
 		t.Fatalf("webhook retry failed: %v", err)
@@ -2373,9 +2370,9 @@ func TestPaymentSafety_DuplicateCallbacks_StrictSingleDispatch(t *testing.T) {
 	_ = providerOrderID
 
 	// 1st callback: captures and dispatches
-	req1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req1.Header.Set("Content-Type", "application/json")
-	req1.Header.Set("X-Razorpay-Signature", sig)
+	req1.Header.Set("X-Fixture-Signature", sig)
 	r1, _ := http.DefaultClient.Do(req1)
 	var res1 map[string]string
 	_ = json.NewDecoder(r1.Body).Decode(&res1)
@@ -2385,9 +2382,9 @@ func TestPaymentSafety_DuplicateCallbacks_StrictSingleDispatch(t *testing.T) {
 	}
 
 	// 2nd callback: returns already_processed
-	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-Razorpay-Signature", sig)
+	req2.Header.Set("X-Fixture-Signature", sig)
 	r2, _ := http.DefaultClient.Do(req2)
 	var res2 map[string]string
 	_ = json.NewDecoder(r2.Body).Decode(&res2)
@@ -2397,9 +2394,9 @@ func TestPaymentSafety_DuplicateCallbacks_StrictSingleDispatch(t *testing.T) {
 	}
 
 	// 3rd callback: still already_processed
-	req3, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	req3, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	req3.Header.Set("Content-Type", "application/json")
-	req3.Header.Set("X-Razorpay-Signature", sig)
+	req3.Header.Set("X-Fixture-Signature", sig)
 	r3, _ := http.DefaultClient.Do(req3)
 	var res3 map[string]string
 	_ = json.NewDecoder(r3.Body).Decode(&res3)
@@ -2452,9 +2449,9 @@ func TestPaymentSafety_ConcurrentDuplicateCallbacks_SamePaymentID(t *testing.T) 
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Razorpay-Signature", sig)
+			req.Header.Set("X-Fixture-Signature", sig)
 			r, err := http.DefaultClient.Do(req)
 			if err != nil {
 				return
@@ -2512,9 +2509,9 @@ func TestPaymentSafety_InterruptedProcessing_KioskOffline_DurableIntentPreserved
 	body, sig := generateSignedWebhookPayload(orderID, paymentID, sessID, kioskID, pricePaise, whSec)
 
 	// Webhook arrives while kiosk is offline
-	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/webhooks/razorpay", bytes.NewReader(body))
+	whReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/test/capture", bytes.NewReader(body))
 	whReq.Header.Set("Content-Type", "application/json")
-	whReq.Header.Set("X-Razorpay-Signature", sig)
+	whReq.Header.Set("X-Fixture-Signature", sig)
 	whResp, err := http.DefaultClient.Do(whReq)
 	if err != nil {
 		t.Fatalf("webhook request failed: %v", err)

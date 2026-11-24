@@ -14,6 +14,8 @@ import (
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 )
 
+const canonicalTestToken = "dmo_0123456789abcdef0123456789abcdef0123456789abcdef"
+
 type mockLookupClient struct {
 	mu           sync.Mutex
 	lookupFn     func(ctx context.Context, pin string) (*cloud.OrderDetails, error)
@@ -22,7 +24,6 @@ type mockLookupClient struct {
 	cancelFn     func(ctx context.Context, sessionID string) error
 	getFn        func(ctx context.Context, sessionID string) (*cloud.SessionDetails, error)
 	initiateFn   func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error)
-	authorizeFn  func(ctx context.Context, token string) error
 	calls        int
 	cancelCalls  int
 	releaseCalls int
@@ -117,19 +118,10 @@ func (m *mockLookupClient) InitiatePayment(ctx context.Context, sessionID string
 		SessionID:     sessionID,
 		Status:        "PAYMENT_PENDING",
 		AttemptStatus: "CREATED",
-		QRPayload:     "https://test.local/pay/dmo_mock123",
+		DemoToken:     canonicalTestToken,
+		QRPayload:     "https://test.local/pay/" + canonicalTestToken,
 		AmountPaise:   1800,
 	}, nil
-}
-
-func (m *mockLookupClient) AuthorizeDemoPayment(ctx context.Context, token string) error {
-	m.mu.Lock()
-	fn := m.authorizeFn
-	m.mu.Unlock()
-	if fn != nil {
-		return fn(ctx, token)
-	}
-	return nil
 }
 
 type mockRenderer struct {
@@ -731,7 +723,8 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 	sim := input.NewSimulatedSource(32)
 	rnd := &mockRenderer{}
 
-	expectedQR := "https://demo.local/pay/dmo_abc123xyz789"
+	token := "dmo_1111222233334444aaaabbbbccccddddeeeeffff00001111"
+	expectedQR := "https://demo.local/pay/" + token
 	client := &mockLookupClient{
 		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
 			return &cloud.OrderDetails{
@@ -766,6 +759,7 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 				KioskID:       "kiosk-1",
 				Status:        "PAYMENT_PENDING",
 				AttemptStatus: "CREATED",
+				DemoToken:     token,
 				QRPayload:     expectedQR,
 				AmountPaise:   1250,
 				Currency:      "INR",
@@ -869,9 +863,11 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 			}, nil
 		},
 		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			token := "dmo_2222333344445555bbbbccccddddeeeeffff000011112222"
 			return &cloud.PaymentAttemptDetails{
 				AttemptID: "att_ssh_001",
-				QRPayload: "https://xeroxgo.demo/pay/tok_ssh",
+				DemoToken: token,
+				QRPayload: "https://xeroxgo.demo/pay/" + token,
 			}, nil
 		},
 	}
@@ -933,8 +929,8 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 	sim := input.NewSimulatedSource(16)
 	rnd := &mockRenderer{}
 
-	expectedDemoToken := "dmo_test_randomizer_777"
-	expectedWrappedURL := "https://xeroxgo.vercel.app/payment/" + expectedDemoToken
+	expectedDemoToken := "dmo_3333444455556666ccccddddeeeeffff0000111122223333"
+	expectedWrappedURL := "https://xeroxgo.vercel.app/pay/" + expectedDemoToken
 
 	mockClient := &mockLookupClient{
 		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
@@ -964,7 +960,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 				AttemptID:     "att_wrap_201",
 				SessionID:     sessionID,
 				DemoToken:     expectedDemoToken,
-				QRPayload:     "upi://pay?pa=mock@upi&am=4.00",
+				QRPayload:     "https://test.local/pay/" + expectedDemoToken,
 				AmountPaise:   400,
 				Status:        "PAYMENT_PENDING",
 				AttemptStatus: "CREATED",
@@ -978,7 +974,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
-		PaymentURLBase:    "https://xeroxgo.vercel.app/payment",
+		PaymentURLBase:    "https://xeroxgo.vercel.app/pay",
 		IdleQRContent:     "https://xeroxgo.vercel.app",
 		PrinterModel:      "Brother HL-L5210DN",
 	}
@@ -1046,7 +1042,6 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 	defer sim.Close()
 
 	rnd := &mockRenderer{}
-	authChan := make(chan string, 1)
 
 	mockClient := &mockLookupClient{
 		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
@@ -1071,16 +1066,9 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 			return &cloud.PaymentAttemptDetails{
 				AttemptID: "att_demo_keypad_1",
 				SessionID: sessionID,
-				DemoToken: "dmo_keypad_confirm_token_999",
-				QRPayload: "https://xeroxgo.vercel.app/pay/dmo_keypad_confirm_token_999",
+				DemoToken: "dmo_4444555566667777ddddeeeeffff00001111222233334444",
+				QRPayload: "https://xeroxgo.vercel.app/pay/dmo_4444555566667777ddddeeeeffff00001111222233334444",
 			}, nil
-		},
-		authorizeFn: func(ctx context.Context, token string) error {
-			select {
-			case authChan <- token:
-			default:
-			}
-			return nil
 		},
 	}
 
@@ -1090,6 +1078,7 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
+		PaymentURLBase:    "https://xeroxgo.vercel.app/pay",
 	}
 
 	ctrl, err := NewController(cfg, sim)
@@ -1118,7 +1107,7 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		last := rnd.LastState()
-		if ctrl.GetState() == StatePaymentPending && last.Mode == ui_ipc.ModePaymentPending && strings.Contains(last.QRContent, "dmo_keypad_confirm_token_999") {
+		if ctrl.GetState() == StatePaymentPending && last.Mode == ui_ipc.ModePaymentPending && strings.Contains(last.QRContent, "dmo_4444555566667777ddddeeeeffff00001111222233334444") {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -1127,117 +1116,13 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
 	}
 
-	// Press Submit (Confirm/Enter) on keypad to demo pay
+	// Press Submit (Confirm/Enter) on keypad - must NOT authorize payment!
 	sim.EmitSubmit()
 
-	select {
-	case tok := <-authChan:
-		if tok != "dmo_keypad_confirm_token_999" {
-			t.Errorf("expected authorized token %q, got %q", "dmo_keypad_confirm_token_999", tok)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("expected AuthorizeDemoPayment to be called on keypad confirm")
-	}
+	time.Sleep(300 * time.Millisecond)
 
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateIdle {
-		t.Errorf("expected controller to reset to IDLE after demo payment, got %s", ctrl.GetState())
-	}
-}
-
-func TestController_BypassPayment_AutoAuthorize(t *testing.T) {
-	sim := input.NewSimulatedSource(32)
-	defer sim.Close()
-
-	rnd := &mockRenderer{}
-	authChan := make(chan string, 1)
-
-	mockClient := &mockLookupClient{
-		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
-			return &cloud.OrderDetails{
-				OrderID:         "ord_auto_bypass_1",
-				TotalPricePaise: 400,
-				TotalPages:      2,
-				TotalSheets:     2,
-				Copies:          1,
-				Duplex:          "simplex",
-				ColorMode:       "bw",
-			}, nil
-		},
-		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
-			return &cloud.SessionDetails{
-				SessionID: "sess_auto_bypass_1",
-				OrderID:   orderID,
-				Status:    "PAYMENT_PENDING",
-			}, nil
-		},
-		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
-			return &cloud.PaymentAttemptDetails{
-				AttemptID: "att_auto_bypass_1",
-				SessionID: sessionID,
-				DemoToken: "dmo_auto_bypass_tok_777",
-				QRPayload: "https://xeroxgo.vercel.app/pay/dmo_auto_bypass_tok_777",
-			}, nil
-		},
-		authorizeFn: func(ctx context.Context, token string) error {
-			select {
-			case authChan <- token:
-			default:
-			}
-			return nil
-		},
-	}
-
-	cfg := Config{
-		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
-		PaymentTimeout:    10 * time.Second,
-		RenderScreen:      rnd.Render,
-		LookupClient:      mockClient,
-		BypassPayment:     true, // auto-authorize enabled!
-	}
-
-	ctrl, err := NewController(cfg, sim)
-	if err != nil {
-		t.Fatalf("failed to create controller: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ctrl.Start(ctx)
-	defer ctrl.Stop()
-
-	// Enter PIN and confirm summary
-	sim.EmitDigit('5')
-	sim.EmitDigit('6')
-	sim.EmitDigit('7')
-	sim.EmitDigit('8')
-	sim.EmitSubmit()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit() // Confirm order summary
-
-	// Without any more user input, bypass payment should automatically authorize and return to IDLE
-	select {
-	case tok := <-authChan:
-		if tok != "dmo_auto_bypass_tok_777" {
-			t.Errorf("expected authorized token %q, got %q", "dmo_auto_bypass_tok_777", tok)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("expected AuthorizeDemoPayment to be automatically called with BypassPayment=true")
-	}
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateIdle {
-		t.Errorf("expected controller to reset to IDLE after auto demo payment, got %s", ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Errorf("expected controller to remain in StatePaymentPending, got %s", ctrl.GetState())
 	}
 }
 
@@ -1291,6 +1176,694 @@ func TestController_ErrorClearTimeout(t *testing.T) {
 	}
 	if ctrl.GetPINBuffer() != "" {
 		t.Errorf("expected PIN buffer to clear after ErrorClearTimeout, got %q", ctrl.GetPINBuffer())
+	}
+}
+
+func TestController_PaymentQR_ValidDemoToken(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	defer sim.Close()
+	rnd := &mockRenderer{}
+
+	expectedDemoToken := "dmo_5555666677778888eeeeffff000011112222333344445555"
+	expectedURL := "https://xeroxgo.vercel.app/pay/" + expectedDemoToken
+
+	client := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:          "ord_valid_qr_1",
+				KioskID:          "kiosk-1",
+				Status:           "PENDING_PAYMENT",
+				TotalPricePaise:  500,
+				TotalPages:       2,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           "simplex",
+				ColorMode:        "BW",
+				SecondsRemaining: 300,
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_valid_qr_1",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				TotalPricePaise:  500,
+				SecondsRemaining: 300,
+			}, nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID:     "att_valid_qr_1",
+				SessionID:     sessionID,
+				OrderID:       "ord_valid_qr_1",
+				Status:        "PAYMENT_PENDING",
+				AttemptStatus: "CREATED",
+				DemoToken:     expectedDemoToken,
+				QRPayload:     "https://ignore.local/pay/" + expectedDemoToken,
+				AmountPaise:   500,
+			}, nil
+		},
+	}
+
+	ctrl, err := NewController(Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    10 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      client,
+		PaymentURLBase:    "https://xeroxgo.vercel.app/pay",
+	}, sim)
+	if err != nil {
+		t.Fatalf("failed to create controller: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// Enter PIN and confirm order summary
+	sim.EmitDigits("1234")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	}
+
+	// Confirm order summary to trigger InitiatePayment
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
+	}
+
+	// Wait for async InitiatePayment to deliver valid QR
+	var foundValidQR bool
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rnd.mu.Lock()
+		for _, s := range rnd.states {
+			if s.Mode == ui_ipc.ModePaymentPending && s.QRContent == expectedURL && s.PINError == "" {
+				foundValidQR = true
+				break
+			}
+		}
+		rnd.mu.Unlock()
+		if foundValidQR {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !foundValidQR {
+		t.Fatalf("expected QRContent %q with empty PINError to be rendered", expectedURL)
+	}
+	if ctrl.GetPINError() != "" {
+		t.Errorf("expected empty pinError, got %q", ctrl.GetPINError())
+	}
+}
+
+func TestController_PaymentQR_MissingOrInvalidDemoToken_ShowsRetryableError(t *testing.T) {
+	testCases := []struct {
+		name           string
+		demoToken      string
+		qrPayload      string
+		paymentURLBase string
+	}{
+		{"empty demo token", "", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"whitespace demo token", "   ", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"incorrect prefix", "tok_0123456789abcdef0123456789abcdef0123456789abcdef", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"too short length", "dmo_0123456789abcdef0123456789abcdef0123456789abcde", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"too long length", "dmo_0123456789abcdef0123456789abcdef0123456789abcdef0", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"uppercase hex", "dmo_0123456789ABCDEF0123456789abcdef0123456789abcdef", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"non-hex character", "dmo_0123456789abcdef0123456789abcdef0123456789abcdeg", "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/pay"},
+		{"mismatched URL token without base", canonicalTestToken, "https://demo.local/pay/dmo_999999999999999999999999999999999999999999999999", ""},
+		{"malformed checkout URL without base", canonicalTestToken, "://bad-checkout-url", ""},
+		{"non-http checkout URL without base", canonicalTestToken, "upi://pay?pa=mock", ""},
+		{"malformed payment URL base (wrong path)", canonicalTestToken, "https://attacker.example.com/arbitrary-raw-qr", "https://xeroxgo.vercel.app/payment"},
+		{"malformed payment URL base (non-http)", canonicalTestToken, "https://attacker.example.com/arbitrary-raw-qr", "ftp://xeroxgo.vercel.app/pay"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sim := input.NewSimulatedSource(16)
+			defer sim.Close()
+			rnd := &mockRenderer{}
+
+			client := &mockLookupClient{
+				lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+					return &cloud.OrderDetails{
+						OrderID:          "ord_missing_qr_1",
+						KioskID:          "kiosk-1",
+						Status:           "PENDING_PAYMENT",
+						TotalPricePaise:  300,
+						TotalPages:       1,
+						TotalSheets:      1,
+						Copies:           1,
+						Duplex:           "simplex",
+						ColorMode:        "BW",
+						SecondsRemaining: 300,
+					}, nil
+				},
+				claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+					return &cloud.SessionDetails{
+						SessionID:        "sess_missing_qr_1",
+						OrderID:          orderID,
+						Status:           "PAYMENT_PENDING",
+						TotalPricePaise:  300,
+						SecondsRemaining: 300,
+					}, nil
+				},
+				initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+					return &cloud.PaymentAttemptDetails{
+						AttemptID:     "att_missing_qr_1",
+						SessionID:     sessionID,
+						OrderID:       "ord_missing_qr_1",
+						Status:        "PAYMENT_PENDING",
+						AttemptStatus: "CREATED",
+						DemoToken:     tc.demoToken,
+						QRPayload:     tc.qrPayload,
+						AmountPaise:   300,
+					}, nil
+				},
+			}
+
+			ctrl, err := NewController(Config{
+				InactivityTimeout: 10 * time.Second,
+				SummaryTimeout:    10 * time.Second,
+				PaymentTimeout:    10 * time.Second,
+				RenderScreen:      rnd.Render,
+				LookupClient:      client,
+				PaymentURLBase:    tc.paymentURLBase,
+			}, sim)
+			if err != nil {
+				t.Fatalf("failed to create controller: %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctrl.Start(ctx)
+			defer ctrl.Stop()
+
+			// Enter PIN and confirm summary
+			sim.EmitDigits("1234")
+			sim.EmitSubmit()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if ctrl.GetState() != StateOrderSummary {
+				t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+			}
+
+			// Confirm order summary to trigger InitiatePayment
+			sim.EmitSubmit()
+
+			deadline = time.Now().Add(2 * time.Second)
+			for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if ctrl.GetState() != StatePaymentPending {
+				t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
+			}
+
+			// Wait for error state to appear
+			expectedErr := "Failed to load payment QR. Press Confirm to retry."
+			deadline = time.Now().Add(2 * time.Second)
+			for ctrl.GetPINError() != expectedErr && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			if ctrl.GetPINError() != expectedErr {
+				t.Fatalf("expected pinError %q, got %q", expectedErr, ctrl.GetPINError())
+			}
+
+			// Verify that arbitrary raw-QR or invalid QR was NEVER rendered, and QRContent remained empty
+			rnd.mu.Lock()
+			for _, s := range rnd.states {
+				if s.Mode == ui_ipc.ModePaymentPending {
+					if tc.qrPayload != "" && s.QRContent == tc.qrPayload {
+						rnd.mu.Unlock()
+						t.Fatalf("raw or mismatched QR payload %q was rendered unexpectedly!", tc.qrPayload)
+					}
+					if s.PINError == expectedErr && s.QRContent != "" {
+						rnd.mu.Unlock()
+						t.Fatalf("expected empty QRContent when error is displayed, got %q", s.QRContent)
+					}
+				}
+			}
+			last := rnd.states[len(rnd.states)-1]
+			rnd.mu.Unlock()
+
+			if last.QRContent != "" {
+				t.Errorf("last rendered state has QRContent = %q, want empty", last.QRContent)
+			}
+			if last.PINError != expectedErr {
+				t.Errorf("last rendered state has PINError = %q, want %q", last.PINError, expectedErr)
+			}
+		})
+	}
+}
+
+func TestController_PaymentQR_RetryBehavior(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	defer sim.Close()
+	rnd := &mockRenderer{}
+
+	var attemptCount int
+	var attemptMu sync.Mutex
+
+	expectedRetryToken := "dmo_6666777788889999ffff0000111122223333444455556666"
+	expectedRetryURL := "https://xeroxgo.vercel.app/pay/" + expectedRetryToken
+
+	client := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:          "ord_retry_test_1",
+				KioskID:          "kiosk-1",
+				Status:           "PENDING_PAYMENT",
+				TotalPricePaise:  700,
+				TotalPages:       2,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           "simplex",
+				ColorMode:        "BW",
+				SecondsRemaining: 300,
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_retry_test_1",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				TotalPricePaise:  700,
+				SecondsRemaining: 300,
+			}, nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			attemptMu.Lock()
+			attemptCount++
+			count := attemptCount
+			attemptMu.Unlock()
+
+			if count == 1 {
+				// First attempt returns missing demo token (fails)
+				return &cloud.PaymentAttemptDetails{
+					AttemptID:     "att_retry_1",
+					SessionID:     sessionID,
+					OrderID:       "ord_retry_test_1",
+					Status:        "PAYMENT_PENDING",
+					AttemptStatus: "CREATED",
+					DemoToken:     "",
+					AmountPaise:   700,
+				}, nil
+			}
+
+			// Subsequent retry returns valid demo token
+			return &cloud.PaymentAttemptDetails{
+				AttemptID:     "att_retry_2",
+				SessionID:     sessionID,
+				OrderID:       "ord_retry_test_1",
+				Status:        "PAYMENT_PENDING",
+				AttemptStatus: "CREATED",
+				DemoToken:     expectedRetryToken,
+				AmountPaise:   700,
+			}, nil
+		},
+	}
+
+	ctrl, err := NewController(Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    10 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      client,
+		PaymentURLBase:    "https://xeroxgo.vercel.app/pay",
+	}, sim)
+	if err != nil {
+		t.Fatalf("failed to create controller: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// Enter PIN and confirm summary
+	sim.EmitDigits("1234")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	}
+
+	// Confirm summary to trigger first InitiatePayment
+	sim.EmitSubmit()
+
+	expectedErr := "Failed to load payment QR. Press Confirm to retry."
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetPINError() != expectedErr && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if ctrl.GetPINError() != expectedErr {
+		t.Fatalf("expected pinError %q after failed first attempt, got %q", expectedErr, ctrl.GetPINError())
+	}
+
+	// Press keypad Confirm (ActionSubmit) to explicitly retry
+	sim.EmitSubmit()
+
+	// Wait for retry to succeed with valid QR
+	var foundRecoveredQR bool
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rnd.mu.Lock()
+		for _, s := range rnd.states {
+			if s.Mode == ui_ipc.ModePaymentPending && s.QRContent == expectedRetryURL && s.PINError == "" {
+				foundRecoveredQR = true
+				break
+			}
+		}
+		rnd.mu.Unlock()
+		if foundRecoveredQR {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !foundRecoveredQR {
+		t.Fatalf("expected QRContent %q after retry, did not find it in rendered states", expectedRetryURL)
+	}
+	if ctrl.GetPINError() != "" {
+		t.Errorf("expected empty pinError after retry recovery, got %q", ctrl.GetPINError())
+	}
+
+	// Pressing Confirm again when QR is active must be ignored
+	attemptMu.Lock()
+	countBefore := attemptCount
+	attemptMu.Unlock()
+
+	sim.EmitSubmit()
+	time.Sleep(50 * time.Millisecond)
+
+	attemptMu.Lock()
+	countAfter := attemptCount
+	attemptMu.Unlock()
+
+	if countAfter != countBefore {
+		t.Errorf("Confirm press on active QR screen triggered redundant InitiatePayment: before=%d after=%d", countBefore, countAfter)
+	}
+	if ctrl.GetPINError() != "" {
+		t.Errorf("pinError became %q after ignoring Confirm, want empty", ctrl.GetPINError())
+	}
+}
+
+func TestController_ResolvePaymentQRPayload(t *testing.T) {
+	ctrlWithBase, _ := NewController(Config{
+		RenderScreen:   func(ui_ipc.ScreenState) error { return nil },
+		LookupClient:   &mockLookupClient{},
+		PaymentURLBase: "https://xeroxgo.vercel.app/pay",
+	}, input.NewSimulatedSource(4))
+
+	ctrlWithTrailingSlash, _ := NewController(Config{
+		RenderScreen:   func(ui_ipc.ScreenState) error { return nil },
+		LookupClient:   &mockLookupClient{},
+		PaymentURLBase: "https://xeroxgo.vercel.app/pay/",
+	}, input.NewSimulatedSource(4))
+
+	ctrlWithoutBase, _ := NewController(Config{
+		RenderScreen: func(ui_ipc.ScreenState) error { return nil },
+		LookupClient: &mockLookupClient{},
+	}, input.NewSimulatedSource(4))
+
+	ctrlWithInvalidBasePath, _ := NewController(Config{
+		RenderScreen:   func(ui_ipc.ScreenState) error { return nil },
+		LookupClient:   &mockLookupClient{},
+		PaymentURLBase: "https://xeroxgo.vercel.app",
+	}, input.NewSimulatedSource(4))
+
+	ctrlWithNonHTTPBase, _ := NewController(Config{
+		RenderScreen:   func(ui_ipc.ScreenState) error { return nil },
+		LookupClient:   &mockLookupClient{},
+		PaymentURLBase: "ftp://xeroxgo.vercel.app/pay",
+	}, input.NewSimulatedSource(4))
+
+	ctrlWithMalformedBase, _ := NewController(Config{
+		RenderScreen:   func(ui_ipc.ScreenState) error { return nil },
+		LookupClient:   &mockLookupClient{},
+		PaymentURLBase: "://bad-url",
+	}, input.NewSimulatedSource(4))
+
+	ctrlWithBaseQuery, _ := NewController(Config{
+		RenderScreen:   func(ui_ipc.ScreenState) error { return nil },
+		LookupClient:   &mockLookupClient{},
+		PaymentURLBase: "https://xeroxgo.vercel.app/pay?foo=bar",
+	}, input.NewSimulatedSource(4))
+
+	tests := []struct {
+		name     string
+		ctrl     *Controller
+		attempt  *cloud.PaymentAttemptDetails
+		expected string
+	}{
+		{
+			name:     "nil attempt returns empty string",
+			ctrl:     ctrlWithBase,
+			attempt:  nil,
+			expected: "",
+		},
+		{
+			name: "missing demo token returns empty string even with raw QRPayload",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_1",
+				DemoToken: "",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "whitespace demo token returns empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_2",
+				DemoToken: "   ",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "incorrect prefix (tok_ instead of dmo_) returns empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_3",
+				DemoToken: "tok_0123456789abcdef0123456789abcdef0123456789abcdef",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "too short length returns empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_4",
+				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcde",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "too long length returns empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_5",
+				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcdef0",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "non-hex uppercase characters return empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_6",
+				DemoToken: "dmo_0123456789ABCDEF0123456789abcdef0123456789abcdef",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "non-hex character g returns empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_7",
+				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcdeg",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "demo token with space returns empty string",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_8",
+				DemoToken: "dmo_0123456789abcdef 123456789abcdef0123456789abcdef",
+				QRPayload: "https://arbitrary.raw.qr/payload",
+			},
+			expected: "",
+		},
+		{
+			name: "valid canonical demo token with configured PaymentURLBase",
+			ctrl: ctrlWithBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_9",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://old.ignored.qr",
+			},
+			expected: "https://xeroxgo.vercel.app/pay/" + canonicalTestToken,
+		},
+		{
+			name: "valid canonical demo token with PaymentURLBase trailing slash normalizes",
+			ctrl: ctrlWithTrailingSlash,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_10",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://old.ignored.qr",
+			},
+			expected: "https://xeroxgo.vercel.app/pay/" + canonicalTestToken,
+		},
+		{
+			name: "configured PaymentURLBase without /pay path is rejected",
+			ctrl: ctrlWithInvalidBasePath,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_11",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://old.ignored.qr",
+			},
+			expected: "",
+		},
+		{
+			name: "configured PaymentURLBase with non-http scheme is rejected",
+			ctrl: ctrlWithNonHTTPBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_12",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://old.ignored.qr",
+			},
+			expected: "",
+		},
+		{
+			name: "configured PaymentURLBase with malformed URL is rejected",
+			ctrl: ctrlWithMalformedBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_13",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://old.ignored.qr",
+			},
+			expected: "",
+		},
+		{
+			name: "configured PaymentURLBase with query parameters is rejected",
+			ctrl: ctrlWithBaseQuery,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_14",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://old.ignored.qr",
+			},
+			expected: "",
+		},
+		{
+			name: "unconfigured PaymentURLBase uses valid cloud checkout URL with exact /pay/{token} path",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_15",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://demo.local/pay/" + canonicalTestToken,
+			},
+			expected: "https://demo.local/pay/" + canonicalTestToken,
+		},
+		{
+			name: "unconfigured PaymentURLBase with mismatched token in cloud checkout URL is rejected",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_16",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://demo.local/pay/dmo_999999999999999999999999999999999999999999999999",
+			},
+			expected: "",
+		},
+		{
+			name: "unconfigured PaymentURLBase with wrong path in cloud checkout URL is rejected",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_17",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://demo.local/payment/" + canonicalTestToken,
+			},
+			expected: "",
+		},
+		{
+			name: "unconfigured PaymentURLBase with non-http scheme in cloud checkout URL is rejected",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_18",
+				DemoToken: canonicalTestToken,
+				QRPayload: "upi://pay?pa=mock",
+			},
+			expected: "",
+		},
+		{
+			name: "unconfigured PaymentURLBase with malformed cloud checkout URL is rejected",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_19",
+				DemoToken: canonicalTestToken,
+				QRPayload: "://bad-url",
+			},
+			expected: "",
+		},
+		{
+			name: "unconfigured PaymentURLBase with query parameter in cloud checkout URL is rejected",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_20",
+				DemoToken: canonicalTestToken,
+				QRPayload: "https://demo.local/pay/" + canonicalTestToken + "?ref=1",
+			},
+			expected: "",
+		},
+		{
+			name: "unconfigured PaymentURLBase with empty QRPayload does not invent fallback",
+			ctrl: ctrlWithoutBase,
+			attempt: &cloud.PaymentAttemptDetails{
+				AttemptID: "att_21",
+				DemoToken: canonicalTestToken,
+				QRPayload: "",
+			},
+			expected: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.ctrl.resolvePaymentQRPayload(tc.attempt)
+			if got != tc.expected {
+				t.Errorf("resolvePaymentQRPayload() = %q, want %q", got, tc.expected)
+			}
+		})
 	}
 }
 
