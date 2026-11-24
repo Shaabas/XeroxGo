@@ -730,3 +730,123 @@ func TestPackage03_Scenario12_ConcurrentMobileUploads_CannotOvercommitPaper(t *t
 		t.Fatalf("expected 12 sheets committed (2 * 6), got %d", committed)
 	}
 }
+
+// Regression test for Correction 1:
+// 1. Capture payment successfully -> establishes COMPLETED session and pending dispatch intent.
+// 2. Late CancelKioskSession on that session must be an idempotent no-op:
+//    order remains DISPATCHED and dispatch intent remains unchanged (PENDING).
+// 3. Existing cancellation-wins behavior: subsequent uncaptured demo payment against canceled session must be rejected.
+func TestPackage03_LateCancellationAfterPayment_PreservesPaidAndDispatch(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	kioskID := "kiosk-p3-reg1"
+	orderID := "ord_p3_reg1"
+
+	ord := sampleOrder(orderID, "job_p3_reg1")
+	ord.Command.KioskID = kioskID
+	ord.Command.DisplayCode = "1234"
+	ord.PricePaise = 1000
+	ord.Status = contracts.JobStatusPendingPayment
+	ord.CreatedAt = t0
+	ord.PINExpiresAt = t0.Add(10 * time.Minute)
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Claim session
+	sess, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 50, 120*time.Second, t0)
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	// 1. Capture payment successfully -> completes session and creates dispatch intent in PENDING
+	tPay := t0.Add(15 * time.Second)
+	capRes, err := s.CapturePaymentAndCheckDispatch(ctx, PaymentRecord{
+		PaymentID:   "pay_p3_reg1",
+		OrderID:     orderID,
+		KioskID:     kioskID,
+		SessionID:   sess.SessionID,
+		AmountPaise: 1000,
+		Provider:    "mock",
+		Status:      "captured",
+	}, tPay)
+	if err != nil {
+		t.Fatalf("capture failed: %v", err)
+	}
+	if !capRes.DispatchEligible {
+		t.Fatalf("expected DispatchEligible true")
+	}
+
+	// Verify database state before late cancel:
+	// Session is COMPLETED
+	curSess, err := s.GetKioskSession(ctx, sess.SessionID, tPay)
+	if err != nil || curSess.Status != KioskSessionCompleted {
+		t.Fatalf("expected session status COMPLETED, got %v", curSess)
+	}
+	// Order is DISPATCHED
+	curOrd, err := s.GetOrder(ctx, orderID)
+	if err != nil || curOrd.Status != contracts.JobStatusDispatched {
+		t.Fatalf("expected order status DISPATCHED, got %v", curOrd)
+	}
+	// Dispatch intent is PENDING
+	pendingIntents, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil || len(pendingIntents) != 1 {
+		t.Fatalf("expected 1 pending dispatch intent, got %d (err=%v)", len(pendingIntents), err)
+	}
+
+	// 2. Customer or kiosk sends late CancelKioskSession
+	tLateCancel := t0.Add(30 * time.Second)
+	err = s.CancelKioskSession(ctx, sess.SessionID, kioskID, tLateCancel)
+	if err != nil {
+		t.Fatalf("CancelKioskSession on completed session should return nil (idempotent no-op), got: %v", err)
+	}
+
+	// Assert that order remains DISPATCHED and intent remains unchanged
+	ordAfterCancel, err := s.GetOrder(ctx, orderID)
+	if err != nil {
+		t.Fatalf("GetOrder failed: %v", err)
+	}
+	if ordAfterCancel.Status != contracts.JobStatusDispatched {
+		t.Fatalf("expected order status to remain DISPATCHED after late cancel, got: %s", ordAfterCancel.Status)
+	}
+
+	intentsAfterCancel, err := s.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil || len(intentsAfterCancel) != 1 {
+		t.Fatalf("expected pending dispatch intent to remain intact after late cancel, got %d", len(intentsAfterCancel))
+	}
+
+	sessAfterCancel, err := s.GetKioskSession(ctx, sess.SessionID, tLateCancel)
+	if err != nil || sessAfterCancel.Status != KioskSessionCompleted {
+		t.Fatalf("expected session status to remain COMPLETED, got %v", sessAfterCancel)
+	}
+
+	// 3. Retain cancellation-wins behavior: subsequent uncaptured demo payment against canceled session must be rejected.
+	orderID2 := "ord_p3_reg1_uncaptured"
+	ord2 := sampleOrder(orderID2, "job_p3_reg1_uncaptured")
+	ord2.Command.KioskID = kioskID
+	ord2.Command.DisplayCode = "5678"
+	ord2.PricePaise = 500
+	ord2.Status = contracts.JobStatusPendingPayment
+	ord2.CreatedAt = t0
+	ord2.PINExpiresAt = t0.Add(10 * time.Minute)
+	_ = s.CreateOrder(ctx, ord2)
+
+	sess2, _ := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID2, 50, 120*time.Second, t0)
+	// Cancel uncaptured session
+	_ = s.CancelKioskSession(ctx, sess2.SessionID, kioskID, t0.Add(10*time.Second))
+
+	// Subsequent payment attempt must be rejected with ErrSessionCanceled
+	_, err = s.CapturePaymentAndCheckDispatch(ctx, PaymentRecord{
+		PaymentID:   "pay_p3_uncaptured",
+		OrderID:     orderID2,
+		KioskID:     kioskID,
+		SessionID:   sess2.SessionID,
+		AmountPaise: 500,
+		Provider:    "mock",
+		Status:      "captured",
+	}, t0.Add(20*time.Second))
+	if !errors.Is(err, ErrSessionCanceled) {
+		t.Fatalf("expected ErrSessionCanceled for payment against canceled session, got: %v", err)
+	}
+}

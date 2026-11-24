@@ -426,23 +426,32 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 
 	// Verify paper supply against other commitments
 	committedSheets, cErr := s.db.GetCommittedPaperSheets(r.Context(), kioskID, orderID, now)
-	if cErr == nil {
-		reqSheets := ord.TotalSheets
-		if reqSheets <= 0 {
-			reqSheets = ord.Command.TotalSheets
-		}
-		if reqSheets <= 0 {
-			reqSheets = 1
-		}
-		if (stock - committedSheets) < reqSheets {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "insufficient paper in kiosk tray to fulfill order",
-				"code":  "INSUFFICIENT_PAPER",
-			})
-			return
-		}
+	if cErr != nil {
+		log.Printf("[INITIATE-PAYMENT] Failed to query paper commitments: %v", cErr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "failed to verify paper commitments",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+
+	reqSheets := ord.TotalSheets
+	if reqSheets <= 0 {
+		reqSheets = ord.Command.TotalSheets
+	}
+	if reqSheets <= 0 {
+		reqSheets = 1
+	}
+	if (stock - committedSheets) < reqSheets {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "insufficient paper in kiosk tray to fulfill order",
+			"code":  "INSUFFICIENT_PAPER",
+		})
+		return
 	}
 
 	// Idempotency: check if an active, unexpired payment attempt already exists for this session

@@ -1085,21 +1085,23 @@ func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
 	// Give the hub a moment to run reconciliation
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify that the order was NOT dispatched, intent was CANCELED, and order is in PAID_WAITING
+	// Verify that late cancellation on a COMPLETED session did not revoke the paid dispatch:
+	// Order remains DISPATCHED and was reconciled and sent to the kiosk upon reconnect.
 	ord, err := st.GetOrder(context.Background(), orderID)
 	if err != nil {
 		t.Fatalf("GetOrder failed: %v", err)
 	}
-	if ord.Status != contracts.JobStatusPaidWaiting {
-		t.Fatalf("expected order status PAID_WAITING after reconnect with canceled session, got %s", ord.Status)
+	if ord.Status != contracts.JobStatusDispatched {
+		t.Fatalf("expected order status DISPATCHED after reconnect with paid order, got %s", ord.Status)
 	}
 
+	// The pending intent was reconciled (sent to kiosk), so 0 PENDING intents remain
 	pending, err := st.GetPendingDispatchOrders(context.Background(), kioskID)
 	if err != nil {
 		t.Fatalf("GetPendingDispatchOrders failed: %v", err)
 	}
 	if len(pending) != 0 {
-		t.Fatalf("expected 0 pending dispatch orders, got %d", len(pending))
+		t.Fatalf("expected 0 pending dispatch orders after reconciliation, got %d", len(pending))
 	}
 }
 

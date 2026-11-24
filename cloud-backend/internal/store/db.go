@@ -48,8 +48,9 @@ type queryable interface {
 }
 
 type Store struct {
-	db      *sql.DB
-	dialect string
+	db                         *sql.DB
+	dialect                    string
+	FaultInjectCommitmentQuery error
 }
 
 // DB returns the underlying *sql.DB handle.
@@ -2711,6 +2712,9 @@ func (s *Store) GetCommittedPaperSheets(ctx context.Context, kioskID, excludeOrd
 	if s == nil || s.db == nil {
 		return 0, errors.New("store not initialized")
 	}
+	if s.FaultInjectCommitmentQuery != nil {
+		return 0, s.FaultInjectCommitmentQuery
+	}
 	return s.getCommittedPaperSheetsTx(ctx, s.db, kioskID, excludeOrderID, now.UTC().UnixNano())
 }
 
@@ -3122,11 +3126,9 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 			}
 			return err
 		}
-		// Session is already CANCELED or EXPIRED.
-		// Repeat cancellation is idempotent; a stale cancellation must not revoke paid dispatch intents.
-		if currentStatus == "CANCELED" || currentStatus == "EXPIRED" {
-			return tx.Commit()
-		}
+		// If session is already COMPLETED, CANCELED, or EXPIRED, return an idempotent no-op.
+		// A late cancellation must never revoke paid dispatch intents, change order status, or modify payment attempts.
+		return tx.Commit()
 	}
 
 	// For unpaid orders, end checkout protection immediately; retain only original PIN reservation if still unexpired.

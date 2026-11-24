@@ -34,6 +34,7 @@ type Config struct {
 	ErrorClearTimeout time.Duration // Duration before clearing PIN error back to clean state (default 5s)
 	SummaryTimeout    time.Duration // Duration before returning to IDLE from ORDER_SUMMARY (default 60s)
 	PaymentTimeout    time.Duration // Duration before returning to IDLE from PAYMENT_PENDING (default 120s)
+	CancelWaitTimeout time.Duration // Duration to wait for in-flight cancellation to resolve before failing safely (default 5s)
 	CountdownInterval time.Duration // Tick interval for countdown timer (default 1s)
 	RenderScreen      func(ui_ipc.ScreenState) error
 	LookupClient      cloud.PINLookupClient
@@ -42,6 +43,11 @@ type Config struct {
 	KioskID           string
 	PrinterModel      string
 	OnTransactionEnd  func()
+}
+
+type cancelTracker struct {
+	done chan struct{}
+	err  error
 }
 
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
@@ -58,7 +64,7 @@ type Controller struct {
 	currentAttempt      *cloud.PaymentAttemptDetails
 	currentQRPayload    string
 	currentRemainingSec int
-	pendingCancels      map[string]chan struct{}
+	pendingCancels      map[string]*cancelTracker
 	lookupSeq           uint64 // Monotonically increasing sequence to discard stale responses
 	isClaiming       bool
 
@@ -95,13 +101,16 @@ func NewController(cfg Config, inputSource input.Source) (*Controller, error) {
 	if cfg.PaymentTimeout <= 0 {
 		cfg.PaymentTimeout = 120 * time.Second
 	}
+	if cfg.CancelWaitTimeout <= 0 {
+		cfg.CancelWaitTimeout = 5 * time.Second
+	}
 
 	return &Controller{
 		cfg:            cfg,
 		inputSource:    inputSource,
 		state:          StateIdle,
 		done:           make(chan struct{}),
-		pendingCancels: make(map[string]chan struct{}),
+		pendingCancels: make(map[string]*cancelTracker),
 	}, nil
 }
 
@@ -342,24 +351,25 @@ func (c *Controller) handleOrderSummaryEvent(ev input.Event) {
 	}
 }
 
+func (c *Controller) cancelSessionAsyncLocked(sessID string) {
+	if sessID == "" {
+		return
+	}
+	tracker := &cancelTracker{done: make(chan struct{})}
+	c.pendingCancels[sessID] = tracker
+	go func(sID string, tr *cancelTracker) {
+		defer close(tr.done)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		tr.err = c.cfg.LookupClient.CancelSession(ctx, sID)
+	}(sessID, tracker)
+}
+
 func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 	switch ev.Type {
 	case input.ActionCancel:
 		if c.currentSession != nil {
-			sessID := c.currentSession.SessionID
-			doneCh := make(chan struct{})
-			c.pendingCancels[sessID] = doneCh
-			go func(sID string, ch chan struct{}) {
-				defer func() {
-					close(ch)
-					c.mu.Lock()
-					delete(c.pendingCancels, sID)
-					c.mu.Unlock()
-				}()
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer cancel()
-				_ = c.cfg.LookupClient.CancelSession(ctx, sID)
-			}(sessID, doneCh)
+			c.cancelSessionAsyncLocked(c.currentSession.SessionID)
 		}
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
@@ -436,19 +446,50 @@ func (c *Controller) startClaimLocked() {
 
 		if err == nil && session != nil {
 			c.mu.Lock()
-			pendingCh, hasPending := c.pendingCancels[session.SessionID]
+			tracker, hasPending := c.pendingCancels[session.SessionID]
 			c.mu.Unlock()
 			if hasPending {
-				select {
-				case <-pendingCh:
-				case <-time.After(2 * time.Second):
+				waitDuration := c.cfg.CancelWaitTimeout
+				if waitDuration <= 0 {
+					waitDuration = 5 * time.Second
 				}
-				c.mu.Lock()
-				delete(c.pendingCancels, session.SessionID)
-				c.mu.Unlock()
-				reclaimCtx, reclaimCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				session, err = c.cfg.LookupClient.ClaimOrder(reclaimCtx, ordID)
-				reclaimCancel()
+				waitTimer := time.NewTimer(waitDuration)
+				defer waitTimer.Stop()
+
+				select {
+				case <-tracker.done:
+					if tracker.err != nil {
+						log.Printf("[PIN-CONTROLLER] Cancellation failed for session %s: %v", session.SessionID, tracker.err)
+						err = errors.New("previous session cancellation failed; please try again")
+						session = nil
+					} else {
+						c.mu.Lock()
+						delete(c.pendingCancels, session.SessionID)
+						c.mu.Unlock()
+
+						reclaimCtx, reclaimCancel := context.WithTimeout(ctx, 10*time.Second)
+						session, err = c.cfg.LookupClient.ClaimOrder(reclaimCtx, ordID)
+						reclaimCancel()
+
+						if err == nil && session != nil {
+							c.mu.Lock()
+							_, stillPending := c.pendingCancels[session.SessionID]
+							c.mu.Unlock()
+							if stillPending {
+								err = errors.New("received unresolved session; please try again")
+								session = nil
+							}
+						}
+					}
+				case <-waitTimer.C:
+					log.Printf("[PIN-CONTROLLER] Cancellation timed out for session %s", session.SessionID)
+					err = errors.New("previous session cancellation timed out; please try again")
+					session = nil
+				case <-ctx.Done():
+					log.Printf("[PIN-CONTROLLER] Context expired while waiting for session %s cancellation", session.SessionID)
+					err = errors.New("previous session cancellation timed out; please try again")
+					session = nil
+				}
 			}
 		}
 
@@ -796,20 +837,7 @@ func (c *Controller) resetInactivityTimerLocked(d time.Duration) {
 		if c.state == StatePINEntry || c.state == StateOrderSummary || c.state == StatePaymentPending {
 			log.Printf("[PIN-CONTROLLER] Inactivity timeout reached, returning to idle screen")
 			if c.currentSession != nil {
-				sessID := c.currentSession.SessionID
-				doneCh := make(chan struct{})
-				c.pendingCancels[sessID] = doneCh
-				go func(sID string, ch chan struct{}) {
-					defer func() {
-						close(ch)
-						c.mu.Lock()
-						delete(c.pendingCancels, sID)
-						c.mu.Unlock()
-					}()
-					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					defer cancel()
-					_ = c.cfg.LookupClient.CancelSession(ctx, sID)
-				}(sessID, doneCh)
+				c.cancelSessionAsyncLocked(c.currentSession.SessionID)
 			}
 			c.resetToIdleLocked()
 		}
