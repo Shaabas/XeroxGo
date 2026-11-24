@@ -12,10 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"xeroxgo/pkg/contracts"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
-	"xeroxgo/pkg/contracts"
 )
 
 var (
@@ -27,9 +28,18 @@ var (
 	ErrKioskMismatch       = errors.New("order does not belong to the requested kiosk")
 	ErrSessionNotFound     = errors.New("kiosk session not found")
 	ErrSessionNotActive    = errors.New("kiosk session is not active")
+	ErrSessionCanceled     = errors.New("kiosk session is canceled")
+	ErrSessionExpired      = errors.New("kiosk session has expired")
 	ErrUnauthorized        = errors.New("unauthorized: missing or invalid recovery credential")
 	ErrInsufficientPaper   = errors.New("insufficient paper in kiosk tray")
 )
+
+var paidPINDeadline = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// PaidPINExpiry returns the non-expiring deadline used for durable paid PIN entitlements.
+func PaidPINExpiry() time.Time {
+	return paidPINDeadline
+}
 
 type queryable interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
@@ -1124,8 +1134,22 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// CreateOrder persists an order and its associated print configuration and child documents atomically.
+// CreateOrder persists an order and its associated print configuration and child documents atomically without upfront paper checks.
+// Internal tests and administration routes may use this; the public mobile finalization path must use CreateOrderWithPaperCheck.
 func (s *Store) CreateOrder(ctx context.Context, order Order) error {
+	return s.createOrder(ctx, order, -1)
+}
+
+// CreateOrderWithPaperCheck atomically reserves the full order's physical sheets before
+// issuing a PIN. availableStock is the latest kiosk-reported physical stock.
+func (s *Store) CreateOrderWithPaperCheck(ctx context.Context, order Order, availableStock int) error {
+	if availableStock < 0 {
+		return fmt.Errorf("create order: available stock must be nonnegative")
+	}
+	return s.createOrder(ctx, order, availableStock)
+}
+
+func (s *Store) createOrder(ctx context.Context, order Order, availableStock int) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("create order: store is closed or nil")
 	}
@@ -1301,7 +1325,7 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 
 	pinExpiresAt := order.PINExpiresAt
 	if pinExpiresAt.IsZero() {
-		pinExpiresAt = createdAt.Add(15 * time.Minute)
+		pinExpiresAt = createdAt.Add(10 * time.Minute)
 	} else {
 		pinExpiresAt = pinExpiresAt.UTC()
 	}
@@ -1315,6 +1339,23 @@ func (s *Store) CreateOrder(ctx context.Context, order Order) error {
 		return fmt.Errorf("create order: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Serialize competing mobile reservations and kiosk session claims per kiosk.
+	// The stock check and order/PIN insert share this transaction.
+	if availableStock >= 0 {
+		if s.dialect == "postgres" {
+			if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", order.Command.KioskID); err != nil {
+				return fmt.Errorf("create order: acquire kiosk paper lock: %w", err)
+			}
+		}
+		committed, err := s.getCommittedPaperSheetsTx(ctx, tx, order.Command.KioskID, "", createdNS)
+		if err != nil {
+			return fmt.Errorf("create order: calculate paper commitments: %w", err)
+		}
+		if availableStock-committed < order.TotalSheets {
+			return ErrInsufficientPaper
+		}
+	}
 
 	// 1. Prune expired PIN reservations on this kiosk atomically
 	_, err = tx.ExecContext(ctx, s.rebind(`
@@ -2683,37 +2724,47 @@ func (s *Store) getCommittedPaperSheetsTx(ctx context.Context, q queryable, kios
 	query := s.rebind(`
 SELECT COALESCE(SUM(c.committed_sheets), 0)
 FROM (
-    SELECT pc.total_sheets AS committed_sheets
+    -- For unpaid orders, count committed sheets once per order whenever its original PIN
+    -- is unexpired OR it has an active, unexpired PAYMENT_PENDING checkout session.
+    SELECT o.total_sheets AS committed_sheets
     FROM orders o
-    JOIN print_configs pc ON o.order_id = pc.order_id
-    JOIN kiosk_sessions ks ON o.order_id = ks.order_id
     WHERE o.kiosk_id = ?
       AND o.status = 'PENDING_PAYMENT'
-      AND ks.status = 'PAYMENT_PENDING'
-      AND ks.expires_at_ns > ?
       AND (? = '' OR o.order_id != ?)
-    GROUP BY o.order_id, pc.total_sheets
+      AND (
+          o.pin_expires_at_ns > ?
+          OR EXISTS (
+              SELECT 1 FROM kiosk_sessions ks
+              WHERE ks.order_id = o.order_id
+                AND ks.status = 'PAYMENT_PENDING'
+                AND ks.expires_at_ns > ?
+          )
+      )
 
     UNION ALL
 
-    SELECT 
-        CASE 
-            WHEN (pc.total_sheets - COALESCE(jp.sheets_printed, 0)) > 0 
-            THEN (pc.total_sheets - COALESCE(jp.sheets_printed, 0))
-            ELSE 0 
-        END AS committed_sheets
-    FROM orders o
-    JOIN print_configs pc ON o.order_id = pc.order_id
-    LEFT JOIN job_progress jp ON o.job_id = jp.job_id
-    WHERE o.kiosk_id = ?
-      AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
-      AND (? = '' OR o.order_id != ?)
+    -- For paid/in-flight orders, subtract progress across child documents without double-counting.
+    SELECT CASE WHEN paid.remaining_sheets > 0 THEN paid.remaining_sheets ELSE 0 END
+    FROM (
+        SELECT o.total_sheets - COALESCE(
+            (SELECT SUM(jp.sheets_printed)
+             FROM order_documents od
+             JOIN job_progress jp ON jp.job_id = od.job_id
+             WHERE od.order_id = o.order_id),
+            (SELECT jp.sheets_printed FROM job_progress jp WHERE jp.job_id = o.job_id),
+            0
+        ) AS remaining_sheets
+        FROM orders o
+        WHERE o.kiosk_id = ?
+          AND o.status IN ('PAID_WAITING', 'DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+          AND (? = '' OR o.order_id != ?)
+    ) paid
 ) c;
 `)
 
 	var totalCommitted int
 	err := q.QueryRowContext(ctx, query,
-		kioskID, nowNS, excludeOrderID, excludeOrderID,
+		kioskID, excludeOrderID, excludeOrderID, nowNS, nowNS,
 		kioskID, excludeOrderID, excludeOrderID,
 	).Scan(&totalCommitted)
 	if err != nil {
@@ -2764,17 +2815,18 @@ func (s *Store) CreateOrGetKioskSessionWithPaperCheck(ctx context.Context, kiosk
 
 	// 1. Verify order existence, kiosk ownership, status, and expiry
 	var (
-		orderKioskID   string
-		statusStr      string
-		pricePaise     int64
-		pinExpiresAtNS int64
+		orderKioskID     string
+		statusStr        string
+		pricePaise       int64
+		pinExpiresAtNS   int64
+		orderTotalSheets int
 	)
 	queryOrder := s.rebind(`
-SELECT kiosk_id, status, price_paise, pin_expires_at_ns
+SELECT kiosk_id, status, price_paise, pin_expires_at_ns, total_sheets
 FROM orders
 WHERE order_id = ?;
 `)
-	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS)
+	err = tx.QueryRowContext(ctx, queryOrder, orderID).Scan(&orderKioskID, &statusStr, &pricePaise, &pinExpiresAtNS, &orderTotalSheets)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrOrderNotFound
@@ -2786,7 +2838,7 @@ WHERE order_id = ?;
 		return nil, ErrOrderNotPending
 	}
 
-	if pinExpiresAtNS > 0 && nowNS >= pinExpiresAtNS {
+	if statusStr == string(contracts.JobStatusPendingPayment) && pinExpiresAtNS > 0 && nowNS >= pinExpiresAtNS {
 		return nil, ErrOrderExpired
 	}
 
@@ -2854,17 +2906,8 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 
 	// 3. If paper checking is enabled (availableStock >= 0), verify sufficient available sheets
 	if availableStock >= 0 {
-		var totalSheets int
-		querySheets := s.rebind(`SELECT total_sheets FROM print_configs WHERE order_id = ?;`)
-		err = tx.QueryRowContext(ctx, querySheets, orderID).Scan(&totalSheets)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrOrderNotFound
-			}
-			return nil, fmt.Errorf("create kiosk session: query print config: %w", err)
-		}
-		if totalSheets <= 0 {
-			totalSheets = 1
+		if orderTotalSheets <= 0 {
+			return nil, fmt.Errorf("create kiosk session: invalid order total_sheets %d", orderTotalSheets)
 		}
 
 		committedSheets, err := s.getCommittedPaperSheetsTx(ctx, tx, kioskID, orderID, nowNS)
@@ -2872,24 +2915,18 @@ WHERE order_id = ? AND status = 'PAYMENT_PENDING';
 			return nil, fmt.Errorf("create kiosk session: check paper commitments: %w", err)
 		}
 		effectiveAvailable := availableStock - committedSheets
-		if effectiveAvailable < totalSheets {
+		if effectiveAvailable < orderTotalSheets {
 			return nil, ErrInsufficientPaper
 		}
 	}
 
-	// 4. Create new session
+	// 4. Create new session: fresh authoritative checkout session, do NOT cap to original PIN expiry
 	sessID, err := generateSessionID()
 	if err != nil {
 		return nil, fmt.Errorf("create kiosk session: generate session id: %w", err)
 	}
 
 	expiresAt := now.Add(sessionExpiry)
-	if pinExpiresAtNS > 0 {
-		pinExp := time.Unix(0, pinExpiresAtNS).UTC()
-		if expiresAt.After(pinExp) {
-			expiresAt = pinExp
-		}
-	}
 	expiresAtNS := expiresAt.UnixNano()
 
 	insertQuery := s.rebind(`
@@ -2897,6 +2934,18 @@ INSERT INTO kiosk_sessions (session_id, kiosk_id, order_id, status, price_paise,
 VALUES (?, ?, ?, 'PAYMENT_PENDING', ?, ?, ?, ?);
 `)
 	_, err = tx.ExecContext(ctx, insertQuery, sessID, kioskID, orderID, pricePaise, expiresAtNS, nowNS, nowNS)
+	if err == nil {
+		// Atomically extend existing pin_reservations lease through checkout deadline if later than original PIN deadline.
+		// Does NOT extend orders.pin_expires_at_ns.
+		_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE pin_reservations
+SET expires_at_ns = ?
+WHERE order_id = ? AND expires_at_ns < ?;
+`), expiresAtNS, orderID, expiresAtNS)
+		if err != nil {
+			return nil, fmt.Errorf("create kiosk session: extend pin reservation lease: %w", err)
+		}
+	}
 	if err != nil {
 		errStr := strings.ToLower(err.Error())
 		if strings.Contains(errStr, "unique") || strings.Contains(errStr, "23505") {
@@ -3060,7 +3109,10 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 	if err != nil {
 		return fmt.Errorf("cancel kiosk session: %w", err)
 	}
-	rows, _ := res.RowsAffected()
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("cancel kiosk session: rows affected: %w", err)
+	}
 	if rows == 0 {
 		var currentStatus string
 		err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM kiosk_sessions WHERE session_id = ? AND kiosk_id = ?;`), sessionID, kioskID).Scan(&currentStatus)
@@ -3070,7 +3122,48 @@ WHERE session_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PENDING';
 			}
 			return err
 		}
+		// Session is already CANCELED or EXPIRED.
+		// Repeat cancellation is idempotent; a stale cancellation must not revoke paid dispatch intents.
+		if currentStatus == "CANCELED" || currentStatus == "EXPIRED" {
+			return tx.Commit()
+		}
 	}
+
+	// For unpaid orders, end checkout protection immediately; retain only original PIN reservation if still unexpired.
+	var (
+		orderID        string
+		orderStatus    string
+		pinExpiresAtNS int64
+	)
+	err = tx.QueryRowContext(ctx, s.rebind(`
+SELECT o.order_id, o.status, o.pin_expires_at_ns
+FROM orders o
+JOIN kiosk_sessions ks ON ks.order_id = o.order_id
+WHERE ks.session_id = ?;
+`), sessionID).Scan(&orderID, &orderStatus, &pinExpiresAtNS)
+	if err == nil {
+		if orderStatus == string(contracts.JobStatusPendingPayment) {
+			if pinExpiresAtNS > nowNS {
+				_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE pin_reservations
+SET expires_at_ns = ?
+WHERE order_id = ?;
+`), pinExpiresAtNS, orderID)
+			} else {
+				_, _ = tx.ExecContext(ctx, s.rebind(`
+DELETE FROM pin_reservations
+WHERE order_id = ?;
+`), orderID)
+			}
+		}
+	}
+
+	// Cancel any active payment attempts for this session
+	_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE payment_attempts
+SET status = 'CANCELED', updated_at_ns = ?
+WHERE session_id = ? AND status = 'CREATED';
+`), nowNS, sessionID)
 
 	// Cancel any pending or unacknowledged dispatch intents for this session
 	_, _ = tx.ExecContext(ctx, s.rebind(`
@@ -3337,6 +3430,35 @@ WHERE order_id = ?;
 		return nil, fmt.Errorf("capture payment: query order: %w", err)
 	}
 
+	// In PostgreSQL, serialize payment capture against session cancellation
+	targetKiosk := orderKioskID
+	if targetKiosk == "" {
+		targetKiosk = p.KioskID
+	}
+	if s.dialect == "postgres" && targetKiosk != "" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22615, hashtext($1));", targetKiosk); err != nil {
+			return nil, fmt.Errorf("capture payment: acquire kiosk advisory lock: %w", err)
+		}
+	}
+
+	// Verify session within transaction:
+	// A canceled/expired demo QR must not create a new captured payment.
+	if p.SessionID != "" {
+		var sessStatus string
+		var sessExpNS int64
+		err = tx.QueryRowContext(ctx, s.rebind(`SELECT status, expires_at_ns FROM kiosk_sessions WHERE session_id = ?;`), p.SessionID).Scan(&sessStatus, &sessExpNS)
+		if err == nil {
+			if sessStatus == string(KioskSessionCanceled) {
+				return nil, fmt.Errorf("%w: session %s has been canceled", ErrSessionCanceled, p.SessionID)
+			}
+			if sessStatus == string(KioskSessionExpired) || sessExpNS <= nowNS {
+				return nil, fmt.Errorf("%w: session %s has expired", ErrSessionExpired, p.SessionID)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("capture payment: query session status: %w", err)
+		}
+	}
+
 	// 3. Verify amount against authoritative price
 	if p.AmountPaise != pricePaise {
 		return nil, fmt.Errorf("payment amount mismatch: expected %d paise, got %d paise", pricePaise, p.AmountPaise)
@@ -3479,6 +3601,32 @@ WHERE order_id = ? AND status = ?;
 			currentStatus = contracts.JobStatus(newStatus)
 		} else {
 			currentStatus = contracts.JobStatusPaidWaiting
+		}
+	}
+
+	// Promote the still-owned, unexpired PIN reservation into a durable paid entitlement during payment capture.
+	// Never resurrect a PIN that has expired and been reassigned.
+	untilNS := paidPINDeadline.UnixNano()
+	resPIN, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE pin_reservations SET expires_at_ns = ?
+WHERE order_id = ? AND expires_at_ns > ?
+  AND kiosk_id = (SELECT kiosk_id FROM orders WHERE order_id = ?)
+  AND pin = (SELECT display_code FROM orders WHERE order_id = ?);
+`), untilNS, p.OrderID, nowNS, p.OrderID, p.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("capture payment: promote paid pin reservation: %w", err)
+	}
+	nPIN, err := resPIN.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("capture payment: check promoted pin rows: %w", err)
+	}
+	if nPIN == 1 {
+		_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders SET pin_expires_at_ns = ?, updated_at_ns = ?
+WHERE order_id = ?;
+`), untilNS, nowNS, p.OrderID)
+		if err != nil {
+			return nil, fmt.Errorf("capture payment: promote order pin expiry: %w", err)
 		}
 	}
 
@@ -3896,6 +4044,9 @@ func (s *Store) RenewOrderPIN(ctx context.Context, orderID, newPIN, recoveryToke
 	now := time.Now().UTC()
 	nowNS := now.UnixNano()
 	expNS := newExpiry.UTC().UnixNano()
+	if newExpiry.IsZero() {
+		expNS = paidPINDeadline.UnixNano()
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

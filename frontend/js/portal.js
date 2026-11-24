@@ -2060,7 +2060,14 @@
 
       if (!resp.ok) {
         const errText = await resp.text();
-        throw new Error(errText || 'Failed to submit order to kiosk');
+        let errMsg = errText || 'Failed to submit order to kiosk';
+        try {
+          const parsedErr = JSON.parse(errText);
+          if (parsedErr && (parsedErr.error || parsedErr.message)) {
+            errMsg = parsedErr.error || parsedErr.message;
+          }
+        } catch (_) { }
+        throw new Error(errMsg);
       }
 
       const data = await resp.json();
@@ -2116,7 +2123,7 @@
       }
     }
     if (!authoritativeExpiryMs) {
-      authoritativeExpiryMs = Date.now() + 2 * 60 * 60 * 1000;
+      authoritativeExpiryMs = Date.now() + 10 * 60 * 1000;
     }
 
     function tick() {

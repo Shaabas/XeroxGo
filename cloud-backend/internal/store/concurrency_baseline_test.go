@@ -202,8 +202,6 @@ func TestConcurrencyBaseline_PaperOvercommitment_SimultaneousOrders(t *testing.T
 	var orderIDs []string
 	for i := 0; i < orderCount; i++ {
 		ordID := fmt.Sprintf("ord_stock_%d_%d", time.Now().UnixNano(), i)
-		pin := fmt.Sprintf("310%d", i)
-		createTestOrderWithSheets(t, s, ctx, ordID, kioskID, pin, sheetsPerOrder, contracts.JobStatusPendingPayment, now)
 		orderIDs = append(orderIDs, ordID)
 	}
 
@@ -219,11 +217,31 @@ func TestConcurrencyBaseline_PaperOvercommitment_SimultaneousOrders(t *testing.T
 	for i := 0; i < orderCount; i++ {
 		idx := i
 		ordID := orderIDs[i]
-		go func() {
+		pin := fmt.Sprintf("310%d", i)
+		go func(id, p string, index int) {
 			defer wg.Done()
-			_, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, availableStock, 5*time.Minute, now)
-			results[idx] = claimRes{orderID: ordID, err: err}
-		}()
+			cmd := contracts.PrintJobCommand{
+				JobID:          "job_" + id,
+				KioskID:        kioskID,
+				DownloadURL:    "https://storage.test/" + id + ".pdf",
+				SHA256Checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				TotalPages:     sheetsPerOrder,
+				TotalSheets:    sheetsPerOrder,
+				Copies:         1,
+				Duplex:         contracts.DuplexSimplex,
+				StartFromPage:  1,
+				DisplayCode:    p,
+			}
+			ord := Order{
+				OrderID:      id,
+				Command:      cmd,
+				Status:       contracts.JobStatusPendingPayment,
+				PricePaise:   int64(sheetsPerOrder * 200),
+				PINExpiresAt: now.Add(10 * time.Minute),
+			}
+			err := s.CreateOrderWithPaperCheck(ctx, ord, availableStock)
+			results[index] = claimRes{orderID: id, err: err}
+		}(ordID, pin, idx)
 	}
 	wg.Wait()
 
@@ -333,20 +351,34 @@ func TestConcurrencyBaseline_ExpiredSession_Reclaim(t *testing.T) {
 		t.Fatalf("active session committed sheets = %d, want 5", committedActive)
 	}
 
-	// At t0 + 3 min, session has expired
+	// At t0 + 3 min, 2-minute session has expired, but original 10-minute PIN is still valid!
+	// Paper reservation remains held by the unexpired PIN.
 	t2 := t0.Add(3 * time.Minute)
-	committedExpired, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", t2)
-	if committedExpired != 0 {
-		t.Fatalf("expired session must commit 0 sheets, got %d", committedExpired)
+	committedExpiredSession, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", t2)
+	if committedExpiredSession != 5 {
+		t.Fatalf("unexpired PIN must maintain paper reservation, got %d", committedExpiredSession)
 	}
 
-	// Reclaim order at t2
-	sess2, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 20, 5*time.Minute, t2)
+	// Reclaim order at t2: customer can re-claim a fresh session while PIN is valid!
+	sess2, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 20, 120*time.Second, t2)
 	if err != nil {
-		t.Fatalf("reclaiming expired order failed: %v", err)
+		t.Fatalf("reclaiming unexpired order failed: %v", err)
 	}
 	if sess2.SessionID == sess1.SessionID {
 		t.Fatalf("reclaimed session must generate a new session ID, got same %s", sess2.SessionID)
+	}
+
+	// At t0 + 11 min, both the session and the 10-minute PIN have expired.
+	t3 := t0.Add(11 * time.Minute)
+	committedExpiredPIN, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", t3)
+	if committedExpiredPIN != 0 {
+		t.Fatalf("expired PIN must commit 0 sheets, got %d", committedExpiredPIN)
+	}
+
+	// Reclaiming after PIN expiry must fail with ErrOrderExpired!
+	_, err = s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 20, 120*time.Second, t3)
+	if !errors.Is(err, ErrOrderExpired) {
+		t.Fatalf("reclaiming expired PIN must fail with ErrOrderExpired, got %v", err)
 	}
 
 	// Verify database rows: exactly 1 EXPIRED row, exactly 1 PAYMENT_PENDING row
@@ -385,15 +417,15 @@ func TestConcurrencyBaseline_Cancellation_Reclaim(t *testing.T) {
 		t.Fatalf("expected 7 committed sheets, got %d", committedBefore)
 	}
 
-	// Cancel session
+	// Cancel session before 10-minute PIN expiry
 	if err := s.CancelKioskSession(ctx, sess.SessionID, kioskID, now); err != nil {
 		t.Fatalf("CancelKioskSession failed: %v", err)
 	}
 
-	// Paper commitment must immediately drop to 0
+	// Under Package 03, canceling before PIN expiry cancels session immediately but retains 10-minute PIN reservation!
 	committedAfter, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", now)
-	if committedAfter != 0 {
-		t.Fatalf("expected 0 committed sheets after cancellation, got %d", committedAfter)
+	if committedAfter != 7 {
+		t.Fatalf("expected 7 committed sheets retained by PIN after early cancel, got %d", committedAfter)
 	}
 
 	// Verify database status is CANCELED
@@ -403,13 +435,28 @@ func TestConcurrencyBaseline_Cancellation_Reclaim(t *testing.T) {
 		t.Fatalf("expected database status CANCELED, got %s", status)
 	}
 
-	// Order can be re-claimed cleanly
-	sessNew, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 30, 5*time.Minute, now)
+	// Customer can re-enter PIN and re-claim cleanly
+	sessNew, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 30, 120*time.Second, now)
 	if err != nil {
 		t.Fatalf("re-claim after cancel failed: %v", err)
 	}
 	if sessNew.SessionID == sess.SessionID {
 		t.Fatalf("new session after cancellation must have distinct ID")
+	}
+
+	// If session is canceled AFTER PIN expiry (t0 + 11 min):
+	tLater := now.Add(11 * time.Minute)
+	if err := s.CancelKioskSession(ctx, sessNew.SessionID, kioskID, tLater); err != nil {
+		t.Fatalf("CancelKioskSession after expiry failed: %v", err)
+	}
+	committedAfterExpiry, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", tLater)
+	if committedAfterExpiry != 0 {
+		t.Fatalf("expected 0 committed sheets after late cancel, got %d", committedAfterExpiry)
+	}
+	// Re-claim after expiry must fail
+	_, err = s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, orderID, 30, 120*time.Second, tLater)
+	if !errors.Is(err, ErrOrderExpired) {
+		t.Fatalf("expected ErrOrderExpired after PIN expiry, got %v", err)
 	}
 }
 

@@ -31,7 +31,7 @@ func createTestOrderWithSheets(t *testing.T, s *Store, ctx context.Context, orde
 		Command:      cmd,
 		Status:       status,
 		PricePaise:   int64(sheets * 200),
-		PINExpiresAt: now.Add(30 * time.Minute),
+		PINExpiresAt: now.Add(10 * time.Minute),
 	}
 	if err := s.CreateOrder(ctx, ord); err != nil {
 		t.Fatalf("failed to create order %s: %v", orderID, err)
@@ -63,14 +63,14 @@ func TestStore_PaperCommitments(t *testing.T) {
 	// 2. Create Order 1 (10 sheets, PENDING_PAYMENT)
 	createTestOrderWithSheets(t, s, ctx, "ord_c1", kioskID, "1001", 10, contracts.JobStatusPendingPayment, now)
 
-	// Before claim, no active session exists -> committed is still 0
+	// In Package 03, unpaid orders with valid 10-minute PIN reserve paper upon issuance
 	committed, _ = s.GetCommittedPaperSheets(ctx, kioskID, "", now)
-	if committed != 0 {
-		t.Errorf("unclaimed order committed = %d, want 0", committed)
+	if committed != 10 {
+		t.Errorf("unclaimed order with valid PIN committed = %d, want 10", committed)
 	}
 
 	// Claim Order 1 with 50 sheets in tray -> succeeds
-	sess1, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord_c1", 50, 5*time.Minute, now)
+	sess1, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord_c1", 50, 120*time.Second, now)
 	if err != nil {
 		t.Fatalf("claim ord_c1 failed: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestStore_PaperCommitments(t *testing.T) {
 		t.Fatal("expected non-nil session")
 	}
 
-	// Now committed sheets should be 10
+	// Now committed sheets should still be 10 (not double counted)
 	committed, _ = s.GetCommittedPaperSheets(ctx, kioskID, "", now)
 	if committed != 10 {
 		t.Errorf("after claim ord_c1 committed = %d, want 10", committed)
@@ -95,13 +95,13 @@ func TestStore_PaperCommitments(t *testing.T) {
 
 	// Available stock is 20 sheets. With ord_c1 committing 10, effective available is 20 - 10 = 10 sheets.
 	// ord_c2 needs 15 sheets -> should fail with ErrInsufficientPaper!
-	_, err = s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord_c2", 20, 5*time.Minute, now)
+	_, err = s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord_c2", 20, 120*time.Second, now)
 	if !errors.Is(err, ErrInsufficientPaper) {
 		t.Fatalf("expected ErrInsufficientPaper, got %v", err)
 	}
 
 	// But if physical stock is 30 sheets, 30 - 10 = 20 >= 15 -> should succeed!
-	sess2, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord_c2", 30, 5*time.Minute, now)
+	sess2, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, "ord_c2", 30, 120*time.Second, now)
 	if err != nil {
 		t.Fatalf("claim ord_c2 with stock 30 failed: %v", err)
 	}
@@ -115,11 +115,11 @@ func TestStore_PaperCommitments(t *testing.T) {
 		t.Errorf("total committed = %d, want 25", committed)
 	}
 
-	// 4. Session Expiry Releases Unpaid Commitment
-	// Move time past sess1 expiry (6 minutes later)
-	later := now.Add(6 * time.Minute)
+	// 4. PIN & Session Expiry Releases Unpaid Commitment
+	// Move time past 10-minute PIN expiry (11 minutes later)
+	later := now.Add(11 * time.Minute)
 	committedLater, _ := s.GetCommittedPaperSheets(ctx, kioskID, "", later)
-	// sess1 expired -> commits 0; sess2 still valid (5m from now is expired too if now+6m, so both expired)
+	// Both ord_c1 and ord_c2 PINs and checkout sessions are expired -> commits 0
 	if committedLater != 0 {
 		t.Errorf("expired sessions committed = %d, want 0", committedLater)
 	}
@@ -207,14 +207,8 @@ func TestStore_ConcurrentOvercommitmentGuard(t *testing.T) {
 	// Available stock is exactly 10 sheets
 	availableStock := 10
 
-	// Create 10 orders each requiring 6 sheets (only 1 can possibly fit in 10 sheets)
+	// 10 concurrent mobile orders each requiring 6 sheets (only 1 can possibly fit in 10 sheets)
 	orderCount := 10
-	for i := 0; i < orderCount; i++ {
-		ordID := fmt.Sprintf("ord_race_%d", i)
-		pin := fmt.Sprintf("200%d", i)
-		createTestOrderWithSheets(t, s, ctx, ordID, kioskID, pin, 6, contracts.JobStatusPendingPayment, now)
-	}
-
 	var wg sync.WaitGroup
 	var successCount int
 	var insufficientCount int
@@ -222,10 +216,31 @@ func TestStore_ConcurrentOvercommitmentGuard(t *testing.T) {
 
 	for i := 0; i < orderCount; i++ {
 		wg.Add(1)
-		ordID := fmt.Sprintf("ord_race_%d", i)
-		go func(id string) {
+		idx := i
+		go func(n int) {
 			defer wg.Done()
-			_, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, id, availableStock, 5*time.Minute, now)
+			ordID := fmt.Sprintf("ord_race_%d", n)
+			pin := fmt.Sprintf("200%d", n)
+			cmd := contracts.PrintJobCommand{
+				JobID:          "job_" + ordID,
+				KioskID:        kioskID,
+				DownloadURL:    "https://storage.test/" + ordID + ".pdf",
+				SHA256Checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				TotalPages:     6,
+				TotalSheets:    6,
+				Copies:         1,
+				Duplex:         contracts.DuplexSimplex,
+				StartFromPage:  1,
+				DisplayCode:    pin,
+			}
+			ord := Order{
+				OrderID:      ordID,
+				Command:      cmd,
+				Status:       contracts.JobStatusPendingPayment,
+				PricePaise:   1200,
+				PINExpiresAt: now.Add(10 * time.Minute),
+			}
+			err := s.CreateOrderWithPaperCheck(ctx, ord, availableStock)
 			mu.Lock()
 			defer mu.Unlock()
 			if err == nil {
@@ -233,12 +248,12 @@ func TestStore_ConcurrentOvercommitmentGuard(t *testing.T) {
 			} else if errors.Is(err, ErrInsufficientPaper) {
 				insufficientCount++
 			}
-		}(ordID)
+		}(idx)
 	}
 	wg.Wait()
 
 	if successCount != 1 {
-		t.Fatalf("expected exactly 1 successful claim, got %d", successCount)
+		t.Fatalf("expected exactly 1 successful creation with paper reservation, got %d", successCount)
 	}
 	if insufficientCount != 9 {
 		t.Fatalf("expected 9 insufficient paper rejections, got %d", insufficientCount)

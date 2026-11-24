@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -516,6 +517,16 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 	}, now)
 	if err != nil {
 		log.Printf("[DEMO-PAY] Capture error for attempt %s: %v", att.AttemptID, err)
+		if errors.Is(err, store.ErrSessionCanceled) || errors.Is(err, store.ErrSessionExpired) {
+			if isJSONRequest(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusGone)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Payment session has expired or was canceled"})
+				return
+			}
+			s.renderDemoErrorPage(w, http.StatusGone, "Payment Session Expired", "This kiosk payment session has timed out or was canceled. Please start a new session at the kiosk to print your documents.")
+			return
+		}
 		if isJSONRequest(r) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)

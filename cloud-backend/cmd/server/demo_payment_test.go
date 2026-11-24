@@ -428,24 +428,24 @@ func TestDemoPaymentSubmit_AbsentOrExpiredSession_Holding(t *testing.T) {
 	}
 	defer payResp.Body.Close()
 
-	if payResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d", payResp.StatusCode)
+	if payResp.StatusCode != http.StatusGone {
+		t.Fatalf("expected HTTP 410 Gone for payment after canceled session, got %d", payResp.StatusCode)
 	}
 
 	var submitData map[string]interface{}
 	_ = json.NewDecoder(payResp.Body).Decode(&submitData)
 
-	if submitData["status"] != "paid_unprinted" {
-		t.Errorf("expected status 'paid_unprinted', got: %v", submitData["status"])
+	if submitData["error"] == nil || submitData["error"] == "" {
+		t.Errorf("expected error message in response, got: %v", submitData)
 	}
 
-	// Verify order state: preserved in PAID_WAITING without unattended printing
+	// Verify order state: rejected payment must not capture or transition to PAID_WAITING; order remains PENDING_PAYMENT
 	ord, err := st.GetOrder(context.Background(), orderID)
 	if err != nil || ord == nil {
 		t.Fatalf("GetOrder failed: %v", err)
 	}
-	if ord.Status != contracts.JobStatusPaidWaiting {
-		t.Errorf("expected order status PAID_WAITING, got: %s", ord.Status)
+	if ord.Status != contracts.JobStatusPendingPayment {
+		t.Errorf("expected order status PENDING_PAYMENT, got: %s", ord.Status)
 	}
 }
 
