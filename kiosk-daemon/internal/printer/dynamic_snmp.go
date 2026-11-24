@@ -3,6 +3,7 @@ package printer
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -110,6 +111,7 @@ type SNMPMarker struct {
 	CounterUnit      int64  `json:"counter_unit"`
 	CounterUnitName  string `json:"counter_unit_name"`
 	IsPageCounter    bool   `json:"is_page_counter"`
+	HasLifeCount     bool   `json:"has_life_count"`
 	LifeCount        int64  `json:"life_count"`
 	PowerOnCount     int64  `json:"power_on_count"`
 	HasPowerOnCount  bool   `json:"has_power_on_count"`
@@ -319,7 +321,7 @@ func walkHRPrinterTable(session DynamicSNMPSession) ([]SNMPPrinterDevice, error)
 		seen[idx] = true
 	}
 
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		st := statusMap[idx]
 		errBytes := errorMap[idx]
 		devices = append(devices, SNMPPrinterDevice{
@@ -389,7 +391,7 @@ func walkPrtCoverTable(session DynamicSNMPSession) ([]SNMPCover, error) {
 	for idx := range descMap {
 		seen[idx] = true
 	}
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		st := statusMap[idx]
 		covers = append(covers, SNMPCover{
 			Index:       idx,
@@ -443,17 +445,30 @@ func walkPrtMarkerTable(session DynamicSNMPSession) ([]SNMPMarker, error) {
 	for idx := range unitMap {
 		seen[idx] = true
 	}
+	for idx := range powerMap {
+		seen[idx] = true
+	}
 
-	for idx := range seen {
-		unit := unitMap[idx]
+	for _, idx := range sortedKeys(seen) {
+		unit, hasUnit := unitMap[idx]
+		if !hasUnit {
+			unit = -1
+		}
 		unitName, isPage := FormatMarkerCounterUnit(unit)
-		life := lifeMap[idx]
+		life, hasLife := lifeMap[idx]
+		if !hasLife {
+			life = -1
+		}
 		pCount, hasP := powerMap[idx]
+		if !hasP {
+			pCount = -1
+		}
 		markers = append(markers, SNMPMarker{
 			Index:           idx,
 			CounterUnit:     unit,
 			CounterUnitName: unitName,
 			IsPageCounter:   isPage,
+			HasLifeCount:    hasLife,
 			LifeCount:       life,
 			PowerOnCount:    pCount,
 			HasPowerOnCount: hasP,
@@ -526,7 +541,7 @@ func walkPrtMarkerSuppliesTable(session DynamicSNMPSession) ([]SNMPSupply, error
 		seen[idx] = true
 	}
 
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		cls := classMap[idx]
 		typ := typeMap[idx]
 		unit := unitMap[idx]
@@ -620,7 +635,7 @@ func walkPrtAlertTable(session DynamicSNMPSession) ([]SNMPAlert, error) {
 		seen[idx] = true
 	}
 
-	for idx := range seen {
+	for _, idx := range sortedKeys(seen) {
 		sev := sevMap[idx]
 		trn := trnMap[idx]
 		grp := grpMap[idx]
@@ -724,12 +739,80 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 				CounterUnit:     markerUnit,
 				CounterUnitName: unitName,
 				IsPageCounter:   isPage,
+				HasLifeCount:    true,
 				LifeCount:       v,
 			})
 		}
 	}
 
 	// 4. Supplies (Toner & Drum standard fallbacks)
+	// Query metadata for standard supply rows without fabricating identities or units
+	var s1Desc, s2Desc string
+	var s1Type, s2Type int64 = 2, 2 // RFC 3805: 2 = unknown
+	var s1Class, s2Class int64 = -1, -1
+	var s1Unit, s2Unit int64 = -1, -1
+
+	suppliesMetaOIDs := []string{
+		"1.3.6.1.2.1.43.11.1.1.4.1.1", // class 1.1
+		"1.3.6.1.2.1.43.11.1.1.5.1.1", // type 1.1
+		"1.3.6.1.2.1.43.11.1.1.6.1.1", // desc 1.1
+		"1.3.6.1.2.1.43.11.1.1.7.1.1", // unit 1.1
+		"1.3.6.1.2.1.43.11.1.1.4.1.2", // class 1.2
+		"1.3.6.1.2.1.43.11.1.1.5.1.2", // type 1.2
+		"1.3.6.1.2.1.43.11.1.1.6.1.2", // desc 1.2
+		"1.3.6.1.2.1.43.11.1.1.7.1.2", // unit 1.2
+	}
+	if metaPacket, mErr := session.Get(suppliesMetaOIDs); mErr == nil && metaPacket != nil {
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.6.1.1", -1); ok && isValidPDU(pdu) {
+			if s, ok := pduToString(pdu); ok {
+				s1Desc = s
+			}
+		}
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.5.1.1", -1); ok && isValidPDU(pdu) {
+			if v, ok := pduToInt64(pdu); ok {
+				s1Type = v
+			}
+		}
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.4.1.1", -1); ok && isValidPDU(pdu) {
+			if v, ok := pduToInt64(pdu); ok {
+				s1Class = v
+			}
+		}
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.7.1.1", -1); ok && isValidPDU(pdu) {
+			if v, ok := pduToInt64(pdu); ok {
+				s1Unit = v
+			}
+		}
+
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.6.1.2", -1); ok && isValidPDU(pdu) {
+			if s, ok := pduToString(pdu); ok {
+				s2Desc = s
+			}
+		}
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.5.1.2", -1); ok && isValidPDU(pdu) {
+			if v, ok := pduToInt64(pdu); ok {
+				s2Type = v
+			}
+		}
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.4.1.2", -1); ok && isValidPDU(pdu) {
+			if v, ok := pduToInt64(pdu); ok {
+				s2Class = v
+			}
+		}
+		if pdu, ok := findPDU(metaPacket, "1.3.6.1.2.1.43.11.1.1.7.1.2", -1); ok && isValidPDU(pdu) {
+			if v, ok := pduToInt64(pdu); ok {
+				s2Unit = v
+			}
+		}
+	}
+
+	if s1Desc == "" {
+		s1Desc = "UNKNOWN (unqueried)"
+	}
+	if s2Desc == "" {
+		s2Desc = "UNKNOWN (unqueried)"
+	}
+
 	var tonerLevel, tonerMax int64 = -2, -2
 	if pdu, ok := findPDU(packet, oidPrtMarkerSuppliesLevel1, -1); ok && isValidPDU(pdu) {
 		if v, ok := pduToInt64(pdu); ok {
@@ -742,16 +825,16 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 		}
 	}
 	if tonerLevel != -2 || tonerMax != -2 {
-		lvlDesc, pct := calculateSupplyLevel(tonerLevel, tonerMax, 19)
+		lvlDesc, pct := calculateSupplyLevel(tonerLevel, tonerMax, s1Unit)
 		res.Supplies = append(res.Supplies, SNMPSupply{
 			Index:       "1.1",
-			Description: "Toner (Standard Index)",
-			Type:        3, // toner
-			TypeName:    FormatSupplyType(3),
-			Class:       3, // consumed
-			ClassName:   FormatSupplyClass(3),
-			Unit:        19, // percent
-			UnitName:    FormatSupplyUnit(19),
+			Description: s1Desc,
+			Type:        s1Type,
+			TypeName:    FormatSupplyType(s1Type),
+			Class:       s1Class,
+			ClassName:   FormatSupplyClass(s1Class),
+			Unit:        s1Unit,
+			UnitName:    FormatSupplyUnit(s1Unit),
 			MaxCapacity: tonerMax,
 			Level:       tonerLevel,
 			LevelDesc:   lvlDesc,
@@ -771,16 +854,16 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 		}
 	}
 	if drumLevel != -2 || drumMax != -2 {
-		lvlDesc, pct := calculateSupplyLevel(drumLevel, drumMax, 19)
+		lvlDesc, pct := calculateSupplyLevel(drumLevel, drumMax, s2Unit)
 		res.Supplies = append(res.Supplies, SNMPSupply{
 			Index:       "1.2",
-			Description: "Drum / Receptacle (Standard Index)",
-			Type:        9, // opc
-			TypeName:    FormatSupplyType(9),
-			Class:       3, // consumed
-			ClassName:   FormatSupplyClass(3),
-			Unit:        19, // percent
-			UnitName:    FormatSupplyUnit(19),
+			Description: s2Desc,
+			Type:        s2Type,
+			TypeName:    FormatSupplyType(s2Type),
+			Class:       s2Class,
+			ClassName:   FormatSupplyClass(s2Class),
+			Unit:        s2Unit,
+			UnitName:    FormatSupplyUnit(s2Unit),
 			MaxCapacity: drumMax,
 			Level:       drumLevel,
 			LevelDesc:   lvlDesc,
@@ -837,7 +920,15 @@ func calculateSupplyLevel(lvl int64, maxVal int64, unit int64) (string, *float64
 		return fmt.Sprintf("%.0f%%", pct), &pct
 	}
 
-	// If max is known and positive
+	// If unit is unqueried/unknown (-1 or <= 0), NEVER fabricate a percentage or percentage unit!
+	if unit <= 0 {
+		if maxVal > 0 {
+			return fmt.Sprintf("%d/%d (raw, unit unverified)", lvl, maxVal), nil
+		}
+		return fmt.Sprintf("%d (raw, unit unverified)", lvl), nil
+	}
+
+	// If max is known and positive and unit is verified
 	if maxVal > 0 {
 		pct := (float64(lvl) / float64(maxVal)) * 100.0
 		if pct > 100.0 {
@@ -907,7 +998,7 @@ func FormatSupplyClass(class int64) string {
 	case 4:
 		return "receptacleThatIsFilled"
 	default:
-		return fmt.Sprintf("unknown(%d)", class)
+		return "unknown"
 	}
 }
 
@@ -1009,6 +1100,9 @@ func FormatSupplyUnit(unit int64) string {
 	case 19:
 		return "percent"
 	default:
+		if unit <= 0 {
+			return "unknown"
+		}
 		return fmt.Sprintf("unit(%d)", unit)
 	}
 }
@@ -1184,4 +1278,13 @@ func pduToBytes(pdu gosnmp.SnmpPDU) ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
