@@ -1319,3 +1319,230 @@ func TestPackage03_RepeatedSessions_NoIndefiniteTrackerAccumulation(t *testing.T
 	}
 }
 
+func TestPackage03_OldSessionRemainsBlockedNearActualExpiry(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	rnd := &mockRenderer{}
+
+	var cancelCalls int32
+	baseTime := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	var clockMu sync.Mutex
+	currentTime := baseTime
+
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+
+	advanceTime := func(d time.Duration) {
+		clockMu.Lock()
+		currentTime = currentTime.Add(d)
+		clockMu.Unlock()
+	}
+
+	mockClient := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:         "ord_near_exp",
+				TotalPricePaise: 400,
+				TotalPages:      1,
+				TotalSheets:     1,
+				PINExpiresAt:    nowFn().Add(10 * time.Minute).Format(time.RFC3339),
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_near_exp",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				SecondsRemaining: 120,
+			}, nil
+		},
+		cancelFn: func(ctx context.Context, sessionID string) error {
+			atomic.AddInt32(&cancelCalls, 1)
+			return errors.New("network error on cancel")
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID: "att_near_exp",
+				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				QRPayload: "https://kiosk.local/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				ExpiresAt: nowFn().Add(120 * time.Second).Format(time.RFC3339),
+			}, nil
+		},
+	}
+
+	cfg := Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    120 * time.Second,
+		CancelWaitTimeout: 100 * time.Millisecond,
+		Now:               nowFn,
+		RenderScreen:      rnd.Render,
+		LookupClient:      mockClient,
+	}
+
+	ctrl, err := NewController(cfg, sim)
+	if err != nil {
+		t.Fatalf("NewController failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Enter PIN and confirm into StatePaymentPending
+	sim.EmitDigits("1234")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending, got %s", ctrl.GetState())
+	}
+
+	// Simulate countdown having ticked down so locally rounded remaining-seconds counter is low (e.g. 5s)
+	ctrl.mu.Lock()
+	ctrl.currentRemainingSec = 5
+	ctrl.mu.Unlock()
+
+	// 2. Press Esc to cancel -> cancellation is initiated with full 120s protection
+	sim.EmitCancel()
+	deadline = time.Now().Add(1 * time.Second)
+	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateIdle {
+		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
+	}
+
+	// Wait for background cancel to fail and be tracked
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for atomic.LoadInt32(&cancelCalls) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 3. Advance clock past the old 5s local counter, to 115s (near actual 120s expiry)
+	advanceTime(115 * time.Second)
+
+	// Session must REMAIN BLOCKED near its actual 120s expiry!
+	if ctrl.PendingCancelCount() != 1 {
+		t.Fatalf("session must remain blocked near 120s expiry (at 115s), got %d", ctrl.PendingCancelCount())
+	}
+
+	// Attempting to checkout must fail closed and never reopen the session
+	sim.EmitDigits("1234")
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sim.EmitSubmit()
+	time.Sleep(150 * time.Millisecond)
+
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected StateOrderSummary when blocked near expiry, got %s", ctrl.GetState())
+	}
+	if ctrl.GetPINError() == "" {
+		t.Fatalf("expected retryable pinError when blocked near expiry")
+	}
+	if rnd.LastState().Mode == ui_ipc.ModePaymentPending {
+		t.Fatalf("must not render payment pending when blocked near expiry")
+	}
+
+	// 4. Advance clock past 120s (e.g. +10s -> 125s total)
+	advanceTime(10 * time.Second)
+
+	if count := ctrl.PendingCancelCount(); count != 0 {
+		t.Fatalf("expected 0 pending cancel trackers after authoritative expiry, got %d", count)
+	}
+}
+
+func TestPackage03_ZeroRemainingSeconds_NeverResetsCheckoutTime(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	rnd := &mockRenderer{}
+
+	var claimCount int32
+	mockClient := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:         "ord_zero_sec",
+				TotalPricePaise: 500,
+				TotalPages:      2,
+				TotalSheets:     2,
+				PINExpiresAt:    time.Now().Add(10 * time.Minute).Format(time.RFC3339),
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			atomic.AddInt32(&claimCount, 1)
+			return &cloud.SessionDetails{
+				SessionID:        "sess_zero_sec",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(-1 * time.Second).Format(time.RFC3339),
+				SecondsRemaining: 0, // ClaimOrder returns 0 seconds remaining
+			}, nil
+		},
+	}
+
+	cfg := Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    120 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      mockClient,
+	}
+
+	ctrl, err := NewController(cfg, sim)
+	if err != nil {
+		t.Fatalf("NewController failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Enter PIN
+	sim.EmitDigits("4321")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected StateOrderSummary, got %s", ctrl.GetState())
+	}
+
+	// 2. Submit order summary
+	sim.EmitSubmit()
+	time.Sleep(150 * time.Millisecond)
+
+	// Must reject safely and remain on StateOrderSummary with error; must NOT start or restart 120s checkout
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected controller to reject SecondsRemaining <= 0 and remain on StateOrderSummary, got %s", ctrl.GetState())
+	}
+	if ctrl.GetPINError() == "" {
+		t.Fatalf("expected error message when SecondsRemaining <= 0")
+	}
+
+	last := rnd.LastState()
+	if last.Mode == ui_ipc.ModePaymentPending {
+		t.Fatalf("must not render ModePaymentPending when SecondsRemaining <= 0")
+	}
+	if last.QRContent != "" {
+		t.Fatalf("must not display payment QR when SecondsRemaining <= 0, got %s", last.QRContent)
+	}
+}
+

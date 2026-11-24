@@ -449,9 +449,6 @@ func (c *Controller) cancelSessionAsyncLocked(sessID string) {
 		timeout = 120 * time.Second
 	}
 	expiresAt := c.now().Add(timeout)
-	if c.currentSession != nil && c.currentSession.SessionID == sessID && c.currentRemainingSec > 0 {
-		expiresAt = c.now().Add(time.Duration(c.currentRemainingSec) * time.Second)
-	}
 
 	c.canceledSessions[sessID] = expiresAt
 
@@ -550,6 +547,13 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 	}
 }
 
+func (c *Controller) isSessionExpired(session *cloud.SessionDetails) bool {
+	if session == nil {
+		return false
+	}
+	return session.SecondsRemaining < 0 || (session.SecondsRemaining == 0 && (session.ExpiresAt != "" || c.cfg.PaymentTimeout >= 120*time.Second))
+}
+
 func (c *Controller) reclaimAndVerifySession(ctx context.Context, ordID string, canceledID string) (*cloud.SessionDetails, error) {
 	reclaimCtx, reclaimCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer reclaimCancel()
@@ -559,6 +563,10 @@ func (c *Controller) reclaimAndVerifySession(ctx context.Context, ordID string, 
 	}
 	if session == nil {
 		return nil, errors.New("received nil session from claim")
+	}
+	if c.isSessionExpired(session) {
+		log.Printf("[PIN-CONTROLLER] Reclaimed session %s returned non-positive SecondsRemaining (%d); rejecting", session.SessionID, session.SecondsRemaining)
+		return nil, cloud.ErrOrderExpired
 	}
 
 	c.mu.Lock()
@@ -592,6 +600,12 @@ func (c *Controller) startClaimLocked() {
 		defer cancel()
 
 		session, err := c.cfg.LookupClient.ClaimOrder(ctx, ordID)
+
+		if err == nil && c.isSessionExpired(session) {
+			log.Printf("[PIN-CONTROLLER] ClaimOrder returned session %s with non-positive SecondsRemaining (%d); rejecting", session.SessionID, session.SecondsRemaining)
+			err = cloud.ErrOrderExpired
+			session = nil
+		}
 
 		if err == nil && session != nil {
 			c.mu.Lock()
@@ -673,6 +687,12 @@ func (c *Controller) startClaimLocked() {
 			}
 		}
 
+		if err == nil && c.isSessionExpired(session) {
+			log.Printf("[PIN-CONTROLLER] Session %s has non-positive SecondsRemaining (%d); rejecting without starting checkout", session.SessionID, session.SecondsRemaining)
+			err = cloud.ErrOrderExpired
+			session = nil
+		}
+
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
@@ -733,17 +753,25 @@ func (c *Controller) startClaimLocked() {
 		c.pinError = ""
 		c.currentQRPayload = c.resolvePaymentQRPayload(nil)
 
-		timeoutSec := int(c.cfg.PaymentTimeout.Seconds())
-		if session.SecondsRemaining > 0 && int(session.SecondsRemaining) < timeoutSec {
-			timeoutSec = int(session.SecondsRemaining)
+		checkoutDuration := c.cfg.PaymentTimeout
+		if checkoutDuration <= 0 {
+			checkoutDuration = 120 * time.Second
 		}
-		if timeoutSec <= 0 {
+		if session.SecondsRemaining > 0 {
+			sessDur := time.Duration(session.SecondsRemaining) * time.Second
+			if sessDur < checkoutDuration {
+				checkoutDuration = sessDur
+			}
+		}
+
+		timeoutSec := int(checkoutDuration.Seconds())
+		if checkoutDuration > 0 && timeoutSec <= 0 {
 			timeoutSec = 1
 		}
 
 		c.currentRemainingSec = timeoutSec
 		c.renderPaymentPendingLocked(timeoutSec)
-		c.startCountdownLocked(time.Duration(timeoutSec) * time.Second)
+		c.startCountdownLocked(checkoutDuration)
 
 		// Asynchronously initiate payment to obtain dynamic payment QR payload with retry
 		sessID := session.SessionID
