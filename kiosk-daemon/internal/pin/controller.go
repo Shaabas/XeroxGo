@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -655,30 +656,59 @@ func (c *Controller) renderOrderSummaryLocked(remainingSeconds int) {
 	})
 }
 
+func isValidDemoToken(token string) bool {
+	if len(token) != 52 || !strings.HasPrefix(token, "dmo_") {
+		return false
+	}
+	hexPart := token[4:]
+	for i := 0; i < len(hexPart); i++ {
+		c := hexPart[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetails) string {
 	if attempt == nil {
 		return ""
 	}
 	token := strings.TrimSpace(attempt.DemoToken)
-	if token == "" || strings.ContainsAny(token, " \t\r\n/?#") {
+	if !isValidDemoToken(token) {
 		return ""
 	}
-	urlBase := strings.TrimRight(strings.TrimSpace(c.cfg.PaymentURLBase), "/")
-	if urlBase != "" {
-		if !strings.HasSuffix(urlBase, "/pay") {
-			urlBase += "/pay"
+
+	rawBase := strings.TrimSpace(c.cfg.PaymentURLBase)
+	if rawBase != "" {
+		parsedBase, err := url.Parse(rawBase)
+		if err != nil || (parsedBase.Scheme != "http" && parsedBase.Scheme != "https") || parsedBase.Host == "" {
+			return ""
 		}
-	} else {
-		if strings.HasPrefix(attempt.QRPayload, "http://") || strings.HasPrefix(attempt.QRPayload, "https://") {
-			if idx := strings.Index(attempt.QRPayload, "/pay/"); idx != -1 {
-				urlBase = strings.TrimRight(attempt.QRPayload[:idx+4], "/")
-			}
+		if strings.TrimRight(parsedBase.Path, "/") != "/pay" {
+			return ""
 		}
-		if urlBase == "" {
-			urlBase = "https://xeroxgo.vercel.app/pay"
+		if parsedBase.RawQuery != "" || parsedBase.Fragment != "" {
+			return ""
 		}
+		return fmt.Sprintf("%s/%s", strings.TrimRight(rawBase, "/"), token)
 	}
-	return fmt.Sprintf("%s/%s", urlBase, token)
+
+	rawCheckout := strings.TrimSpace(attempt.QRPayload)
+	if rawCheckout == "" {
+		return ""
+	}
+	parsedCheckout, err := url.Parse(rawCheckout)
+	if err != nil || (parsedCheckout.Scheme != "http" && parsedCheckout.Scheme != "https") || parsedCheckout.Host == "" {
+		return ""
+	}
+	if parsedCheckout.Path != "/pay/"+token {
+		return ""
+	}
+	if parsedCheckout.RawQuery != "" || parsedCheckout.Fragment != "" {
+		return ""
+	}
+	return rawCheckout
 }
 
 func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
