@@ -18,7 +18,7 @@ func TestParseDNSSDURI(t *testing.T) {
 		wantErr     bool
 	}{
 		{
-			name:        "standard HP LaserJet Tank 1020w driverless URI",
+			name:        "standard HP LaserJet Tank 1020w driverless URI (synthetic test fixture - not real hardware)",
 			uri:         "dnssd://HP%20LaserJet%20Tank%201020w._ipp._tcp.local/?uuid=381v6a-12345",
 			wantService: "HP LaserJet Tank 1020w",
 			wantRegType: "_ipp._tcp",
@@ -83,20 +83,24 @@ func TestResolveDNSSDTarget_SuccessViaIPPFind(t *testing.T) {
 		return nil, errors.New("command not found")
 	}
 
+	// Synthetic test fixture URI (not real hardware measurement)
 	rawURI := "dnssd://HP%20LaserJet%20Tank%201020w._ipp._tcp.local/?uuid=381v6a"
-	host, port, path, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
+	endpoint, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
 	if err != nil {
 		t.Fatalf("unexpected error resolving DNS-SD target: %v", err)
 	}
 
-	if host != "192.168.1.50" {
-		t.Errorf("expected host 192.168.1.50, got %q", host)
+	if endpoint.Host != "192.168.1.50" {
+		t.Errorf("expected host 192.168.1.50, got %q", endpoint.Host)
 	}
-	if port != 631 {
-		t.Errorf("expected port 631, got %d", port)
+	if endpoint.Port != 631 {
+		t.Errorf("expected port 631, got %d", endpoint.Port)
 	}
-	if path != "/ipp/print" {
-		t.Errorf("expected path /ipp/print, got %q", path)
+	if endpoint.Path != "/ipp/print" {
+		t.Errorf("expected path /ipp/print, got %q", endpoint.Path)
+	}
+	if endpoint.Scheme != "ipp" {
+		t.Errorf("expected scheme ipp, got %q", endpoint.Scheme)
 	}
 }
 
@@ -111,17 +115,47 @@ func TestResolveDNSSDTarget_SuccessViaAvahi(t *testing.T) {
 		return nil, errors.New("command not found")
 	}
 
+	// Synthetic test fixture URI
 	rawURI := "dnssd://HPLaserJet._ipp._tcp.local/"
-	host, port, _, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
+	endpoint, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
 	if err != nil {
 		t.Fatalf("unexpected error resolving DNS-SD target via avahi: %v", err)
 	}
 
-	if host != "192.168.1.65" {
-		t.Errorf("expected host 192.168.1.65, got %q", host)
+	if endpoint.Host != "192.168.1.65" {
+		t.Errorf("expected host 192.168.1.65, got %q", endpoint.Host)
 	}
-	if port != 631 {
-		t.Errorf("expected port 631, got %d", port)
+	if endpoint.Port != 631 {
+		t.Errorf("expected port 631, got %d", endpoint.Port)
+	}
+	// Must not manufacture a resource path without evidence
+	if endpoint.Path != "" {
+		t.Errorf("expected unverified path to be empty, got %q", endpoint.Path)
+	}
+}
+
+func TestResolveDNSSDTarget_PreservesIPPSchemeAndPort(t *testing.T) {
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "avahi-resolve" {
+			return []byte("SecurePrinter.local   192.168.1.88\n"), nil
+		}
+		return nil, errors.New("command not found")
+	}
+
+	rawURI := "dnssd://SecurePrinter._ipps._tcp.local/"
+	endpoint, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if endpoint.Scheme != "ipps" {
+		t.Errorf("expected scheme ipps, got %q", endpoint.Scheme)
+	}
+	if endpoint.Port != 443 {
+		t.Errorf("expected default port 443 for ipps, got %d", endpoint.Port)
+	}
+	if endpoint.Path != "" {
+		t.Errorf("expected unverified path to be empty, got %q", endpoint.Path)
 	}
 }
 
@@ -131,15 +165,16 @@ func TestResolveDNSSDTarget_FailureNeverGuessesIP(t *testing.T) {
 		return nil, errors.New("service resolution failed")
 	}
 
+	// Synthetic test fixture URI (not real hardware measurement)
 	rawURI := "dnssd://HP%20LaserJet%20Tank%201020w._ipp._tcp.local/"
-	host, port, path, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
+	endpoint, err := ResolveDNSSDTarget(context.Background(), runner, rawURI)
 	if err == nil {
-		t.Fatalf("expected error when DNS-SD resolution fails, got nil (host=%q)", host)
+		t.Fatalf("expected error when DNS-SD resolution fails, got nil (host=%q)", endpoint.Host)
 	}
 
 	// Must never invent or guess an IP address
-	if host != "" || port != 0 || path != "" {
-		t.Errorf("host, port, path must be empty on failure, got host=%q, port=%d, path=%q", host, port, path)
+	if endpoint.Host != "" || endpoint.Port != 0 || endpoint.Path != "" {
+		t.Errorf("host, port, path must be empty on failure, got %+v", endpoint)
 	}
 
 	if !strings.Contains(err.Error(), "could not be resolved automatically") {

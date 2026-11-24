@@ -42,7 +42,7 @@ func TestDynamicSNMP_TableWalk_CustomIndicesAndUnits(t *testing.T) {
 		getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 			return &gosnmp.SnmpPacket{
 				Variables: []gosnmp.SnmpPDU{
-					{Name: "1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("HP LaserJet Tank 1020w Test Engine")},
+					{Name: "1.3.6.1.2.1.1.1.0", Type: gosnmp.OctetString, Value: []byte("HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)")},
 					{Name: "1.3.6.1.2.1.1.2.0", Type: gosnmp.OctetString, Value: []byte("1.3.6.1.4.1.11.2.3.9.1")},
 					{Name: "1.3.6.1.2.1.1.3.0", Type: gosnmp.TimeTicks, Value: uint32(1234567)},
 				},
@@ -67,7 +67,7 @@ func TestDynamicSNMP_TableWalk_CustomIndicesAndUnits(t *testing.T) {
 				_ = walkFn(gosnmp.SnmpPDU{
 					Name:  "1.3.6.1.2.1.43.5.1.1.16.1", // prtGeneralPrinterName
 					Type:  gosnmp.OctetString,
-					Value: []byte("HP LaserJet Tank 1020w"),
+					Value: []byte("HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)"),
 				})
 
 			case normalizeOID(oidSubtreePrtCover): // 1.3.6.1.2.1.43.6.1
@@ -131,10 +131,10 @@ func TestDynamicSNMP_TableWalk_CustomIndicesAndUnits(t *testing.T) {
 	if res.DiscoveryMode != "SNMP_TABLE_WALK" {
 		t.Errorf("expected discovery mode SNMP_TABLE_WALK, got %q", res.DiscoveryMode)
 	}
-	if res.SysDescr != "HP LaserJet Tank 1020w Test Engine" {
+	if res.SysDescr != "HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)" {
 		t.Errorf("expected sysDescr, got %q", res.SysDescr)
 	}
-	if res.PrinterName != "HP LaserJet Tank 1020w" {
+	if res.PrinterName != "HP LaserJet Tank 1020w (Synthetic Test Fixture - Not Real Hardware Measurement)" {
 		t.Errorf("expected printer name, got %q", res.PrinterName)
 	}
 

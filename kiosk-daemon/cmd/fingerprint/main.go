@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -109,14 +108,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Write JSON to file if requested
+	// Write JSON to file if requested with restrictive permissions (0600 file, 0700 dir)
 	if strings.TrimSpace(outputPath) != "" {
 		outPath := strings.TrimSpace(outputPath)
-		dir := filepath.Dir(outPath)
-		if dir != "" && dir != "." {
-			_ = os.MkdirAll(dir, 0755)
-		}
-		if writeErr := os.WriteFile(outPath, jsonBytes, 0644); writeErr != nil {
+		if writeErr := printer.SaveReportFile(outPath, jsonBytes); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "Error writing report file %q: %v\n", outPath, writeErr)
 		} else {
 			fmt.Fprintf(os.Stderr, "Saved structured JSON report to %s\n\n", outPath)
