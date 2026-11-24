@@ -551,7 +551,7 @@ func (c *Controller) isSessionExpired(session *cloud.SessionDetails) bool {
 	if session == nil {
 		return false
 	}
-	return session.SecondsRemaining < 0 || (session.SecondsRemaining == 0 && (session.ExpiresAt != "" || c.cfg.PaymentTimeout >= 120*time.Second))
+	return session.SecondsRemaining <= 0
 }
 
 func (c *Controller) reclaimAndVerifySession(ctx context.Context, ordID string, canceledID string) (*cloud.SessionDetails, error) {

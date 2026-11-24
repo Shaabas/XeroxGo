@@ -1057,9 +1057,10 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 		},
 		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
 			return &cloud.SessionDetails{
-				SessionID: "sess_demo_keypad_1",
-				OrderID:   orderID,
-				Status:    "PAYMENT_PENDING",
+				SessionID:        "sess_demo_keypad_1",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				SecondsRemaining: 300,
 			}, nil
 		},
 		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
