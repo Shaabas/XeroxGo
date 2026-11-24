@@ -174,13 +174,19 @@ func (s *appServer) handlePINLookup(w http.ResponseWriter, r *http.Request) {
 		KioskID:          order.Command.KioskID,
 		Status:           string(order.Status),
 		TotalPricePaise:  order.PricePaise,
-		TotalPages:       order.Command.TotalPages,
-		TotalSheets:      order.Command.TotalSheets,
+		TotalPages:       order.TotalPages,
+		TotalSheets:      order.TotalSheets,
 		Copies:           order.Command.Copies,
 		Duplex:           string(order.Command.Duplex),
 		ColorMode:        order.ColorMode,
 		PINExpiresAt:     order.PINExpiresAt.Format(time.RFC3339),
 		SecondsRemaining: secondsRemaining,
+	}
+	if resp.TotalPages <= 0 {
+		resp.TotalPages = order.Command.TotalPages
+	}
+	if resp.TotalSheets <= 0 {
+		resp.TotalSheets = order.Command.TotalSheets
 	}
 
 	w.Header().Set("Content-Type", "application/json")

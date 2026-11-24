@@ -33,7 +33,8 @@ type Config struct {
 	InactivityTimeout time.Duration // Duration of inactivity before returning to IDLE from PIN_ENTRY (default 30s)
 	ErrorClearTimeout time.Duration // Duration before clearing PIN error back to clean state (default 5s)
 	SummaryTimeout    time.Duration // Duration before returning to IDLE from ORDER_SUMMARY (default 60s)
-	PaymentTimeout    time.Duration // Duration before returning to IDLE from PAYMENT_PENDING (default 300s)
+	PaymentTimeout    time.Duration // Duration before returning to IDLE from PAYMENT_PENDING (default 120s)
+	CancelWaitTimeout time.Duration // Duration to wait for in-flight cancellation to resolve before failing safely (default 5s)
 	CountdownInterval time.Duration // Tick interval for countdown timer (default 1s)
 	RenderScreen      func(ui_ipc.ScreenState) error
 	LookupClient      cloud.PINLookupClient
@@ -42,23 +43,36 @@ type Config struct {
 	KioskID           string
 	PrinterModel      string
 	OnTransactionEnd  func()
+	Now               func() time.Time // Optional clock injection; defaults to time.Now
+}
+
+type cancelTracker struct {
+	sessionID string
+	done      chan struct{}
+	err       error
+	attempts  int
+	createdAt time.Time
+	expiresAt time.Time
 }
 
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
 type Controller struct {
 	cfg Config
 
-	mu             sync.Mutex
-	state          State
-	pinBuffer      string
-	activePIN      string
-	pinError       string
-	currentOrder     *cloud.OrderDetails
-	currentSession   *cloud.SessionDetails
-	currentAttempt   *cloud.PaymentAttemptDetails
-	currentQRPayload string
-	lookupSeq        uint64 // Monotonically increasing sequence to discard stale responses
-	isClaiming       bool
+	mu                  sync.Mutex
+	state               State
+	pinBuffer           string
+	activePIN           string
+	pinError            string
+	currentOrder        *cloud.OrderDetails
+	currentSession      *cloud.SessionDetails
+	currentAttempt      *cloud.PaymentAttemptDetails
+	currentQRPayload    string
+	currentRemainingSec int
+	pendingCancels      map[string]*cancelTracker
+	canceledSessions    map[string]time.Time
+	lookupSeq           uint64 // Monotonically increasing sequence to discard stale responses
+	isClaiming          bool
 
 	inactivityTimer *time.Timer
 	errorTimer      *time.Timer
@@ -91,14 +105,22 @@ func NewController(cfg Config, inputSource input.Source) (*Controller, error) {
 		cfg.CountdownInterval = 1 * time.Second
 	}
 	if cfg.PaymentTimeout <= 0 {
-		cfg.PaymentTimeout = 300 * time.Second
+		cfg.PaymentTimeout = 120 * time.Second
+	}
+	if cfg.CancelWaitTimeout <= 0 {
+		cfg.CancelWaitTimeout = 5 * time.Second
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 
 	return &Controller{
-		cfg:         cfg,
-		inputSource: inputSource,
-		state:       StateIdle,
-		done:        make(chan struct{}),
+		cfg:              cfg,
+		inputSource:      inputSource,
+		state:            StateIdle,
+		done:             make(chan struct{}),
+		pendingCancels:   make(map[string]*cancelTracker),
+		canceledSessions: make(map[string]time.Time),
 	}, nil
 }
 
@@ -190,6 +212,59 @@ func (c *Controller) GetCurrentSession() *cloud.SessionDetails {
 	return c.currentSession
 }
 
+func (c *Controller) now() time.Time {
+	if c.cfg.Now != nil {
+		return c.cfg.Now()
+	}
+	return time.Now()
+}
+
+// PendingCancelCount returns the current number of tracked in-flight or unresolved cancellations.
+func (c *Controller) PendingCancelCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneCompletedTrackersLocked()
+	return len(c.pendingCancels)
+}
+
+// CanceledSessionCount returns the current number of tracked canceled sessions.
+func (c *Controller) CanceledSessionCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneCompletedTrackersLocked()
+	return len(c.canceledSessions)
+}
+
+func (c *Controller) isSessionCanceledLocked(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	exp, ok := c.canceledSessions[sessionID]
+	if !ok {
+		return false
+	}
+	if !c.now().Before(exp) {
+		delete(c.canceledSessions, sessionID)
+		return false
+	}
+	return true
+}
+
+func (c *Controller) isSessionPendingCancelLocked(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	tr, ok := c.pendingCancels[sessionID]
+	if !ok {
+		return false
+	}
+	if !c.now().Before(tr.expiresAt) {
+		delete(c.pendingCancels, sessionID)
+		return false
+	}
+	return true
+}
+
 // ResetToIdle resets the controller to StateIdle and re-renders the idle screen.
 func (c *Controller) ResetToIdle() {
 	c.mu.Lock()
@@ -198,6 +273,7 @@ func (c *Controller) ResetToIdle() {
 }
 
 func (c *Controller) resetToIdleLocked() {
+	c.pruneCompletedTrackersLocked()
 	c.stopInactivityTimerLocked()
 	c.stopCountdownLocked()
 	c.stopErrorTimerLocked()
@@ -210,6 +286,7 @@ func (c *Controller) resetToIdleLocked() {
 	c.currentSession = nil
 	c.currentAttempt = nil
 	c.currentQRPayload = ""
+	c.currentRemainingSec = 0
 
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
 		Mode:         ui_ipc.ModeIdle,
@@ -338,23 +415,96 @@ func (c *Controller) handleOrderSummaryEvent(ev input.Event) {
 	}
 }
 
+func (c *Controller) pruneCompletedTrackersLocked() {
+	now := c.now()
+	for id, tr := range c.pendingCancels {
+		select {
+		case <-tr.done:
+			if tr.err == nil {
+				delete(c.pendingCancels, id)
+			} else if !now.Before(tr.expiresAt) {
+				delete(c.pendingCancels, id)
+			}
+		default:
+			if !now.Before(tr.expiresAt) {
+				delete(c.pendingCancels, id)
+			}
+		}
+	}
+	for id, exp := range c.canceledSessions {
+		if !now.Before(exp) {
+			delete(c.canceledSessions, id)
+		}
+	}
+}
+
+func (c *Controller) cancelSessionAsyncLocked(sessID string) {
+	if sessID == "" {
+		return
+	}
+	c.pruneCompletedTrackersLocked()
+
+	timeout := c.cfg.PaymentTimeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	expiresAt := c.now().Add(timeout)
+
+	c.canceledSessions[sessID] = expiresAt
+
+	if existing, ok := c.pendingCancels[sessID]; ok {
+		select {
+		case <-existing.done:
+			// Existing tracker completed previously; allow re-attempt
+		default:
+			// In-flight cancellation is already running for this session
+			return
+		}
+	}
+
+	tracker := &cancelTracker{
+		sessionID: sessID,
+		done:      make(chan struct{}),
+		createdAt: c.now(),
+		expiresAt: expiresAt,
+	}
+	c.pendingCancels[sessID] = tracker
+	go func(sID string, tr *cancelTracker, exp time.Time) {
+		defer close(tr.done)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := c.cfg.LookupClient.CancelSession(ctx, sID)
+		c.mu.Lock()
+		tr.err = err
+		if err == nil {
+			delete(c.pendingCancels, sID)
+			c.canceledSessions[sID] = exp
+		}
+		c.mu.Unlock()
+		if err != nil {
+			log.Printf("[PIN-CONTROLLER] Background cancel failed for session %s: %v", sID, err)
+		} else {
+			log.Printf("[PIN-CONTROLLER] Background cancel completed for session %s", sID)
+		}
+	}(sessID, tracker, expiresAt)
+}
+
 func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 	switch ev.Type {
 	case input.ActionCancel:
 		if c.currentSession != nil {
-			sessID := c.currentSession.SessionID
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer cancel()
-				_ = c.cfg.LookupClient.CancelSession(ctx, sessID)
-			}()
+			c.cancelSessionAsyncLocked(c.currentSession.SessionID)
 		}
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
 		if c.pinError != "" && c.currentSession != nil {
 			log.Printf("[PIN-CONTROLLER] Retrying payment initiation for session %s", c.currentSession.SessionID)
 			c.pinError = ""
-			c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+			remSec := c.currentRemainingSec
+			if remSec <= 0 {
+				remSec = int(c.cfg.PaymentTimeout.Seconds())
+			}
+			c.renderPaymentPendingLocked(remSec)
 			seq := atomic.AddUint64(&c.lookupSeq, 1)
 			sID := c.currentSession.SessionID
 			go func(targetSeq uint64, sessionID string) {
@@ -366,10 +516,14 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 				if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
 					return
 				}
+				rem := c.currentRemainingSec
+				if rem <= 0 {
+					rem = int(c.cfg.PaymentTimeout.Seconds())
+				}
 				if pErr != nil || attempt == nil {
 					log.Printf("[PIN-CONTROLLER] Retry initiate payment failed: %v", pErr)
 					c.pinError = "Failed to load payment QR. Press Confirm to retry."
-					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+					c.renderPaymentPendingLocked(rem)
 					return
 				}
 				qrPayload := c.resolvePaymentQRPayload(attempt)
@@ -378,19 +532,52 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 					c.currentAttempt = attempt
 					c.currentQRPayload = ""
 					c.pinError = "Failed to load payment QR. Press Confirm to retry."
-					c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+					c.renderPaymentPendingLocked(rem)
 					return
 				}
 				c.currentAttempt = attempt
 				c.currentQRPayload = qrPayload
 				c.pinError = ""
 				log.Printf("[PAYMENT] Demo checkout QR displayed for order %s", c.activeOrderIDLocked())
-				c.renderPaymentPendingLocked(int(c.cfg.PaymentTimeout.Seconds()))
+				c.renderPaymentPendingLocked(rem)
 			}(seq, sID)
 		} else {
 			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored on payment QR screen for order %s (scan QR code to pay)", c.activeOrderIDLocked())
 		}
 	}
+}
+
+func (c *Controller) isSessionExpired(session *cloud.SessionDetails) bool {
+	if session == nil {
+		return false
+	}
+	return session.SecondsRemaining <= 0
+}
+
+func (c *Controller) reclaimAndVerifySession(ctx context.Context, ordID string, canceledID string) (*cloud.SessionDetails, error) {
+	reclaimCtx, reclaimCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer reclaimCancel()
+	session, err := c.cfg.LookupClient.ClaimOrder(reclaimCtx, ordID)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil {
+		return nil, errors.New("received nil session from claim")
+	}
+	if c.isSessionExpired(session) {
+		log.Printf("[PIN-CONTROLLER] Reclaimed session %s returned non-positive SecondsRemaining (%d); rejecting", session.SessionID, session.SecondsRemaining)
+		return nil, cloud.ErrOrderExpired
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stillPending := c.isSessionPendingCancelLocked(session.SessionID)
+	stillCanceled := c.isSessionCanceledLocked(session.SessionID)
+	if stillPending || stillCanceled || session.SessionID == canceledID {
+		log.Printf("[PIN-CONTROLLER] Reclaimed session %s matches canceled session %s; rejecting fail-closed", session.SessionID, canceledID)
+		return nil, errors.New("received unresolved session; please try again")
+	}
+	return session, nil
 }
 
 func (c *Controller) startClaimLocked() {
@@ -413,6 +600,98 @@ func (c *Controller) startClaimLocked() {
 		defer cancel()
 
 		session, err := c.cfg.LookupClient.ClaimOrder(ctx, ordID)
+
+		if err == nil && c.isSessionExpired(session) {
+			log.Printf("[PIN-CONTROLLER] ClaimOrder returned session %s with non-positive SecondsRemaining (%d); rejecting", session.SessionID, session.SecondsRemaining)
+			err = cloud.ErrOrderExpired
+			session = nil
+		}
+
+		if err == nil && session != nil {
+			c.mu.Lock()
+			c.pruneCompletedTrackersLocked()
+			tracker, hasPending := c.pendingCancels[session.SessionID]
+			isCanceled := c.isSessionCanceledLocked(session.SessionID)
+			c.mu.Unlock()
+			if hasPending {
+				waitDuration := c.cfg.CancelWaitTimeout
+				if waitDuration <= 0 {
+					waitDuration = 5 * time.Second
+				}
+				waitTimer := time.NewTimer(waitDuration)
+				defer waitTimer.Stop()
+
+				var cancelCompleted bool
+				select {
+				case <-tracker.done:
+					cancelCompleted = true
+				case <-waitTimer.C:
+					log.Printf("[PIN-CONTROLLER] Cancellation timed out for session %s", session.SessionID)
+					tracker.attempts++
+					err = errors.New("previous session cancellation timed out; please try again")
+					session = nil
+				case <-ctx.Done():
+					log.Printf("[PIN-CONTROLLER] Context expired while waiting for session %s cancellation", session.SessionID)
+					tracker.attempts++
+					err = errors.New("previous session cancellation timed out; please try again")
+					session = nil
+				}
+
+				if cancelCompleted {
+					if tracker.err != nil {
+						// Previous cancellation failed. If customer is retrying (tracker.attempts > 0),
+						// safely reattempt cancellation after connectivity recovers.
+						if tracker.attempts > 0 {
+							log.Printf("[PIN-CONTROLLER] Customer retry: reattempting cancellation for session %s", session.SessionID)
+							retryCtx, retryCancel := context.WithTimeout(ctx, waitDuration)
+							retryErr := c.cfg.LookupClient.CancelSession(retryCtx, session.SessionID)
+							retryCancel()
+							if retryErr != nil {
+								log.Printf("[PIN-CONTROLLER] Cancellation reattempt failed for session %s: %v", session.SessionID, retryErr)
+								tracker.err = retryErr
+								err = errors.New("previous session cancellation failed; please try again")
+								session = nil
+							} else {
+								log.Printf("[PIN-CONTROLLER] Cancellation reattempt succeeded for session %s", session.SessionID)
+								tracker.err = nil
+								canceledID := session.SessionID
+								c.mu.Lock()
+								delete(c.pendingCancels, canceledID)
+								c.canceledSessions[canceledID] = c.now().Add(c.cfg.PaymentTimeout)
+								c.mu.Unlock()
+
+								session, err = c.reclaimAndVerifySession(ctx, ordID, canceledID)
+							}
+						} else {
+							tracker.attempts++
+							log.Printf("[PIN-CONTROLLER] Cancellation failed for session %s: %v", session.SessionID, tracker.err)
+							err = errors.New("previous session cancellation failed; please try again")
+							session = nil
+						}
+					} else {
+						// Cancellation completed successfully
+						canceledID := session.SessionID
+						c.mu.Lock()
+						delete(c.pendingCancels, canceledID)
+						c.canceledSessions[canceledID] = c.now().Add(c.cfg.PaymentTimeout)
+						c.mu.Unlock()
+
+						session, err = c.reclaimAndVerifySession(ctx, ordID, canceledID)
+					}
+				}
+			} else if isCanceled {
+				// Recognized as a previously canceled session even if tracker was already cleaned up
+				canceledID := session.SessionID
+				log.Printf("[PIN-CONTROLLER] Stale ClaimOrder response returned canceled session %s; requesting fresh checkout", canceledID)
+				session, err = c.reclaimAndVerifySession(ctx, ordID, canceledID)
+			}
+		}
+
+		if err == nil && c.isSessionExpired(session) {
+			log.Printf("[PIN-CONTROLLER] Session %s has non-positive SecondsRemaining (%d); rejecting without starting checkout", session.SessionID, session.SecondsRemaining)
+			err = cloud.ErrOrderExpired
+			session = nil
+		}
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -474,16 +753,25 @@ func (c *Controller) startClaimLocked() {
 		c.pinError = ""
 		c.currentQRPayload = c.resolvePaymentQRPayload(nil)
 
-		timeoutSec := int(c.cfg.PaymentTimeout.Seconds())
-		if session.SecondsRemaining > 0 && int(session.SecondsRemaining) < timeoutSec {
-			timeoutSec = int(session.SecondsRemaining)
+		checkoutDuration := c.cfg.PaymentTimeout
+		if checkoutDuration <= 0 {
+			checkoutDuration = 120 * time.Second
 		}
-		if timeoutSec < 10 {
-			timeoutSec = 10
+		if session.SecondsRemaining > 0 {
+			sessDur := time.Duration(session.SecondsRemaining) * time.Second
+			if sessDur < checkoutDuration {
+				checkoutDuration = sessDur
+			}
 		}
 
+		timeoutSec := int(checkoutDuration.Seconds())
+		if checkoutDuration > 0 && timeoutSec <= 0 {
+			timeoutSec = 1
+		}
+
+		c.currentRemainingSec = timeoutSec
 		c.renderPaymentPendingLocked(timeoutSec)
-		c.startCountdownLocked(time.Duration(timeoutSec) * time.Second)
+		c.startCountdownLocked(checkoutDuration)
 
 		// Asynchronously initiate payment to obtain dynamic payment QR payload with retry
 		sessID := session.SessionID
@@ -525,10 +813,15 @@ func (c *Controller) startClaimLocked() {
 				return
 			}
 
+			rem := c.currentRemainingSec
+			if rem <= 0 {
+				rem = tSec
+			}
+
 			if pErr != nil || attempt == nil {
 				log.Printf("[PIN-CONTROLLER] All initiate payment attempts failed for session %s: %v", sID, pErr)
 				c.pinError = "Failed to load payment QR. Press Confirm to retry."
-				c.renderPaymentPendingLocked(tSec)
+				c.renderPaymentPendingLocked(rem)
 				return
 			}
 
@@ -538,7 +831,7 @@ func (c *Controller) startClaimLocked() {
 				c.currentAttempt = attempt
 				c.currentQRPayload = ""
 				c.pinError = "Failed to load payment QR. Press Confirm to retry."
-				c.renderPaymentPendingLocked(tSec)
+				c.renderPaymentPendingLocked(rem)
 				return
 			}
 
@@ -546,7 +839,7 @@ func (c *Controller) startClaimLocked() {
 			c.currentQRPayload = qrPayload
 			c.pinError = ""
 			log.Printf("[PAYMENT] Demo checkout QR displayed for order %s", c.activeOrderIDLocked())
-			c.renderPaymentPendingLocked(tSec)
+			c.renderPaymentPendingLocked(rem)
 		}(targetSeq, sessID, timeoutSec)
 	}(seq, orderID)
 }
@@ -752,12 +1045,7 @@ func (c *Controller) resetInactivityTimerLocked(d time.Duration) {
 		if c.state == StatePINEntry || c.state == StateOrderSummary || c.state == StatePaymentPending {
 			log.Printf("[PIN-CONTROLLER] Inactivity timeout reached, returning to idle screen")
 			if c.currentSession != nil {
-				sessID := c.currentSession.SessionID
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					defer cancel()
-					_ = c.cfg.LookupClient.CancelSession(ctx, sessID)
-				}()
+				c.cancelSessionAsyncLocked(c.currentSession.SessionID)
 			}
 			c.resetToIdleLocked()
 		}
@@ -819,6 +1107,7 @@ func (c *Controller) startCountdownLocked(totalDuration time.Duration) {
 					return
 				}
 				c.mu.Lock()
+				c.currentRemainingSec = rem
 				if c.state == StateOrderSummary {
 					c.renderOrderSummaryLocked(rem)
 				} else if c.state == StatePaymentPending {

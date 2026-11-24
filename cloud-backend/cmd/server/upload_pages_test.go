@@ -69,6 +69,7 @@ func setupUploadTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		dbPath:         dbPath,
 		jobsDir:        jobsDir,
 		downloadSecret: []byte("test_secret_key_1234567890"),
+		devMode:        true,
 	}
 
 	hub := ws.NewHub(s)

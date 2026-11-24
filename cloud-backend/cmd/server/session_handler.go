@@ -14,6 +14,8 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
+const kioskCheckoutSessionDuration = 120 * time.Second
+
 type sessionResponse struct {
 	SessionID        string `json:"session_id"`
 	OrderID          string `json:"order_id"`
@@ -193,7 +195,7 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.db.CreateOrGetKioskSessionWithPaperCheck(r.Context(), kioskID, orderID, stock, 10*time.Minute, now)
+	sess, err := s.db.CreateOrGetKioskSessionWithPaperCheck(r.Context(), kioskID, orderID, stock, kioskCheckoutSessionDuration, now)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -424,23 +426,32 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 
 	// Verify paper supply against other commitments
 	committedSheets, cErr := s.db.GetCommittedPaperSheets(r.Context(), kioskID, orderID, now)
-	if cErr == nil {
-		reqSheets := ord.TotalSheets
-		if reqSheets <= 0 {
-			reqSheets = ord.Command.TotalSheets
-		}
-		if reqSheets <= 0 {
-			reqSheets = 1
-		}
-		if (stock - committedSheets) < reqSheets {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "insufficient paper in kiosk tray to fulfill order",
-				"code":  "INSUFFICIENT_PAPER",
-			})
-			return
-		}
+	if cErr != nil {
+		log.Printf("[INITIATE-PAYMENT] Failed to query paper commitments: %v", cErr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "failed to verify paper commitments",
+			"code":  "DATABASE_ERROR",
+		})
+		return
+	}
+
+	reqSheets := ord.TotalSheets
+	if reqSheets <= 0 {
+		reqSheets = ord.Command.TotalSheets
+	}
+	if reqSheets <= 0 {
+		reqSheets = 1
+	}
+	if (stock - committedSheets) < reqSheets {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "insufficient paper in kiosk tray to fulfill order",
+			"code":  "INSUFFICIENT_PAPER",
+		})
+		return
 	}
 
 	// Idempotency: check if an active, unexpired payment attempt already exists for this session
@@ -470,9 +481,9 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Calculate attempt expiration (bound to session expiration, max 15 minutes)
+	// The payment attempt and QR must expire no later than the checkout session.
 	attemptExpiresAt := sess.ExpiresAt
-	if maxExp := now.Add(15 * time.Minute); attemptExpiresAt.After(maxExp) {
+	if maxExp := now.Add(kioskCheckoutSessionDuration); attemptExpiresAt.After(maxExp) {
 		attemptExpiresAt = maxExp
 	}
 
@@ -737,7 +748,8 @@ func (s *appServer) handleRecoveryPIN(w http.ResponseWriter, r *http.Request) {
 	// Generate fresh 4-digit PIN with collision retry
 	const maxRetries = 25
 	var newPIN string
-	newExpiry := time.Now().UTC().Add(15 * time.Minute)
+	// Recovery is only for an already-paid PAID_WAITING order: durable paid entitlement.
+	newExpiry := store.PaidPINExpiry()
 	renewed := false
 
 	for attempt := 0; attempt < maxRetries; attempt++ {

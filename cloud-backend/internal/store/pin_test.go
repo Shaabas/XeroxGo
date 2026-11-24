@@ -26,7 +26,7 @@ func TestStore_PINExpiryAndStorage(t *testing.T) {
 	if err != nil || got1 == nil {
 		t.Fatalf("GetOrder failed: %v", err)
 	}
-	expectedExpiry1 := ord1.CreatedAt.Add(15 * time.Minute)
+	expectedExpiry1 := ord1.CreatedAt.Add(10 * time.Minute)
 	if !got1.PINExpiresAt.Equal(expectedExpiry1) {
 		t.Fatalf("expected default PIN expiry %v, got %v", expectedExpiry1, got1.PINExpiresAt)
 	}

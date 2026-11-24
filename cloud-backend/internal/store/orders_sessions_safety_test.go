@@ -259,25 +259,35 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 		sheetsPerOrder := 6
 		orderCount := 4 // Total needed = 24 sheets > 15 available. Exactly 2 should succeed, 2 should fail.
 
-		var orderIDs []string
-		for i := 0; i < orderCount; i++ {
-			ordID := fmt.Sprintf("ord_pg_stock_%d_%d", time.Now().UnixNano(), i)
-			pin := fmt.Sprintf("51%02d", i)
-			createTestOrderWithSheets(t, s, ctx, ordID, kioskStock, pin, sheetsPerOrder, contracts.JobStatusPendingPayment, now)
-			orderIDs = append(orderIDs, ordID)
-		}
-
 		var wg sync.WaitGroup
 		wg.Add(orderCount)
 		errorsList := make([]error, orderCount)
 
 		for i := 0; i < orderCount; i++ {
 			idx := i
-			ordID := orderIDs[i]
+			ordID := fmt.Sprintf("ord_pg_stock_%d_%d", time.Now().UnixNano(), i)
+			pin := fmt.Sprintf("51%02d", i)
 			go func() {
 				defer wg.Done()
-				_, err := s.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskStock, ordID, availableStock, 5*time.Minute, now)
-				errorsList[idx] = err
+				cmd := contracts.PrintJobCommand{
+					JobID:         "job_" + ordID,
+					KioskID:       kioskStock,
+					DownloadURL:   "https://storage.test/" + ordID + ".pdf",
+					TotalPages:    sheetsPerOrder,
+					TotalSheets:   sheetsPerOrder,
+					Copies:        1,
+					Duplex:        contracts.DuplexSimplex,
+					StartFromPage: 1,
+					DisplayCode:   pin,
+				}
+				ord := Order{
+					OrderID:      ordID,
+					Command:      cmd,
+					Status:       contracts.JobStatusPendingPayment,
+					PricePaise:   int64(sheetsPerOrder * 200),
+					PINExpiresAt: now.Add(10 * time.Minute),
+				}
+				errorsList[idx] = s.CreateOrderWithPaperCheck(ctx, ord, availableStock)
 			}()
 		}
 		wg.Wait()
@@ -344,10 +354,10 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 			t.Fatalf("CancelKioskSession failed: %v", err)
 		}
 
-		// Paper commitment must immediately drop to 0
+		// Under Package 03, canceling before PIN expiry cancels session immediately but retains 10-minute PIN reservation!
 		committedAfter, _ := s.GetCommittedPaperSheets(ctx, kioskCancel, "", now)
-		if committedAfter != 0 {
-			t.Fatalf("expected 0 committed sheets after cancel, got %d", committedAfter)
+		if committedAfter != 5 {
+			t.Fatalf("expected 5 committed sheets retained by PIN after early cancel, got %d", committedAfter)
 		}
 
 		// Re-claim order
@@ -357,6 +367,16 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 		}
 		if sessNew.SessionID == sess.SessionID {
 			t.Fatalf("new session after cancellation must have distinct ID")
+		}
+
+		// If session is canceled AFTER PIN expiry (now + 11 min):
+		tLater := now.Add(11 * time.Minute)
+		if err := s.CancelKioskSession(ctx, sessNew.SessionID, kioskCancel, tLater); err != nil {
+			t.Fatalf("CancelKioskSession after expiry failed: %v", err)
+		}
+		committedAfterExpiry, _ := s.GetCommittedPaperSheets(ctx, kioskCancel, "", tLater)
+		if committedAfterExpiry != 0 {
+			t.Fatalf("expected 0 committed sheets after late cancel, got %d", committedAfterExpiry)
 		}
 	})
 
@@ -372,11 +392,11 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 			t.Fatalf("initial claim failed: %v", err)
 		}
 
-		// At t0 + 3 min, session has expired
+		// At t0 + 3 min, session has expired, but unexpired 10-minute PIN still holds paper reservation
 		tExpired := t0.Add(3 * time.Minute)
 		committedExpired, _ := s.GetCommittedPaperSheets(ctx, kioskExp, "", tExpired)
-		if committedExpired != 0 {
-			t.Fatalf("expired session must commit 0 sheets, got %d", committedExpired)
+		if committedExpired != 4 {
+			t.Fatalf("unexpired PIN must maintain paper reservation, got %d", committedExpired)
 		}
 
 		// Re-claim order at tExpired
@@ -394,6 +414,13 @@ func TestPostgresConcurrency_IntegrationSuite(t *testing.T) {
 		_ = s.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM kiosk_sessions WHERE order_id = $1 AND status = 'PAYMENT_PENDING';", orderID).Scan(&actCount)
 		if expCount != 1 || actCount != 1 {
 			t.Fatalf("expected 1 EXPIRED and 1 PAYMENT_PENDING row in Postgres, got %d and %d", expCount, actCount)
+		}
+
+		// At t0 + 11 min, both session and PIN have expired
+		tFinalExpired := t0.Add(11 * time.Minute)
+		committedFinal, _ := s.GetCommittedPaperSheets(ctx, kioskExp, "", tFinalExpired)
+		if committedFinal != 0 {
+			t.Fatalf("expired PIN must commit 0 sheets, got %d", committedFinal)
 		}
 	})
 
