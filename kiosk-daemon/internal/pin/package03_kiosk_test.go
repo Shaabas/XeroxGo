@@ -900,11 +900,326 @@ func TestPackage03_CancellationTimeout_EventualCompletionAllowsFreshSession(t *t
 	}
 }
 
-func TestPackage03_RepeatedCancellations_NoStaleTrackingStateAccumulation(t *testing.T) {
+func TestPackage03_FailedCancellation_ProtectedAfter30sWhileSessionValid(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	rnd := &mockRenderer{}
+
+	var cancelCalls int32
+	baseTime := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	var clockMu sync.Mutex
+	currentTime := baseTime
+
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+
+	advanceTime := func(d time.Duration) {
+		clockMu.Lock()
+		currentTime = currentTime.Add(d)
+		clockMu.Unlock()
+	}
+
+	mockClient := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:         "ord_fail_30s",
+				TotalPricePaise: 500,
+				TotalPages:      1,
+				TotalSheets:     1,
+				PINExpiresAt:    nowFn().Add(10 * time.Minute).Format(time.RFC3339),
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			return &cloud.SessionDetails{
+				SessionID:        "sess_fail_30s",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				SecondsRemaining: 120,
+			}, nil
+		},
+		cancelFn: func(ctx context.Context, sessionID string) error {
+			atomic.AddInt32(&cancelCalls, 1)
+			return errors.New("network error on cancel")
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID: "att_fail_30s",
+				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				QRPayload: "https://kiosk.local/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				ExpiresAt: nowFn().Add(120 * time.Second).Format(time.RFC3339),
+			}, nil
+		},
+	}
+
+	cfg := Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    120 * time.Second,
+		CancelWaitTimeout: 100 * time.Millisecond,
+		Now:               nowFn,
+		RenderScreen:      rnd.Render,
+		LookupClient:      mockClient,
+	}
+
+	ctrl, err := NewController(cfg, sim)
+	if err != nil {
+		t.Fatalf("NewController failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Enter PIN and confirm into StatePaymentPending
+	sim.EmitDigits("1234")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending, got %s", ctrl.GetState())
+	}
+
+	// 2. Press Esc to cancel -> immediate return to idle
+	sim.EmitCancel()
+	deadline = time.Now().Add(1 * time.Second)
+	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateIdle {
+		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
+	}
+
+	// Wait for background cancellation to execute and fail
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for atomic.LoadInt32(&cancelCalls) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Tracker exists and failed
+	if ctrl.PendingCancelCount() != 1 {
+		t.Fatalf("expected 1 pending cancel tracker, got %d", ctrl.PendingCancelCount())
+	}
+
+	// 3. Advance clock by 45 seconds (> 30 seconds, but < 120 seconds PaymentTimeout)
+	advanceTime(45 * time.Second)
+
+	// In safe lifecycle tracking, it must remain protected because 120s session is still valid
+	if ctrl.PendingCancelCount() != 1 {
+		t.Fatalf("failed cancellation must remain protected after 45 seconds, got %d", ctrl.PendingCancelCount())
+	}
+
+	// 4. User re-enters PIN and attempts to start checkout
+	sim.EmitDigits("1234")
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sim.EmitSubmit()
+	time.Sleep(150 * time.Millisecond)
+
+	// Must fail closed on StateOrderSummary; must NOT reopen the failed session
+	if ctrl.GetState() != StateOrderSummary {
+		t.Fatalf("expected StateOrderSummary on protected failed cancellation, got %s", ctrl.GetState())
+	}
+	if ctrl.GetPINError() == "" {
+		t.Fatalf("expected retryable pinError when failed cancellation is protected")
+	}
+	if rnd.LastState().Mode == ui_ipc.ModePaymentPending {
+		t.Fatalf("must not render payment pending for protected failed session")
+	}
+
+	// 5. Advance clock past authoritative 120s session expiry (e.g. advance 80s more -> 125s total)
+	advanceTime(80 * time.Second)
+
+	// Now that authoritative session expiry has passed, cleanup can occur
+	if count := ctrl.PendingCancelCount(); count != 0 {
+		t.Fatalf("expected 0 pending cancel trackers after authoritative expiry, got %d", count)
+	}
+}
+
+func TestPackage03_StaleClaimOrder_RejectedAfterSuccessfulCancelAndCleanup(t *testing.T) {
+	sim := input.NewSimulatedSource(16)
+	rnd := &mockRenderer{}
+
+	var claimCallCount int32
+	baseTime := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	var clockMu sync.Mutex
+	currentTime := baseTime
+
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+
+	mockClient := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:         "ord_stale_claim",
+				TotalPricePaise: 500,
+				TotalPages:      1,
+				TotalSheets:     1,
+				PINExpiresAt:    nowFn().Add(10 * time.Minute).Format(time.RFC3339),
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			count := atomic.AddInt32(&claimCallCount, 1)
+			// Call 1: initial checkout -> returns sess_stale_1
+			// Call 2: user re-claims after cancellation -> backend returns stale sess_stale_1!
+			// Call 3: controller reclaims -> backend returns fresh sess_stale_2!
+			if count == 1 || count == 2 {
+				return &cloud.SessionDetails{
+					SessionID:        "sess_stale_1",
+					OrderID:          orderID,
+					Status:           "PAYMENT_PENDING",
+					SecondsRemaining: 120,
+				}, nil
+			}
+			return &cloud.SessionDetails{
+				SessionID:        "sess_stale_2",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				SecondsRemaining: 120,
+			}, nil
+		},
+		cancelFn: func(ctx context.Context, sessionID string) error {
+			// Successful cancellation
+			return nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			return &cloud.PaymentAttemptDetails{
+				AttemptID: "att_stale_claim",
+				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				QRPayload: "https://kiosk.local/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				ExpiresAt: nowFn().Add(120 * time.Second).Format(time.RFC3339),
+			}, nil
+		},
+	}
+
+	cfg := Config{
+		InactivityTimeout: 10 * time.Second,
+		SummaryTimeout:    10 * time.Second,
+		PaymentTimeout:    120 * time.Second,
+		CancelWaitTimeout: 100 * time.Millisecond,
+		Now:               nowFn,
+		RenderScreen:      rnd.Render,
+		LookupClient:      mockClient,
+	}
+
+	ctrl, err := NewController(cfg, sim)
+	if err != nil {
+		t.Fatalf("NewController failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	// 1. Enter PIN and confirm into StatePaymentPending with sess_stale_1
+	sim.EmitDigits("2345")
+	sim.EmitSubmit()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending, got %s", ctrl.GetState())
+	}
+	if sess := ctrl.GetCurrentSession(); sess == nil || sess.SessionID != "sess_stale_1" {
+		t.Fatalf("expected session sess_stale_1, got %+v", sess)
+	}
+
+	// 2. Press Esc to cancel -> immediate return to idle
+	sim.EmitCancel()
+	deadline = time.Now().Add(1 * time.Second)
+	for ctrl.GetState() != StateIdle && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.GetState() != StateIdle {
+		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
+	}
+
+	// Wait for async cancel to complete and tracker cleanup to remove from pendingCancels
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for ctrl.PendingCancelCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ctrl.PendingCancelCount() != 0 {
+		t.Fatalf("expected tracker cleaned up from pendingCancels, got %d", ctrl.PendingCancelCount())
+	}
+
+	// 3. User re-enters PIN and submits checkout.
+	// The backend ClaimOrder initially returns stale sess_stale_1.
+	sim.EmitDigits("2345")
+	sim.EmitSubmit()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	sim.EmitSubmit()
+
+	// Wait for claim and reclaim to process
+	deadline = time.Now().Add(2 * time.Second)
+	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Must transition to StatePaymentPending WITH sess_stale_2, NEVER reopening sess_stale_1!
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending after reclaim, got %s", ctrl.GetState())
+	}
+	if sess := ctrl.GetCurrentSession(); sess == nil || sess.SessionID != "sess_stale_2" {
+		t.Fatalf("stale session was reopened! expected fresh sess_stale_2, got %+v", sess)
+	}
+	if atomic.LoadInt32(&claimCallCount) < 3 {
+		t.Fatalf("expected controller to reclaim fresh session, claim calls: %d", atomic.LoadInt32(&claimCallCount))
+	}
+}
+
+func TestPackage03_RepeatedSessions_NoIndefiniteTrackerAccumulation(t *testing.T) {
 	sim := input.NewSimulatedSource(16)
 	rnd := &mockRenderer{}
 
 	var sessionSeq int64
+	baseTime := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	var clockMu sync.Mutex
+	currentTime := baseTime
+
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return currentTime
+	}
+
+	advanceTime := func(d time.Duration) {
+		clockMu.Lock()
+		currentTime = currentTime.Add(d)
+		clockMu.Unlock()
+	}
+
 	mockClient := &mockLookupClient{
 		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
 			return &cloud.OrderDetails{
@@ -912,7 +1227,7 @@ func TestPackage03_RepeatedCancellations_NoStaleTrackingStateAccumulation(t *tes
 				TotalPricePaise: 300,
 				TotalPages:      1,
 				TotalSheets:     1,
-				PINExpiresAt:    time.Now().Add(10 * time.Minute).Format(time.RFC3339),
+				PINExpiresAt:    nowFn().Add(10 * time.Minute).Format(time.RFC3339),
 			}, nil
 		},
 		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
@@ -925,7 +1240,6 @@ func TestPackage03_RepeatedCancellations_NoStaleTrackingStateAccumulation(t *tes
 			}, nil
 		},
 		cancelFn: func(ctx context.Context, sessionID string) error {
-			// Fast successful cancellation
 			return nil
 		},
 		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
@@ -933,7 +1247,7 @@ func TestPackage03_RepeatedCancellations_NoStaleTrackingStateAccumulation(t *tes
 				AttemptID: "att_rep",
 				DemoToken: "dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
 				QRPayload: "https://kiosk.local/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
-				ExpiresAt: time.Now().Add(120 * time.Second).Format(time.RFC3339),
+				ExpiresAt: nowFn().Add(120 * time.Second).Format(time.RFC3339),
 			}, nil
 		},
 	}
@@ -942,6 +1256,7 @@ func TestPackage03_RepeatedCancellations_NoStaleTrackingStateAccumulation(t *tes
 		InactivityTimeout: 10 * time.Second,
 		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
+		Now:               nowFn,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
 	}
@@ -988,34 +1303,19 @@ func TestPackage03_RepeatedCancellations_NoStaleTrackingStateAccumulation(t *tes
 		if ctrl.GetState() != StateIdle {
 			t.Fatalf("cycle %d: expected StateIdle after Esc, got %s", i, ctrl.GetState())
 		}
-
-		// Wait for async cancellation to complete and delete tracker
-		deadline = time.Now().Add(1 * time.Second)
-		for ctrl.PendingCancelCount() > 0 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-
-		if count := ctrl.PendingCancelCount(); count != 0 {
-			t.Fatalf("cycle %d: expected 0 pending cancel trackers, got %d", i, count)
-		}
 	}
 
-	// Verify that pruneCompletedTrackersLocked strictly bounds tracker map under simulated accumulation
-	ctrl.mu.Lock()
-	for i := 0; i < 50; i++ {
-		ctrl.pendingCancels[fmt.Sprintf("excess_%d", i)] = &cancelTracker{
-			attempts:  1,
-			createdAt: time.Now().Add(-1 * time.Hour),
-			err:       errors.New("stale failure"),
-			done:      make(chan struct{}),
-		}
-	}
-	ctrl.pruneCompletedTrackersLocked()
-	count := len(ctrl.pendingCancels)
-	ctrl.mu.Unlock()
+	// Advance clock past authoritative session expiry (120s)
+	advanceTime(130 * time.Second)
 
-	if count > 32 {
-		t.Fatalf("expected tracker map to be bounded to at most 32 entries, got %d", count)
+	// Reset/prune triggers cleanup of expired sessions
+	ctrl.ResetToIdle()
+
+	if count := ctrl.PendingCancelCount(); count != 0 {
+		t.Fatalf("expected 0 pending cancel trackers, got %d", count)
+	}
+	if count := ctrl.CanceledSessionCount(); count != 0 {
+		t.Fatalf("expected 0 canceled session entries after authoritative expiry, got %d", count)
 	}
 }
 
