@@ -82,7 +82,7 @@ func setupSafetyTestApp(t *testing.T, kioskID, orderID, pin string, status contr
 			app.handleRecoveryPIN(w, r)
 		case stringsContains(path, "/sessions/") && stringsHasSuffix(path, "/cancel"):
 			app.handleSessionCancel(w, r)
-		case stringsHasSuffix(path, "/initiate-payment"):
+		case stringsContains(path, "/sessions/") && stringsHasSuffix(path, "/initiate-payment"):
 			app.handleInitiatePayment(w, r)
 		case stringsContains(path, "/sessions/"):
 			app.handleGetSession(w, r)
@@ -1426,7 +1426,7 @@ func TestPaymentPhase1_InitiatePayment_ActiveSessionRequired(t *testing.T) {
 	_, kSec, _, ts, _ := setupSafetyTestApp(t, kioskID, orderID, pin, contracts.JobStatusPendingPayment, pricePaise, pinExpiry)
 
 	// Case 1: Unauthenticated request -> 401 Unauthorized
-	reqNoAuth, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	reqNoAuth, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/sess_missing_001/initiate-payment", ts.URL, kioskID), nil)
 	respNoAuth, err := http.DefaultClient.Do(reqNoAuth)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
@@ -1437,7 +1437,7 @@ func TestPaymentPhase1_InitiatePayment_ActiveSessionRequired(t *testing.T) {
 	}
 
 	// Case 2: Authenticated request, but NO active kiosk transaction session -> 409 Conflict
-	reqNoSess, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	reqNoSess, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/sess_missing_001/initiate-payment", ts.URL, kioskID), nil)
 	reqNoSess.Header.Set("Authorization", "Bearer "+kSec)
 	respNoSess, err := http.DefaultClient.Do(reqNoSess)
 	if err != nil {
@@ -1477,7 +1477,7 @@ func TestPaymentPhase1_InitiatePayment_SuccessAndIdempotency(t *testing.T) {
 	sessionID := claimBody["session_id"].(string)
 
 	// 2. First Initiate Payment Call
-	initReq1, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq1, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessionID), nil)
 	initReq1.Header.Set("Authorization", "Bearer "+kSec)
 	initResp1, err := http.DefaultClient.Do(initReq1)
 	if err != nil {
@@ -1520,7 +1520,7 @@ func TestPaymentPhase1_InitiatePayment_SuccessAndIdempotency(t *testing.T) {
 	}
 
 	// 3. Second Initiate Payment Call (IDEMPOTENCY CHECK)
-	initReq2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessionID), nil)
 	initReq2.Header.Set("Authorization", "Bearer "+kSec)
 	initResp2, err := http.DefaultClient.Do(initReq2)
 	if err != nil {
@@ -1568,7 +1568,7 @@ func TestPaymentPhase1_InitiatePayment_RetryAfterExpiry(t *testing.T) {
 	sessionID := claimBody["session_id"].(string)
 
 	// 2. Initiate payment first time
-	initReq1, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq1, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessionID), nil)
 	initReq1.Header.Set("Authorization", "Bearer "+kSec)
 	initResp1, _ := http.DefaultClient.Do(initReq1)
 	var initBody1 map[string]interface{}
@@ -1581,7 +1581,7 @@ func TestPaymentPhase1_InitiatePayment_RetryAfterExpiry(t *testing.T) {
 	_, _ = st.DB().ExecContext(context.Background(), "UPDATE payment_attempts SET expires_at_ns = ? WHERE attempt_id = ?;", pastNS, attemptID1)
 
 	// 4. Initiate payment again: expired attempt must be replaced by a fresh new attempt
-	initReq2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessionID), nil)
 	initReq2.Header.Set("Authorization", "Bearer "+kSec)
 	initResp2, _ := http.DefaultClient.Do(initReq2)
 	if initResp2.StatusCode != http.StatusOK {
@@ -1611,9 +1611,11 @@ func TestPaymentPhase1_Webhook_MismatchedAmount_Rejected(t *testing.T) {
 	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
 	claimReq.Header.Set("Authorization", "Bearer "+kSec)
 	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBodyAmt map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBodyAmt)
 	claimResp.Body.Close()
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, claimBodyAmt["session_id"].(string)), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, _ := http.DefaultClient.Do(initReq)
 	var initBody map[string]interface{}
@@ -1674,9 +1676,11 @@ func TestPaymentPhase1_Webhook_InvalidCurrency_Rejected(t *testing.T) {
 	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
 	claimReq.Header.Set("Authorization", "Bearer "+kSec)
 	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBodyAmt map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBodyAmt)
 	claimResp.Body.Close()
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, claimBodyAmt["session_id"].(string)), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, _ := http.DefaultClient.Do(initReq)
 	var initBody map[string]interface{}
@@ -1854,7 +1858,7 @@ func TestPaymentPhase1_Webhook_FullLifecycleAndDispatch(t *testing.T) {
 	sessionID := claimBody["session_id"].(string)
 
 	// 3. Initiate payment
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessionID), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, err := http.DefaultClient.Do(initReq)
 	if err != nil || initResp.StatusCode != http.StatusOK {
@@ -1959,10 +1963,12 @@ func TestPaymentSafety_Webhook_AuthorizedEvent_Ignored(t *testing.T) {
 	if err != nil || claimResp.StatusCode != http.StatusOK {
 		t.Fatalf("claim failed: %v", err)
 	}
+	var claimBodyAuth map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBodyAuth)
 	claimResp.Body.Close()
 
 	// 2. Initiate payment
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, claimBodyAuth["session_id"].(string)), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, err := http.DefaultClient.Do(initReq)
 	if err != nil || initResp.StatusCode != http.StatusOK {
@@ -2043,9 +2049,11 @@ func TestPaymentSafety_Webhook_CapturedEvent_AuthorizedStatus_Rejected(t *testin
 	if err != nil || claimResp.StatusCode != http.StatusOK {
 		t.Fatalf("claim failed: %v", err)
 	}
+	var claimBodyStatAuth map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBodyStatAuth)
 	claimResp.Body.Close()
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, claimBodyStatAuth["session_id"].(string)), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, err := http.DefaultClient.Do(initReq)
 	if err != nil || initResp.StatusCode != http.StatusOK {
@@ -2109,9 +2117,11 @@ func TestPaymentSafety_Webhook_FailedEvent_Ignored(t *testing.T) {
 	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
 	claimReq.Header.Set("Authorization", "Bearer "+kSec)
 	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBodyFailEvt map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBodyFailEvt)
 	claimResp.Body.Close()
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, claimBodyFailEvt["session_id"].(string)), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, _ := http.DefaultClient.Do(initReq)
 	var initBody map[string]interface{}
@@ -2176,9 +2186,11 @@ func TestPaymentSafety_Webhook_InvalidAmount_Rejected(t *testing.T) {
 	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
 	claimReq.Header.Set("Authorization", "Bearer "+kSec)
 	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBodyFailEvt map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBodyFailEvt)
 	claimResp.Body.Close()
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, claimBodyFailEvt["session_id"].(string)), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, _ := http.DefaultClient.Do(initReq)
 	var initBody map[string]interface{}
@@ -2238,7 +2250,7 @@ func TestPaymentSafety_CaptureFailure_RetrySucceedsWithoutBeingIgnored(t *testin
 	claimResp.Body.Close()
 	sessID := claimBody["session_id"].(string)
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessID), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, _ := http.DefaultClient.Do(initReq)
 	var initBody map[string]interface{}
@@ -2359,7 +2371,7 @@ func TestPaymentSafety_DuplicateCallbacks_StrictSingleDispatch(t *testing.T) {
 	claimResp.Body.Close()
 	sessID := claimBody["session_id"].(string)
 
-	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID), nil)
+	initReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/sessions/%s/initiate-payment", ts.URL, kioskID, sessID), nil)
 	initReq.Header.Set("Authorization", "Bearer "+kSec)
 	initResp, _ := http.DefaultClient.Do(initReq)
 	var initBody map[string]interface{}

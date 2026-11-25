@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,17 +45,13 @@ func TestPackage03_InitiatePayment_PaperCommitmentQueryError_FailsClosed(t *test
 	st.FaultInjectCommitmentQuery = errors.New("simulated database failure on paper commitment query")
 	defer func() { st.FaultInjectCommitmentQuery = nil }()
 
-	// 5. Initiate payment via HTTP API
-	reqBody, _ := json.Marshal(map[string]string{
-		"session_id": sess.SessionID,
-	})
-	payURL := srv.URL + "/api/k/" + kioskID + "/orders/" + orderID + "/initiate-payment"
-	req, err := http.NewRequest(http.MethodPost, payURL, bytes.NewReader(reqBody))
+	// 5. Initiate payment via canonical session-scoped HTTP API
+	payURL := srv.URL + "/api/k/" + kioskID + "/sessions/" + sess.SessionID + "/initiate-payment"
+	req, err := http.NewRequest(http.MethodPost, payURL, nil)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -92,9 +87,8 @@ func TestPackage03_InitiatePayment_PaperCommitmentQueryError_FailsClosed(t *test
 	// 8. Clear fault injection: subsequent payment initiation must succeed
 	st.FaultInjectCommitmentQuery = nil
 
-	req2, _ := http.NewRequest(http.MethodPost, payURL, bytes.NewReader(reqBody))
+	req2, _ := http.NewRequest(http.MethodPost, payURL, nil)
 	req2.Header.Set("Authorization", "Bearer "+secret)
-	req2.Header.Set("Content-Type", "application/json")
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)

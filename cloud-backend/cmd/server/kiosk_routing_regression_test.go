@@ -71,7 +71,7 @@ func setupRoutingRegressionServer(t *testing.T) (*appServer, *httptest.Server, *
 			app.handleOrderRelease(w, r)
 		case strings.HasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
-		case strings.HasSuffix(path, "/initiate-payment"):
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/initiate-payment"):
 			app.handleInitiatePayment(w, r)
 		case strings.Contains(path, "/sessions/") && (strings.HasSuffix(path, "/cancel") || strings.HasSuffix(path, "/cancel-session")):
 			app.handleSessionCancel(w, r)
@@ -216,41 +216,46 @@ func TestKioskRouting_InitiatePaymentExactPINClientURL(t *testing.T) {
 	}
 }
 
-// TestKioskRouting_OrderInitiatePaymentBackwardCompatibility verifies that
-// POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment remains functional and does not return 405.
-func TestKioskRouting_OrderInitiatePaymentBackwardCompatibility(t *testing.T) {
+// TestKioskRouting_OrderInitiatePaymentRemoved verifies that the removed order-scoped
+// endpoint POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment is unavailable (404 Not Found).
+func TestKioskRouting_OrderInitiatePaymentRemoved(t *testing.T) {
 	_, ts, st, kioskSecret, cleanup := setupRoutingRegressionServer(t)
 	defer cleanup()
 
-	kioskID := "kiosk-compat-test"
-	orderID := "ord_compat_001"
+	kioskID := "kiosk-removed-route"
+	orderID := "ord_removed_route_001"
 	pin := "5678"
 
 	createRoutingTestOrder(t, st, kioskID, orderID, pin, 1, 500)
 
-	// Claim order
+	// Claim order so an active session exists
 	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
 	claimReq.Header.Set("Authorization", "Bearer "+kioskSecret)
 	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimBody map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimBody)
 	claimResp.Body.Close()
+	sessID := claimBody["session_id"].(string)
 
-	// Call /orders/{order_id}/initiate-payment
-	compatURL := fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID)
-	req, _ := http.NewRequest(http.MethodPost, compatURL, nil)
+	// Call removed /orders/{order_id}/initiate-payment -> must return 404 Not Found
+	removedURL := fmt.Sprintf("%s/api/k/%s/orders/%s/initiate-payment", ts.URL, kioskID, orderID)
+	req, _ := http.NewRequest(http.MethodPost, removedURL, nil)
 	req.Header.Set("Authorization", "Bearer "+kioskSecret)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("compat request failed: %v", err)
+		t.Fatalf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusMethodNotAllowed {
-		t.Fatalf("expected 200 OK, got 405 Method Not Allowed on %s", compatURL)
-	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(body))
+		t.Fatalf("expected 404 Not Found for removed order-scoped initiate-payment, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	att, err := st.GetActivePaymentAttempt(context.Background(), sessID, time.Now().UTC())
+	if err != nil || att != nil {
+		t.Fatalf("expected no payment attempt created from removed route, got %+v (err=%v)", att, err)
 	}
 }
 
