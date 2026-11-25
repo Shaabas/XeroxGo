@@ -151,6 +151,7 @@ func TestRenderCheckoutStates(t *testing.T) {
 					ColorMode:       "mono",
 				},
 				PINError:       "Paper tray supply is low or empty. Please ask attendant to refill paper and press Confirm.",
+				PINErrorRetry:  true,
 				TimeoutSeconds: 0,
 			},
 		},
@@ -417,9 +418,10 @@ func TestRenderCheckout_PhasesAndCountdownSuppression(t *testing.T) {
 
 	// 4. Failure phase renders error banner and no countdown when no session exists
 	imgFail, err := Render(ScreenState{
-		Mode:         ModePaymentPending,
-		OrderSummary: summary,
-		PINError:     "Unable to start payment session. Please try again.",
+		Mode:          ModePaymentPending,
+		OrderSummary:  summary,
+		PINError:      "Unable to start payment session. Please try again.",
+		PINErrorRetry: true,
 	})
 	if err != nil {
 		t.Fatalf("Render(failure) failed: %v", err)
@@ -446,3 +448,103 @@ func TestRenderCheckout_PhasesAndCountdownSuppression(t *testing.T) {
 	}
 }
 
+
+func TestPackage04_PaymentPendingErrorInstructions(t *testing.T) {
+	// Label selection must rely strictly on explicit controller-provided flags rather than inspecting PINError text.
+	cases := []struct {
+		name         string
+		state        ScreenState
+		wantTitle    string
+		wantSubtitle string
+	}{
+		{
+			name: "retryable error allows Confirm retry even if message mentions release",
+			state: ScreenState{
+				Mode:               ModePaymentPending,
+				PINError:           "release failed text should not override flags",
+				PINErrorRetry:      true,
+				PrintReleaseFailed: false,
+			},
+			wantTitle:    "QR Unavailable",
+			wantSubtitle: "Press Confirm to retry",
+		},
+		{
+			name: "non-retryable error never displays Press Confirm to retry",
+			state: ScreenState{
+				Mode:               ModePaymentPending,
+				PINError:           "Failed to load payment QR. Press Confirm to retry.",
+				PINErrorRetry:      false,
+				PrintReleaseFailed: false,
+			},
+			wantTitle:    "QR Unavailable",
+			wantSubtitle: "Press Esc to return",
+		},
+		{
+			name: "paid-order release failure displays Print Release Failed and Press Esc to return",
+			state: ScreenState{
+				Mode:               ModePaymentPending,
+				PINError:           "Please press Confirm to retry.",
+				PINErrorRetry:      false,
+				PrintReleaseFailed: true,
+			},
+			wantTitle:    "Print Release Failed",
+			wantSubtitle: "Press Esc to return",
+		},
+	}
+
+	summary := &OrderSummary{
+		OrderID:         "ord_err_instr",
+		TotalPricePaise: 1200,
+		TotalPages:      2,
+		TotalSheets:     1,
+		Copies:          1,
+		Duplex:          "simplex",
+		ColorMode:       "mono",
+	}
+
+	renderedBoxes := make(map[string][]byte)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			title, subtitle := paymentPendingErrorLabels(tc.state)
+			if title != tc.wantTitle || subtitle != tc.wantSubtitle {
+				t.Fatalf("paymentPendingErrorLabels() = (%q, %q), want (%q, %q)", title, subtitle, tc.wantTitle, tc.wantSubtitle)
+			}
+
+			state := tc.state
+			state.OrderSummary = summary
+			img, err := Render(state)
+			if err != nil {
+				t.Fatalf("Render failed: %v", err)
+			}
+
+			// Extract QR box region (1475..1785, topY+35..topY+345 where topY=295 -> y=330..640)
+			var boxPixels []byte
+			for y := 330; y < 640; y++ {
+				for x := 1475; x < 1785; x++ {
+					c := img.RGBAAt(x, y)
+					boxPixels = append(boxPixels, c.R, c.G, c.B, c.A)
+				}
+			}
+			renderedBoxes[tc.name] = boxPixels
+		})
+	}
+
+	equalBytes := func(a, b []byte) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	if equalBytes(renderedBoxes[cases[0].name], renderedBoxes[cases[1].name]) {
+		t.Errorf("retryable vs non-retryable QR error rendered identical QR box pixels")
+	}
+	if equalBytes(renderedBoxes[cases[1].name], renderedBoxes[cases[2].name]) {
+		t.Errorf("non-retryable QR error vs Print Release Failed rendered identical QR box pixels")
+	}
+}

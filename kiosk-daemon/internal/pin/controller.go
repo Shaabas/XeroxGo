@@ -525,20 +525,20 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored while checkout request is in flight for order %s", c.activeOrderIDLocked())
 			return
 		}
-		// Never initiate payment or auto-retry print release on an already-paid order
-		if c.isPaidOrderLocked() {
-			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored for already-paid order %s", c.activeOrderIDLocked())
-			return
-		}
 		// Ignore Enter when a valid QR is already displayed
 		if c.currentQRPayload != "" {
 			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored on payment QR screen for order %s (scan QR code to pay)", c.activeOrderIDLocked())
 			return
 		}
-		// Retry claiming when claim failed before a session was obtained
+		// Retry claiming when claim failed before a session was obtained (allowed for both unpaid and PAID_WAITING orders)
 		if c.currentSession == nil && c.pinError != "" {
 			log.Printf("[PIN-CONTROLLER] Retrying claim for order %s", c.activeOrderIDLocked())
 			c.startClaimLocked()
+			return
+		}
+		// Never initiate payment or retry print release on an already-paid order after a session was obtained
+		if c.isPaidOrderLocked() {
+			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored for already-paid order %s", c.activeOrderIDLocked())
 			return
 		}
 		// Retry payment initiation against the existing session without extending checkout deadline
@@ -564,6 +564,19 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 		}
 		log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored on payment QR screen for order %s (scan QR code to pay)", c.activeOrderIDLocked())
 	}
+}
+
+func (c *Controller) canRetryConfirmLocked() bool {
+	if c.state != StatePaymentPending || c.isClaiming || c.isInitiating || c.currentQRPayload != "" || c.pinError == "" {
+		return false
+	}
+	if c.currentSession == nil {
+		return true
+	}
+	if c.isPaidOrderLocked() {
+		return false
+	}
+	return !c.isCheckoutExpiredLocked()
 }
 
 func (c *Controller) isPaidOrderLocked() bool {
@@ -1001,6 +1014,12 @@ func (c *Controller) startClaimLocked() {
 			c.currentSession = session
 			c.checkoutDeadline = deadline
 			relTimeout := deadline.Sub(c.now())
+			if relTimeout <= 0 {
+				log.Printf("[PIN-CONTROLLER] Session %s deadline already passed before paid-order release for order %s; expiring immediately", session.SessionID, ordID)
+				c.expireCheckoutLocked()
+				c.mu.Unlock()
+				return
+			}
 			if relTimeout > 10*time.Second {
 				relTimeout = 10 * time.Second
 			}
@@ -1026,9 +1045,20 @@ func (c *Controller) startClaimLocked() {
 				c.currentSession = session
 				c.checkoutDeadline = deadline
 				c.currentQRPayload = ""
+				rem := c.checkoutRemainingLocked()
+				if rem <= 0 {
+					log.Printf("[PIN-CONTROLLER] Session %s deadline passed after paid-order release failure for order %s; expiring immediately", session.SessionID, ordID)
+					c.expireCheckoutLocked()
+					c.mu.Unlock()
+					return
+				}
 				c.pinError = mapReleaseError(relErr)
-				c.renderPaymentPendingLocked(0)
-				c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
+				inactivityDur := c.cfg.InactivityTimeout
+				if inactivityDur <= 0 || rem < inactivityDur {
+					inactivityDur = rem
+				}
+				c.renderPaymentPendingLocked(c.checkoutRemainingSecondsLocked())
+				c.startCountdownWithTimeoutLocked(inactivityDur)
 				c.mu.Unlock()
 				return
 			}
@@ -1217,15 +1247,19 @@ func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
 		}
 	}
 
+	printReleaseFailed := c.pinError != "" && c.currentSession != nil && c.isPaidOrderLocked()
+
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
-		Mode:           ui_ipc.ModePaymentPending,
-		OrderSummary:   summary,
-		SessionID:      sessID,
-		QRContent:      c.currentQRPayload,
-		PINLoading:     c.isClaiming,
-		PINError:       c.pinError,
-		TimeoutSeconds: remainingSeconds,
-		PrinterModel:   c.cfg.PrinterModel,
+		Mode:               ui_ipc.ModePaymentPending,
+		OrderSummary:       summary,
+		SessionID:          sessID,
+		QRContent:          c.currentQRPayload,
+		PINLoading:         c.isClaiming,
+		PINError:           c.pinError,
+		PINErrorRetry:      c.canRetryConfirmLocked(),
+		PrintReleaseFailed: printReleaseFailed,
+		TimeoutSeconds:     remainingSeconds,
+		PrinterModel:       c.cfg.PrinterModel,
 	})
 }
 
@@ -1288,14 +1322,17 @@ func (c *Controller) stopErrorTimerLocked() {
 }
 
 func (c *Controller) startCountdownLocked() {
+	c.startCountdownWithTimeoutLocked(c.checkoutRemainingLocked())
+}
+
+func (c *Controller) startCountdownWithTimeoutLocked(inactivityDur time.Duration) {
 	c.stopCountdownLocked()
-	totalDuration := c.checkoutRemainingLocked()
-	if totalDuration <= 0 {
+	if c.checkoutRemainingLocked() <= 0 || inactivityDur <= 0 {
 		c.expireCheckoutLocked()
 		return
 	}
 	c.stopCountdown = make(chan struct{})
-	c.resetInactivityTimerLocked(totalDuration)
+	c.resetInactivityTimerLocked(inactivityDur)
 	baseCtx := c.ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()

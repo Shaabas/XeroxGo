@@ -737,7 +737,7 @@ func TestPackage04_PaidOrder_ClaimsAndReleasesWithSessionID(t *testing.T) {
 			return &cloud.SessionDetails{
 				SessionID:        "sess_paid_release_1",
 				OrderID:          orderID,
-				Status:           string(contracts.JobStatusPaidWaiting),
+				Status:           "PAYMENT_PENDING",
 				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
@@ -819,7 +819,7 @@ func TestPackage04_PaidOrder_ReleaseFailureShowsVisibleErrorWithoutAutoRetry(t *
 			return &cloud.SessionDetails{
 				SessionID:        "sess_paid_rel_fail",
 				OrderID:          orderID,
-				Status:           string(contracts.JobStatusPaidWaiting),
+				Status:           "PAYMENT_PENDING",
 				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
@@ -864,6 +864,12 @@ func TestPackage04_PaidOrder_ReleaseFailureShowsVisibleErrorWithoutAutoRetry(t *
 	last := rnd.LastState()
 	if last.QRContent != "" {
 		t.Errorf("expected empty QRContent on paid-order release failure, got %q", last.QRContent)
+	}
+	if last.PINErrorRetry {
+		t.Errorf("expected PINErrorRetry=false on paid-order release failure")
+	}
+	if !last.PrintReleaseFailed {
+		t.Errorf("expected PrintReleaseFailed=true on paid-order release failure")
 	}
 
 	// Pressing Confirm or waiting must not auto-retry print release or initiate payment.
@@ -1528,5 +1534,294 @@ func TestPackage04_ClaimSerialization_TimedOutWaiterDoesNotBypassInFlightClaim(t
 		n := len(ctrl.orderClaims)
 		ctrl.mu.Unlock()
 		return n == 0
+	})
+}
+
+// Failed paid-order claim retains retry eligibility via Confirm, deduplicates in-flight retries, and releases without payment.
+func TestPackage04_PaidOrder_ClaimFailureAllowsConfirmRetryAndReleases(t *testing.T) {
+	sim := input.NewSimulatedSource(32)
+	defer sim.Close()
+	rnd := &mockRenderer{}
+
+	var claimCalls int32
+	var initCalls int32
+	retryClaimStarted := make(chan struct{})
+	retryClaimRelease := make(chan struct{})
+	type releaseCall struct {
+		orderID   string
+		sessionID string
+	}
+	releasedCh := make(chan releaseCall, 1)
+
+	client := &mockLookupClient{
+		lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+			return &cloud.OrderDetails{
+				OrderID:         "ord_paid_claim_retry",
+				Status:          string(contracts.JobStatusPaidWaiting),
+				TotalPricePaise: 1500,
+				TotalPages:      3,
+				TotalSheets:     2,
+				Copies:          1,
+			}, nil
+		},
+		claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+			n := atomic.AddInt32(&claimCalls, 1)
+			if n == 1 {
+				return nil, cloud.ErrInsufficientPaper
+			}
+			if n == 2 {
+				close(retryClaimStarted)
+				<-retryClaimRelease
+			}
+			return &cloud.SessionDetails{
+				SessionID:        "sess_paid_retry_ok",
+				OrderID:          orderID,
+				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
+				SecondsRemaining: 120,
+			}, nil
+		},
+		initiateFn: func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error) {
+			atomic.AddInt32(&initCalls, 1)
+			return nil, errors.New("must not initiate payment on PAID_WAITING order")
+		},
+		releaseFn: func(ctx context.Context, orderID, sessionID string) error {
+			releasedCh <- releaseCall{orderID: orderID, sessionID: sessionID}
+			return nil
+		},
+	}
+
+	ctrl, err := NewController(Config{
+		InactivityTimeout: 10 * time.Second,
+		PaymentTimeout:    120 * time.Second,
+		RenderScreen:      rnd.Render,
+		LookupClient:      client,
+	}, sim)
+	if err != nil {
+		t.Fatalf("NewController failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctrl.Start(ctx)
+	defer ctrl.Stop()
+
+	sim.EmitDigits("4321")
+	sim.EmitSubmit()
+
+	waitUntil(t, time.Second, "paid-order claim failure rendered", func() bool {
+		last := rnd.LastState()
+		return ctrl.GetState() == StatePaymentPending && last.PINError != ""
+	})
+
+	last := rnd.LastState()
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session on claim failure, got %+v", ctrl.GetCurrentSession())
+	}
+	if !last.PINErrorRetry {
+		t.Errorf("expected PINErrorRetry=true when PAID_WAITING claim fails without session")
+	}
+	if last.PrintReleaseFailed {
+		t.Errorf("expected PrintReleaseFailed=false when claim failed before session")
+	}
+
+	// Customer presses Confirm to retry claim; repeated presses during in-flight claim must be deduplicated.
+	sim.EmitSubmit()
+	<-retryClaimStarted
+	sim.EmitSubmit()
+	sim.EmitSubmit()
+	time.Sleep(30 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&claimCalls); got != 2 {
+		t.Fatalf("expected exactly 2 ClaimOrder calls during in-flight Confirm retry, got %d", got)
+	}
+
+	close(retryClaimRelease)
+
+	select {
+	case rel := <-releasedCh:
+		if rel.orderID != "ord_paid_claim_retry" {
+			t.Errorf("release orderID = %q, want ord_paid_claim_retry", rel.orderID)
+		}
+		if rel.sessionID != "sess_paid_retry_ok" {
+			t.Errorf("release sessionID = %q, want sess_paid_retry_ok", rel.sessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ReleaseOrder after Confirm retry")
+	}
+
+	waitUntil(t, time.Second, "StateIdle after retried paid-order release", func() bool {
+		return ctrl.GetState() == StateIdle
+	})
+
+	if got := atomic.LoadInt32(&initCalls); got != 0 {
+		t.Errorf("expected 0 InitiatePayment calls for PAID_WAITING retry flow, got %d", got)
+	}
+}
+
+// Retaining a session after paid-order release failure bounds lifetime by authoritative deadline and expires cleanly.
+func TestPackage04_PaidOrder_ReleaseFailureSessionExpiry(t *testing.T) {
+	t.Run("retained session expires on bounded wall-clock inactivity deadline without extending expiry", func(t *testing.T) {
+		sim := input.NewSimulatedSource(16)
+		defer sim.Close()
+		rnd := &mockRenderer{}
+
+		canceledCh := make(chan string, 1)
+		client := &mockLookupClient{
+			lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+				return &cloud.OrderDetails{
+					OrderID:         "ord_rel_exp_wall",
+					Status:          string(contracts.JobStatusPaidWaiting),
+					TotalPricePaise: 900,
+					TotalPages:      2,
+					TotalSheets:     1,
+				}, nil
+			},
+			claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+				return &cloud.SessionDetails{
+					SessionID:        "sess_rel_exp_wall",
+					OrderID:          orderID,
+					Status:           "PAYMENT_PENDING",
+					ExpiresAt:        time.Now().Add(200 * time.Millisecond).Format(time.RFC3339Nano),
+					SecondsRemaining: 1,
+				}, nil
+			},
+			releaseFn: func(ctx context.Context, orderID, sessionID string) error {
+				return cloud.ErrPrinterError
+			},
+			cancelFn: func(ctx context.Context, sessionID string) error {
+				select {
+				case canceledCh <- sessionID:
+				default:
+				}
+				return nil
+			},
+		}
+
+		ctrl, err := NewController(Config{
+			InactivityTimeout: 10 * time.Second, // Longer than session lifetime; must be bounded to ~200ms
+			PaymentTimeout:    120 * time.Second,
+			CountdownInterval: time.Hour, // Prove inactivity timer itself is bounded without waiting for ticks
+			RenderScreen:      rnd.Render,
+			LookupClient:      client,
+		}, sim)
+		if err != nil {
+			t.Fatalf("NewController failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ctrl.Start(ctx)
+		defer ctrl.Stop()
+
+		sim.EmitDigits("2424")
+		sim.EmitSubmit()
+
+		select {
+		case sid := <-canceledCh:
+			if sid != "sess_rel_exp_wall" {
+				t.Errorf("expected sess_rel_exp_wall canceled at bounded deadline, got %q", sid)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for release-failure session expiration (inactivity timer was not bounded)")
+		}
+
+		waitUntil(t, time.Second, "StateIdle after bounded release-failure expiry", func() bool {
+			return ctrl.GetState() == StateIdle
+		})
+	})
+
+	t.Run("session whose deadline passes during ReleaseOrder expires immediately without lingering", func(t *testing.T) {
+		sim := input.NewSimulatedSource(16)
+		defer sim.Close()
+		rnd := &mockRenderer{}
+
+		var clockMu sync.Mutex
+		now := time.Date(2026, 11, 25, 14, 0, 0, 0, time.UTC)
+		nowFn := func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return now
+		}
+		advanceTime := func(d time.Duration) {
+			clockMu.Lock()
+			now = now.Add(d)
+			clockMu.Unlock()
+		}
+
+		releaseStarted := make(chan struct{})
+		releaseDone := make(chan struct{})
+		canceledCh := make(chan string, 1)
+
+		client := &mockLookupClient{
+			lookupFn: func(ctx context.Context, pin string) (*cloud.OrderDetails, error) {
+				return &cloud.OrderDetails{
+					OrderID:         "ord_rel_exp_inflight",
+					Status:          string(contracts.JobStatusPaidWaiting),
+					TotalPricePaise: 900,
+					TotalPages:      2,
+					TotalSheets:     1,
+				}, nil
+			},
+			claimFn: func(ctx context.Context, orderID string) (*cloud.SessionDetails, error) {
+				return &cloud.SessionDetails{
+					SessionID:        "sess_rel_exp_inflight",
+					OrderID:          orderID,
+					Status:           "PAYMENT_PENDING",
+					ExpiresAt:        nowFn().Add(4 * time.Second).Format(time.RFC3339Nano),
+					SecondsRemaining: 4,
+				}, nil
+			},
+			releaseFn: func(ctx context.Context, orderID, sessionID string) error {
+				close(releaseStarted)
+				<-releaseDone
+				return cloud.ErrPrinterOffline
+			},
+			cancelFn: func(ctx context.Context, sessionID string) error {
+				select {
+				case canceledCh <- sessionID:
+				default:
+				}
+				return nil
+			},
+		}
+
+		ctrl, err := NewController(Config{
+			InactivityTimeout: 10 * time.Second,
+			PaymentTimeout:    120 * time.Second,
+			CountdownInterval: 25 * time.Millisecond,
+			Now:               nowFn,
+			RenderScreen:      rnd.Render,
+			LookupClient:      client,
+		}, sim)
+		if err != nil {
+			t.Fatalf("NewController failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ctrl.Start(ctx)
+		defer ctrl.Stop()
+
+		sim.EmitDigits("2525")
+		sim.EmitSubmit()
+
+		<-releaseStarted
+		// Advance clock past session's 4s deadline while ReleaseOrder is in flight.
+		advanceTime(5 * time.Second)
+		close(releaseDone)
+
+		select {
+		case sid := <-canceledCh:
+			if sid != "sess_rel_exp_inflight" {
+				t.Errorf("expected sess_rel_exp_inflight canceled immediately on post-deadline release failure, got %q", sid)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for immediate cancellation when deadline expired during release")
+		}
+
+		waitUntil(t, time.Second, "StateIdle immediately after expired release failure", func() bool {
+			return ctrl.GetState() == StateIdle
+		})
 	})
 }

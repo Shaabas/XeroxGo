@@ -67,12 +67,14 @@ type ScreenState struct {
 	TransitionProg  float64 // 0.0 to 1.0 progress of slide transition
 
 	// PIN entry & transaction state (Phase PIN-2 & PIN-3)
-	PINDigits      string        // Current buffer (0 to 4 numeric characters)
-	PINLoading     bool          // True while cloud lookup is in progress
-	PINError       string        // User-facing sanitized error message
-	OrderSummary   *OrderSummary // Authoritative order details when lookup succeeds
-	SessionID      string        // Active transaction session ID (Phase PIN-3)
-	TimeoutSeconds int           // Countdown seconds before returning to idle screen
+	PINDigits          string        // Current buffer (0 to 4 numeric characters)
+	PINLoading         bool          // True while cloud lookup is in progress
+	PINError           string        // User-facing sanitized error message
+	PINErrorRetry      bool          // Explicit controller-provided eligibility for Confirm retry
+	PrintReleaseFailed bool          // True when paid-order physical print release failed (no Confirm retry)
+	OrderSummary       *OrderSummary // Authoritative order details when lookup succeeds
+	SessionID          string        // Active transaction session ID (Phase PIN-3)
+	TimeoutSeconds     int           // Countdown seconds before returning to idle screen
 }
 
 type Sink func(*image.RGBA) error
@@ -1215,10 +1217,9 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 			xdraw.NearestNeighbor.Scale(dst, qrTarget, qrImg, qrImg.Bounds(), xdraw.Over, nil)
 		}
 	} else if strings.TrimSpace(state.PINError) != "" {
-		failLabel := "QR Unavailable"
+		failLabel, retryLabel := paymentPendingErrorLabels(state)
 		fW := measureTextWidth(faceBold20, failLabel)
 		drawText(dst, faceBold20, failLabel, qrBox.Min.X+(qrBox.Dx()-fW)/2, topY+150, colorErrorRed)
-		retryLabel := "Press Confirm to retry"
 		rW := measureTextWidth(faceReg18, retryLabel)
 		drawText(dst, faceReg18, retryLabel, qrBox.Min.X+(qrBox.Dx()-rW)/2, topY+185, colorTextSecondary)
 	} else if state.PINLoading {
@@ -1270,6 +1271,16 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	cancelX := (ScreenWidth - cW) / 2
 	cancelY := 935
 	drawText(dst, faceReg22, cancelText, cancelX, cancelY, colorTextSecondary)
+}
+
+func paymentPendingErrorLabels(state ScreenState) (string, string) {
+	if state.PrintReleaseFailed {
+		return "Print Release Failed", "Press Esc to return"
+	}
+	if state.PINErrorRetry {
+		return "QR Unavailable", "Press Confirm to retry"
+	}
+	return "QR Unavailable", "Press Esc to return"
 }
 
 func renderPaymentPending(dst *image.RGBA, state ScreenState) {
