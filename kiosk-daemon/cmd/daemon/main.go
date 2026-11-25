@@ -269,7 +269,6 @@ func main() {
 	enableKeypad := flag.Bool("enable-keypad", true, "Enable keyboard/keypad input for PIN entry (default true)")
 	keypadDevice := flag.String("keypad-device", "", "Path to keyboard TTY device (e.g. /dev/tty1). If specified, reads from device; otherwise reads from stdin")
 	pinInactivityTimeout := flag.Duration("pin-timeout", 60*time.Second, "Inactivity timeout for PIN entry screen before returning to idle")
-	orderSummaryTimeout := flag.Duration("summary-timeout", 180*time.Second, "Inactivity timeout for order summary screen before returning to idle")
 	paymentPendingTimeout := flag.Duration("payment-timeout", 120*time.Second, "Inactivity timeout for payment pending screen before returning to idle")
 	refill := flag.Int("refill", -1, "Reset and calibrate estimated paper tray stock to N sheets (0-250) and exit")
 	simulatedStock := flag.Int("simulated-stock", -1, "Initialize and calibrate estimated paper tray stock to N sheets (0-250) for testing/demo")
@@ -526,7 +525,6 @@ func main() {
 		EnableCloudRecovery:      *enableCloudRecovery,
 		InputSource:              inputSource,
 		InactivityTimeout:        *pinInactivityTimeout,
-		SummaryTimeout:           *orderSummaryTimeout,
 		PaymentTimeout:           *paymentPendingTimeout,
 		PaymentURLBase:           *paymentURLBase,
 		SoundPlayer:              soundPlayer,

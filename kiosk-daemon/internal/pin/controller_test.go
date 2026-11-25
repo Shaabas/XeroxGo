@@ -20,7 +20,7 @@ type mockLookupClient struct {
 	mu           sync.Mutex
 	lookupFn     func(ctx context.Context, pin string) (*cloud.OrderDetails, error)
 	claimFn      func(ctx context.Context, orderID string) (*cloud.SessionDetails, error)
-	releaseFn    func(ctx context.Context, orderID string) error
+	releaseFn    func(ctx context.Context, orderID, sessionID string) error
 	cancelFn     func(ctx context.Context, sessionID string) error
 	getFn        func(ctx context.Context, sessionID string) (*cloud.SessionDetails, error)
 	initiateFn   func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error)
@@ -54,18 +54,19 @@ func (m *mockLookupClient) ClaimOrder(ctx context.Context, orderID string) (*clo
 		OrderID:          orderID,
 		Status:           "PAYMENT_PENDING",
 		TotalPricePaise:  1800,
+		ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 		SecondsRemaining: 300,
 	}, nil
 }
 
-func (m *mockLookupClient) ReleaseOrder(ctx context.Context, orderID string) error {
+func (m *mockLookupClient) ReleaseOrder(ctx context.Context, orderID, sessionID string) error {
 	m.mu.Lock()
 	m.releaseCalls++
 	fn := m.releaseFn
 	m.mu.Unlock()
 
 	if fn != nil {
-		return fn(ctx, orderID)
+		return fn(ctx, orderID, sessionID)
 	}
 	return nil
 }
@@ -160,7 +161,6 @@ func TestController_DigitInputAndBufferOperations(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
 		IdleQRContent:     "https://test.kiosk",
@@ -240,7 +240,6 @@ func TestController_SubmitLessThan4Digits(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
 	}, sim)
@@ -268,7 +267,7 @@ func TestController_SubmitLessThan4Digits(t *testing.T) {
 	}
 }
 
-func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
+func TestController_SuccessfulLookupAndDirectCheckout(t *testing.T) {
 	sim := input.NewSimulatedSource(32)
 	defer sim.Close()
 
@@ -296,7 +295,6 @@ func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		CountdownInterval: 100 * time.Millisecond,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
@@ -314,15 +312,18 @@ func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	sim.EmitSubmit()
-	time.Sleep(50 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
 	}
 
 	last := rnd.LastState()
-	if last.Mode != ui_ipc.ModeOrderSummary {
-		t.Errorf("expected mode %s, got %s", ui_ipc.ModeOrderSummary, last.Mode)
+	if last.Mode != ui_ipc.ModePaymentPending {
+		t.Errorf("expected mode %s, got %s", ui_ipc.ModePaymentPending, last.Mode)
 	}
 	if last.OrderSummary == nil {
 		t.Fatalf("expected non-nil OrderSummary")
@@ -334,16 +335,16 @@ func TestController_SuccessfulLookupAndOrderSummary(t *testing.T) {
 		t.Errorf("expected price 1800 paise, got %d", last.OrderSummary.TotalPricePaise)
 	}
 
-	// Cancel on Order Summary returns to Idle
+	// Cancel on Checkout returns to Idle
 	sim.EmitCancel()
 	time.Sleep(20 * time.Millisecond)
 
 	if ctrl.GetState() != StateIdle {
-		t.Errorf("state after cancel on summary = %s, want %s", ctrl.GetState(), StateIdle)
+		t.Errorf("state after cancel on checkout = %s, want %s", ctrl.GetState(), StateIdle)
 	}
 }
 
-func TestController_OrderConfirmationAndPaymentPending(t *testing.T) {
+func TestController_DirectCheckoutClaimAndPaymentPending(t *testing.T) {
 	sim := input.NewSimulatedSource(32)
 	defer sim.Close()
 
@@ -370,6 +371,7 @@ func TestController_OrderConfirmationAndPaymentPending(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  2100,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -377,7 +379,6 @@ func TestController_OrderConfirmationAndPaymentPending(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		CountdownInterval: 50 * time.Millisecond,
 		RenderScreen:      rnd.Render,
@@ -392,19 +393,14 @@ func TestController_OrderConfirmationAndPaymentPending(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN & Submit -> Order Summary
+	// Enter PIN & single Submit -> automatically claims order and transitions to PAYMENT_PENDING
 	sim.EmitDigits("1234")
 	time.Sleep(20 * time.Millisecond)
 	sim.EmitSubmit()
-	time.Sleep(50 * time.Millisecond)
-
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
+	deadline := time.Now().Add(2 * time.Second)
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	// 2. Submit on Order Summary -> Claim Order & Transition to PAYMENT_PENDING
-	sim.EmitSubmit()
-	time.Sleep(60 * time.Millisecond)
 
 	if ctrl.GetState() != StatePaymentPending {
 		t.Fatalf("expected state %s, got %s", StatePaymentPending, ctrl.GetState())
@@ -487,7 +483,6 @@ func TestController_LookupErrors(t *testing.T) {
 
 			ctrl, err := NewController(Config{
 				InactivityTimeout: 10 * time.Second,
-				SummaryTimeout:    10 * time.Second,
 				RenderScreen:      rnd.Render,
 				LookupClient:      client,
 			}, sim)
@@ -531,7 +526,6 @@ func TestController_InactivityTimeout(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 50 * time.Millisecond,
-		SummaryTimeout:    50 * time.Millisecond,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
 	}, sim)
@@ -587,7 +581,6 @@ func TestController_DiscardStaleResponseOnCancel(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
 	}, sim)
@@ -657,6 +650,7 @@ func TestController_PaperShortageAndRetryAfterRefill(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  2000,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -664,7 +658,6 @@ func TestController_PaperShortageAndRetryAfterRefill(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
@@ -678,41 +671,40 @@ func TestController_PaperShortageAndRetryAfterRefill(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN
+	// 1. Enter PIN and submit -> automatically attempts ClaimOrder and shows paper shortage error in StatePaymentPending
 	sim.EmitDigits("4567")
 	sim.EmitSubmit()
 
-	// Wait for lookup to complete and reach StateOrderSummary
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for !strings.Contains(ctrl.GetPINError(), "refill paper") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("state = %s, want %s", ctrl.GetState(), StateOrderSummary)
+
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected state %s on shortage, got %s", StatePaymentPending, ctrl.GetState())
 	}
-
-	// 2. Customer confirms order
-	sim.EmitSubmit()
-	time.Sleep(50 * time.Millisecond)
-
-	// Claim failed with ErrInsufficientPaper -> State should STILL be StateOrderSummary!
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state to remain %s on shortage, got %s", StateOrderSummary, ctrl.GetState())
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session on claim failure, got %+v", ctrl.GetCurrentSession())
 	}
 	if !strings.Contains(ctrl.GetPINError(), "refill paper") {
 		t.Errorf("expected refill paper message in pinError, got %q", ctrl.GetPINError())
 	}
+	if last := rnd.LastState(); last.TimeoutSeconds != 0 {
+		t.Errorf("expected no session countdown (TimeoutSeconds=0) before valid session exists, got %d", last.TimeoutSeconds)
+	}
 
-	// 3. Attendant refills paper; customer presses confirm AGAIN without retyping PIN!
+	// 2. Attendant refills paper; customer presses Confirm to retry claim without retyping PIN
 	sim.EmitSubmit()
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetCurrentSession() == nil || ctrl.GetPINError() != "") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// State should now be StatePaymentPending!
 	if ctrl.GetState() != StatePaymentPending {
 		t.Fatalf("state after refill retry = %s, want %s", ctrl.GetState(), StatePaymentPending)
+	}
+	if sess := ctrl.GetCurrentSession(); sess == nil || sess.SessionID != "sess_refilled_123" {
+		t.Fatalf("expected session sess_refilled_123 after refill retry, got %+v", sess)
 	}
 	if ctrl.GetPINError() != "" {
 		t.Errorf("pinError after success = %q, want empty", ctrl.GetPINError())
@@ -748,6 +740,7 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 				KioskID:          "kiosk-1",
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  1250,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -769,7 +762,6 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
@@ -783,22 +775,11 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and submit
+	// Enter PIN and submit -> directly claims order and initiates payment
 	sim.EmitDigits("8888")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// 2. Confirm order to transition to StatePaymentPending and initiate payment
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -859,6 +840,7 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  200,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -874,7 +856,6 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		CountdownInterval: 100 * time.Millisecond,
 		PaymentTimeout:    300 * time.Second,
 		RenderScreen:      rnd.Render,
@@ -893,35 +874,21 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Simulate user typing "4281\n" over SSH in line-buffered canonical mode
+	// Simulate user typing "4281\n" over SSH in line-buffered canonical mode -> direct checkout
 	go func() {
 		_, _ = pw.Write([]byte("4281\n"))
 	}()
 
-	// Wait for transition to StateOrderSummary
-	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s after typing 4281\\n, got %s", StateOrderSummary, ctrl.GetState())
-	}
-	if ctrl.ActiveOrderID() != "ord_ssh_4281" {
-		t.Errorf("ActiveOrderID = %q, want ord_ssh_4281", ctrl.ActiveOrderID())
-	}
-
-	// 2. Simulate user pressing Enter (\n) to confirm order summary
-	go func() {
-		_, _ = pw.Write([]byte("\n"))
-	}()
-
 	// Wait for transition to StatePaymentPending
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	deadline := time.Now().Add(2 * time.Second)
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
-		t.Fatalf("expected state %s after Enter confirmation, got %s", StatePaymentPending, ctrl.GetState())
+		t.Fatalf("expected state %s after typing 4281\\n, got %s", StatePaymentPending, ctrl.GetState())
+	}
+	if ctrl.ActiveOrderID() != "ord_ssh_4281" {
+		t.Errorf("ActiveOrderID = %q, want ord_ssh_4281", ctrl.ActiveOrderID())
 	}
 }
 
@@ -952,6 +919,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "CLAIMED",
 				TotalPricePaise:  400,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -970,7 +938,6 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
@@ -988,7 +955,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN "1234"
+	// Enter PIN "1234" and submit -> direct checkout
 	sim.EmitDigit('1')
 	sim.EmitDigit('2')
 	sim.EmitDigit('3')
@@ -996,17 +963,6 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// 2. Confirm order to transition to PaymentPending
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1060,6 +1016,7 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 				SessionID:        "sess_demo_keypad_1",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -1075,7 +1032,6 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
@@ -1091,21 +1047,15 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// Enter PIN and confirm
+	// Enter PIN -> directly claims order and enters StatePaymentPending
 	sim.EmitDigit('1')
 	sim.EmitDigit('2')
 	sim.EmitDigit('3')
 	sim.EmitDigit('4')
 	sim.EmitSubmit()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
 	// Wait for PaymentPending and QRContent arrival in rendered state
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		last := rnd.LastState()
 		if ctrl.GetState() == StatePaymentPending && last.Mode == ui_ipc.ModePaymentPending && strings.Contains(last.QRContent, "dmo_4444555566667777ddddeeeeffff00001111222233334444") {
@@ -1141,7 +1091,6 @@ func TestController_ErrorClearTimeout(t *testing.T) {
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
 		ErrorClearTimeout: 80 * time.Millisecond,
-		SummaryTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
 	}, sim)
@@ -1209,6 +1158,7 @@ func TestController_PaymentQR_ValidDemoToken(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  500,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -1228,7 +1178,6 @@ func TestController_PaymentQR_ValidDemoToken(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
@@ -1243,22 +1192,11 @@ func TestController_PaymentQR_ValidDemoToken(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// Enter PIN and confirm order summary
+	// Enter PIN and submit -> direct checkout
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// Confirm order summary to trigger InitiatePayment
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
 	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1340,6 +1278,7 @@ func TestController_PaymentQR_MissingOrInvalidDemoToken_ShowsRetryableError(t *t
 						OrderID:          orderID,
 						Status:           "PAYMENT_PENDING",
 						TotalPricePaise:  300,
+						ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 						SecondsRemaining: 300,
 					}, nil
 				},
@@ -1359,7 +1298,6 @@ func TestController_PaymentQR_MissingOrInvalidDemoToken_ShowsRetryableError(t *t
 
 			ctrl, err := NewController(Config{
 				InactivityTimeout: 10 * time.Second,
-				SummaryTimeout:    10 * time.Second,
 				PaymentTimeout:    10 * time.Second,
 				RenderScreen:      rnd.Render,
 				LookupClient:      client,
@@ -1374,22 +1312,11 @@ func TestController_PaymentQR_MissingOrInvalidDemoToken_ShowsRetryableError(t *t
 			ctrl.Start(ctx)
 			defer ctrl.Stop()
 
-			// Enter PIN and confirm summary
+			// Enter PIN -> directly enters checkout and initiates payment
 			sim.EmitDigits("1234")
 			sim.EmitSubmit()
 
 			deadline := time.Now().Add(2 * time.Second)
-			for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-				time.Sleep(10 * time.Millisecond)
-			}
-			if ctrl.GetState() != StateOrderSummary {
-				t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-			}
-
-			// Confirm order summary to trigger InitiatePayment
-			sim.EmitSubmit()
-
-			deadline = time.Now().Add(2 * time.Second)
 			for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -1467,6 +1394,7 @@ func TestController_PaymentQR_RetryBehavior(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  700,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -1504,7 +1432,6 @@ func TestController_PaymentQR_RetryBehavior(t *testing.T) {
 
 	ctrl, err := NewController(Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      client,
@@ -1519,23 +1446,12 @@ func TestController_PaymentQR_RetryBehavior(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// Enter PIN and confirm summary
+	// Enter PIN -> directly triggers ClaimOrder and first InitiatePayment
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected state %s, got %s", StateOrderSummary, ctrl.GetState())
-	}
-
-	// Confirm summary to trigger first InitiatePayment
-	sim.EmitSubmit()
-
 	expectedErr := "Failed to load payment QR. Press Confirm to retry."
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for ctrl.GetPINError() != expectedErr && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}

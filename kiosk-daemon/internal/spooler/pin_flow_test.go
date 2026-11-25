@@ -93,7 +93,43 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 			return
 		}
 
-		// 2. Mock ads endpoint
+		// 2. Claim Order endpoint
+		if r.URL.Path == "/api/k/kiosk-e2e/orders/ord_e2e_valid/claim" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"session_id":        "sess_e2e_valid",
+				"order_id":          "ord_e2e_valid",
+				"kiosk_id":          "kiosk-e2e",
+				"status":            "PAYMENT_PENDING",
+				"total_price_paise": 2400,
+				"expires_at":        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
+				"seconds_remaining": 120,
+			})
+			return
+		}
+
+		// 3. Initiate payment endpoint
+		if r.URL.Path == "/api/k/kiosk-e2e/sessions/sess_e2e_valid/initiate-payment" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"attempt_id":   "att_e2e_valid",
+				"session_id":   "sess_e2e_valid",
+				"order_id":     "ord_e2e_valid",
+				"amount_paise": 2400,
+				"status":       "INITIATED",
+				"demo_token":   "dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				"qr_payload":   "https://xeroxgo.demo/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+			})
+			return
+		}
+
+		// 4. Cancel session endpoint
+		if strings.HasPrefix(r.URL.Path, "/api/k/kiosk-e2e/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// 5. Mock ads endpoint
 		if r.URL.Path == "/api/ads" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ads":[]}`))
@@ -126,7 +162,6 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 		ScreenSink:               screenSink,
 		InputSource:              simInput,
 		InactivityTimeout:        10 * time.Second,
-		SummaryTimeout:           10 * time.Second,
 	}
 	_ = os.MkdirAll(cfg.DownloadDir, 0700)
 
@@ -155,10 +190,10 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 		t.Fatalf("expected buffer 8899, got %s", pinCtrl.GetPINBuffer())
 	}
 
-	// Submit PIN
+	// Submit PIN -> automatically claims and transitions to PAYMENT_PENDING
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", pinCtrl.GetState())
+	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected state PAYMENT_PENDING, got %s", pinCtrl.GetState())
 	}
 
 	history := client.RenderHistory()
@@ -167,8 +202,8 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 	}
 	lastState := history[len(history)-1]
 
-	if lastState.Mode != ui_ipc.ModeOrderSummary {
-		t.Errorf("expected mode ORDER_SUMMARY, got %s", lastState.Mode)
+	if lastState.Mode != ui_ipc.ModePaymentPending {
+		t.Errorf("expected mode PAYMENT_PENDING, got %s", lastState.Mode)
 	}
 	if lastState.OrderSummary == nil {
 		t.Fatalf("expected non-nil OrderSummary")
@@ -186,7 +221,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 		t.Errorf("expected total sheets 4, got %d", lastState.OrderSummary.TotalSheets)
 	}
 
-	// Step 2: Cancel from order summary returns to idle
+	// Step 2: Cancel from checkout returns to idle
 	simInput.EmitCancel()
 	if !waitCondition(5*time.Second, func() bool { return pinCtrl.GetState() == "IDLE" }) {
 		t.Errorf("expected state IDLE after cancel, got %s", pinCtrl.GetState())
@@ -263,7 +298,6 @@ func TestPINFlow_KioskIsolationAndUnauthorized(t *testing.T) {
 		ScreenSink:        func(img *image.RGBA) error { return nil },
 		InputSource:       simInput,
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 	}
 	_ = os.MkdirAll(cfgB.DownloadDir, 0700)
 
@@ -344,7 +378,6 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 		ScreenSink:        func(img *image.RGBA) error { return nil },
 		InputSource:       simInput,
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 	}
 	_ = os.MkdirAll(cfg.DownloadDir, 0700)
 
@@ -365,11 +398,11 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 	}
 	simInput.EmitSubmit()
 
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
+		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
 	}
 
-	// User submits on order summary
+	// Extra submit in checkout must be ignored
 	simInput.EmitSubmit()
 	time.Sleep(50 * time.Millisecond)
 
@@ -418,6 +451,7 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 				"kiosk_id":          "kiosk-prot",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 3000,
+				"expires_at":        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 300,
 			})
 		case strings.HasPrefix(r.URL.Path, "/api/k/kiosk-prot/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel"):
@@ -442,7 +476,6 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 		ScreenSink:        func(img *image.RGBA) error { return nil },
 		InputSource:       simInput,
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 	}
 	_ = os.MkdirAll(cfg.DownloadDir, 0700)
@@ -458,20 +491,16 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 1. Enter PIN & lookup -> ORDER_SUMMARY
+	// 1. Enter PIN & lookup -> automatically claims order and enters PAYMENT_PENDING
 	simInput.EmitDigits("9876")
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "9876" }) {
 		t.Fatalf("expected buffer 9876, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
-	}
-
-	// 2. Confirm order -> PAYMENT_PENDING
-	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool {
+		return client.PINController().GetState() == "PAYMENT_PENDING" && client.PINController().GetCurrentSession() != nil
+	}) {
+		t.Fatalf("expected state PAYMENT_PENDING with active session, got state=%s", client.PINController().GetState())
 	}
 
 	// Verify Payment Pending screen state
@@ -552,6 +581,7 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 				"kiosk_id":          "kiosk-qr",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 1500,
+				"expires_at":        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 300,
 			})
 		case r.URL.Path == "/api/k/kiosk-qr/sessions/sess_qr_789/initiate-payment":
@@ -596,7 +626,6 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 		ScreenSink:        func(img *image.RGBA) error { return nil },
 		InputSource:       simInput,
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    10 * time.Second,
 	}
 	_ = os.MkdirAll(cfg.DownloadDir, 0700)
@@ -612,17 +641,11 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 1. Enter PIN & lookup -> ORDER_SUMMARY
+	// 1. Enter PIN & lookup -> automatically claims and initiates payment in PAYMENT_PENDING
 	simInput.EmitDigits("1122")
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "1122" }) {
 		t.Fatalf("expected buffer 1122, got %s", client.PINController().GetPINBuffer())
 	}
-	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
-	}
-
-	// 2. Confirm order -> PAYMENT_PENDING with dynamic QR
 	simInput.EmitSubmit()
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
 		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
@@ -804,6 +827,7 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 				"kiosk_id":          "kiosk-deadlock-test",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 2000,
+				"expires_at":        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 300,
 			})
 		case strings.HasSuffix(r.URL.Path, "/pdf"):
@@ -852,7 +876,6 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 		ScreenSink:               func(img *image.RGBA) error { return nil },
 		InputSource:              simInput,
 		InactivityTimeout:        10 * time.Second,
-		SummaryTimeout:           10 * time.Second,
 		PaymentTimeout:           10 * time.Second,
 		CompletedDisplayDuration: 100 * time.Millisecond,
 		OnJobCompleted: func(jobID string) {
@@ -878,12 +901,10 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 		t.Fatalf("expected buffer 5555, got %s", client.PINController().GetPINBuffer())
 	}
 	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "ORDER_SUMMARY" }) {
-		t.Fatalf("expected state ORDER_SUMMARY, got %s", client.PINController().GetState())
-	}
-	simInput.EmitSubmit()
-	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetState() == "PAYMENT_PENDING" }) {
-		t.Fatalf("expected state PAYMENT_PENDING, got %s", client.PINController().GetState())
+	if !waitCondition(5*time.Second, func() bool {
+		return client.PINController().GetState() == "PAYMENT_PENDING" && client.PINController().GetCurrentSession() != nil
+	}) {
+		t.Fatalf("expected state PAYMENT_PENDING with active session, got %s", client.PINController().GetState())
 	}
 
 	// 5. Unrelated job arrives FIRST while customer is looking at QR payment screen

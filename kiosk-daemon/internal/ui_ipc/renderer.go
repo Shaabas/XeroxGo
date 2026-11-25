@@ -33,14 +33,13 @@ const (
 type ScreenMode string
 
 const (
-	ModeIdle         ScreenMode = "IDLE"
-	ModePINEntry     ScreenMode = "PIN_ENTRY"
-	ModeOrderSummary ScreenMode = "ORDER_SUMMARY"
+	ModeIdle           ScreenMode = "IDLE"
+	ModePINEntry       ScreenMode = "PIN_ENTRY"
 	ModePaymentPending ScreenMode = "PAYMENT_PENDING"
-	ModeDownloading  ScreenMode = "DOWNLOADING"
-	ModePrinting     ScreenMode = "PRINTING"
-	ModeCompleted    ScreenMode = "COMPLETED"
-	ModeError        ScreenMode = "ERROR"
+	ModeDownloading    ScreenMode = "DOWNLOADING"
+	ModePrinting       ScreenMode = "PRINTING"
+	ModeCompleted      ScreenMode = "COMPLETED"
+	ModeError          ScreenMode = "ERROR"
 )
 
 // OrderSummary holds the safe, authoritative order details displayed on the kiosk screen.
@@ -68,12 +67,14 @@ type ScreenState struct {
 	TransitionProg  float64 // 0.0 to 1.0 progress of slide transition
 
 	// PIN entry & transaction state (Phase PIN-2 & PIN-3)
-	PINDigits      string        // Current buffer (0 to 4 numeric characters)
-	PINLoading     bool          // True while cloud lookup is in progress
-	PINError       string        // User-facing sanitized error message
-	OrderSummary   *OrderSummary // Authoritative order details when lookup succeeds
-	SessionID      string        // Active transaction session ID (Phase PIN-3)
-	TimeoutSeconds int           // Countdown seconds before returning to idle screen
+	PINDigits          string        // Current buffer (0 to 4 numeric characters)
+	PINLoading         bool          // True while cloud lookup is in progress
+	PINError           string        // User-facing sanitized error message
+	PINErrorRetry      bool          // Explicit controller-provided eligibility for Confirm retry
+	PrintReleaseFailed bool          // True when paid-order physical print release failed (no Confirm retry)
+	OrderSummary       *OrderSummary // Authoritative order details when lookup succeeds
+	SessionID          string        // Active transaction session ID (Phase PIN-3)
+	TimeoutSeconds     int           // Countdown seconds before returning to idle screen
 }
 
 type Sink func(*image.RGBA) error
@@ -129,19 +130,6 @@ func (state ScreenState) Validate() error {
 	case ModePINEntry:
 		if len(state.PINDigits) > 4 {
 			return fmt.Errorf("pin_entry mode: PINDigits length cannot exceed 4 digits, got %d", len(state.PINDigits))
-		}
-	case ModeOrderSummary:
-		if state.OrderSummary == nil {
-			return fmt.Errorf("order_summary mode: OrderSummary cannot be nil")
-		}
-		if state.OrderSummary.TotalPages < 1 {
-			return fmt.Errorf("order_summary mode: TotalPages must be >= 1, got %d", state.OrderSummary.TotalPages)
-		}
-		if state.OrderSummary.TotalSheets < 1 {
-			return fmt.Errorf("order_summary mode: TotalSheets must be >= 1, got %d", state.OrderSummary.TotalSheets)
-		}
-		if state.OrderSummary.Copies < 1 {
-			return fmt.Errorf("order_summary mode: Copies must be >= 1, got %d", state.OrderSummary.Copies)
 		}
 	case ModePaymentPending:
 		if state.OrderSummary == nil {
@@ -209,8 +197,6 @@ func RenderTo(dst *image.RGBA, state ScreenState) error {
 		renderError(fullCanvas, state)
 	case ModePINEntry:
 		renderPINEntry(fullCanvas, state)
-	case ModeOrderSummary:
-		renderOrderSummary(fullCanvas, state)
 	case ModePaymentPending:
 		renderPaymentPending(fullCanvas, state)
 	}
@@ -1231,10 +1217,9 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 			xdraw.NearestNeighbor.Scale(dst, qrTarget, qrImg, qrImg.Bounds(), xdraw.Over, nil)
 		}
 	} else if strings.TrimSpace(state.PINError) != "" {
-		failLabel := "QR Unavailable"
+		failLabel, retryLabel := paymentPendingErrorLabels(state)
 		fW := measureTextWidth(faceBold20, failLabel)
 		drawText(dst, faceBold20, failLabel, qrBox.Min.X+(qrBox.Dx()-fW)/2, topY+150, colorErrorRed)
-		retryLabel := "Press Confirm to retry"
 		rW := measureTextWidth(faceReg18, retryLabel)
 		drawText(dst, faceReg18, retryLabel, qrBox.Min.X+(qrBox.Dx()-rW)/2, topY+185, colorTextSecondary)
 	} else if state.PINLoading {
@@ -1253,17 +1238,17 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 		drawText(dst, faceReg20, waitLabel, qrBox.Min.X+(qrBox.Dx()-wW)/2, topY+195, colorTextSecondary)
 	}
 
-	// Matching Mint-Green UPI Pill below QR box
+	// Matching Mint-Green Demo Checkout Pill below QR box
 	upiPill := image.Rect(1460, topY+365, 1800, topY+415)
 	pillBg := color.RGBA{R: 209, G: 250, B: 229, A: 255}    // Mint green accent #D1FAE5
 	pillBorder := color.RGBA{R: 167, G: 243, B: 208, A: 255} // Emerald border #A7F3D0
 	drawPill(dst, upiPill, pillBg, pillBorder)
-	upiText := "GPay • PhonePe • Paytm • BHIM"
+	upiText := "Demo Checkout"
 	upiW := measureTextWidth(faceBold18, upiText)
 	drawText(dst, faceBold18, upiText, upiPill.Min.X+(upiPill.Dx()-upiW)/2, topY+380, colorEmeraldGreen)
 
-	// Expiry Timer inside Right Card at the bottom
-	if state.TimeoutSeconds > 0 {
+	// Expiry Timer inside Right Card at the bottom (only once a valid session exists)
+	if state.TimeoutSeconds > 0 && !state.PINLoading && strings.TrimSpace(state.SessionID) != "" {
 		timerStr := fmt.Sprintf("Session expires in %ds", state.TimeoutSeconds)
 		timW := measureTextWidth(faceBold18, timerStr)
 		timerY := bottomY - 45
@@ -1281,15 +1266,21 @@ func renderReviewOrderAndPayment(dst *image.RGBA, state ScreenState) {
 	}
 
 	// Centered cancel instruction in gray text where buttons used to be
-	cancelText := "Press 'Esc' to Cancel order"
+	cancelText := "Press 'Esc' to Cancel checkout"
 	cW := measureTextWidth(faceReg22, cancelText)
 	cancelX := (ScreenWidth - cW) / 2
 	cancelY := 935
 	drawText(dst, faceReg22, cancelText, cancelX, cancelY, colorTextSecondary)
 }
 
-func renderOrderSummary(dst *image.RGBA, state ScreenState) {
-	renderReviewOrderAndPayment(dst, state)
+func paymentPendingErrorLabels(state ScreenState) (string, string) {
+	if state.PrintReleaseFailed {
+		return "Print Release Failed", "Press Esc to return"
+	}
+	if state.PINErrorRetry {
+		return "QR Unavailable", "Press Confirm to retry"
+	}
+	return "QR Unavailable", "Press Esc to return"
 }
 
 func renderPaymentPending(dst *image.RGBA, state ScreenState) {

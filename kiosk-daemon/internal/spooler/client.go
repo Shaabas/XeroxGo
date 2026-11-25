@@ -90,7 +90,6 @@ type ClientConfig struct {
 	EnableCloudRecovery          bool
 	InputSource                  input.Source
 	InactivityTimeout            time.Duration
-	SummaryTimeout               time.Duration
 	PaymentTimeout               time.Duration
 	PaymentURLBase               string
 	SoundPlayer                  audio.Player
@@ -409,7 +408,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		if err == nil {
 			pinCtrl, err := pin.NewController(pin.Config{
 				InactivityTimeout: cfg.InactivityTimeout,
-				SummaryTimeout:    cfg.SummaryTimeout,
 				PaymentTimeout:    cfg.PaymentTimeout,
 				PaymentURLBase:    cfg.PaymentURLBase,
 				KioskID:           cfg.KioskID,
