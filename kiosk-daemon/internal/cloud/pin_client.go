@@ -430,6 +430,10 @@ func (c *HTTPPINClient) ReleaseOrder(ctx context.Context, orderID, sessionID str
 
 // InitiatePayment requests payment attempt creation / dynamic QR payload for an active session.
 func (c *HTTPPINClient) InitiatePayment(ctx context.Context, sessionID string) (*PaymentAttemptDetails, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("session_id is required to initiate payment")
+	}
 	initiateURL := fmt.Sprintf("%s/sessions/%s/initiate-payment", c.baseURL, url.PathEscape(sessionID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, initiateURL, nil)
 	if err != nil {
@@ -452,6 +456,9 @@ func (c *HTTPPINClient) InitiatePayment(ctx context.Context, sessionID string) (
 		var att PaymentAttemptDetails
 		if err := json.Unmarshal(bodyBytes, &att); err != nil {
 			return nil, fmt.Errorf("unmarshal payment attempt details: %w", err)
+		}
+		if strings.TrimSpace(att.SessionID) != sessionID {
+			return nil, fmt.Errorf("payment attempt session_id mismatch: got %q, want %q", att.SessionID, sessionID)
 		}
 		return &att, nil
 	case http.StatusConflict:

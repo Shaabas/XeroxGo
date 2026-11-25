@@ -55,13 +55,21 @@ func parseKioskAndOrder(path, suffix string) (kioskID, orderID string, err error
 func parseKioskAndSession(path, suffix string) (kioskID, sessionID string, err error) {
 	trimmed := strings.TrimPrefix(path, "/api/k/")
 	if suffix != "" {
+		if !strings.HasSuffix(trimmed, suffix) {
+			return "", "", fmt.Errorf("invalid session path: %s", path)
+		}
 		trimmed = strings.TrimSuffix(trimmed, suffix)
 	}
 	parts := strings.Split(trimmed, "/sessions/")
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
 		return "", "", fmt.Errorf("invalid session path: %s", path)
 	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
+	kioskID = strings.TrimSpace(parts[0])
+	sessionID = strings.TrimSpace(parts[1])
+	if strings.Contains(kioskID, "/") || strings.Contains(sessionID, "/") {
+		return "", "", fmt.Errorf("invalid session path: %s", path)
+	}
+	return kioskID, sessionID, nil
 }
 
 type printerConditionError struct {
@@ -358,8 +366,7 @@ func (s *appServer) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleInitiatePayment verifies that an active transaction session exists before initiating payment.
-// POST /api/k/{kiosk_id}/orders/{order_id}/initiate-payment
+// handleInitiatePayment verifies the exact requested active transaction session before initiating payment.
 // POST /api/k/{kiosk_id}/sessions/{session_id}/initiate-payment
 func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -370,33 +377,32 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	now := time.Now().UTC()
-	var kioskID, orderID string
-	var err error
-
-	if strings.Contains(r.URL.Path, "/sessions/") {
-		var sessionID string
-		kioskID, sessionID, err = parseKioskAndSession(r.URL.Path, "/initiate-payment")
-		if err == nil {
-			sess, sErr := s.db.GetKioskSession(r.Context(), sessionID, now)
-			if sErr == nil && sess != nil {
-				orderID = sess.OrderID
-			}
-		}
-	} else {
-		kioskID, orderID, err = parseKioskAndOrder(r.URL.Path, "/initiate-payment")
-	}
-	if err != nil || orderID == "" {
-		http.Error(w, "invalid initiate payment path or order not found", http.StatusBadRequest)
+	if !strings.Contains(r.URL.Path, "/sessions/") {
+		http.NotFound(w, r)
 		return
 	}
 
-	sess, err := s.db.GetActiveKioskSession(r.Context(), kioskID, orderID, now)
+	kioskID, sessionID, err := parseKioskAndSession(r.URL.Path, "/initiate-payment")
 	if err != nil {
+		http.Error(w, "invalid initiate payment path", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC()
+	sess, err := s.db.GetKioskSession(r.Context(), sessionID, now)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "valid active transaction session required to initiate payment",
+			})
+			return
+		}
 		http.Error(w, "failed to check active session", http.StatusInternalServerError)
 		return
 	}
-	if sess == nil || sess.Status != store.KioskSessionPaymentPending {
+	if sess == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -404,6 +410,20 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
+	if sess.KioskID != kioskID {
+		http.Error(w, "session does not belong to this kiosk", http.StatusForbidden)
+		return
+	}
+	if sess.Status != store.KioskSessionPaymentPending || !sess.ExpiresAt.After(now) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "valid active transaction session required to initiate payment",
+		})
+		return
+	}
+
+	orderID := sess.OrderID
 
 	// Load order to verify document count and printable readiness
 	ord, oErr := s.db.GetOrder(r.Context(), orderID)
@@ -457,7 +477,14 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 	// Idempotency: check if an active, unexpired payment attempt already exists for this session
 	activeAttempt, err := s.db.GetActivePaymentAttempt(r.Context(), sess.SessionID, now)
 	if err != nil {
-		log.Printf("[PAYMENT] Failed to query active payment attempt: %v", err)
+		log.Printf("[PAYMENT] Failed to query active payment attempt for session %s: %v", sess.SessionID, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "failed to check active payment attempt",
+			"code":  "DATABASE_ERROR",
+		})
+		return
 	}
 	if activeAttempt != nil {
 		w.Header().Set("Content-Type", "application/json")

@@ -359,3 +359,54 @@ func TestHTTPPINClient_ReleaseOrder(t *testing.T) {
 		t.Fatal("expected error when sessionID is empty")
 	}
 }
+
+func TestHTTPPINClient_InitiatePayment_RejectsMismatchedSessionID(t *testing.T) {
+	cases := []struct {
+		name      string
+		respSess  string
+		wantError bool
+	}{
+		{name: "different session id", respSess: "sess_other_B", wantError: true},
+		{name: "empty session id", respSess: "", wantError: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/k/kiosk-bind/sessions/sess_req_A/initiate-payment" {
+					t.Errorf("unexpected path %q", r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(PaymentAttemptDetails{
+					AttemptID:   "att_mismatch_1",
+					SessionID:   tc.respSess,
+					OrderID:     "ord_mismatch_1",
+					KioskID:     "kiosk-bind",
+					Provider:    "mock",
+					AmountPaise: 1500,
+					Status:      "INITIATED",
+					DemoToken:   "dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+					QRPayload:   "https://demo.pay/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef",
+				})
+			}))
+			defer ts.Close()
+
+			client, err := NewHTTPPINClient(ts.URL, "kiosk-bind", "sec-bind", nil)
+			if err != nil {
+				t.Fatalf("NewHTTPPINClient failed: %v", err)
+			}
+
+			att, err := client.InitiatePayment(context.Background(), "sess_req_A")
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected error on mismatched session_id %q, got attempt %+v", tc.respSess, att)
+				}
+				if att != nil {
+					t.Errorf("expected nil attempt on mismatch error, got %+v", att)
+				}
+			}
+		})
+	}
+}

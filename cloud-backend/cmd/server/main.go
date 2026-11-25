@@ -1139,7 +1139,7 @@ func (app *appServer) routes() *http.ServeMux {
 			app.handleOrderRelease(w, r)
 		case strings.HasSuffix(path, "/recovery-pin"):
 			app.handleRecoveryPIN(w, r)
-		case strings.HasSuffix(path, "/initiate-payment"):
+		case strings.Contains(path, "/sessions/") && strings.HasSuffix(path, "/initiate-payment"):
 			app.handleInitiatePayment(w, r)
 		case strings.Contains(path, "/sessions/") && (strings.HasSuffix(path, "/cancel") || strings.HasSuffix(path, "/cancel-session")):
 			app.handleSessionCancel(w, r)
@@ -1219,7 +1219,7 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 				path == "/ws" ||
 				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
 				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
-				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.HasSuffix(path, "/initiate-payment") || strings.Contains(path, "/sessions/")))
+				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.Contains(path, "/sessions/")))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))
