@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -302,3 +303,59 @@ func TestHTTPPINClient_InitiatePayment(t *testing.T) {
 	}
 }
 
+
+func TestHTTPPINClient_ReleaseOrder(t *testing.T) {
+	var gotMethod string
+	var gotPath string
+	var gotAuth string
+	var gotContentType string
+	var gotBody map[string]string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotContentType = r.Header.Get("Content-Type")
+
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read release body: %v", err)
+		}
+		if err := json.Unmarshal(rawBody, &gotBody); err != nil {
+			t.Fatalf("decode release JSON %q: %v", string(rawBody), err)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"released"}`))
+	}))
+	defer srv.Close()
+
+	client, err := NewHTTPPINClient(srv.URL, "kiosk-release-1", "secret-release-xyz", nil)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	if err := client.ReleaseOrder(context.Background(), "ord_rel_123", "sess_rel_456"); err != nil {
+		t.Fatalf("ReleaseOrder returned error: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/api/k/kiosk-release-1/orders/ord_rel_123/release" {
+		t.Errorf("path = %q, want /api/k/kiosk-release-1/orders/ord_rel_123/release", gotPath)
+	}
+	if gotAuth != "Bearer secret-release-xyz" {
+		t.Errorf("Authorization = %q, want Bearer secret-release-xyz", gotAuth)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotContentType)
+	}
+	if gotBody["session_id"] != "sess_rel_456" {
+		t.Errorf("body session_id = %q, want sess_rel_456", gotBody["session_id"])
+	}
+
+	// Empty session_id must fail fast before hitting network.
+	if err := client.ReleaseOrder(context.Background(), "ord_rel_123", "  "); err == nil {
+		t.Fatal("expected error when sessionID is empty")
+	}
+}

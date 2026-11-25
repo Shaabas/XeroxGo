@@ -102,6 +102,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 				"kiosk_id":          "kiosk-e2e",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 2400,
+				"expires_at":        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 120,
 			})
 			return
@@ -450,6 +451,7 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 				"kiosk_id":          "kiosk-prot",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 3000,
+				"expires_at":        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 300,
 			})
 		case strings.HasPrefix(r.URL.Path, "/api/k/kiosk-prot/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel"):
@@ -579,6 +581,7 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 				"kiosk_id":          "kiosk-qr",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 1500,
+				"expires_at":        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 300,
 			})
 		case r.URL.Path == "/api/k/kiosk-qr/sessions/sess_qr_789/initiate-payment":
@@ -824,6 +827,7 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 				"kiosk_id":          "kiosk-deadlock-test",
 				"status":            "PAYMENT_PENDING",
 				"total_price_paise": 2000,
+				"expires_at":        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				"seconds_remaining": 300,
 			})
 		case strings.HasSuffix(r.URL.Path, "/pdf"):

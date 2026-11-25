@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type Config struct {
 	InactivityTimeout time.Duration // Duration of inactivity before returning to IDLE from PIN_ENTRY or claim failure (default 30s)
 	ErrorClearTimeout time.Duration // Duration before clearing PIN error back to clean state (default 5s)
 	PaymentTimeout    time.Duration // Duration before returning to IDLE from PAYMENT_PENDING (default 120s)
+	ClaimTimeout      time.Duration // Per-attempt timeout for acquiring claim slot or claiming an order (default 15s)
 	CancelWaitTimeout time.Duration // Duration to wait for in-flight cancellation to resolve before failing safely (default 5s)
 	CountdownInterval time.Duration // Tick interval for countdown timer (default 1s)
 	RenderScreen      func(ui_ipc.ScreenState) error
@@ -53,28 +55,33 @@ type cancelTracker struct {
 	expiresAt time.Time
 }
 
+type orderClaimLock struct {
+	mu   chan struct{}
+	refs int
+}
+
 // Controller coordinates user keypad inputs, cloud lookup, timeouts, and UI rendering.
 type Controller struct {
 	cfg Config
 
-	mu                  sync.Mutex
-	state               State
-	pinBuffer           string
-	activePIN           string
-	pinError            string
-	currentOrder        *cloud.OrderDetails
-	currentSession      *cloud.SessionDetails
-	currentAttempt      *cloud.PaymentAttemptDetails
-	currentQRPayload    string
-	currentRemainingSec int
-	pendingCancels      map[string]*cancelTracker
-	canceledSessions    map[string]time.Time
-	orderClaimTails     map[string]chan struct{}
-	lookupSeq           uint64 // Monotonically increasing sequence to discard stale responses
-	timerGen            uint64 // Guards against stale inactivity timer callbacks
-	errorTimerGen       uint64 // Guards against stale error-clear timer callbacks
-	isClaiming          bool
-	isInitiating        bool
+	mu               sync.Mutex
+	state            State
+	pinBuffer        string
+	activePIN        string
+	pinError         string
+	currentOrder     *cloud.OrderDetails
+	currentSession   *cloud.SessionDetails
+	currentAttempt   *cloud.PaymentAttemptDetails
+	currentQRPayload string
+	checkoutDeadline time.Time
+	pendingCancels   map[string]*cancelTracker
+	canceledSessions map[string]time.Time
+	orderClaims      map[string]*orderClaimLock
+	lookupSeq        uint64 // Monotonically increasing sequence to discard stale responses
+	timerGen         uint64 // Guards against stale inactivity timer callbacks
+	errorTimerGen    uint64 // Guards against stale error-clear timer callbacks
+	isClaiming       bool
+	isInitiating     bool
 
 	inactivityTimer *time.Timer
 	errorTimer      *time.Timer
@@ -106,6 +113,9 @@ func NewController(cfg Config, inputSource input.Source) (*Controller, error) {
 	if cfg.PaymentTimeout <= 0 {
 		cfg.PaymentTimeout = 120 * time.Second
 	}
+	if cfg.ClaimTimeout <= 0 {
+		cfg.ClaimTimeout = 15 * time.Second
+	}
 	if cfg.CancelWaitTimeout <= 0 {
 		cfg.CancelWaitTimeout = 5 * time.Second
 	}
@@ -120,7 +130,7 @@ func NewController(cfg Config, inputSource input.Source) (*Controller, error) {
 		done:             make(chan struct{}),
 		pendingCancels:   make(map[string]*cancelTracker),
 		canceledSessions: make(map[string]time.Time),
-		orderClaimTails:  make(map[string]chan struct{}),
+		orderClaims:      make(map[string]*orderClaimLock),
 	}, nil
 }
 
@@ -287,7 +297,7 @@ func (c *Controller) resetToIdleLocked() {
 	c.currentSession = nil
 	c.currentAttempt = nil
 	c.currentQRPayload = ""
-	c.currentRemainingSec = 0
+	c.checkoutDeadline = time.Time{}
 
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
 		Mode:         ui_ipc.ModeIdle,
@@ -400,23 +410,32 @@ func (c *Controller) handlePINLoadingEvent(ev input.Event) {
 	}
 }
 
-func (c *Controller) enterOrderClaimSlotLocked(orderID string) (prevDone, myDone chan struct{}) {
-	myDone = make(chan struct{})
-	if c.orderClaimTails == nil {
-		c.orderClaimTails = make(map[string]chan struct{})
+func (c *Controller) acquireOrderClaimEntryLocked(orderID string) *orderClaimLock {
+	if c.orderClaims == nil {
+		c.orderClaims = make(map[string]*orderClaimLock)
 	}
-	prevDone = c.orderClaimTails[orderID]
-	c.orderClaimTails[orderID] = myDone
-	return prevDone, myDone
+	entry, ok := c.orderClaims[orderID]
+	if !ok {
+		entry = &orderClaimLock{
+			mu: make(chan struct{}, 1),
+		}
+		entry.mu <- struct{}{}
+		c.orderClaims[orderID] = entry
+	}
+	entry.refs++
+	return entry
 }
 
-func (c *Controller) leaveOrderClaimSlot(orderID string, myDone chan struct{}) {
-	close(myDone)
+func (c *Controller) releaseOrderClaimEntry(orderID string, entry *orderClaimLock) {
 	c.mu.Lock()
-	if c.orderClaimTails[orderID] == myDone {
-		delete(c.orderClaimTails, orderID)
+	defer c.mu.Unlock()
+	if entry == nil {
+		return
 	}
-	c.mu.Unlock()
+	entry.refs--
+	if entry.refs <= 0 && c.orderClaims[orderID] == entry {
+		delete(c.orderClaims, orderID)
+	}
 }
 
 func (c *Controller) pruneCompletedTrackersLocked() {
@@ -501,9 +520,14 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 		}
 		c.resetToIdleLocked()
 	case input.ActionSubmit:
-		// Ignore repeated Enter presses while claim or payment initiation is already in flight
+		// Ignore repeated Enter presses while claim, release, or payment initiation is already in flight
 		if c.isClaiming || c.isInitiating {
 			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored while checkout request is in flight for order %s", c.activeOrderIDLocked())
+			return
+		}
+		// Never initiate payment or auto-retry print release on an already-paid order
+		if c.isPaidOrderLocked() {
+			log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored for already-paid order %s", c.activeOrderIDLocked())
 			return
 		}
 		// Ignore Enter when a valid QR is already displayed
@@ -519,13 +543,15 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 		}
 		// Retry payment initiation against the existing session without extending checkout deadline
 		if c.pinError != "" && c.currentSession != nil {
+			if c.isCheckoutExpiredLocked() {
+				log.Printf("[PIN-CONTROLLER] Checkout deadline expired before retry for session %s; returning to idle", c.currentSession.SessionID)
+				c.expireCheckoutLocked()
+				return
+			}
 			log.Printf("[PIN-CONTROLLER] Retrying payment initiation for session %s", c.currentSession.SessionID)
 			c.isInitiating = true
 			c.pinError = ""
-			remSec := c.currentRemainingSec
-			if remSec <= 0 {
-				remSec = int(c.cfg.PaymentTimeout.Seconds())
-			}
+			remSec := c.checkoutRemainingSecondsLocked()
 			c.renderPaymentPendingLocked(remSec)
 			seq := atomic.AddUint64(&c.lookupSeq, 1)
 			sID := c.currentSession.SessionID
@@ -533,19 +559,100 @@ func (c *Controller) handlePaymentPendingEvent(ev input.Event) {
 			if baseCtx == nil {
 				baseCtx = context.Background()
 			}
-			go c.initiatePaymentAsync(baseCtx, seq, sID, remSec, 1)
+			go c.initiatePaymentAsync(baseCtx, seq, sID, 1)
 			return
 		}
 		log.Printf("[PIN-CONTROLLER] Keypad Confirm ignored on payment QR screen for order %s (scan QR code to pay)", c.activeOrderIDLocked())
 	}
 }
 
-func (c *Controller) initiatePaymentAsync(baseCtx context.Context, targetSeq uint64, sID string, fallbackRemSec int, maxAttempts int) {
+func (c *Controller) isPaidOrderLocked() bool {
+	if c.currentOrder != nil && c.currentOrder.Status == string(contracts.JobStatusPaidWaiting) {
+		return true
+	}
+	if c.currentSession != nil && c.currentSession.Status == string(contracts.JobStatusPaidWaiting) {
+		return true
+	}
+	return false
+}
+
+func (c *Controller) resolveSessionDeadline(session *cloud.SessionDetails) (time.Time, bool) {
+	if session == nil || session.SecondsRemaining <= 0 {
+		return time.Time{}, false
+	}
+	expiresRaw := strings.TrimSpace(session.ExpiresAt)
+	if expiresRaw == "" {
+		return time.Time{}, false
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresRaw)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	now := c.now()
+	if !expiresAt.After(now) {
+		return time.Time{}, false
+	}
+
+	deadline := expiresAt
+	maxLocal := c.cfg.PaymentTimeout
+	if maxLocal <= 0 {
+		maxLocal = 120 * time.Second
+	}
+	if localCap := now.Add(maxLocal); localCap.Before(deadline) {
+		deadline = localCap
+	}
+	if reportedCap := now.Add(time.Duration(session.SecondsRemaining) * time.Second); reportedCap.Before(deadline) {
+		deadline = reportedCap
+	}
+	if !deadline.After(now) {
+		return time.Time{}, false
+	}
+	return deadline, true
+}
+
+func (c *Controller) checkoutRemainingLocked() time.Duration {
+	if c.checkoutDeadline.IsZero() {
+		return 0
+	}
+	rem := c.checkoutDeadline.Sub(c.now())
+	if rem <= 0 {
+		return 0
+	}
+	return rem
+}
+
+func (c *Controller) checkoutRemainingSecondsLocked() int {
+	rem := c.checkoutRemainingLocked()
+	if rem <= 0 {
+		return 0
+	}
+	return int(math.Ceil(rem.Seconds()))
+}
+
+func (c *Controller) isCheckoutExpiredLocked() bool {
+	return c.checkoutDeadline.IsZero() || !c.checkoutDeadline.After(c.now())
+}
+
+func (c *Controller) expireCheckoutLocked() {
+	if c.currentSession != nil {
+		c.cancelSessionAsyncLocked(c.currentSession.SessionID)
+	}
+	c.resetToIdleLocked()
+}
+
+func (c *Controller) initiatePaymentAsync(baseCtx context.Context, targetSeq uint64, sID string, maxAttempts int) {
 	var attempt *cloud.PaymentAttemptDetails
 	var pErr error
 
 	for try := 0; try < maxAttempts; try++ {
 		if try > 0 {
+			c.mu.Lock()
+			remForRetry := c.checkoutRemainingLocked()
+			c.mu.Unlock()
+			if remForRetry <= 2*time.Second {
+				break
+			}
 			timer := time.NewTimer(2 * time.Second)
 			select {
 			case <-baseCtx.Done():
@@ -559,12 +666,20 @@ func (c *Controller) initiatePaymentAsync(baseCtx context.Context, targetSeq uin
 		curSeq := atomic.LoadUint64(&c.lookupSeq)
 		curState := c.state
 		curSess := c.currentSession
+		remDur := c.checkoutRemainingLocked()
 		c.mu.Unlock()
 		if curSeq != targetSeq || curState != StatePaymentPending || curSess == nil || curSess.SessionID != sID {
 			return
 		}
+		if remDur <= 0 {
+			break
+		}
 
-		initCtx, initCancel := context.WithTimeout(baseCtx, 15*time.Second)
+		attemptTimeout := 15 * time.Second
+		if remDur < attemptTimeout {
+			attemptTimeout = remDur
+		}
+		initCtx, initCancel := context.WithTimeout(baseCtx, attemptTimeout)
 		attempt, pErr = c.cfg.LookupClient.InitiatePayment(initCtx, sID)
 		initCancel()
 
@@ -582,11 +697,13 @@ func (c *Controller) initiatePaymentAsync(baseCtx context.Context, targetSeq uin
 	}
 	c.isInitiating = false
 
-	rem := c.currentRemainingSec
-	if rem <= 0 {
-		rem = fallbackRemSec
+	if c.isCheckoutExpiredLocked() {
+		log.Printf("[PIN-CONTROLLER] Checkout deadline expired during InitiatePayment for session %s; discarding response", sID)
+		c.expireCheckoutLocked()
+		return
 	}
 
+	rem := c.checkoutRemainingSecondsLocked()
 	if pErr != nil || attempt == nil {
 		log.Printf("[PIN-CONTROLLER] InitiatePayment failed for session %s: %v", sID, pErr)
 		c.pinError = "Failed to load payment QR. Press Confirm to retry."
@@ -612,14 +729,25 @@ func (c *Controller) initiatePaymentAsync(baseCtx context.Context, targetSeq uin
 	c.renderPaymentPendingLocked(rem)
 }
 
-func (c *Controller) releasePaidOrderAsync(releaseOrdID string) {
-	go func(ordID string) {
-		relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer relCancel()
-		if rErr := c.cfg.LookupClient.ReleaseOrder(relCtx, ordID); rErr != nil {
-			log.Printf("[PIN-CONTROLLER] Failed to release paid order %s: %v", ordID, rErr)
+func mapReleaseError(err error) string {
+	switch {
+	case errors.Is(err, cloud.ErrInsufficientPaper):
+		return "Paper tray supply is low or empty. Please ask attendant to refill paper."
+	case errors.Is(err, cloud.ErrPrinterOffline):
+		return "Printer is offline or disconnected. Please ask attendant for assistance."
+	case errors.Is(err, cloud.ErrPrinterError):
+		return "Printer hardware error. Please ask attendant for assistance."
+	case errors.Is(err, cloud.ErrOrderExpired), errors.Is(err, cloud.ErrInvalidOrExpiredPIN), errors.Is(err, cloud.ErrSessionNotFound):
+		return "Print session expired. Please press Esc and try again."
+	case errors.Is(err, cloud.ErrUnauthorized):
+		return "Kiosk authentication error. Please see attendant."
+	default:
+		var netErr *cloud.NetworkError
+		if errors.As(err, &netErr) {
+			return "Network error connecting to cloud. Please ask attendant or press Esc to retry."
 		}
-	}(releaseOrdID)
+		return "Unable to release print job. Please ask attendant for assistance."
+	}
 }
 
 func mapClaimError(err error) string {
@@ -649,7 +777,8 @@ func (c *Controller) isSessionExpired(session *cloud.SessionDetails) bool {
 	if session == nil {
 		return false
 	}
-	return session.SecondsRemaining <= 0
+	_, ok := c.resolveSessionDeadline(session)
+	return !ok
 }
 
 func (c *Controller) reclaimAndVerifySession(ctx context.Context, ordID string, canceledID string) (*cloud.SessionDetails, error) {
@@ -691,7 +820,7 @@ func (c *Controller) startClaimLocked() {
 	c.currentSession = nil
 	c.currentAttempt = nil
 	c.currentQRPayload = ""
-	c.currentRemainingSec = 0
+	c.checkoutDeadline = time.Time{}
 
 	c.stopInactivityTimerLocked()
 	c.stopCountdownLocked()
@@ -699,32 +828,38 @@ func (c *Controller) startClaimLocked() {
 
 	orderID := c.currentOrder.OrderID
 	seq := atomic.AddUint64(&c.lookupSeq, 1)
-	prevDone, myDone := c.enterOrderClaimSlotLocked(orderID)
+	claimEntry := c.acquireOrderClaimEntryLocked(orderID)
 	baseCtx := c.ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
 
-	go func(targetSeq uint64, ordID string, bCtx context.Context, prevCh, doneCh chan struct{}) {
-		defer c.leaveOrderClaimSlot(ordID, doneCh)
+	go func(targetSeq uint64, ordID string, bCtx context.Context, entry *orderClaimLock) {
+		defer c.releaseOrderClaimEntry(ordID, entry)
 
-		ctx, cancel := context.WithTimeout(bCtx, 15*time.Second)
-		defer cancel()
+		claimTimeout := c.cfg.ClaimTimeout
+		if claimTimeout <= 0 {
+			claimTimeout = 15 * time.Second
+		}
+		slotCtx, slotCancel := context.WithTimeout(bCtx, claimTimeout)
+		defer slotCancel()
 
-		if prevCh != nil {
-			select {
-			case <-prevCh:
-			case <-ctx.Done():
-				c.mu.Lock()
-				if atomic.LoadUint64(&c.lookupSeq) == targetSeq && c.state == StatePaymentPending {
-					c.isClaiming = false
-					c.pinError = mapClaimError(ctx.Err())
-					c.renderPaymentPendingLocked(0)
-					c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
-				}
-				c.mu.Unlock()
-				return
+		// Acquire per-order binary semaphore; timed-out waiters never release another claim's barrier.
+		select {
+		case <-entry.mu:
+			defer func() {
+				entry.mu <- struct{}{}
+			}()
+		case <-slotCtx.Done():
+			c.mu.Lock()
+			if atomic.LoadUint64(&c.lookupSeq) == targetSeq && c.state == StatePaymentPending {
+				c.isClaiming = false
+				c.pinError = mapClaimError(slotCtx.Err())
+				c.renderPaymentPendingLocked(0)
+				c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
 			}
+			c.mu.Unlock()
+			return
 		}
 
 		c.mu.Lock()
@@ -734,10 +869,13 @@ func (c *Controller) startClaimLocked() {
 			return
 		}
 
+		ctx, cancel := context.WithTimeout(bCtx, claimTimeout)
+		defer cancel()
+
 		session, err := c.cfg.LookupClient.ClaimOrder(ctx, ordID)
 
-		if err == nil && c.isSessionExpired(session) {
-			log.Printf("[PIN-CONTROLLER] ClaimOrder returned session %s with non-positive SecondsRemaining (%d); rejecting", session.SessionID, session.SecondsRemaining)
+		if err == nil && session != nil && c.isSessionExpired(session) {
+			log.Printf("[PIN-CONTROLLER] ClaimOrder returned session %s with invalid or expired deadline (expires_at=%q, remaining=%d); rejecting", session.SessionID, session.ExpiresAt, session.SecondsRemaining)
 			err = cloud.ErrOrderExpired
 			session = nil
 		}
@@ -822,10 +960,15 @@ func (c *Controller) startClaimLocked() {
 			}
 		}
 
-		if err == nil && c.isSessionExpired(session) {
-			log.Printf("[PIN-CONTROLLER] Session %s has non-positive SecondsRemaining (%d); rejecting without starting checkout", session.SessionID, session.SecondsRemaining)
-			err = cloud.ErrOrderExpired
-			session = nil
+		var deadline time.Time
+		if err == nil && session != nil {
+			var deadlineOK bool
+			deadline, deadlineOK = c.resolveSessionDeadline(session)
+			if !deadlineOK {
+				log.Printf("[PIN-CONTROLLER] Session %s has invalid or expired deadline (expires_at=%q, remaining=%d); rejecting without starting checkout", session.SessionID, session.ExpiresAt, session.SecondsRemaining)
+				err = cloud.ErrOrderExpired
+				session = nil
+			}
 		}
 
 		c.mu.Lock()
@@ -839,60 +982,80 @@ func (c *Controller) startClaimLocked() {
 			c.mu.Unlock()
 			return
 		}
-		c.isClaiming = false
 
 		if err != nil || session == nil {
+			c.isClaiming = false
 			log.Printf("[PIN-CONTROLLER] Failed to claim order %s: %v", ordID, err)
 			c.pinError = mapClaimError(err)
 			c.currentSession = nil
+			c.checkoutDeadline = time.Time{}
 			c.renderPaymentPendingLocked(0)
 			c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
 			c.mu.Unlock()
 			return
 		}
 
-		c.currentSession = session
+		isPaidOrder := (c.currentOrder != nil && c.currentOrder.Status == string(contracts.JobStatusPaidWaiting)) ||
+			session.Status == string(contracts.JobStatusPaidWaiting)
+		if isPaidOrder {
+			c.currentSession = session
+			c.checkoutDeadline = deadline
+			relTimeout := deadline.Sub(c.now())
+			if relTimeout > 10*time.Second {
+				relTimeout = 10 * time.Second
+			}
+			c.mu.Unlock()
 
-		// If the order is already paid, release physical print dispatch immediately without requesting payment!
-		if (c.currentOrder != nil && c.currentOrder.Status == string(contracts.JobStatusPaidWaiting)) ||
-			session.Status == string(contracts.JobStatusPaidWaiting) {
-			log.Printf("[PIN-CONTROLLER] Order %s is already PAID_WAITING; requesting physical print release", ordID)
-			c.releasePaidOrderAsync(ordID)
+			log.Printf("[PIN-CONTROLLER] Order %s is already PAID_WAITING; releasing physical print with session %s", ordID, session.SessionID)
+			relCtx, relCancel := context.WithTimeout(bCtx, relTimeout)
+			relErr := c.cfg.LookupClient.ReleaseOrder(relCtx, ordID, session.SessionID)
+			relCancel()
+
+			c.mu.Lock()
+			if atomic.LoadUint64(&c.lookupSeq) != targetSeq || c.state != StatePaymentPending {
+				if relErr != nil && (c.currentSession == nil || c.currentSession.SessionID != session.SessionID) {
+					c.cancelSessionAsyncLocked(session.SessionID)
+				}
+				c.mu.Unlock()
+				return
+			}
+			c.isClaiming = false
+
+			if relErr != nil {
+				log.Printf("[PIN-CONTROLLER] Failed to release paid order %s (session %s): %v", ordID, session.SessionID, relErr)
+				c.currentSession = session
+				c.checkoutDeadline = deadline
+				c.currentQRPayload = ""
+				c.pinError = mapReleaseError(relErr)
+				c.renderPaymentPendingLocked(0)
+				c.resetInactivityTimerLocked(c.cfg.InactivityTimeout)
+				c.mu.Unlock()
+				return
+			}
+
+			log.Printf("[PIN-CONTROLLER] Released paid order %s using session %s", ordID, session.SessionID)
 			c.resetToIdleLocked()
 			c.mu.Unlock()
 			return
 		}
 
+		c.isClaiming = false
+		c.currentSession = session
+		c.checkoutDeadline = deadline
 		c.state = StatePaymentPending
 		c.isInitiating = true
 		c.pinError = ""
 		c.currentQRPayload = c.resolvePaymentQRPayload(nil)
 
-		checkoutDuration := c.cfg.PaymentTimeout
-		if checkoutDuration <= 0 {
-			checkoutDuration = 120 * time.Second
-		}
-		if session.SecondsRemaining > 0 {
-			sessDur := time.Duration(session.SecondsRemaining) * time.Second
-			if sessDur < checkoutDuration {
-				checkoutDuration = sessDur
-			}
-		}
-
-		timeoutSec := int(checkoutDuration.Seconds())
-		if checkoutDuration > 0 && timeoutSec <= 0 {
-			timeoutSec = 1
-		}
-
-		c.currentRemainingSec = timeoutSec
+		timeoutSec := c.checkoutRemainingSecondsLocked()
 		c.renderPaymentPendingLocked(timeoutSec)
-		c.startCountdownLocked(checkoutDuration)
+		c.startCountdownLocked()
 
 		// Asynchronously initiate payment to obtain dynamic payment QR payload with retry
 		sessID := session.SessionID
-		go c.initiatePaymentAsync(bCtx, targetSeq, sessID, timeoutSec, 3)
+		go c.initiatePaymentAsync(bCtx, targetSeq, sessID, 3)
 		c.mu.Unlock()
-	}(seq, orderID, baseCtx, prevDone, myDone)
+	}(seq, orderID, baseCtx, claimEntry)
 }
 
 func (c *Controller) startLookupLocked() {
@@ -955,15 +1118,7 @@ func (c *Controller) startLookupLocked() {
 			return
 		}
 
-		// If order is already paid, release physical print dispatch immediately without claiming/payment!
-		if order.Status == string(contracts.JobStatusPaidWaiting) {
-			log.Printf("[PIN-CONTROLLER] Order %s is already PAID_WAITING; requesting physical print release", order.OrderID)
-			c.releasePaidOrderAsync(order.OrderID)
-			c.resetToIdleLocked()
-			return
-		}
-
-		// Direct PIN-to-Checkout: automatically claim order and transition into unified checkout
+		// Direct PIN-to-Checkout: automatically claim an authoritative session for both unpaid and PAID_WAITING orders
 		c.currentOrder = order
 		c.startClaimLocked()
 	}(seq, pinToLookup)
@@ -1132,8 +1287,13 @@ func (c *Controller) stopErrorTimerLocked() {
 	}
 }
 
-func (c *Controller) startCountdownLocked(totalDuration time.Duration) {
+func (c *Controller) startCountdownLocked() {
 	c.stopCountdownLocked()
+	totalDuration := c.checkoutRemainingLocked()
+	if totalDuration <= 0 {
+		c.expireCheckoutLocked()
+		return
+	}
 	c.stopCountdown = make(chan struct{})
 	c.resetInactivityTimerLocked(totalDuration)
 	baseCtx := c.ctx
@@ -1141,11 +1301,10 @@ func (c *Controller) startCountdownLocked(totalDuration time.Duration) {
 		baseCtx = context.Background()
 	}
 
-	go func(stopCh chan struct{}, bCtx context.Context, totalSec int) {
+	go func(stopCh chan struct{}, bCtx context.Context) {
 		ticker := time.NewTicker(c.cfg.CountdownInterval)
 		defer ticker.Stop()
 
-		rem := totalSec
 		for {
 			select {
 			case <-stopCh:
@@ -1153,10 +1312,6 @@ func (c *Controller) startCountdownLocked(totalDuration time.Duration) {
 			case <-bCtx.Done():
 				return
 			case <-ticker.C:
-				rem--
-				if rem <= 0 {
-					return
-				}
 				c.mu.Lock()
 				select {
 				case <-stopCh:
@@ -1164,14 +1319,21 @@ func (c *Controller) startCountdownLocked(totalDuration time.Duration) {
 					return
 				default:
 				}
-				c.currentRemainingSec = rem
-				if c.state == StatePaymentPending && c.currentSession != nil {
-					c.renderPaymentPendingLocked(rem)
+				if c.state != StatePaymentPending || c.currentSession == nil {
+					c.mu.Unlock()
+					return
 				}
+				rem := c.checkoutRemainingSecondsLocked()
+				if rem <= 0 {
+					c.expireCheckoutLocked()
+					c.mu.Unlock()
+					return
+				}
+				c.renderPaymentPendingLocked(rem)
 				c.mu.Unlock()
 			}
 		}
-	}(c.stopCountdown, baseCtx, int(totalDuration.Seconds()))
+	}(c.stopCountdown, baseCtx)
 }
 
 func (c *Controller) stopCountdownLocked() {

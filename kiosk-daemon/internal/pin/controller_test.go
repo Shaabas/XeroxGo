@@ -20,7 +20,7 @@ type mockLookupClient struct {
 	mu           sync.Mutex
 	lookupFn     func(ctx context.Context, pin string) (*cloud.OrderDetails, error)
 	claimFn      func(ctx context.Context, orderID string) (*cloud.SessionDetails, error)
-	releaseFn    func(ctx context.Context, orderID string) error
+	releaseFn    func(ctx context.Context, orderID, sessionID string) error
 	cancelFn     func(ctx context.Context, sessionID string) error
 	getFn        func(ctx context.Context, sessionID string) (*cloud.SessionDetails, error)
 	initiateFn   func(ctx context.Context, sessionID string) (*cloud.PaymentAttemptDetails, error)
@@ -54,18 +54,19 @@ func (m *mockLookupClient) ClaimOrder(ctx context.Context, orderID string) (*clo
 		OrderID:          orderID,
 		Status:           "PAYMENT_PENDING",
 		TotalPricePaise:  1800,
+		ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 		SecondsRemaining: 300,
 	}, nil
 }
 
-func (m *mockLookupClient) ReleaseOrder(ctx context.Context, orderID string) error {
+func (m *mockLookupClient) ReleaseOrder(ctx context.Context, orderID, sessionID string) error {
 	m.mu.Lock()
 	m.releaseCalls++
 	fn := m.releaseFn
 	m.mu.Unlock()
 
 	if fn != nil {
-		return fn(ctx, orderID)
+		return fn(ctx, orderID, sessionID)
 	}
 	return nil
 }
@@ -370,6 +371,7 @@ func TestController_DirectCheckoutClaimAndPaymentPending(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  2100,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -648,6 +650,7 @@ func TestController_PaperShortageAndRetryAfterRefill(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  2000,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -737,6 +740,7 @@ func TestController_InitiatePayment_DynamicQR(t *testing.T) {
 				KioskID:          "kiosk-1",
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  1250,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -836,6 +840,7 @@ func TestController_SSH_CanonicalStdinSequence(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  200,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -914,6 +919,7 @@ func TestController_PaymentURLBase_Wrapping(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "CLAIMED",
 				TotalPricePaise:  400,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -1010,6 +1016,7 @@ func TestController_KeypadConfirm_DemoPayment(t *testing.T) {
 				SessionID:        "sess_demo_keypad_1",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -1151,6 +1158,7 @@ func TestController_PaymentQR_ValidDemoToken(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  500,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},
@@ -1270,6 +1278,7 @@ func TestController_PaymentQR_MissingOrInvalidDemoToken_ShowsRetryableError(t *t
 						OrderID:          orderID,
 						Status:           "PAYMENT_PENDING",
 						TotalPricePaise:  300,
+						ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 						SecondsRemaining: 300,
 					}, nil
 				},
@@ -1385,6 +1394,7 @@ func TestController_PaymentQR_RetryBehavior(t *testing.T) {
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
 				TotalPricePaise:  700,
+				ExpiresAt:        time.Now().Add(300 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 300,
 			}, nil
 		},

@@ -49,6 +49,7 @@ func TestPackage03_Scenario06_CheckoutTimeout120s_ReturnsToIdleAndCancelsSession
 				SessionID:        "sess_sc6_to",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -139,6 +140,7 @@ func TestPackage03_Scenario09_RapidEscReentry_DoesNotCancelFreshSession(t *testi
 					SessionID:        "sess_old_1",
 					OrderID:          orderID,
 					Status:           "PAYMENT_PENDING",
+					ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 					SecondsRemaining: 120,
 				}, nil
 			}
@@ -148,6 +150,7 @@ func TestPackage03_Scenario09_RapidEscReentry_DoesNotCancelFreshSession(t *testi
 					SessionID:        "sess_old_1",
 					OrderID:          orderID,
 					Status:           "PAYMENT_PENDING",
+					ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 					SecondsRemaining: 120,
 				}, nil
 			}
@@ -156,6 +159,7 @@ func TestPackage03_Scenario09_RapidEscReentry_DoesNotCancelFreshSession(t *testi
 				SessionID:        "sess_fresh_2",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -254,6 +258,7 @@ func TestPackage03_SlowCancellation_WaitsAndObtainsFreshSession(t *testing.T) {
 					SessionID:        "sess_slow_1",
 					OrderID:          orderID,
 					Status:           "PAYMENT_PENDING",
+					ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 					SecondsRemaining: 120,
 				}, nil
 			}
@@ -261,6 +266,7 @@ func TestPackage03_SlowCancellation_WaitsAndObtainsFreshSession(t *testing.T) {
 				SessionID:        "sess_slow_2",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -354,6 +360,7 @@ func TestPackage03_CancellationFailure_FailsSafelyWithoutDisplayingQR(t *testing
 				SessionID:        "sess_fail_1",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -456,6 +463,7 @@ func TestPackage03_CancellationTimeout_FailsSafelyWithoutDisplayingQR(t *testing
 				SessionID:        "sess_hang_1",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -561,6 +569,7 @@ func TestPackage03_CancellationFailure_RetryRecoversFreshSession(t *testing.T) {
 				SessionID:        sID,
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -706,6 +715,7 @@ func TestPackage03_CancellationTimeout_EventualCompletionAllowsFreshSession(t *t
 				SessionID:        sID,
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -869,6 +879,7 @@ func TestPackage03_FailedCancellation_ProtectedAfter30sWhileSessionValid(t *test
 				SessionID:        "sess_fail_30s",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -1013,6 +1024,7 @@ func TestPackage03_StaleClaimOrder_RejectedAfterSuccessfulCancelAndCleanup(t *te
 					SessionID:        "sess_stale_1",
 					OrderID:          orderID,
 					Status:           "PAYMENT_PENDING",
+					ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 					SecondsRemaining: 120,
 				}, nil
 			}
@@ -1020,6 +1032,7 @@ func TestPackage03_StaleClaimOrder_RejectedAfterSuccessfulCancelAndCleanup(t *te
 				SessionID:        "sess_stale_2",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -1149,6 +1162,7 @@ func TestPackage03_RepeatedSessions_NoIndefiniteTrackerAccumulation(t *testing.T
 				SessionID:        fmt.Sprintf("sess_rep_%d", seq),
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        time.Now().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -1257,6 +1271,7 @@ func TestPackage03_OldSessionRemainsBlockedNearActualExpiry(t *testing.T) {
 				SessionID:        "sess_near_exp",
 				OrderID:          orderID,
 				Status:           "PAYMENT_PENDING",
+				ExpiresAt:        nowFn().Add(120 * time.Second).Format(time.RFC3339Nano),
 				SecondsRemaining: 120,
 			}, nil
 		},
@@ -1305,9 +1320,9 @@ func TestPackage03_OldSessionRemainsBlockedNearActualExpiry(t *testing.T) {
 		t.Fatalf("expected StatePaymentPending, got %s", ctrl.GetState())
 	}
 
-	// Simulate countdown having ticked down so locally rounded remaining-seconds counter is low (e.g. 5s)
+	// Simulate countdown having ticked down so locally rounded remaining-seconds deadline is low (e.g. 5s)
 	ctrl.mu.Lock()
-	ctrl.currentRemainingSec = 5
+	ctrl.checkoutDeadline = nowFn().Add(5 * time.Second)
 	ctrl.mu.Unlock()
 
 	// 2. Press Esc to cancel -> cancellation is initiated with full 120s protection

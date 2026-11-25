@@ -113,7 +113,7 @@ type PaymentAttemptDetails struct {
 type PINLookupClient interface {
 	LookupOrderByPIN(ctx context.Context, pin string) (*OrderDetails, error)
 	ClaimOrder(ctx context.Context, orderID string) (*SessionDetails, error)
-	ReleaseOrder(ctx context.Context, orderID string) error
+	ReleaseOrder(ctx context.Context, orderID, sessionID string) error
 	CancelSession(ctx context.Context, sessionID string) error
 	GetSession(ctx context.Context, sessionID string) (*SessionDetails, error)
 	InitiatePayment(ctx context.Context, sessionID string) (*PaymentAttemptDetails, error)
@@ -361,13 +361,28 @@ func (c *HTTPPINClient) GetSession(ctx context.Context, sessionID string) (*Sess
 	}
 }
 
-// ReleaseOrder requests physical print release for an already paid order.
-func (c *HTTPPINClient) ReleaseOrder(ctx context.Context, orderID string) error {
+// ReleaseOrder requests physical print release for an already paid order using an active session ID.
+func (c *HTTPPINClient) ReleaseOrder(ctx context.Context, orderID, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("session_id is required for order release")
+	}
+
+	payload, err := json.Marshal(struct {
+		SessionID string `json:"session_id"`
+	}{
+		SessionID: sessionID,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal release request: %w", err)
+	}
+
 	releaseURL := fmt.Sprintf("%s/orders/%s/release", c.baseURL, url.PathEscape(orderID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, releaseURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, releaseURL, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("create release request: %w", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	if c.kioskSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+c.kioskSecret)
