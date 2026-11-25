@@ -2,6 +2,9 @@ package ui_ipc
 
 import (
 	"image"
+	"image/png"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -78,7 +81,7 @@ func TestRenderPINEntry(t *testing.T) {
 	}
 }
 
-func TestRenderOrderSummary(t *testing.T) {
+func TestRenderCheckoutStates(t *testing.T) {
 	testCases := []struct {
 		name  string
 		state ScreenState
@@ -86,7 +89,7 @@ func TestRenderOrderSummary(t *testing.T) {
 		{
 			name: "simplex_mono_1_copy",
 			state: ScreenState{
-				Mode: ModeOrderSummary,
+				Mode: ModePaymentPending,
 				OrderSummary: &OrderSummary{
 					OrderID:         "ord_sum_001",
 					TotalPricePaise: 1500,
@@ -96,13 +99,14 @@ func TestRenderOrderSummary(t *testing.T) {
 					Duplex:          "simplex",
 					ColorMode:       "mono",
 				},
-				TimeoutSeconds: 60,
+				SessionID:      "sess_sum_001",
+				TimeoutSeconds: 120,
 			},
 		},
 		{
 			name: "duplex_color_3_copies",
 			state: ScreenState{
-				Mode: ModeOrderSummary,
+				Mode: ModePaymentPending,
 				OrderSummary: &OrderSummary{
 					OrderID:         "ord_sum_002",
 					TotalPricePaise: 7200,
@@ -112,13 +116,14 @@ func TestRenderOrderSummary(t *testing.T) {
 					Duplex:          "long_edge",
 					ColorMode:       "color",
 				},
+				SessionID:      "sess_sum_002",
 				TimeoutSeconds: 45,
 			},
 		},
 		{
-			name: "order_summary_loading",
+			name: "checkout_claiming_loading",
 			state: ScreenState{
-				Mode: ModeOrderSummary,
+				Mode: ModePaymentPending,
 				OrderSummary: &OrderSummary{
 					OrderID:         "ord_sum_003",
 					TotalPricePaise: 2000,
@@ -129,13 +134,13 @@ func TestRenderOrderSummary(t *testing.T) {
 					ColorMode:       "mono",
 				},
 				PINLoading:     true,
-				TimeoutSeconds: 60,
+				TimeoutSeconds: 0,
 			},
 		},
 		{
-			name: "order_summary_error",
+			name: "checkout_claim_error",
 			state: ScreenState{
-				Mode: ModeOrderSummary,
+				Mode: ModePaymentPending,
 				OrderSummary: &OrderSummary{
 					OrderID:         "ord_sum_004",
 					TotalPricePaise: 2000,
@@ -146,7 +151,7 @@ func TestRenderOrderSummary(t *testing.T) {
 					ColorMode:       "mono",
 				},
 				PINError:       "Paper tray supply is low or empty. Please ask attendant to refill paper and press Confirm.",
-				TimeoutSeconds: 60,
+				TimeoutSeconds: 0,
 			},
 		},
 	}
@@ -234,16 +239,16 @@ func TestRenderValidation_PINAndSummary(t *testing.T) {
 
 	// 2. Nil OrderSummary
 	err = ScreenState{
-		Mode:         ModeOrderSummary,
+		Mode:         ModePaymentPending,
 		OrderSummary: nil,
 	}.Validate()
 	if err == nil {
 		t.Errorf("expected validation error for nil OrderSummary")
 	}
 
-	// 3. OrderSummary with zero pages
+	// 3. PaymentPending with zero pages
 	err = ScreenState{
-		Mode: ModeOrderSummary,
+		Mode: ModePaymentPending,
 		OrderSummary: &OrderSummary{
 			TotalPricePaise: 100,
 			TotalPages:      0,
@@ -255,9 +260,9 @@ func TestRenderValidation_PINAndSummary(t *testing.T) {
 		t.Errorf("expected validation error for 0 TotalPages")
 	}
 
-	// 4. OrderSummary with zero sheets
+	// 4. PaymentPending with zero sheets
 	err = ScreenState{
-		Mode: ModeOrderSummary,
+		Mode: ModePaymentPending,
 		OrderSummary: &OrderSummary{
 			TotalPricePaise: 100,
 			TotalPages:      1,
@@ -269,9 +274,9 @@ func TestRenderValidation_PINAndSummary(t *testing.T) {
 		t.Errorf("expected validation error for 0 TotalSheets")
 	}
 
-	// 5. OrderSummary with zero copies
+	// 5. PaymentPending with zero copies
 	err = ScreenState{
-		Mode: ModeOrderSummary,
+		Mode: ModePaymentPending,
 		OrderSummary: &OrderSummary{
 			TotalPricePaise: 100,
 			TotalPages:      1,
@@ -298,9 +303,9 @@ func TestRenderPINAndSummary_Target720p(t *testing.T) {
 		t.Fatalf("RenderTo 720p PIN entry failed: %v", err)
 	}
 
-	// Order summary 720p
+	// Checkout 720p
 	err = RenderTo(buf, ScreenState{
-		Mode: ModeOrderSummary,
+		Mode: ModePaymentPending,
 		OrderSummary: &OrderSummary{
 			OrderID:         "ord_720p",
 			TotalPricePaise: 2000,
@@ -310,10 +315,134 @@ func TestRenderPINAndSummary_Target720p(t *testing.T) {
 			Duplex:          "long_edge",
 			ColorMode:       "mono",
 		},
+		SessionID:      "sess_720p",
 		TimeoutSeconds: 60,
 	})
 	if err != nil {
-		t.Fatalf("RenderTo 720p Order summary failed: %v", err)
+		t.Fatalf("RenderTo 720p checkout failed: %v", err)
+	}
+}
+
+func TestRenderCheckout_PhasesAndCountdownSuppression(t *testing.T) {
+	summary := &OrderSummary{
+		OrderID:         "ord_phase_01",
+		TotalPricePaise: 2500,
+		TotalPages:      5,
+		TotalSheets:     3,
+		Copies:          1,
+		Duplex:          "long_edge",
+		ColorMode:       "mono",
+	}
+
+	// Timer region around bottomY - 45 = 320 + 510 - 45 = 785 inside rightCard (980..1820)
+	hasRedTimerPixels := func(img *image.RGBA) bool {
+		for y := 775; y <= 810; y++ {
+			for x := 1250; x <= 1550; x++ {
+				c := img.RGBAAt(x, y)
+				if c.R > 200 && c.G < 100 && c.B < 100 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// 1. Claiming phase ("Preparing Session...") must NOT render session countdown even if TimeoutSeconds > 0 or SessionID empty
+	imgClaiming, err := Render(ScreenState{
+		Mode:           ModePaymentPending,
+		OrderSummary:   summary,
+		PINLoading:     true,
+		TimeoutSeconds: 120,
+	})
+	if err != nil {
+		t.Fatalf("Render(claiming) failed: %v", err)
+	}
+	if hasRedTimerPixels(imgClaiming) {
+		t.Errorf("countdown timer must not render before valid session exists (claiming phase)")
+	}
+
+	// 2. Initiating phase ("Generating QR...") renders session countdown once session exists
+	imgInitiating, err := Render(ScreenState{
+		Mode:           ModePaymentPending,
+		OrderSummary:   summary,
+		SessionID:      "sess_phase_01",
+		TimeoutSeconds: 120,
+	})
+	if err != nil {
+		t.Fatalf("Render(initiating) failed: %v", err)
+	}
+	if !hasRedTimerPixels(imgInitiating) {
+		t.Errorf("expected session countdown timer to render when valid session exists during QR initiation")
+	}
+
+	// 3. Ready phase renders valid QR and countdown
+	checkoutURL := "https://xeroxgo.vercel.app/pay/dmo_0123456789abcdef0123456789abcdef0123456789abcdef"
+	imgReady, err := Render(ScreenState{
+		Mode:           ModePaymentPending,
+		OrderSummary:   summary,
+		SessionID:      "sess_phase_01",
+		QRContent:      checkoutURL,
+		TimeoutSeconds: 118,
+	})
+	if err != nil {
+		t.Fatalf("Render(ready) failed: %v", err)
+	}
+	if !hasRedTimerPixels(imgReady) {
+		t.Errorf("expected session countdown timer to render when valid session exists")
+	}
+
+	// Verify QR region (1490, 370, 1770, 650) matches encoded demo URL QR modules
+	expectedQR, err := getQRCodeImage(checkoutURL)
+	if err != nil {
+		t.Fatalf("getQRCodeImage failed: %v", err)
+	}
+	if expectedQR == nil {
+		t.Fatalf("expected non-nil QR image")
+	}
+	darkCount := 0
+	lightCount := 0
+	for y := 370; y < 650; y++ {
+		for x := 1490; x < 1770; x++ {
+			c := imgReady.RGBAAt(x, y)
+			if c.R < 50 && c.G < 50 && c.B < 50 {
+				darkCount++
+			} else if c.R > 230 && c.G > 230 && c.B > 230 {
+				lightCount++
+			}
+		}
+	}
+	if darkCount == 0 || lightCount == 0 {
+		t.Errorf("expected QR modules in checkout QR box (dark=%d, light=%d)", darkCount, lightCount)
+	}
+
+	// 4. Failure phase renders error banner and no countdown when no session exists
+	imgFail, err := Render(ScreenState{
+		Mode:         ModePaymentPending,
+		OrderSummary: summary,
+		PINError:     "Unable to start payment session. Please try again.",
+	})
+	if err != nil {
+		t.Fatalf("Render(failure) failed: %v", err)
+	}
+	if hasRedTimerPixels(imgFail) {
+		t.Errorf("countdown timer must not render on claim failure without active session")
+	}
+
+	if outDir := os.Getenv("XEROXGO_RENDER_OUT_DIR"); outDir != "" {
+		save := func(name string, img *image.RGBA) {
+			f, fErr := os.Create(filepath.Join(outDir, name))
+			if fErr != nil {
+				t.Fatalf("create %s: %v", name, fErr)
+			}
+			defer f.Close()
+			if encErr := png.Encode(f, img); encErr != nil {
+				t.Fatalf("encode %s: %v", name, encErr)
+			}
+		}
+		save("checkout_loading.png", imgClaiming)
+		save("checkout_initiating.png", imgInitiating)
+		save("checkout_ready.png", imgReady)
+		save("checkout_failure.png", imgFail)
 	}
 }
 

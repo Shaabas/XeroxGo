@@ -60,7 +60,6 @@ func TestPackage03_Scenario06_CheckoutTimeout120s_ReturnsToIdleAndCancelsSession
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    100 * time.Millisecond,
 		CountdownInterval: 10 * time.Millisecond,
 		RenderScreen:      rnd.Render,
@@ -77,23 +76,12 @@ func TestPackage03_Scenario06_CheckoutTimeout120s_ReturnsToIdleAndCancelsSession
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// Enter PIN "1234"
+	// Enter PIN "1234" -> direct transition to StatePaymentPending
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary, got %s", ctrl.GetState())
-	}
-
-	// Confirm order summary -> transitions to StatePaymentPending
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -181,7 +169,6 @@ func TestPackage03_Scenario09_RapidEscReentry_DoesNotCancelFreshSession(t *testi
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
@@ -197,18 +184,12 @@ func TestPackage03_Scenario09_RapidEscReentry_DoesNotCancelFreshSession(t *testi
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition to StatePaymentPending
 	sim.EmitDigits("9999")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -228,19 +209,13 @@ func TestPackage03_Scenario09_RapidEscReentry_DoesNotCancelFreshSession(t *testi
 		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
 	}
 
-	// 3. User rapidly re-enters PIN and confirms immediately (before cancel finishes)
+	// 3. User rapidly re-enters PIN (before cancel finishes) -> auto-claims and verifies fresh session
 	sim.EmitDigits("9999")
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
 	sim.EmitSubmit()
 
 	// Wait for controller to enter StatePaymentPending with fresh session
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -299,7 +274,6 @@ func TestPackage03_SlowCancellation_WaitsAndObtainsFreshSession(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 5 * time.Second,
 		RenderScreen:      rnd.Render,
@@ -316,18 +290,12 @@ func TestPackage03_SlowCancellation_WaitsAndObtainsFreshSession(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct checkout into StatePaymentPending
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -347,19 +315,13 @@ func TestPackage03_SlowCancellation_WaitsAndObtainsFreshSession(t *testing.T) {
 		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
 	}
 
-	// 3. User rapidly re-enters PIN and submits
+	// 3. User rapidly re-enters PIN -> waits for slow cancel resolution and claims fresh session
 	sim.EmitDigits("1234")
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
 	sim.EmitSubmit()
 
 	// Wait for controller to wait out the 2.2s cancel and obtain fresh session sess_slow_2
 	deadline = time.Now().Add(4 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -403,7 +365,6 @@ func TestPackage03_CancellationFailure_FailsSafelyWithoutDisplayingQR(t *testing
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 2 * time.Second,
 		RenderScreen:      rnd.Render,
@@ -420,18 +381,12 @@ func TestPackage03_CancellationFailure_FailsSafelyWithoutDisplayingQR(t *testing
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition to StatePaymentPending
 	sim.EmitDigits("5555")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -448,30 +403,33 @@ func TestPackage03_CancellationFailure_FailsSafelyWithoutDisplayingQR(t *testing
 		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
 	}
 
-	// 3. User rapidly re-enters PIN and submits
+	// 3. User rapidly re-enters PIN
 	sim.EmitDigits("5555")
 	sim.EmitSubmit()
 
+	// Wait for claim failure resolution
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	sim.EmitSubmit()
 
-	// Wait for claim resolution
-	time.Sleep(200 * time.Millisecond)
-
-	// Must fail safely and remain on StateOrderSummary with error; must NOT enter StatePaymentPending
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary on cancellation failure, got %s", ctrl.GetState())
+	// Must fail safely on checkout screen with nil session, error message, no countdown and no QR!
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending with error on cancellation failure, got %s", ctrl.GetState())
+	}
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session on cancellation failure, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected retryable pinError on cancellation failure")
 	}
 
 	last := rnd.LastState()
-	if last.Mode == ui_ipc.ModePaymentPending {
-		t.Fatalf("expected not to render ModePaymentPending on cancellation failure")
+	if last.PINError == "" {
+		t.Fatalf("expected rendered PINError on cancellation failure")
+	}
+	if last.TimeoutSeconds != 0 {
+		t.Fatalf("expected no session countdown on cancellation failure, got %d", last.TimeoutSeconds)
 	}
 	if last.QRContent != "" {
 		t.Fatalf("expected empty QRContent on cancellation failure, got %s", last.QRContent)
@@ -509,7 +467,6 @@ func TestPackage03_CancellationTimeout_FailsSafelyWithoutDisplayingQR(t *testing
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 100 * time.Millisecond, // short wait timeout
 		RenderScreen:      rnd.Render,
@@ -526,18 +483,12 @@ func TestPackage03_CancellationTimeout_FailsSafelyWithoutDisplayingQR(t *testing
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition into StatePaymentPending
 	sim.EmitDigits("7777")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -554,30 +505,30 @@ func TestPackage03_CancellationTimeout_FailsSafelyWithoutDisplayingQR(t *testing
 		t.Fatalf("expected StateIdle immediately after Esc, got %s", ctrl.GetState())
 	}
 
-	// 3. User rapidly re-enters PIN and submits
+	// 3. User rapidly re-enters PIN
 	sim.EmitDigits("7777")
 	sim.EmitSubmit()
 
+	// Wait for 100ms CancelWaitTimeout to fire and resolve
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	sim.EmitSubmit()
 
-	// Wait for 100ms CancelWaitTimeout to fire and resolve
-	time.Sleep(250 * time.Millisecond)
-
-	// Must fail safely and remain on StateOrderSummary with error; must NOT enter StatePaymentPending
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary on cancellation timeout, got %s", ctrl.GetState())
+	// Must fail safely on checkout screen with nil session and error; must NOT start countdown or render QR
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending with error on cancellation timeout, got %s", ctrl.GetState())
+	}
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session on cancellation timeout, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected retryable pinError on cancellation timeout")
 	}
 
 	last := rnd.LastState()
-	if last.Mode == ui_ipc.ModePaymentPending {
-		t.Fatalf("expected not to render ModePaymentPending on cancellation timeout")
+	if last.TimeoutSeconds != 0 {
+		t.Fatalf("expected no session countdown on cancellation timeout, got %d", last.TimeoutSeconds)
 	}
 	if last.QRContent != "" {
 		t.Fatalf("expected empty QRContent on cancellation timeout, got %s", last.QRContent)
@@ -634,7 +585,6 @@ func TestPackage03_CancellationFailure_RetryRecoversFreshSession(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 100 * time.Millisecond,
 		RenderScreen:      rnd.Render,
@@ -651,21 +601,12 @@ func TestPackage03_CancellationFailure_RetryRecoversFreshSession(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition to StatePaymentPending
 	sim.EmitDigits("8888")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary, got %s", ctrl.GetState())
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -691,37 +632,33 @@ func TestPackage03_CancellationFailure_RetryRecoversFreshSession(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// 3. User re-enters PIN and attempts to start checkout
+	// 3. User re-enters PIN -> first attempt to claim after failed cancellation must fail closed
 	sim.EmitDigits("8888")
 	sim.EmitSubmit()
 
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary, got %s", ctrl.GetState())
+
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected controller to stay in StatePaymentPending on failed cancellation, got %s", ctrl.GetState())
 	}
-
-	// First attempt to confirm checkout after failed cancellation must fail closed
-	sim.EmitSubmit()
-	time.Sleep(150 * time.Millisecond)
-
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected controller to stay in StateOrderSummary on failed cancellation, got %s", ctrl.GetState())
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session when previous cancellation failed, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected retryable pinError when previous cancellation failed")
 	}
-	if rnd.LastState().Mode == ui_ipc.ModePaymentPending {
-		t.Fatalf("must not render payment pending when previous cancellation failed")
+	if last := rnd.LastState(); last.QRContent != "" || last.TimeoutSeconds != 0 {
+		t.Fatalf("must not display QR or countdown when previous cancellation failed: %+v", last)
 	}
 
-	// 4. Customer retries by pressing Confirm again; this reattempts cancellation and recovers fresh session
+	// 4. Customer retries by pressing Confirm; this reattempts cancellation and recovers fresh session
 	sim.EmitSubmit()
 
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetCurrentSession() == nil || ctrl.GetPINError() != "") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -796,7 +733,6 @@ func TestPackage03_CancellationTimeout_EventualCompletionAllowsFreshSession(t *t
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 50 * time.Millisecond,
 		RenderScreen:      rnd.Render,
@@ -813,18 +749,12 @@ func TestPackage03_CancellationTimeout_EventualCompletionAllowsFreshSession(t *t
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition into StatePaymentPending
 	sim.EmitDigits("9999")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -848,21 +778,21 @@ func TestPackage03_CancellationTimeout_EventualCompletionAllowsFreshSession(t *t
 		t.Fatalf("background cancellation did not start")
 	}
 
-	// 3. User rapidly re-enters PIN and submits checkout while cancellation is still blocked
+	// 3. User rapidly re-enters PIN while cancellation is still blocked
 	sim.EmitDigits("9999")
 	sim.EmitSubmit()
 
+	// Wait for 50ms CancelWaitTimeout to fire and resolve
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	sim.EmitSubmit()
 
-	// Wait for 50ms CancelWaitTimeout to fire and resolve
-	time.Sleep(150 * time.Millisecond)
-
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary on cancellation timeout, got %s", ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending with error on cancellation timeout, got %s", ctrl.GetState())
+	}
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session on cancellation timeout, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected retryable pinError on cancellation timeout")
@@ -880,16 +810,19 @@ func TestPackage03_CancellationTimeout_EventualCompletionAllowsFreshSession(t *t
 		t.Fatalf("expected pending cancel count to reach 0 after completion, got %d", count)
 	}
 
-	// Assert that late cancellation completion did NOT invalidate or mutate the order summary screen
-	if ctrl.GetState() != StateOrderSummary {
+	// Assert that late cancellation completion did NOT invalidate or mutate the checkout error screen
+	if ctrl.GetState() != StatePaymentPending {
 		t.Fatalf("late cancellation completion mutated state to %s", ctrl.GetState())
+	}
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("late cancellation unexpectedly populated session: %+v", ctrl.GetCurrentSession())
 	}
 
 	// 5. Customer now presses Enter to retry; since cancellation finished cleanly, fresh session is granted
 	sim.EmitSubmit()
 
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetCurrentSession() == nil || ctrl.GetPINError() != "") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -955,7 +888,6 @@ func TestPackage03_FailedCancellation_ProtectedAfter30sWhileSessionValid(t *test
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 100 * time.Millisecond,
 		Now:               nowFn,
@@ -973,18 +905,12 @@ func TestPackage03_FailedCancellation_ProtectedAfter30sWhileSessionValid(t *test
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition into StatePaymentPending
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -1020,26 +946,27 @@ func TestPackage03_FailedCancellation_ProtectedAfter30sWhileSessionValid(t *test
 		t.Fatalf("failed cancellation must remain protected after 45 seconds, got %d", ctrl.PendingCancelCount())
 	}
 
-	// 4. User re-enters PIN and attempts to start checkout
+	// 4. User re-enters PIN
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	sim.EmitSubmit()
-	time.Sleep(150 * time.Millisecond)
 
-	// Must fail closed on StateOrderSummary; must NOT reopen the failed session
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary on protected failed cancellation, got %s", ctrl.GetState())
+	// Must fail closed on checkout error screen; must NOT reopen the failed session
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending with error on protected failed cancellation, got %s", ctrl.GetState())
+	}
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session when failed cancellation is protected, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected retryable pinError when failed cancellation is protected")
 	}
-	if rnd.LastState().Mode == ui_ipc.ModePaymentPending {
-		t.Fatalf("must not render payment pending for protected failed session")
+	if last := rnd.LastState(); last.QRContent != "" || last.TimeoutSeconds != 0 {
+		t.Fatalf("must not render QR or countdown for protected failed session: %+v", last)
 	}
 
 	// 5. Advance clock past authoritative 120s session expiry (e.g. advance 80s more -> 125s total)
@@ -1112,7 +1039,6 @@ func TestPackage03_StaleClaimOrder_RejectedAfterSuccessfulCancelAndCleanup(t *te
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 100 * time.Millisecond,
 		Now:               nowFn,
@@ -1130,18 +1056,12 @@ func TestPackage03_StaleClaimOrder_RejectedAfterSuccessfulCancelAndCleanup(t *te
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending with sess_stale_1
+	// 1. Enter PIN -> direct transition into StatePaymentPending with sess_stale_1
 	sim.EmitDigits("2345")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -1170,20 +1090,13 @@ func TestPackage03_StaleClaimOrder_RejectedAfterSuccessfulCancelAndCleanup(t *te
 		t.Fatalf("expected tracker cleaned up from pendingCancels, got %d", ctrl.PendingCancelCount())
 	}
 
-	// 3. User re-enters PIN and submits checkout.
-	// The backend ClaimOrder initially returns stale sess_stale_1.
+	// 3. User re-enters PIN -> auto-claims. Backend ClaimOrder initially returns stale sess_stale_1.
 	sim.EmitDigits("2345")
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
 	sim.EmitSubmit()
 
 	// Wait for claim and reclaim to process
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -1254,7 +1167,6 @@ func TestPackage03_RepeatedSessions_NoIndefiniteTrackerAccumulation(t *testing.T
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		Now:               nowFn,
 		RenderScreen:      rnd.Render,
@@ -1277,17 +1189,7 @@ func TestPackage03_RepeatedSessions_NoIndefiniteTrackerAccumulation(t *testing.T
 		sim.EmitSubmit()
 
 		deadline := time.Now().Add(2 * time.Second)
-		for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-		if ctrl.GetState() != StateOrderSummary {
-			t.Fatalf("cycle %d: expected StateOrderSummary, got %s", i, ctrl.GetState())
-		}
-
-		sim.EmitSubmit()
-
-		deadline = time.Now().Add(2 * time.Second)
-		for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+		for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		if ctrl.GetState() != StatePaymentPending {
@@ -1374,7 +1276,6 @@ func TestPackage03_OldSessionRemainsBlockedNearActualExpiry(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		CancelWaitTimeout: 100 * time.Millisecond,
 		Now:               nowFn,
@@ -1392,18 +1293,12 @@ func TestPackage03_OldSessionRemainsBlockedNearActualExpiry(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN and confirm into StatePaymentPending
+	// 1. Enter PIN -> direct transition into StatePaymentPending
 	sim.EmitDigits("1234")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	sim.EmitSubmit()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StatePaymentPending && time.Now().Before(deadline) {
+	for (ctrl.GetState() != StatePaymentPending || ctrl.GetCurrentSession() == nil) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if ctrl.GetState() != StatePaymentPending {
@@ -1444,20 +1339,21 @@ func TestPackage03_OldSessionRemainsBlockedNearActualExpiry(t *testing.T) {
 	sim.EmitSubmit()
 
 	deadline = time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	sim.EmitSubmit()
-	time.Sleep(150 * time.Millisecond)
 
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary when blocked near expiry, got %s", ctrl.GetState())
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected StatePaymentPending with error when blocked near expiry, got %s", ctrl.GetState())
+	}
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session when blocked near expiry, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected retryable pinError when blocked near expiry")
 	}
-	if rnd.LastState().Mode == ui_ipc.ModePaymentPending {
-		t.Fatalf("must not render payment pending when blocked near expiry")
+	if last := rnd.LastState(); last.QRContent != "" || last.TimeoutSeconds != 0 {
+		t.Fatalf("must not render QR or countdown when blocked near expiry: %+v", last)
 	}
 
 	// 4. Advance clock past 120s (e.g. +10s -> 125s total)
@@ -1497,7 +1393,6 @@ func TestPackage03_ZeroRemainingSeconds_NeverResetsCheckoutTime(t *testing.T) {
 
 	cfg := Config{
 		InactivityTimeout: 10 * time.Second,
-		SummaryTimeout:    10 * time.Second,
 		PaymentTimeout:    120 * time.Second,
 		RenderScreen:      rnd.Render,
 		LookupClient:      mockClient,
@@ -1513,33 +1408,29 @@ func TestPackage03_ZeroRemainingSeconds_NeverResetsCheckoutTime(t *testing.T) {
 	ctrl.Start(ctx)
 	defer ctrl.Stop()
 
-	// 1. Enter PIN
+	// 1. Enter PIN -> automatically attempts claim returning SecondsRemaining: 0
 	sim.EmitDigits("4321")
 	sim.EmitSubmit()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for ctrl.GetState() != StateOrderSummary && time.Now().Before(deadline) {
+	for ctrl.GetPINError() == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected StateOrderSummary, got %s", ctrl.GetState())
+
+	// Must reject safely on checkout screen with nil session, error message, no countdown and no QR!
+	if ctrl.GetState() != StatePaymentPending {
+		t.Fatalf("expected controller to reject SecondsRemaining <= 0 on checkout error screen, got %s", ctrl.GetState())
 	}
-
-	// 2. Submit order summary
-	sim.EmitSubmit()
-	time.Sleep(150 * time.Millisecond)
-
-	// Must reject safely and remain on StateOrderSummary with error; must NOT start or restart 120s checkout
-	if ctrl.GetState() != StateOrderSummary {
-		t.Fatalf("expected controller to reject SecondsRemaining <= 0 and remain on StateOrderSummary, got %s", ctrl.GetState())
+	if ctrl.GetCurrentSession() != nil {
+		t.Fatalf("expected nil session when SecondsRemaining <= 0, got %+v", ctrl.GetCurrentSession())
 	}
 	if ctrl.GetPINError() == "" {
 		t.Fatalf("expected error message when SecondsRemaining <= 0")
 	}
 
 	last := rnd.LastState()
-	if last.Mode == ui_ipc.ModePaymentPending {
-		t.Fatalf("must not render ModePaymentPending when SecondsRemaining <= 0")
+	if last.TimeoutSeconds != 0 {
+		t.Fatalf("must not start countdown when SecondsRemaining <= 0, got %d", last.TimeoutSeconds)
 	}
 	if last.QRContent != "" {
 		t.Fatalf("must not display payment QR when SecondsRemaining <= 0, got %s", last.QRContent)
