@@ -171,6 +171,7 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 	}
 
 	// Induce hardware paper jam
+	preJamLen := len(client.RenderHistory())
 	jamReported.Store(true)
 
 	// Verify ModeError immediately overrides ModePrinting
@@ -179,7 +180,7 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		history := client.RenderHistory()
-		for _, st := range history {
+		for _, st := range history[preJamLen:] {
 			if st.Mode == ui_ipc.ModeError {
 				errorSeen = true
 				lastError = st

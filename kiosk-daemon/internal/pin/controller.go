@@ -82,6 +82,8 @@ type Controller struct {
 	errorTimerGen    uint64 // Guards against stale error-clear timer callbacks
 	isClaiming       bool
 	isInitiating     bool
+	blocked          bool
+	blockReason      string
 
 	inactivityTimer *time.Timer
 	errorTimer      *time.Timer
@@ -300,6 +302,10 @@ func (c *Controller) resetToIdleLocked() {
 	c.currentQRPayload = ""
 	c.checkoutDeadline = time.Time{}
 
+	if c.blocked {
+		return
+	}
+
 	_ = c.cfg.RenderScreen(ui_ipc.ScreenState{
 		Mode:         ui_ipc.ModeIdle,
 		QRContent:    c.cfg.IdleQRContent,
@@ -334,10 +340,60 @@ func (c *Controller) eventLoop() {
 	}
 }
 
+// SetAvailability updates the kiosk service availability barrier.
+// When unavailable, customer keypad input is blocked across all states, any active
+// unpaid checkout/lookup/claim/initiation is invalidated and canceled with the cloud,
+// and customer-facing checkout/PIN/idle screens are suppressed.
+func (c *Controller) SetAvailability(available bool, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if available {
+		c.blocked = false
+		c.blockReason = ""
+		return
+	}
+
+	c.blocked = true
+	c.blockReason = reason
+
+	if c.state != StateIdle {
+		atomic.AddUint64(&c.lookupSeq, 1)
+		if c.currentSession != nil && c.currentSession.SessionID != "" {
+			c.cancelSessionAsyncLocked(c.currentSession.SessionID)
+		}
+		c.stopInactivityTimerLocked()
+		c.stopCountdownLocked()
+		c.stopErrorTimerLocked()
+		c.state = StateIdle
+		c.pinBuffer = ""
+		c.activePIN = ""
+		c.pinError = ""
+		c.currentOrder = nil
+		c.currentSession = nil
+		c.currentAttempt = nil
+		c.currentQRPayload = ""
+		c.checkoutDeadline = time.Time{}
+		c.isClaiming = false
+		c.isInitiating = false
+	}
+}
+
+// IsBlocked returns true if the controller is currently blocking customer interaction due to unavailability.
+func (c *Controller) IsBlocked() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.blocked
+}
+
 func (c *Controller) handleEvent(ev input.Event) {
 	defer c.eventsProcessed.Add(1)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.blocked {
+		return
+	}
 
 	switch c.state {
 	case StateIdle:
@@ -1157,6 +1213,9 @@ func (c *Controller) startLookupLocked() {
 }
 
 func (c *Controller) renderPINEntryLocked() {
+	if c.blocked {
+		return
+	}
 	remSeconds := 0
 	if c.inactivityTimer != nil {
 		remSeconds = int(c.cfg.InactivityTimeout.Seconds())
@@ -1228,7 +1287,7 @@ func (c *Controller) resolvePaymentQRPayload(attempt *cloud.PaymentAttemptDetail
 }
 
 func (c *Controller) renderPaymentPendingLocked(remainingSeconds int) {
-	if c.currentOrder == nil {
+	if c.blocked || c.currentOrder == nil {
 		return
 	}
 

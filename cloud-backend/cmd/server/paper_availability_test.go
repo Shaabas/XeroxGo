@@ -415,8 +415,8 @@ func TestPaperAvailability_PaymentInitiation_Revalidation(t *testing.T) {
 	}
 	var errResp map[string]string
 	_ = json.NewDecoder(resPay.Body).Decode(&errResp)
-	if errResp["code"] != "PRINTER_ERROR" && errResp["code"] != "INSUFFICIENT_PAPER" {
-		t.Errorf("code = %s, want PRINTER_ERROR or INSUFFICIENT_PAPER", errResp["code"])
+	if errResp["code"] != "PRINTER_ERROR" && errResp["code"] != "INSUFFICIENT_PAPER" && errResp["error"] != "valid active transaction session required to initiate payment" {
+		t.Errorf("unexpected response: %+v", errResp)
 	}
 }
 

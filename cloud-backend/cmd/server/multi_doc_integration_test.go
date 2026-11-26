@@ -254,22 +254,7 @@ func TestMultiDoc_Cloud_FullFlowAndPricing(t *testing.T) {
 		t.Fatalf("expected price %d, got %v", totalPricePaise, lookupData["total_price_paise"])
 	}
 
-	// 3. Claim order
-	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
-	claimReq.Header.Set("Authorization", "Bearer "+kSec)
-	claimResp, err := http.DefaultClient.Do(claimReq)
-	if err != nil || claimResp.StatusCode != http.StatusOK {
-		t.Fatalf("order claim failed: err=%v, code=%d", err, claimResp.StatusCode)
-	}
-	var claimData map[string]interface{}
-	_ = json.NewDecoder(claimResp.Body).Decode(&claimData)
-	claimResp.Body.Close()
-	sessionID := claimData["session_id"].(string)
-	if sessionID == "" {
-		t.Fatalf("expected non-empty session_id")
-	}
-
-	// 4. Kiosk connects via WebSocket
+	// 3. Kiosk connects via WebSocket and reports healthy status before claiming
 	u, _ := url.Parse(ts.URL)
 	u.Scheme = "ws"
 	u.Path = "/ws"
@@ -288,6 +273,21 @@ func TestMultiDoc_Cloud_FullFlowAndPricing(t *testing.T) {
 	}
 	defer wsConn.CloseNow()
 	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
+
+	// 4. Claim order
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, err := http.DefaultClient.Do(claimReq)
+	if err != nil || claimResp.StatusCode != http.StatusOK {
+		t.Fatalf("order claim failed: err=%v, code=%d", err, claimResp.StatusCode)
+	}
+	var claimData map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimData)
+	claimResp.Body.Close()
+	sessionID := claimData["session_id"].(string)
+	if sessionID == "" {
+		t.Fatalf("expected non-empty session_id")
+	}
 
 	// 5. Payment captured via direct store-level capture (isolated test fixture)
 	captureRes, err := testDirectStoreCapturePayment(ctx, app, orderID, kioskID, sessionID)
@@ -615,16 +615,7 @@ func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
 	)
 	orderID := uploadResp["order_id"].(string)
 
-	// Claim
-	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
-	claimReq.Header.Set("Authorization", "Bearer "+kSec)
-	claimResp, _ := http.DefaultClient.Do(claimReq)
-	var claimData map[string]interface{}
-	_ = json.NewDecoder(claimResp.Body).Decode(&claimData)
-	claimResp.Body.Close()
-	sessionID := claimData["session_id"].(string)
-
-	// Connect WS 1
+	// Connect WS 1 before claiming
 	u, _ := url.Parse(ts.URL)
 	u.Scheme = "ws"
 	u.Path = "/ws"
@@ -642,6 +633,15 @@ func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
 		t.Fatalf("websocket 1 dial failed: %v", err)
 	}
 	sendTestHealthyStatus(ctx1, t, app.hub, ws1, kioskID)
+
+	// Claim
+	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
+	claimReq.Header.Set("Authorization", "Bearer "+kSec)
+	claimResp, _ := http.DefaultClient.Do(claimReq)
+	var claimData map[string]interface{}
+	_ = json.NewDecoder(claimResp.Body).Decode(&claimData)
+	claimResp.Body.Close()
+	sessionID := claimData["session_id"].(string)
 
 	// Trigger payment via direct store-level capture (isolated test fixture)
 	if _, err := testDirectStoreCapturePayment(ctx1, app, orderID, kioskID, sessionID); err != nil {
@@ -717,6 +717,26 @@ func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 	)
 	orderID := uploadResp["order_id"].(string)
 
+	// 0. Kiosk connects via WebSocket and reports healthy status before customer session
+	u, _ := url.Parse(ts.URL)
+	u.Scheme = "ws"
+	u.Path = "/ws"
+	q := u.Query()
+	q.Set("kiosk_id", kioskID)
+	u.RawQuery = q.Encode()
+
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer wsCancel()
+	wsConn, _, err := websocket.Dial(wsCtx, u.String(), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + kSec}},
+	})
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+	sendTestHealthyStatus(wsCtx, t, nil, wsConn, kioskID)
+	time.Sleep(50 * time.Millisecond)
+
 	// Create an active kiosk session for this order
 	sess, err := st.CreateOrGetKioskSessionWithPaperCheck(context.Background(), kioskID, orderID, 100, 5*time.Minute, time.Now().UTC())
 	if err != nil {
@@ -736,26 +756,6 @@ func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 	if initData["attempt_id"] == nil || initData["attempt_id"] == "" {
 		t.Errorf("expected non-empty attempt_id in initiate-payment response, got %v", initData)
 	}
-
-	// 2. Kiosk connects via WebSocket to receive print jobs
-	u, _ := url.Parse(ts.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-	q := u.Query()
-	q.Set("kiosk_id", kioskID)
-	u.RawQuery = q.Encode()
-
-	wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer wsCancel()
-	wsConn, _, err := websocket.Dial(wsCtx, u.String(), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + kSec}},
-	})
-	if err != nil {
-		t.Fatalf("websocket.Dial failed: %v", err)
-	}
-	defer wsConn.CloseNow()
-	sendTestHealthyStatus(wsCtx, t, nil, wsConn, kioskID)
-	time.Sleep(50 * time.Millisecond)
 
 	// 3. Confirm payment through the real demo checkout endpoint.
 	token, _ := initData["demo_token"].(string)

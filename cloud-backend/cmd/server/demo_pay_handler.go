@@ -536,6 +536,23 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 			s.renderDemoErrorPage(w, polErr.StatusCode, "Unsupported Print Options", polErr.Message)
 			return
 		}
+
+		unlockReserve := s.lockKioskReservation(att.KioskID)
+		defer unlockReserve()
+
+		if _, condErr := s.checkPrinterCondition(att.KioskID); condErr != nil {
+			if isJSONRequest(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "service is temporarily unavailable",
+					"code":  "SERVICE_UNAVAILABLE",
+				})
+				return
+			}
+			s.renderDemoErrorPage(w, http.StatusServiceUnavailable, "Service Unavailable", "Kiosk printing is temporarily unavailable. Please try again shortly.")
+			return
+		}
 	}
 
 	// Capture payment atomically

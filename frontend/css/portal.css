@@ -3175,3 +3175,60 @@ body {
   color: var(--text-muted);
   margin-top: 6px;
 }
+
+.availability-barrier {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(248, 250, 252, 0.96);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.availability-barrier.hidden {
+  display: none;
+}
+
+.availability-card {
+  width: 100%;
+  max-width: 360px;
+  background: #ffffff;
+  border: 1px solid var(--border-light);
+  border-radius: 20px;
+  padding: 28px 22px;
+  text-align: center;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+}
+
+.availability-spinner {
+  width: 32px;
+  height: 32px;
+  margin: 0 auto 14px;
+  border: 3px solid #e2e8f0;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: availability-spin 0.8s linear infinite;
+}
+
+.availability-spinner.hidden {
+  display: none;
+}
+
+@keyframes availability-spin {
+  to { transform: rotate(360deg); }
+}
+
+.availability-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-main);
+  margin-bottom: 6px;
+}
+
+.availability-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 0;
+}

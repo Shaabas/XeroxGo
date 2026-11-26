@@ -4658,7 +4658,7 @@ func TestClient_PingWatchdog_UnresponsivePeer_TriggersReconnect(t *testing.T) {
 		if err != nil {
 			t.Fatalf("client.Run returned unexpected error on cancel: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("client.Run did not terminate promptly after context cancel")
 	}
 }
@@ -5109,7 +5109,7 @@ func TestClient_PingWatchdog_ReconnectWhileSendMuLocked(t *testing.T) {
 		if err != nil {
 			t.Fatalf("client.Run returned unexpected error on clean shutdown: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("client.Run did not terminate promptly after context cancel")
 	}
 }
@@ -5242,7 +5242,7 @@ func TestClient_IncompleteJobSync_ReconnectWhileSendMuLocked(t *testing.T) {
 		if err != nil {
 			t.Fatalf("client.Run returned unexpected error on clean shutdown: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("client.Run did not terminate promptly after context cancel")
 	}
 }

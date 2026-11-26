@@ -1122,5 +1122,33 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleKioskAvailability returns the canonical customer-facing service availability for a kiosk.
+// GET /api/k/{kiosk_id}/availability
+func (s *appServer) handleKioskAvailability(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/k/")
+	trimmed = strings.TrimSuffix(trimmed, "/availability")
+	kioskID := strings.TrimSpace(trimmed)
+	if kioskID == "" || strings.Contains(kioskID, "/") {
+		http.Error(w, "invalid availability path: missing kiosk id", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+
+	if _, condErr := s.checkPrinterCondition(kioskID); condErr != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"available": false})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]bool{"available": true})
+}
+
 
 
