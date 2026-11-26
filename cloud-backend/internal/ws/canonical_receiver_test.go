@@ -72,6 +72,12 @@ func TestCloudHub_ConnectionBoundHealth_StartsUnverified_ReconcilesOnlyOnVerifie
 	}
 
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
 	defer srv.Close()
 
@@ -310,6 +316,12 @@ func TestCloudHub_Correction3And4_FreshnessResetCadenceAndSendTimeCheck(t *testi
 	}
 
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
 	defer srv.Close()
 
@@ -426,6 +438,12 @@ func TestCloudHub_PendingDispatchRetry_WithoutReconnection(t *testing.T) {
 	defer cancel()
 
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
 	defer srv.Close()
 
@@ -613,6 +631,12 @@ func TestCloudHub_EqualTimestampInvalidation_NeverRestores(t *testing.T) {
 func TestCloudHub_ConcurrentReplacement_ActiveSessionIsolation(t *testing.T) {
 	db := newTestStore(t)
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
 	defer srv.Close()
 
@@ -728,6 +752,12 @@ func TestCloudHub_ReconcileDispatch_SendFailureNoDeadlockAndRetries(t *testing.T
 	defer cancel()
 
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
 	defer srv.Close()
 
@@ -865,6 +895,12 @@ func waitForIntentStatus(ctx context.Context, t *testing.T, db *store.Store, job
 func TestCloudHub_InitialResetSerializedWithReplacement(t *testing.T) {
 	db := newTestStore(t)
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
 	defer srv.Close()
 

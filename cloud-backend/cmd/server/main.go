@@ -35,16 +35,36 @@ type serverConfig struct {
 	dbPath         string
 	jobsDir        string
 	devMode        bool
+	duplexEnabled  bool
+	colorEnabled   bool
+	policy         *contracts.ProductCapabilityPolicy
 	downloadSecret []byte
 	kioskSecret    []byte
 }
 
 type appServer struct {
-	cfg        *serverConfig
-	db         *store.Store
-	hub        *ws.Hub
-	convWake   chan struct{}
-	pinLimiter *PINRateLimiter
+	cfg                   *serverConfig
+	db                    *store.Store
+	hub                   *ws.Hub
+	convWake              chan struct{}
+	pinLimiter            *PINRateLimiter
+	beforeReserveCommitFn func()
+}
+
+func (app *appServer) policy() contracts.ProductCapabilityPolicy {
+	if app != nil && app.cfg != nil && app.cfg.policy != nil {
+		return *app.cfg.policy
+	}
+	pol := contracts.DefaultDemoProductPolicy()
+	if app != nil && app.cfg != nil {
+		if app.cfg.duplexEnabled {
+			pol.AllowDuplex = true
+		}
+		if app.cfg.colorEnabled {
+			pol.AllowColor = true
+		}
+	}
+	return pol
 }
 
 func (s *appServer) getBaseURL(r *http.Request) string {
@@ -300,7 +320,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "pricing unavailable: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	colorEnabled := pricing.ColorEnabled
+	productPolicy := s.policy()
+	colorEnabled := pricing.ColorEnabled && productPolicy.AllowColor
+	duplexEnabled := productPolicy.AllowDuplex
 
 	orderHex, err := randomHex(12)
 	if err != nil {
@@ -353,9 +375,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		var docOpts docPrintOptions
 		if idx < len(metaItems) {
-			docOpts, err = parseMetadataPrintOptions(metaItems[idx], colorEnabled, docNum)
+			docOpts, err = parseMetadataPrintOptions(metaItems[idx], colorEnabled, duplexEnabled, docNum)
 		} else {
-			docOpts, err = parseFormPrintOptions(r, colorEnabled, docNum)
+			docOpts, err = parseFormPrintOptions(r, colorEnabled, duplexEnabled, docNum)
 		}
 		if err != nil {
 			_ = f.Close()
@@ -483,9 +505,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
-	// Validate fresh kiosk/printer health and estimated paper stock before issuing PIN
+	// Validate fresh kiosk/printer health and estimated paper stock before issuing PIN,
+	// serialized per kiosk against downward calibration until durable order/PIN reservation completes.
+	unlockReserve := s.lockKioskReservation(kioskID)
 	availableStock, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(condErr.StatusCode)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -495,7 +520,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.beforeReserveCommitFn != nil {
+		s.beforeReserveCommitFn()
+	}
+
 	if err := s.createOrderWithPINRetryAndPaperCheck(r.Context(), &order, 25, availableStock); err != nil {
+		unlockReserve()
 		if errors.Is(err, store.ErrInsufficientPaper) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
@@ -509,6 +539,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to reserve paper and issue PIN", http.StatusInternalServerError)
 		return
 	}
+	unlockReserve()
 	success = true
 	displayCode := order.Command.DisplayCode
 
@@ -737,7 +768,10 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, 0)
+	productPolicy := s.policy()
+	colorEnabled := pricing.ColorEnabled && productPolicy.AllowColor
+	duplexEnabled := productPolicy.AllowDuplex
+	opts, err := parseFormPrintOptions(r, colorEnabled, duplexEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1080,6 +1114,7 @@ func main() {
 		convWake:   make(chan struct{}, 1),
 		pinLimiter: pinLimiter,
 	}
+	hub.SetProductPolicy(app.policy())
 
 	mux := app.routes()
 

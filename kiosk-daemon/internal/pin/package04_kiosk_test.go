@@ -338,9 +338,13 @@ func TestPackage04_InitiateRetry_PreservesDeadlineAndDeduplicatesEnter(t *testin
 	waitUntil(t, time.Second, "claiming started", func() bool {
 		return atomic.LoadInt32(&claimCalls) == 1
 	})
+	beforeEnters := ctrl.eventsProcessed.Load()
 	sim.EmitSubmit()
 	sim.EmitSubmit()
 	sim.EmitSubmit()
+	waitUntil(t, time.Second, "repeated Enter events processed during in-flight claim", func() bool {
+		return ctrl.eventsProcessed.Load() >= beforeEnters+3
+	})
 	close(claimGate)
 
 	expectedErr := "Failed to load payment QR. Press Confirm to retry."

@@ -21,6 +21,7 @@ import (
 
 	"xeroxgo/kiosk-daemon/internal/audio"
 	"xeroxgo/kiosk-daemon/internal/input"
+	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/spooler"
 	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
@@ -270,14 +271,31 @@ func main() {
 	keypadDevice := flag.String("keypad-device", "", "Path to keyboard TTY device (e.g. /dev/tty1). If specified, reads from device; otherwise reads from stdin")
 	pinInactivityTimeout := flag.Duration("pin-timeout", 60*time.Second, "Inactivity timeout for PIN entry screen before returning to idle")
 	paymentPendingTimeout := flag.Duration("payment-timeout", 120*time.Second, "Inactivity timeout for payment pending screen before returning to idle")
-	refill := flag.Int("refill", -1, "Reset and calibrate estimated paper tray stock to N sheets (0-250) and exit")
-	simulatedStock := flag.Int("simulated-stock", -1, "Initialize and calibrate estimated paper tray stock to N sheets (0-250) for testing/demo")
+	refill := flag.Int("refill", -1, "Reset and calibrate estimated paper tray stock to N sheets (0..tray-capacity) and exit")
+	simulatedStock := flag.Int("simulated-stock", -1, "Initialize and calibrate estimated paper tray stock to N sheets (0..tray-capacity) for testing/demo")
+	trayCapacity := flag.Int("tray-capacity", state.DefaultTrayCapacity, "Configured physical paper tray sheet capacity (positive integer, default 150 for HP LaserJet Tank 1020w)")
+	allowColor := flag.Bool("allow-color", false, "Allow color print jobs under configured printer capability policy (default false for HP LaserJet Tank 1020w)")
+	allowDuplex := flag.Bool("allow-duplex", false, "Allow duplex (double-sided) print jobs under configured printer capability policy (default false for HP LaserJet Tank 1020w)")
 	viewerAddr := flag.String("viewer-addr", "", "HTTP address to serve the live preview browser viewer (e.g. :8081 or 0.0.0.0:8081). If empty, viewer HTTP server is disabled.")
 	enableSound := flag.Bool("enable-sound", true, "Enable sound playback on job completion (degrades gracefully if hardware unavailable)")
 	simulatedFailure := flag.String("simulated-failure", "", "Simulated failure condition: none, paper-empty, jam, offline")
 	simulatedFailureSheet := flag.Int("simulated-failure-sheet", 0, "Sheet number after which to inject simulated failure (0 = fail at start/health)")
 	nativeIPPURI := flag.String("native-ipp-uri", "", "Optional explicit native printer IPP URI override when DNS-SD path cannot be verified automatically")
 	flag.Parse()
+
+	var refillSet, simulatedStockSet bool
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "refill":
+			refillSet = true
+		case "simulated-stock":
+			simulatedStockSet = true
+		}
+	})
+
+	if *trayCapacity <= 0 {
+		log.Fatalf("Fatal: --tray-capacity must be a positive integer, got %d", *trayCapacity)
+	}
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
 		*cupsPrinter = *cupsQueue
@@ -305,37 +323,52 @@ func main() {
 		log.Fatalf("Fatal: failed to create download directory: %v", err)
 	}
 
-	stateStore, err := state.Open(*stateDB)
+	lockPath := *stateDB + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		log.Fatalf("Fatal: failed to open daemon lock file %s: %v", lockPath, err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		log.Fatalf("Fatal: another kiosk daemon instance holds %s (%v); stop it or use remote refill", lockPath, err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+	}()
+
+	stateStore, err := state.OpenWithCapacity(*stateDB, *trayCapacity)
 	if err != nil {
 		log.Fatalf("Fatal: failed to open state database at %s: %v", *stateDB, err)
 	}
 	defer stateStore.Close()
 
-	if *refill >= 0 {
+	if refillSet {
+		if *refill < 0 || *refill > *trayCapacity {
+			log.Fatalf("Fatal: --refill must be between 0 and %d inclusive, got %d", *trayCapacity, *refill)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := stateStore.ResetPaperTray(ctx, *refill); err != nil {
+		if err := stateStore.CalibratePaperTray(ctx, *refill); err != nil {
 			log.Fatalf("Fatal: failed to refill paper tray to %d sheets: %v", *refill, err)
 		}
-		log.Printf("Successfully refilled and calibrated paper tray to %d sheets", *refill)
+		log.Printf("Successfully refilled and calibrated paper tray to %d sheets (capacity %d)", *refill, *trayCapacity)
 		return
 	}
 
-	if *simulatedStock >= 0 {
+	if simulatedStockSet {
+		if !*mockPrinter {
+			log.Fatalf("Fatal: --simulated-stock requires --mock-printer; cannot mutate production inventory without explicit simulation mode")
+		}
+		if *simulatedStock < 0 || *simulatedStock > *trayCapacity {
+			log.Fatalf("Fatal: --simulated-stock must be between 0 and %d inclusive, got %d", *trayCapacity, *simulatedStock)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := stateStore.ResetPaperTray(ctx, *simulatedStock); err != nil {
+		if err := stateStore.CalibratePaperTray(ctx, *simulatedStock); err != nil {
 			log.Fatalf("Fatal: failed to set simulated paper stock: %v", err)
 		}
-		log.Printf("Initialized simulated paper tray to %d sheets", *simulatedStock)
-	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		sheets, calib, err := stateStore.GetPaperSupply(ctx)
-		if err == nil && !calib && sheets > 0 {
-			_ = stateStore.ResetPaperTray(ctx, sheets)
-			log.Printf("XeroxGo kiosk daemon: initialized calibrated paper supply to %d sheets", sheets)
-		}
+		log.Printf("Initialized simulated paper tray to %d sheets (capacity %d)", *simulatedStock, *trayCapacity)
 	}
 
 	var screenSink ui_ipc.Sink
@@ -417,13 +450,15 @@ func main() {
 		}
 
 		mockHealthPoller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+			_, calib, _ := stateStore.GetPaperSupply(ctx)
 			h := contracts.PrinterHealth{
-				Online:              true,
-				State:               "IDLE",
-				EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
-				PaperTrayStatus:     "OK",
-				EstimatedSheets:     estimatedSheets,
-				InventoryCalibrated: true,
+				Online:                 true,
+				State:                  "IDLE",
+				EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+				PaperTrayStatus:        "OK",
+				EstimatedSheets:        estimatedSheets,
+				ConfiguredTrayCapacity: *trayCapacity,
+				InventoryCalibrated:    calib,
 				ExecutionSafe:       true,
 				TonerLevelPercent:   95,
 				TonerLevelKnown:     true,
@@ -496,11 +531,7 @@ func main() {
 
 	effectivePrinterModel := strings.TrimSpace(*printerModel)
 	if effectivePrinterModel == "" {
-		if strings.TrimSpace(*cupsPrinter) != "" {
-			effectivePrinterModel = "Brother DCP-T310"
-		} else {
-			effectivePrinterModel = "Brother HL-L5210DN"
-		}
+		effectivePrinterModel = "HP LaserJet Tank 1020w"
 	}
 
 	var inputSource input.Source
@@ -528,11 +559,32 @@ func main() {
 		}
 	}
 
+	demoPolicy := printer.DefaultDemoCapabilityPolicy()
+	demoPolicy.AllowColor = *allowColor
+	demoPolicy.AllowDuplex = *allowDuplex
+
+	var mockCaps *printer.PrinterCapabilities
+	if *mockPrinter {
+		synth := printer.SyntheticDemoCapabilities()
+		if *allowColor {
+			synth.ColorSupport = printer.CapabilitySupported
+		}
+		if *allowDuplex {
+			synth.DuplexLongEdgeSupport = printer.CapabilitySupported
+			synth.DuplexShortEdgeSupport = printer.CapabilitySupported
+			synth.SidesSupported = append(synth.SidesSupported, "two-sided-long-edge", "two-sided-short-edge")
+		}
+		mockCaps = &synth
+	}
+
 	clientCfg := spooler.ClientConfig{
 		CloudURL:                 *cloudURL,
 		KioskID:                  *kioskID,
 		KioskSecret:              strings.TrimSpace(*kioskSecret),
 		StateStore:               stateStore,
+		ConfiguredTrayCapacity:   *trayCapacity,
+		CapabilityPolicy:         &demoPolicy,
+		MockCapabilities:         mockCaps,
 		PrinterAddr:              actualPrinterAddr,
 		SNMPTarget:               *snmpTarget,
 		SNMPCommunity:            *snmpCommunity,

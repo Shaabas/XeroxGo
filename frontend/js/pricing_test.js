@@ -255,3 +255,18 @@ test('Frontend Pricing — UI Cart: Malformed or missing rates keep checkout dis
   assert.equal(btnReviewOrder.disabled, true, 'Checkout must be disabled when rate is string');
   assert.equal(cartTotalAmount.textContent, '--', 'Cart total must display placeholder -- on string rate');
 });
+
+test('Frontend Capability Policy — Hides and disables Color and Double-sided by default', () => {
+  setPricingConfig({
+    bw_simplex_price_paise: 300,
+    bw_duplex_price_paise: 500,
+    color_simplex_price_paise: 800,
+    color_duplex_price_paise: 1000,
+    color_enabled: false,
+    duplex_enabled: false
+  });
+  const cardModeColor = document.getElementById('card-mode-color');
+  const cardSideDouble = document.getElementById('card-side-double');
+  assert.equal(cardModeColor.disabled, true, 'Color card must be disabled when color_enabled is false');
+  assert.equal(cardSideDouble.disabled, true, 'Double-sided card must be disabled when duplex_enabled is false');
+});

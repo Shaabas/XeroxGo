@@ -24,8 +24,27 @@ func (app *appServer) handlePublicPricing(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	policy := app.policy()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(pricingConfig)
+	_ = json.NewEncoder(w).Encode(struct {
+		BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
+		BWDuplexPricePaise     int64     `json:"bw_duplex_price_paise"`
+		ColorSimplexPricePaise int64     `json:"color_simplex_price_paise"`
+		ColorDuplexPricePaise  int64     `json:"color_duplex_price_paise"`
+		ColorEnabled           bool      `json:"color_enabled"`
+		DuplexEnabled          bool      `json:"duplex_enabled"`
+		PaperSize              string    `json:"paper_size"`
+		UpdatedAt              time.Time `json:"updated_at"`
+	}{
+		BWSimplexPricePaise:    pricingConfig.BWSimplexPricePaise,
+		BWDuplexPricePaise:     pricingConfig.BWDuplexPricePaise,
+		ColorSimplexPricePaise: pricingConfig.ColorSimplexPricePaise,
+		ColorDuplexPricePaise:  pricingConfig.ColorDuplexPricePaise,
+		ColorEnabled:           pricingConfig.ColorEnabled && policy.AllowColor,
+		DuplexEnabled:          policy.AllowDuplex,
+		PaperSize:              policy.PaperSize,
+		UpdatedAt:              pricingConfig.UpdatedAt,
+	})
 }
 
 // handleAdminPricing handles GET and PUT /api/admin/pricing

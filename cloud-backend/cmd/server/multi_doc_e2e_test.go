@@ -192,6 +192,8 @@ func TestMultiDoc_E2E_FullFlowAndOrdering(t *testing.T) {
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 
 	var daemonLogs syncBuffer
@@ -406,6 +408,8 @@ func TestMultiDoc_E2E_CrashAndReconnectionRecovery(t *testing.T) {
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var logs1 syncBuffer
 	cmd1.Stdout = &logs1
@@ -462,10 +466,11 @@ func TestMultiDoc_E2E_CrashAndReconnectionRecovery(t *testing.T) {
 		"--state-db="+stateDB,
 		"--download-dir="+downloadDir,
 		"--preview-png="+previewPNG,
-		"--simulated-stock=100",
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var logs2 syncBuffer
 	cmd2.Stdout = &logs2
@@ -607,6 +612,8 @@ func TestMultiDoc_E2E_HardwareFaultSafety(t *testing.T) {
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var daemonLogs syncBuffer
 	cmd.Stdout = &daemonLogs
@@ -821,6 +828,8 @@ func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var logs1 syncBuffer
 	cmd1.Stdout = &logs1
@@ -915,10 +924,11 @@ func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 		"--state-db="+stateDB,
 		"--download-dir="+downloadDir,
 		"--preview-png="+previewPNG,
-		"--simulated-stock=100",
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var logs2 syncBuffer
 	cmd2.Stdout = &logs2
@@ -1093,6 +1103,8 @@ func TestMultiDoc_E2E_CrashRecovery_PhysicallyUncertain_RequiresReconciliation(t
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var logs1 syncBuffer
 	cmd1.Stdout = &logs1
@@ -1185,10 +1197,11 @@ func TestMultiDoc_E2E_CrashRecovery_PhysicallyUncertain_RequiresReconciliation(t
 		"--state-db="+stateDB,
 		"--download-dir="+downloadDir,
 		"--preview-png="+previewPNG,
-		"--simulated-stock=100",
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	var logs2 syncBuffer
 	cmd2.Stdout = &logs2
@@ -1575,6 +1588,8 @@ func TestMultiDoc_E2E_CUPS_SequentialSubmissionAndOptions(t *testing.T) {
 		"--enable-keypad=false",
 		"--enable-sound=false",
 		"--completed-timeout=100ms",
+		"--allow-color=true",
+		"--allow-duplex=true",
 	)
 	cmd.Env = append(os.Environ(),
 		"PATH="+cupsDir+":"+os.Getenv("PATH"),

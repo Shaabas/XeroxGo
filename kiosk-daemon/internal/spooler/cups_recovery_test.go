@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"xeroxgo/kiosk-daemon/internal/printer"
-	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -26,7 +25,7 @@ import (
 func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_tracking.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -86,6 +85,7 @@ func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -134,7 +134,7 @@ func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 func TestCUPS_AmbiguousSubmissionCrashedDuringLP(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_ambig.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -181,6 +181,7 @@ func TestCUPS_AmbiguousSubmissionCrashedDuringLP(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -223,7 +224,7 @@ func TestCUPS_AmbiguousSubmissionCrashedDuringLP(t *testing.T) {
 func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_active_rec.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -301,6 +302,7 @@ func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -341,7 +343,7 @@ func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_done_rec.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -407,6 +409,7 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -444,7 +447,7 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 func TestCUPS_DuplicateCommandsIgnored(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_dup.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -487,6 +490,7 @@ func TestCUPS_DuplicateCommandsIgnored(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -508,7 +512,7 @@ func TestCUPS_DuplicateCommandsIgnored(t *testing.T) {
 func TestCUPS_CloudRecoveryOutageLeavesJobPaused(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_outage.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -578,7 +582,7 @@ func TestCUPS_CloudRecoveryOutageLeavesJobPaused(t *testing.T) {
 func TestCUPS_MultiCopyRecoveryIntegrity(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_multicopy.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -728,7 +732,7 @@ func TestCUPS_MultiCopyRecoveryIntegrity(t *testing.T) {
 func TestCUPS_RetriedDispatch_NeverDuplicatesSubmission(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_dup_prevent.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -801,7 +805,7 @@ func TestCUPS_RetriedDispatch_NeverDuplicatesSubmission(t *testing.T) {
 func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_rec_sheets.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -877,6 +881,7 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -931,7 +936,7 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliation(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_err_rec.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -998,6 +1003,7 @@ func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliati
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -1041,7 +1047,7 @@ func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliati
 func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_nostock_rec.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1098,6 +1104,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -1139,7 +1146,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cloud_sheets_check.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1222,6 +1229,7 @@ func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -1255,7 +1263,7 @@ func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 func TestSpooler_DuplicateCompletion_NeverDoubleDeducts(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "dup_comp.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1292,6 +1300,7 @@ func TestSpooler_DuplicateCompletion_NeverDoubleDeducts(t *testing.T) {
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)

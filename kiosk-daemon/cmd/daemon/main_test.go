@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -96,5 +98,29 @@ func TestResolveIdleQRContent(t *testing.T) {
 					tt.idleQRContent, tt.portalURLBase, tt.kioskID, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestSimulatedStockRequiresMockPrinterValidation(t *testing.T) {
+	validateSimulatedStockFlags := func(simulatedStockSet bool, mockPrinter bool, stock int, capacity int) error {
+		if simulatedStockSet {
+			if !mockPrinter {
+				return errors.New("--simulated-stock requires --mock-printer; cannot mutate production inventory without explicit simulation mode")
+			}
+			if stock < 0 || stock > capacity {
+				return fmt.Errorf("--simulated-stock must be between 0 and %d inclusive, got %d", capacity, stock)
+			}
+		}
+		return nil
+	}
+
+	if err := validateSimulatedStockFlags(true, false, 50, 150); err == nil {
+		t.Fatal("expected error when simulated stock is set without mock printer")
+	}
+	if err := validateSimulatedStockFlags(true, true, 50, 150); err != nil {
+		t.Fatalf("expected valid simulated stock with mock printer to pass, got %v", err)
+	}
+	if err := validateSimulatedStockFlags(true, true, 200, 150); err == nil {
+		t.Fatal("expected error when simulated stock exceeds capacity")
 	}
 }

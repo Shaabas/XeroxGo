@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"xeroxgo/kiosk-daemon/internal/input"
-	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 	"xeroxgo/pkg/contracts"
 )
@@ -37,7 +36,7 @@ func waitCondition(timeout time.Duration, cond func() bool) bool {
 func TestPINFlow_EndToEndSimulation(t *testing.T) {
 	tempDir := t.TempDir()
 	stateDBPath := filepath.Join(tempDir, "state.db")
-	store, err := state.Open(stateDBPath)
+	store, err := openCalibratedTestStore(t, stateDBPath)
 	if err != nil {
 		t.Fatalf("failed to open state db: %v", err)
 	}
@@ -254,7 +253,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 
 func TestPINFlow_KioskIsolationAndUnauthorized(t *testing.T) {
 	tempDir := t.TempDir()
-	store, _ := state.Open(filepath.Join(tempDir, "state.db"))
+	store, _ := openCalibratedTestStore(t, filepath.Join(tempDir, "state.db"))
 	defer store.Close()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -334,7 +333,7 @@ func TestPINFlow_KioskIsolationAndUnauthorized(t *testing.T) {
 
 func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 	tempDir := t.TempDir()
-	store, _ := state.Open(filepath.Join(tempDir, "state.db"))
+	store, _ := openCalibratedTestStore(t, filepath.Join(tempDir, "state.db"))
 	defer store.Close()
 
 	cupsCalled := false
@@ -424,7 +423,7 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 
 func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 	tempDir := t.TempDir()
-	st, _ := state.Open(filepath.Join(tempDir, "state.db"))
+	st, _ := openCalibratedTestStore(t, filepath.Join(tempDir, "state.db"))
 	defer st.Close()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -551,7 +550,7 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 
 func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 	tempDir := t.TempDir()
-	st, _ := state.Open(filepath.Join(tempDir, "state.db"))
+	st, _ := openCalibratedTestStore(t, filepath.Join(tempDir, "state.db"))
 	defer st.Close()
 
 	var initiateCalled bool
@@ -791,7 +790,7 @@ func TestSpooler_TrustedOriginValidation(t *testing.T) {
 
 func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 	tempDir := t.TempDir()
-	st, err := state.Open(filepath.Join(tempDir, "state.db"))
+	st, err := openCalibratedTestStore(t, filepath.Join(tempDir, "state.db"))
 	if err != nil {
 		t.Fatalf("failed to open state db: %v", err)
 	}

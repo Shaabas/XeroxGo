@@ -76,10 +76,10 @@ func createTestOrderAndSession(t *testing.T, st *store.Store, kioskID, orderID, 
 		DisplayCode:    pin,
 		DownloadURL:    "http://test.local/download",
 		SHA256Checksum: "checksum123",
-		TotalPages:     sheets * 2,
+		TotalPages:     sheets,
 		TotalSheets:    sheets,
 		Copies:         1,
-		Duplex:         contracts.DuplexLongEdge,
+		Duplex:         contracts.DuplexSimplex,
 		StartFromPage:  1,
 	}
 

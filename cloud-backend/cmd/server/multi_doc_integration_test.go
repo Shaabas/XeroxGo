@@ -59,6 +59,8 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 		kioskSecret:    []byte(kioskSecret),
 		downloadSecret: downloadSecret,
 		devMode:        true,
+		duplexEnabled:  true,
+		colorEnabled:   true,
 	}
 
 	hub := ws.NewHub(st)
@@ -73,6 +75,7 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 		hub:      hub,
 		convWake: make(chan struct{}, 10),
 	}
+	hub.SetProductPolicy(app.policy())
 
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/test/capture" {

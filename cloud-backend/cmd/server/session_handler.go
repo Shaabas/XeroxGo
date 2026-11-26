@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,7 +87,7 @@ func (e *printerConditionError) Error() string {
 func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditionError) {
 	if s.hub == nil {
 		if s.cfg != nil && s.cfg.devMode {
-			return 250, nil
+			return 150, nil
 		}
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
@@ -98,7 +99,7 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 	connected, health, hasHealth, ready, readyReason := s.hub.EvaluateKioskReadiness(kioskID)
 	if !connected {
 		if s.cfg != nil && s.cfg.devMode && !hasHealth {
-			return 250, nil
+			return 150, nil
 		}
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
@@ -109,7 +110,7 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 
 	if !hasHealth {
 		if s.cfg != nil && s.cfg.devMode {
-			return 250, nil
+			return 150, nil
 		}
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
@@ -174,6 +175,22 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
+	// Validate configured capacity and estimated stock consistently
+	if health.ConfiguredTrayCapacity <= 0 {
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "MALFORMED_TELEMETRY",
+			Message:    "kiosk reported invalid or non-positive tray capacity",
+		}
+	}
+	if health.EstimatedSheets < 0 || health.EstimatedSheets > health.ConfiguredTrayCapacity {
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "MALFORMED_TELEMETRY",
+			Message:    fmt.Sprintf("kiosk estimated sheets %d out of bounds [0, %d]", health.EstimatedSheets, health.ConfiguredTrayCapacity),
+		}
+	}
+
 	// Existing inventory and calibration check
 	tray := strings.ToUpper(strings.TrimSpace(health.PaperTrayStatus))
 	if tray == "UNKNOWN" || !health.InventoryCalibrated {
@@ -191,7 +208,53 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
-	return health.EstimatedSheets, nil
+	// Conservative capacity enforcement: contradictory physical capacity must not permit
+	// inventory or reservations above the verified physical limit.
+	effectiveStock := contracts.EffectiveInventorySheets(
+		health.EstimatedSheets,
+		health.ConfiguredTrayCapacity,
+		health.InputTrayCapacity,
+		health.InputTrayCapacityKnown,
+	)
+
+	return effectiveStock, nil
+}
+
+func validateOrderAgainstPolicy(ord *store.Order, policy contracts.ProductCapabilityPolicy) *printerConditionError {
+	if ord == nil {
+		return &printerConditionError{
+			StatusCode: http.StatusBadRequest,
+			Code:       "MISSING_ORDER_DATA",
+			Message:    "order data is missing or unavailable",
+		}
+	}
+	if len(ord.Documents) > 0 {
+		for _, doc := range ord.Documents {
+			if err := contracts.ValidatePrintModeAgainstPolicy(doc.Duplex, doc.ColorMode, policy); err != nil {
+				return &printerConditionError{
+					StatusCode: http.StatusBadRequest,
+					Code:       "CAPABILITY_UNSUPPORTED",
+					Message:    fmt.Sprintf("document %d: %v", doc.DocumentIndex, err),
+				}
+			}
+		}
+	} else {
+		if err := contracts.ValidatePrintModeAgainstPolicy(ord.Command.Duplex, ord.ColorMode, policy); err != nil {
+			return &printerConditionError{
+				StatusCode: http.StatusBadRequest,
+				Code:       "CAPABILITY_UNSUPPORTED",
+				Message:    err.Error(),
+			}
+		}
+		if err := contracts.ValidatePrintModeAgainstPolicy(ord.Command.Duplex, ord.Command.ColorMode, policy); err != nil {
+			return &printerConditionError{
+				StatusCode: http.StatusBadRequest,
+				Code:       "CAPABILITY_UNSUPPORTED",
+				Message:    err.Error(),
+			}
+		}
+	}
+	return nil
 }
 
 func firstNonEmptySessionErr(vals ...string) string {
@@ -207,7 +270,12 @@ func (s *appServer) dispatchAuthorizedCommands(ctx context.Context, tag string, 
 	if s == nil || s.hub == nil {
 		return
 	}
+	policy := s.policy()
 	for _, cmd := range cmds {
+		if err := contracts.ValidatePrintModeAgainstPolicy(cmd.Duplex, cmd.ColorMode, policy); err != nil {
+			log.Printf("%s Blocked dispatch of job %s to kiosk %s by product policy: %v", tag, cmd.JobID, cmd.KioskID, err)
+			break
+		}
 		if err := s.hub.SendJob(ctx, cmd); err != nil {
 			log.Printf("%s Warning: failed to send job %s to kiosk %s: %v", tag, cmd.JobID, cmd.KioskID, err)
 			s.hub.MarkDispatchRetryNeeded(cmd.KioskID)
@@ -226,6 +294,13 @@ func (s *appServer) dispatchAuthorizedCommands(ctx context.Context, tag string, 
 			}
 		}
 	}
+}
+
+func (s *appServer) lockKioskReservation(kioskID string) func() {
+	if s != nil && s.hub != nil {
+		return s.hub.LockKioskReservation(kioskID)
+	}
+	return func() {}
 }
 
 // handleOrderClaim creates or retrieves an active transaction session for a kiosk order.
@@ -251,6 +326,9 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 
+	unlockReserve := s.lockKioskReservation(kioskID)
+	defer unlockReserve()
+
 	// Validate printer condition and get current estimated physical stock
 	stock, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
@@ -261,6 +339,25 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 			"code":  condErr.Code,
 		})
 		return
+	}
+
+	ord, oErr := s.db.GetOrder(r.Context(), orderID)
+	if oErr != nil || ord == nil {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(polErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": polErr.Message,
+			"code":  polErr.Code,
+		})
+		return
+	}
+
+	if s.beforeReserveCommitFn != nil {
+		s.beforeReserveCommitFn()
 	}
 
 	sess, err := s.db.CreateOrGetKioskSessionWithPaperCheck(r.Context(), kioskID, orderID, stock, kioskCheckoutSessionDuration, now)
@@ -491,6 +588,18 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		http.Error(w, "order not found", http.StatusNotFound)
 		return
 	}
+	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(polErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": polErr.Message,
+			"code":  polErr.Code,
+		})
+		return
+	}
+
+	unlockReserve := s.lockKioskReservation(kioskID)
+	defer unlockReserve()
 
 	// Revalidate printer condition and fresh stock before initiating payment
 	stock, condErr := s.checkPrinterCondition(kioskID)
@@ -662,14 +771,34 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unlockReserve := s.lockKioskReservation(kioskID)
+
 	// Validate printer condition and stock before releasing paid order
 	_, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(condErr.StatusCode)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": condErr.Message,
 			"code":  condErr.Code,
+		})
+		return
+	}
+
+	ord, oErr := s.db.GetOrder(r.Context(), orderID)
+	if oErr != nil || ord == nil {
+		unlockReserve()
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		unlockReserve()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(polErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": polErr.Message,
+			"code":  polErr.Code,
 		})
 		return
 	}
@@ -683,6 +812,7 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 
 	reqBody.SessionID = strings.TrimSpace(reqBody.SessionID)
 	if reqBody.SessionID == "" {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -693,6 +823,7 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	order, err := s.db.ReleasePaidOrder(r.Context(), kioskID, orderID, reqBody.SessionID, now)
+	unlockReserve()
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -894,14 +1025,49 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Sheets int `json:"sheets"`
+	if r.Body == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "request body with integer sheets count is required",
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+
+	var raw struct {
+		Sheets json.RawMessage `json:"sheets"`
 	}
-	if req.Sheets <= 0 || req.Sheets > 250 {
-		req.Sheets = 250
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&raw); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("malformed refill JSON payload: %v", err),
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
+	}
+
+	sheetsStr := strings.TrimSpace(string(raw.Sheets))
+	if sheetsStr == "" || sheetsStr == "null" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "sheets count is required",
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
+	}
+	sheets, err := strconv.Atoi(sheetsStr)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("sheets must be an integer, got %s", sheetsStr),
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
 	}
 
 	if s.hub == nil {
@@ -909,11 +1075,38 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.hub.SendRefill(r.Context(), kioskID, req.Sheets); err != nil {
+	_, health, hasHealth, _, _ := s.hub.EvaluateKioskReadiness(kioskID)
+	if !hasHealth || health.ConfiguredTrayCapacity <= 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": fmt.Sprintf("failed to send refill command to kiosk: %v", err),
+			"error": "kiosk configured tray capacity is unavailable; cannot validate refill",
+			"code":  "CAPACITY_UNAVAILABLE",
+		})
+		return
+	}
+	maxCapacity := contracts.EffectiveTrayCapacity(
+		health.ConfiguredTrayCapacity,
+		health.InputTrayCapacity,
+		health.InputTrayCapacityKnown,
+	)
+	if sheets < 0 || sheets > maxCapacity {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("sheets must be between 0 and %d inclusive, got %d", maxCapacity, sheets),
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
+	}
+
+	refillCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := s.hub.SendRefill(refillCtx, kioskID, sheets); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("refill calibration not confirmed by kiosk: %v", err),
 			"code":  "REFILL_FAILED",
 		})
 		return
@@ -922,9 +1115,10 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":       true,
-		"kiosk_id": kioskID,
-		"sheets":   req.Sheets,
+		"ok":         true,
+		"calibrated": true,
+		"kiosk_id":   kioskID,
+		"sheets":     sheets,
 	})
 }
 

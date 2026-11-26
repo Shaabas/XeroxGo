@@ -31,6 +31,19 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
+func openCalibratedTestStore(t *testing.T, dbPath string) (*state.Store, error) {
+	t.Helper()
+	s, err := state.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ResetPaperTray(context.Background(), state.DefaultTrayCapacity); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
 // createThreePageFixture writes a valid PostScript file with three distinct pages
 // and generates a PDF using Ghostscript under dir.
 func createThreePageFixture(t *testing.T, dir string) (string, []byte, string) {
@@ -94,7 +107,7 @@ func noopSink(*image.RGBA) error {
 func TestNewClientRejectsInvalidConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_config.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open state store: %v", err)
 	}
@@ -160,7 +173,7 @@ func TestNewClientRejectsInvalidConfig(t *testing.T) {
 func TestDownloadPDFVerifiesSHA256(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_b.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -242,7 +255,7 @@ func TestDownloadPDFVerifiesSHA256(t *testing.T) {
 func TestDownloadPDFRejectsNon200AndOversizedResponses(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_c.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -336,7 +349,7 @@ func TestDownloadPDFRejectsNon200AndOversizedResponses(t *testing.T) {
 func TestClientProcessesJobEndToEnd(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -490,19 +503,43 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 		t.Fatal("timeout waiting for mock printer to complete")
 	}
 
-	// Wait a moment for completion to settle in store and WS
-	deadline := time.Now().Add(3 * time.Second)
+	// Wait for durable completion, completion-screen transition, and COMPLETED progress event before canceling daemon.
+	deadline := time.Now().Add(5 * time.Second)
 	completed := false
 	for time.Now().Before(deadline) {
 		inc, err := store.GetIncompleteJob(ctx)
-		if err == nil && inc == nil {
-			// If incomplete job is nil, verify local DB is readable
-			if _, sErr := store.GetEstimatedSheets(ctx); sErr == nil {
-				completed = true
+		durableDone := err == nil && inc == nil
+		if durableDone {
+			if _, sErr := store.GetEstimatedSheets(ctx); sErr != nil {
+				durableDone = false
+			}
+		}
+
+		client.renderHistoryMu.Lock()
+		var uiCompleted bool
+		for _, s := range client.renderHistory {
+			if s.Mode == ui_ipc.ModeCompleted {
+				uiCompleted = true
 				break
 			}
 		}
-		time.Sleep(30 * time.Millisecond)
+		client.renderHistoryMu.Unlock()
+
+		progressMu.Lock()
+		var wsCompleted bool
+		for _, p := range receivedProgress {
+			if p.Status == contracts.JobStatusCompleted && p.PagesPrinted == 1 && p.SheetsPrinted == 1 {
+				wsCompleted = true
+				break
+			}
+		}
+		progressMu.Unlock()
+
+		if durableDone && uiCompleted && wsCompleted {
+			completed = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	cancel()
@@ -572,7 +609,7 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 func TestClientPersistsStateWhenCloudDisconnects(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_e.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -684,7 +721,7 @@ func TestClientPersistsStateWhenCloudDisconnects(t *testing.T) {
 func TestClientReconnectsWithBackoff(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_f.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -778,7 +815,7 @@ func TestClientReconnectsWithBackoff(t *testing.T) {
 func TestClientHeartbeat(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_g.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -889,9 +926,10 @@ func TestClientRefill_OverWebSocket(t *testing.T) {
 			if msg.Type == "health" && msg.Health != nil {
 				if msg.Health.PaperTrayStatus == "UNKNOWN" {
 					gotInitialUnknown.Store(true)
-					// Trigger operator refill of 215 sheets
-					_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 215})
-				} else if msg.Health.PaperTrayStatus == "OK" && msg.Health.EstimatedSheets == 215 {
+					// Trigger operator refill of 140 sheets
+					s140 := 140
+					_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: &s140})
+				} else if msg.Health.PaperTrayStatus == "OK" && msg.Health.EstimatedSheets == 140 {
 					gotRefilledHealth.Store(true)
 					refilledSheets.Store(int32(msg.Health.EstimatedSheets))
 				}
@@ -953,10 +991,10 @@ func TestClientRefill_OverWebSocket(t *testing.T) {
 		t.Fatal("expected uncalibrated client to report PaperTrayStatus UNKNOWN initially")
 	}
 	if !gotRefilledHealth.Load() {
-		t.Fatal("expected client to report PaperTrayStatus OK with 215 sheets after refill")
+		t.Fatal("expected client to report PaperTrayStatus OK with 140 sheets after refill")
 	}
-	if refilledSheets.Load() != 215 {
-		t.Fatalf("expected refilled sheets 215, got %d", refilledSheets.Load())
+	if refilledSheets.Load() != 140 {
+		t.Fatalf("expected refilled sheets 140, got %d", refilledSheets.Load())
 	}
 
 	// Verify stateStore persisted the calibrated state
@@ -967,8 +1005,8 @@ func TestClientRefill_OverWebSocket(t *testing.T) {
 	if !calib {
 		t.Errorf("expected stateStore calibrated=true")
 	}
-	if storedSheets != 215 {
-		t.Errorf("expected stateStore sheets=215, got %d", storedSheets)
+	if storedSheets != 140 {
+		t.Errorf("expected stateStore sheets=140, got %d", storedSheets)
 	}
 }
 
@@ -976,7 +1014,7 @@ func TestClientRefill_OverWebSocket(t *testing.T) {
 func TestClientRejectsWrongKioskJob(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_h.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1051,7 +1089,7 @@ func TestClientRejectsWrongKioskJob(t *testing.T) {
 func TestClientDuplicateJobDoesNotPrintTwice(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_i.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1190,7 +1228,7 @@ func TestClientDuplicateJobDoesNotPrintTwice(t *testing.T) {
 func TestClientStartupRecovery(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_j.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1414,7 +1452,7 @@ func TestClientStartupRecovery(t *testing.T) {
 func TestClientCancellationStopsOwnedGoroutines(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_k.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1462,7 +1500,7 @@ func TestClientCancellationStopsOwnedGoroutines(t *testing.T) {
 func TestClientProcessesCUPSJob(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_cups.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -1589,7 +1627,7 @@ func TestClientResetsToIdleAfterCompletion(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "state.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1699,7 +1737,7 @@ func TestClientResetsToIdleAfterCompletion(t *testing.T) {
 func TestSpooler_SNMPTargetSelectionPolicy(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "state.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open test state db: %v", err)
 	}
@@ -1839,7 +1877,7 @@ func TestJobPDFCleanup(t *testing.T) {
 	// Test A — Successful completion
 	t.Run("successful completion deletes intended PDF and preserves others", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -1926,7 +1964,7 @@ func TestJobPDFCleanup(t *testing.T) {
 	// Test B — Persistence failure
 	t.Run("persistence failure preserves PDF and does not invoke callback", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -1942,13 +1980,13 @@ func TestJobPDFCleanup(t *testing.T) {
 			StartFromPage: 1,
 			Duplex:        contracts.DuplexSimplex,
 		}
-		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-			t.Fatalf("SaveJob failed: %v", err)
-		}
-
 		// Arrange for persistence failure by exhausting paper inventory to 0 while job requires 2 sheets
 		if err := store.ResetPaperTray(ctx, 0); err != nil {
 			t.Fatalf("ResetPaperTray failed: %v", err)
+		}
+
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
 		}
 
 		pdfPath := jobPDFPath(tmpDir, cmd.JobID)
@@ -1998,7 +2036,7 @@ func TestJobPDFCleanup(t *testing.T) {
 	// Test C — Missing PDF
 	t.Run("missing PDF does not prevent successful completion", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -2097,7 +2135,7 @@ func TestJobPDFCleanup(t *testing.T) {
 	// Test E — Interrupted / paused jobs retain their files
 	t.Run("interrupted and paused jobs retain downloaded PDF files", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -2161,7 +2199,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioA_PersistenceFailure", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_a.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -2207,7 +2245,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			// Deterministic synchronization probe: send refill immediately after.
 			// Because handleConnection processes messages sequentially on a single goroutine,
 			// receiving "health" deterministically proves handleIncomingJob finished.
-			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+			s120 := 120
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: &s120})
 
 			for {
 				var msg wireMessage
@@ -2297,7 +2336,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioB_SuccessfulAcceptance", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_b.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -2328,8 +2367,9 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 
 			// Send job command
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
-			// Deterministic synchronization: probe with refill message
-			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+			// Deterministic synchronization: probe with refill message (rejected while active job exists)
+			s120 := 120
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: &s120, RequestID: "sync-b"})
 
 			for {
 				var msg wireMessage
@@ -2352,7 +2392,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 					}
 					receivedAck <- msg
 				}
-				if msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 200 {
+				if msg.Type == "refill_ack" || (msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 120) {
 					close(doneSync)
 					return
 				}
@@ -2427,7 +2467,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioC_DuplicateBeforePrinting", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_c.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -2598,7 +2638,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioD_DuplicateAfterPrinterSubmission", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_d.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -2728,7 +2768,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioE_DuplicateCompletedJob", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_e.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -2854,7 +2894,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioF_ConflictingDuplicatePayload", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_f.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -2893,7 +2933,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &conflictingCmd})
 			// Deterministic synchronization: probe with refill message
-			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+			s120 := 120
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: &s120})
 
 			for {
 				var msg wireMessage
@@ -2966,7 +3007,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioG_QueueSaturationDurableAcceptance", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_g.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3096,7 +3137,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioH_ReconnectRepeatedDelivery", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_h.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3246,7 +3287,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 	t.Run("ScenarioI_AdmissionSendsOnlyAckEvenIfAdvancedToPrinting", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_i.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3279,7 +3320,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			// Send job command
 			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "job", Job: &cmd})
 			// Probe with refill to confirm handleIncomingJob is completely finished
-			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+			s120 := 120
+			_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: &s120, RequestID: "sync-i"})
 
 			for {
 				var msg wireMessage
@@ -3289,7 +3331,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 				msgMu.Lock()
 				receivedMessages = append(receivedMessages, msg)
 				msgMu.Unlock()
-				if msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 200 {
+				if msg.Type == "refill_ack" || (msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 120) {
 					close(doneSync)
 					return
 				}
@@ -3415,7 +3457,7 @@ func TestCUPSSubmissionPersistence(t *testing.T) {
 	t.Run("ScenarioA_PreSubmissionSQLiteFailure", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_a.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3497,7 +3539,7 @@ func TestCUPSSubmissionPersistence(t *testing.T) {
 	t.Run("ScenarioB_SuccessfulSubmission", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_b.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3613,7 +3655,7 @@ job-media-sheets-completed (integer) = 1
 	t.Run("ScenarioC_PostSubmissionSQLiteFailure", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_c.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3712,7 +3754,7 @@ job-media-sheets-completed (integer) = 1
 	t.Run("ScenarioD_CUPSSubmissionCommandFailure", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_d.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3790,7 +3832,7 @@ job-media-sheets-completed (integer) = 1
 	t.Run("ScenarioE_MissingOrUnparseableCUPSRequestID", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_e.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3868,7 +3910,7 @@ job-media-sheets-completed (integer) = 1
 	t.Run("ScenarioF_RestartAfterSubmissionIntentPersistence", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_f.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -3974,7 +4016,7 @@ job-media-sheets-completed (integer) = 1
 	t.Run("ScenarioG_CancellationAndExistingMonitoring", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_g.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -4021,7 +4063,7 @@ job-media-sheets-completed (integer) = 1
 	t.Run("MockCUPSPrint_PreSubmissionFailure_PreventsPrinting", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		dbPath := filepath.Join(tmpDir, "kiosk_mock.db")
-		store, err := state.Open(dbPath)
+		store, err := openCalibratedTestStore(t, dbPath)
 		if err != nil {
 			t.Fatalf("failed to open store: %v", err)
 		}
@@ -4158,7 +4200,7 @@ func TestCUPSHoldOutcomeHandling(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
 			dbPath := filepath.Join(tmpDir, "kiosk.db")
-			store, err := state.Open(dbPath)
+			store, err := openCalibratedTestStore(t, dbPath)
 			if err != nil {
 				t.Fatalf("failed to open store: %v", err)
 			}
@@ -4406,7 +4448,7 @@ func TestFormatCUPSHoldOutcomeReasonDirect(t *testing.T) {
 
 func TestClient_WebSocket_SecretSanitization(t *testing.T) {
 	secret := "kiosk-super-secret-auth-key-987654"
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_secret.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_secret.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -4562,7 +4604,7 @@ func TestClient_PingWatchdog_UnresponsivePeer_TriggersReconnect(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_watchdog.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_watchdog.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -4670,7 +4712,7 @@ func TestClient_Heartbeat_WriteError_TerminatesConnection(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_hb_err.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_hb_err.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -4768,7 +4810,7 @@ func TestClient_PingWatchdog_CleanShutdown(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_clean_shutdown.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_clean_shutdown.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -4835,7 +4877,7 @@ func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_sendmu.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_sendmu.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -4928,7 +4970,7 @@ func TestClient_PingWatchdog_NotBlockedBySendMu(t *testing.T) {
 }
 
 func TestClient_SafeURL_RemovesEmbeddedUserInfoAndFragment(t *testing.T) {
-	st, err := state.Open(filepath.Join(t.TempDir(), "safe_url.db"))
+	st, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "safe_url.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5002,7 +5044,7 @@ func TestClient_PingWatchdog_ReconnectWhileSendMuLocked(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_watchdog_sendmu_reconnect.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_watchdog_sendmu_reconnect.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -5117,7 +5159,7 @@ func TestClient_IncompleteJobSync_ReconnectWhileSendMuLocked(t *testing.T) {
 	}))
 	defer wsServer.Close()
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "test_incomplete_sync_sendmu.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(t.TempDir(), "test_incomplete_sync_sendmu.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}

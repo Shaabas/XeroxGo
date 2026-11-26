@@ -33,7 +33,7 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestHealthScreen_FaultPersistence_DoesNotResetToReadyToPrint(t *testing.T) 
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestHealthScreen_FaultPersistence_DoesNotResetToReadyToPrint(t *testing.T) 
 // back to ModePrinting.
 func TestHealthScreen_StaleProgressUpdates_CannotOverwriteErrorScreen(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestHealthScreen_Recovery_RefreshesScreenWithoutReprintingOrCompleting(t *t
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -750,7 +750,7 @@ func TestHealthScreen_DuplicateErrorHandling_ExactlyOnce(t *testing.T) {
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -879,7 +879,7 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1047,7 +1047,7 @@ func TestHealthScreen_UnstableRecovery_TransientAndSNMPTimeoutRejected(t *testin
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1163,7 +1163,7 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1314,7 +1314,7 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1444,7 +1444,7 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1563,7 +1563,7 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 func TestHealthScreen_ConcurrentCheckThenRender_ErrorScreenNeverOverwritten(t *testing.T) {
 	for iter := 0; iter < 10; iter++ {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -1676,7 +1676,7 @@ func TestHealthScreen_ConcurrentCheckThenRender_ErrorScreenNeverOverwritten(t *t
 // ModeIdle frames are suppressed from rendering while a hardware fault is active.
 func TestHealthScreen_ModeIdleSuppressedDuringActiveHardwareFault(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1737,7 +1737,7 @@ func TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk(t *t
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1854,7 +1854,7 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1973,7 +1973,7 @@ func TestHealthScreen_UncertainHeldState_PreservesPausedError(t *testing.T) {
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2079,7 +2079,7 @@ func TestHealthScreen_CompletedCUPSWithoutPhysicalProof_NeverSynthesizesTotalShe
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2194,7 +2194,7 @@ func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesiz
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2326,7 +2326,7 @@ func TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricate
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "state.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "state.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2468,7 +2468,7 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "partial_odo.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "partial_odo.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2547,6 +2547,7 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	}
 
 	client, err := NewClient(cfg)
@@ -2600,7 +2601,7 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "missing_odo.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "missing_odo.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2669,6 +2670,7 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	}
 
 	client, err := NewClient(cfg)
@@ -2711,7 +2713,7 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "rec_noproof.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "rec_noproof.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2845,7 +2847,7 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 	defer cancel()
 
 	tmpDir := t.TempDir()
-	store, err := state.Open(filepath.Join(tmpDir, "full_odo.db"))
+	store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "full_odo.db"))
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2924,6 +2926,7 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
+		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	}
 
 	client, err := NewClient(cfg)

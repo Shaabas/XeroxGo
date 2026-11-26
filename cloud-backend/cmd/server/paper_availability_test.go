@@ -54,6 +54,13 @@ func connectKioskWithHealth(t *testing.T, srvURL, kioskID string, initialHealth 
 	// Send initial health observation
 	writeCtx, wCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer wCancel()
+	if initialHealth.ConfiguredTrayCapacity <= 0 {
+		if initialHealth.EstimatedSheets > 0 {
+			initialHealth.ConfiguredTrayCapacity = initialHealth.EstimatedSheets
+		} else {
+			initialHealth.ConfiguredTrayCapacity = 150
+		}
+	}
 	if initialHealth.EvaluatedHealth == "" {
 		switch {
 		case !initialHealth.Online || initialHealth.State == "ERROR" || initialHealth.State == "OFFLINE" || initialHealth.PaperJam || initialHealth.CoverOpen || initialHealth.OutputBinFull:
@@ -92,8 +99,9 @@ func sendTestHealthyStatus(ctx context.Context, t *testing.T, hub *ws.Hub, conn 
 		State:               "IDLE",
 		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
 		PaperTrayStatus:     "OK",
-		EstimatedSheets:     250,
-		InventoryCalibrated: true,
+		EstimatedSheets:        250,
+		ConfiguredTrayCapacity: 250,
+		InventoryCalibrated:    true,
 		ExecutionSafe:       true,
 		TonerLevelPercent:   90,
 		TonerLevelKnown:     true,
@@ -223,15 +231,16 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	// 3. Connect/update with Tray UNKNOWN -> HTTP 409 Conflict (PAPER_UNKNOWN)
 	now3 := time.Now().UTC()
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:              true,
-		State:               "IDLE",
-		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
-		PaperTrayStatus:     "UNKNOWN",
-		EstimatedSheets:     100,
-		InventoryCalibrated: false,
-		ExecutionSafe:       true,
-		UpdatedAt:           now3,
-		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now3, contracts.DefaultTelemetryMaxAge),
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "UNKNOWN",
+		EstimatedSheets:        100,
+		ConfiguredTrayCapacity: 250,
+		InventoryCalibrated:    false,
+		ExecutionSafe:          true,
+		UpdatedAt:              now3,
+		EvidenceFreshness:      contracts.BuildUniformEvidenceFreshness(now3, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -253,15 +262,16 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	// 4. Update with Tray EMPTY -> HTTP 409 Conflict (INSUFFICIENT_PAPER)
 	now4 := time.Now().UTC().Add(time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:              true,
-		State:               "IDLE",
-		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
-		PaperTrayStatus:     "OK",
-		EstimatedSheets:     0,
-		InventoryCalibrated: true,
-		ExecutionSafe:       true,
-		UpdatedAt:           now4,
-		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now4, contracts.DefaultTelemetryMaxAge),
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "OK",
+		EstimatedSheets:        0,
+		ConfiguredTrayCapacity: 250,
+		InventoryCalibrated:    true,
+		ExecutionSafe:          true,
+		UpdatedAt:              now4,
+		EvidenceFreshness:      contracts.BuildUniformEvidenceFreshness(now4, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -283,15 +293,16 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	// 5. Update with Insufficient Sheets: tray has 5 sheets, order needs 10 -> HTTP 409 Conflict (INSUFFICIENT_PAPER)
 	now5 := time.Now().UTC().Add(2 * time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:              true,
-		State:               "IDLE",
-		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
-		PaperTrayStatus:     "LOW",
-		EstimatedSheets:     5,
-		InventoryCalibrated: true,
-		ExecutionSafe:       true,
-		UpdatedAt:           now5,
-		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now5, contracts.DefaultTelemetryMaxAge),
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "LOW",
+		EstimatedSheets:        5,
+		ConfiguredTrayCapacity: 250,
+		InventoryCalibrated:    true,
+		ExecutionSafe:          true,
+		UpdatedAt:              now5,
+		EvidenceFreshness:      contracts.BuildUniformEvidenceFreshness(now5, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -313,15 +324,16 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	// 6. Update with Sufficient Sheets: tray has 50 sheets, order needs 10 -> HTTP 200 OK!
 	now6 := time.Now().UTC().Add(3 * time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:              true,
-		State:               "IDLE",
-		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
-		PaperTrayStatus:     "OK",
-		EstimatedSheets:     50,
-		InventoryCalibrated: true,
-		ExecutionSafe:       true,
-		UpdatedAt:           now6,
-		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now6, contracts.DefaultTelemetryMaxAge),
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "OK",
+		EstimatedSheets:        50,
+		ConfiguredTrayCapacity: 250,
+		InventoryCalibrated:    true,
+		ExecutionSafe:          true,
+		UpdatedAt:              now6,
+		EvidenceFreshness:      contracts.BuildUniformEvidenceFreshness(now6, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -413,35 +425,49 @@ func TestPaperAvailability_Refill_Endpoint(t *testing.T) {
 	kioskID := "kiosk-refill-test"
 
 	conn, cancel := connectKioskWithHealth(t, server.URL, kioskID, contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "EMPTY",
-		EstimatedSheets: 0,
-		UpdatedAt:       time.Now().UTC(),
+		Online:                 false,
+		State:                  "ERROR",
+		EvaluatedHealth:        contracts.EvaluatedHealthFault,
+		PaperTrayStatus:        "EMPTY",
+		EstimatedSheets:        0,
+		ConfiguredTrayCapacity: 150,
+		UpdatedAt:              time.Now().UTC(),
 	})
 	defer func() {
 		cancel()
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}()
 
-	// Background reader for kiosk WebSocket to receive the refill command
+	// Background reader for kiosk WebSocket to receive the refill command and send refill_ack
 	receivedRefill := make(chan wireMsg, 1)
 	go func() {
 		for {
-			var msg wireMsg
+			var msg struct {
+				Type      string `json:"type"`
+				Sheets    int    `json:"sheets,omitempty"`
+				RequestID string `json:"request_id,omitempty"`
+			}
 			if err := wsjson.Read(context.Background(), conn, &msg); err != nil {
 				return
 			}
 			if msg.Type == "refill" {
-				receivedRefill <- msg
+				_ = wsjson.Write(context.Background(), conn, map[string]interface{}{
+					"type":          "refill_ack",
+					"request_id":    msg.RequestID,
+					"ok":            true,
+					"calibrated":    true,
+					"sheets":        msg.Sheets,
+					"inventory_seq": 1,
+				})
+				receivedRefill <- wireMsg{Type: msg.Type, Sheets: msg.Sheets}
 				return
 			}
 		}
 	}()
 
-	// Call POST /api/k/{kiosk_id}/refill with {"sheets": 250}
+	// Call POST /api/k/{kiosk_id}/refill with {"sheets": 140}
 	refillURL := fmt.Sprintf("%s/api/k/%s/refill", server.URL, kioskID)
-	reqBody := bytes.NewReader([]byte(`{"sheets": 250}`))
+	reqBody := bytes.NewReader([]byte(`{"sheets": 140}`))
 	req, _ := http.NewRequest(http.MethodPost, refillURL, reqBody)
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
@@ -456,14 +482,14 @@ func TestPaperAvailability_Refill_Endpoint(t *testing.T) {
 
 	var resData map[string]interface{}
 	_ = json.NewDecoder(res.Body).Decode(&resData)
-	if resData["ok"] != true || resData["sheets"] != float64(250) {
+	if resData["ok"] != true || resData["sheets"] != float64(140) || resData["calibrated"] != true {
 		t.Errorf("unexpected refill response: %v", resData)
 	}
 
 	select {
 	case msg := <-receivedRefill:
-		if msg.Type != "refill" || msg.Sheets != 250 {
-			t.Errorf("expected wire message {Type: refill, Sheets: 250}, got %+v", msg)
+		if msg.Type != "refill" || msg.Sheets != 140 {
+			t.Errorf("expected wire message {Type: refill, Sheets: 140}, got %+v", msg)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for kiosk to receive refill wire message")

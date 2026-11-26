@@ -15,6 +15,7 @@ import (
 
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/cloud-backend/internal/ws"
+	"xeroxgo/pkg/contracts"
 )
 
 func setupAcceptanceTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
@@ -32,12 +33,21 @@ func setupAcceptanceTestServer(t *testing.T) (*appServer, *http.ServeMux, string
 		t.Fatalf("failed to create jobs dir: %v", err)
 	}
 
+	fullPolicy := contracts.ProductCapabilityPolicy{
+		AllowColor:     true,
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	}
 	cfg := &serverConfig{
 		addr:           "localhost:0",
 		dbPath:         dbPath,
 		jobsDir:        jobsDir,
 		downloadSecret: []byte("test_secret_key_1234567890"),
 		devMode:        true,
+		duplexEnabled:  true,
+		policy:         &fullPolicy,
 	}
 
 	hub := ws.NewHub(s)

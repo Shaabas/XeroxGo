@@ -45,12 +45,15 @@ func TestOpenInitializesDatabase(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
-	sheets, err := s.GetEstimatedSheets(ctx)
+	sheets, calib, err := s.GetPaperSupply(ctx)
 	if err != nil {
-		t.Fatalf("GetEstimatedSheets failed: %v", err)
+		t.Fatalf("GetPaperSupply failed: %v", err)
 	}
-	if sheets != 250 {
-		t.Errorf("initial estimated sheets = %d, want 250", sheets)
+	if sheets != 0 {
+		t.Errorf("initial estimated sheets = %d, want 0", sheets)
+	}
+	if calib {
+		t.Errorf("initial calibrated = true, want false")
 	}
 
 	var journalMode string
@@ -141,6 +144,10 @@ func TestCrashRecoveryAfterReopen(t *testing.T) {
 	cmd.Copies = 2
 	cmd.Duplex = contracts.DuplexShortEdge
 	cmd.StartFromPage = 2
+
+	if err := store1.ResetPaperTray(ctx, 150); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
 
 	if err := store1.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
@@ -238,8 +245,8 @@ func TestCrashRecoveryAfterReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
-	if sheets != 247 {
-		t.Errorf("estimated sheets after reopen = %d, want 247", sheets)
+	if sheets != 147 {
+		t.Errorf("estimated sheets after reopen = %d, want 147", sheets)
 	}
 }
 
@@ -346,13 +353,16 @@ func TestDecrementSheets(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1. Initial count is 250
+	// 1. Initial count is 0, calibrate to 150
 	sheets, err := s.GetEstimatedSheets(ctx)
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
-	if sheets != 250 {
-		t.Fatalf("initial sheets = %d, want 250", sheets)
+	if sheets != 0 {
+		t.Fatalf("initial sheets = %d, want 0", sheets)
+	}
+	if err := s.ResetPaperTray(ctx, 150); err != nil {
+		t.Fatalf("ResetPaperTray(150) failed: %v", err)
 	}
 
 	// 2. Decrement by 3 succeeds
@@ -360,18 +370,18 @@ func TestDecrementSheets(t *testing.T) {
 		t.Fatalf("DecrementSheets(3) failed: %v", err)
 	}
 
-	// 3. Count is 247
+	// 3. Count is 147
 	sheets, err = s.GetEstimatedSheets(ctx)
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
-	if sheets != 247 {
-		t.Errorf("sheets after decrement = %d, want 247", sheets)
+	if sheets != 147 {
+		t.Errorf("sheets after decrement = %d, want 147", sheets)
 	}
 
-	// 4. Decrement by 247 succeeds and yields 0
-	if err := s.DecrementSheets(ctx, 247); err != nil {
-		t.Fatalf("DecrementSheets(247) failed: %v", err)
+	// 4. Decrement by 147 succeeds and yields 0
+	if err := s.DecrementSheets(ctx, 147); err != nil {
+		t.Fatalf("DecrementSheets(147) failed: %v", err)
 	}
 	sheets, err = s.GetEstimatedSheets(ctx)
 	if err != nil {
@@ -418,13 +428,13 @@ func TestResetPaperTray(t *testing.T) {
 	if calib {
 		t.Errorf("expected initial calibrated=false, got true")
 	}
-	if initSheets != 250 {
-		t.Errorf("initial sheets = %d, want 250", initSheets)
+	if initSheets != 0 {
+		t.Errorf("initial sheets = %d, want 0", initSheets)
 	}
 
-	// Reset to 250 succeeds and calibrates tray
-	if err := s.ResetPaperTray(ctx, 250); err != nil {
-		t.Fatalf("ResetPaperTray(250) failed: %v", err)
+	// Reset to 150 (default tray capacity) succeeds and calibrates tray
+	if err := s.ResetPaperTray(ctx, 150); err != nil {
+		t.Fatalf("ResetPaperTray(150) failed: %v", err)
 	}
 	sheets, calib, err := s.GetPaperSupply(ctx)
 	if err != nil {
@@ -433,8 +443,8 @@ func TestResetPaperTray(t *testing.T) {
 	if !calib {
 		t.Errorf("expected calibrated=true after ResetPaperTray, got false")
 	}
-	if sheets != 250 {
-		t.Errorf("sheets = %d, want 250", sheets)
+	if sheets != 150 {
+		t.Errorf("sheets = %d, want 150", sheets)
 	}
 
 	// Reset to 120 succeeds
@@ -455,12 +465,12 @@ func TestResetPaperTray(t *testing.T) {
 		t.Errorf("sheets = %d, want 0", sheets)
 	}
 
-	// Counts outside 0-250 are rejected
+	// Counts outside 0-150 are rejected
 	if err := s.ResetPaperTray(ctx, -1); err == nil {
 		t.Error("expected error for ResetPaperTray(-1), got nil")
 	}
-	if err := s.ResetPaperTray(ctx, 251); err == nil {
-		t.Error("expected error for ResetPaperTray(251), got nil")
+	if err := s.ResetPaperTray(ctx, 151); err == nil {
+		t.Error("expected error for ResetPaperTray(151), got nil")
 	}
 
 	// Value was not corrupted by failed resets
@@ -898,13 +908,13 @@ func TestRecordSheetProgress_AtomicityAndRollbackOnInsufficientSupply(t *testing
 	cmd.TotalPages = 10
 	cmd.TotalSheets = 5
 
-	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
-
 	// Set tray stock to exactly 2 sheets
 	if err := s.ResetPaperTray(ctx, 2); err != nil {
 		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	// 1. Progress by 1 sheet (stock 2 -> 1, sheets_printed 0 -> 1)
@@ -964,11 +974,11 @@ func TestRecordSheetProgress_MonotonicityAndDuplicateIdempotency(t *testing.T) {
 	cmd.TotalPages = 10
 	cmd.TotalSheets = 5
 
-	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
 	if err := s.ResetPaperTray(ctx, 20); err != nil {
 		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	// Initial progress: sheet 1
@@ -1047,11 +1057,11 @@ func TestRecordSheetProgress_CompletionDeductionAndDuplicateCompletion(t *testin
 	cmd.TotalPages = 10
 	cmd.TotalSheets = 5
 
-	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
 	if err := s.ResetPaperTray(ctx, 50); err != nil {
 		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	// 1. Partial print: 2 sheets
@@ -1140,5 +1150,74 @@ func TestRecordSheetProgress_Validation(t *testing.T) {
 	// job not found
 	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{JobID: "non-existent-job", Status: contracts.JobStatusPrinting}); err == nil {
 		t.Error("expected error for non-existent job")
+	}
+}
+
+func TestPackage5B_ConfigurableCapacityBoundsAndRestartPreservation(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "cap_5b.db")
+
+	if _, err := OpenWithCapacity(dbPath, 0); err == nil {
+		t.Fatal("expected OpenWithCapacity(0) to fail")
+	}
+	if _, err := OpenWithCapacity(dbPath, -10); err == nil {
+		t.Fatal("expected OpenWithCapacity(-10) to fail")
+	}
+
+	s1, err := OpenWithCapacity(dbPath, 200)
+	if err != nil {
+		t.Fatalf("OpenWithCapacity(200) failed: %v", err)
+	}
+	ctx := context.Background()
+
+	sheets, calib, err := s1.GetPaperSupply(ctx)
+	if err != nil || calib || sheets != 0 {
+		t.Fatalf("fresh DB want (0, false, nil), got (%d, %v, %v)", sheets, calib, err)
+	}
+	if err := s1.ResetPaperTray(ctx, 180); err != nil {
+		t.Fatalf("ResetPaperTray(180) with capacity 200 failed: %v", err)
+	}
+	if err := s1.ResetPaperTray(ctx, 201); err == nil {
+		t.Fatal("expected ResetPaperTray(201) with capacity 200 to fail")
+	}
+	_ = s1.Close()
+
+	// Reopen with same capacity preserves inventory & calibration (no auto-calibration overwrite)
+	s2, err := OpenWithCapacity(dbPath, 200)
+	if err != nil {
+		t.Fatalf("reopen OpenWithCapacity(200) failed: %v", err)
+	}
+	sheets, calib, err = s2.GetPaperSupply(ctx)
+	if err != nil || !calib || sheets != 180 {
+		t.Fatalf("reopen want (180, true, nil), got (%d, %v, %v)", sheets, calib, err)
+	}
+	_ = s2.Close()
+
+	// Reopen with smaller capacity (150) must fail bounds check rather than silently clamping
+	s3, err := OpenWithCapacity(dbPath, 150)
+	if err != nil {
+		t.Fatalf("OpenWithCapacity(150) failed: %v", err)
+	}
+	defer s3.Close()
+	if _, _, err := s3.GetPaperSupply(ctx); err == nil {
+		t.Fatal("expected GetPaperSupply to reject out-of-bounds stored 180 > 150 without silent clamping")
+	}
+}
+
+func TestPackage5B_CalibratePaperTrayRejectsActiveOrUncertainJobs(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	cmd := sampleCommand("job-calib-block")
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	if err := s.CalibratePaperTray(ctx, 100); err == nil {
+		t.Fatal("expected CalibratePaperTray to reject while PRINTING job exists")
+	}
+	sheets, calib, err := s.GetPaperSupply(ctx)
+	if err != nil || calib || sheets != 0 {
+		t.Fatalf("expected inventory untouched (0, false), got (%d, %v, %v)", sheets, calib, err)
 	}
 }

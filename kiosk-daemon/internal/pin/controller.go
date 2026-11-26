@@ -87,10 +87,11 @@ type Controller struct {
 	errorTimer      *time.Timer
 	stopCountdown   chan struct{}
 
-	inputSource input.Source
-	ctx         context.Context
-	cancel      context.CancelFunc
-	done        chan struct{}
+	inputSource     input.Source
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	eventsProcessed atomic.Uint64
 }
 
 // NewController creates and validates a new PIN Controller.
@@ -334,6 +335,7 @@ func (c *Controller) eventLoop() {
 }
 
 func (c *Controller) handleEvent(ev input.Event) {
+	defer c.eventsProcessed.Add(1)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
