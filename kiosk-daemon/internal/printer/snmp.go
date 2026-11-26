@@ -26,6 +26,7 @@ const (
 	oidHrPrinterStatus             = "1.3.6.1.2.1.25.3.5.1.1.1"
 	oidHrPrinterDetectedErrorState = "1.3.6.1.2.1.25.3.5.1.2.1"
 	oidPrtMarkerLifeCount          = "1.3.6.1.2.1.43.10.2.1.4.1.1"
+	oidPrtMarkerCounterUnit        = "1.3.6.1.2.1.43.10.2.1.3.1.1"
 )
 
 // SNMPConfig encapsulates SNMP connection parameters.
@@ -806,13 +807,19 @@ func firstNonEmpty(vals ...string) string {
 
 // HardwareTelemetry encapsulates physical hardware readings from SNMP.
 type HardwareTelemetry struct {
-	Online      bool
-	LifeCount   int64
-	HasLife     bool
-	Flags       PrinterErrorFlags
-	HasFlags    bool
-	StatusState string
-	ErrorMsg    string
+	Online          bool
+	LifeCount       int64
+	HasLife         bool
+	CounterIndex    string
+	CounterUnit     int64
+	CounterUnitName string
+	IsPageCounter   bool
+	HasCounterMeta  bool
+	ObservedAt      time.Time
+	Flags           PrinterErrorFlags
+	HasFlags        bool
+	StatusState     string
+	ErrorMsg        string
 }
 
 func pollHardwareTelemetryWithFactory(
@@ -843,6 +850,7 @@ func pollHardwareTelemetryWithFactory(
 
 	var telem HardwareTelemetry
 	telem.Online = true
+	telem.ObservedAt = time.Now().UTC()
 
 	// 1. Status
 	if pdu, ok := findPDU(packet, oidHrPrinterStatus, 0); ok && isValidPDU(pdu) {
@@ -875,11 +883,25 @@ func pollHardwareTelemetryWithFactory(
 		}
 	}
 
-	// 3. LifeCount
+	// 3. LifeCount & CounterUnit
 	if pdu, ok := findPDU(packet, oidPrtMarkerLifeCount, 2); ok && isValidPDU(pdu) {
 		if v, okVal := pduToInt64(pdu); okVal {
 			telem.LifeCount = v
 			telem.HasLife = true
+			telem.CounterIndex = "1.1"
+		}
+	}
+	if telem.HasLife {
+		if unitPkt, uErr := session.Get([]string{oidPrtMarkerCounterUnit}); uErr == nil && unitPkt != nil {
+			if pdu, ok := findPDU(unitPkt, oidPrtMarkerCounterUnit, 0); ok && isValidPDU(pdu) {
+				if v, okVal := pduToInt64(pdu); okVal {
+					unitName, isPage := FormatMarkerCounterUnit(v)
+					telem.CounterUnit = v
+					telem.CounterUnitName = unitName
+					telem.IsPageCounter = isPage
+					telem.HasCounterMeta = true
+				}
+			}
 		}
 	}
 

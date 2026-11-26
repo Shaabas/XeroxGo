@@ -55,6 +55,7 @@ type StateStore interface {
 	UpdateProgress(ctx context.Context, event contracts.JobProgressEvent) error
 	RecordSheetProgress(ctx context.Context, event contracts.JobProgressEvent) error
 	MarkJobSubmitting(ctx context.Context, jobID string) error
+	MarkJobSubmittingWithBaseline(ctx context.Context, jobID string, baselineSet bool, baselineValue int64, baselineIndex string, baselineUnit int64, baselineObservedAt time.Time) error
 	RecordJobSubmission(ctx context.Context, jobID string, cupsJobID string) error
 	GetIncompleteJobs(ctx context.Context) ([]state.StoredJob, error)
 	GetJob(ctx context.Context, jobID string) (*state.StoredJob, error)
@@ -1869,39 +1870,10 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 			return
 		}
 
-		targetSheets := streamSheetsCompleted
-		if targetSheets > cmd.TotalSheets {
-			targetSheets = cmd.TotalSheets
-		}
-		if targetSheets < sheetsPrinted {
-			targetSheets = sheetsPrinted
-		}
-
-		if cmd.Duplex == contracts.DuplexSimplex {
-			pagesPrinted = (cmd.StartFromPage - 1) + streamSheetsCompleted/cmd.Copies
-		} else {
-			pagesPrinted = (cmd.StartFromPage - 1) + (streamSheetsCompleted*2)/cmd.Copies
-		}
-		if pagesPrinted > cmd.TotalPages {
-			pagesPrinted = cmd.TotalPages
-		}
-
-		evt := contracts.JobProgressEvent{
-			JobID:         cmd.JobID,
-			KioskID:       cmd.KioskID,
-			Status:        contracts.JobStatusPrinting,
-			PagesPrinted:  pagesPrinted,
-			SheetsPrinted: targetSheets,
-			Timestamp:     time.Now().UTC(),
-		}
-		if err := c.cfg.StateStore.RecordSheetProgress(jobCtx, evt); err != nil {
-			log.Printf("[SPOOLER] RecordSheetProgress error during CUPS monitoring for job %s: %v", cmd.JobID, err)
+		if !c.recordPhysicalSheetProgress(jobCtx, cmd, "Job ID: "+cmd.JobID, cmd.StartFromPage, 0, true, streamSheetsCompleted, &pagesPrinted, &sheetsPrinted) {
 			cancelJob()
 			return
 		}
-		sheetsPrinted = targetSheets
-		c.sendProgress(jobCtx, evt)
-
 		if !c.isHardwareFaultActive() && !faultHandled.Load() {
 			_ = c.renderScreen(ui_ipc.ScreenState{
 				Mode:            ui_ipc.ModePrinting,
@@ -1914,13 +1886,23 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		}
 	}
 
-	var err error
-	if c.snmpPoller != nil {
-		err = printer.MonitorCUPSJobWithTelemetryCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, c.snmpPoller)
-	} else {
-		snmpCfg := c.getSNMPConfig()
-		err = printer.MonitorCUPSJobWithSNMPCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, snmpCfg)
+	baseline := printer.CounterBaseline{
+		HasBaseline: job.BaselineCounterSet,
+		Value:       job.BaselineCounterValue,
+		Index:       job.BaselineCounterIndex,
+		Unit:        job.BaselineCounterUnit,
+		ObservedAt:  job.BaselineObservedAt,
 	}
+	poller := c.snmpPoller
+	if poller == nil {
+		if snmpCfg := c.getSNMPConfig(); snmpCfg != nil {
+			cfgCopy := *snmpCfg
+			poller = func(pCtx context.Context) printer.HardwareTelemetry {
+				return printer.PollHardwareTelemetry(pCtx, cfgCopy)
+			}
+		}
+	}
+	err := printer.MonitorCUPSJobWithTelemetryBaselineCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, cmd, job.CUPSJobID, onPage, 500*time.Millisecond, poller, baseline)
 
 	cancelJob()
 	<-monitorDone
@@ -2708,42 +2690,11 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 		if streamSheetsCompleted > lastReportedStreamSheets {
 			lastReportedStreamSheets = streamSheetsCompleted
-			targetSheets := initialSheetsOffset + streamSheetsCompleted
-			if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
-				targetSheets = streamSheetsCompleted
-			}
-			if targetSheets > cmd.TotalSheets {
-				targetSheets = cmd.TotalSheets
-			}
-			if targetSheets < sheetsPrinted {
-				targetSheets = sheetsPrinted
-			}
-
-			if cmd.Duplex == contracts.DuplexSimplex {
-				pagesPrinted = (startPage - 1) + streamSheetsCompleted/cmd.Copies
-			} else {
-				pagesPrinted = (startPage - 1) + (streamSheetsCompleted*2)/cmd.Copies
-			}
-
-			if pagesPrinted > cmd.TotalPages {
-				pagesPrinted = cmd.TotalPages
-			}
-
-			evt := contracts.JobProgressEvent{
-				JobID:         cmd.JobID,
-				KioskID:       cmd.KioskID,
-				Status:        contracts.JobStatusPrinting,
-				PagesPrinted:  pagesPrinted,
-				SheetsPrinted: targetSheets,
-				Timestamp:     time.Now().UTC(),
-			}
-			if err := c.cfg.StateStore.RecordSheetProgress(jobCtx, evt); err != nil {
-				log.Printf("[SPOOLER] RecordSheetProgress error for job %s: %v", cmd.JobID, err)
+			isCUPS := strings.TrimSpace(c.cfg.CUPSQueue) != ""
+			if !c.recordPhysicalSheetProgress(jobCtx, cmd, docDetail, startPage, initialSheetsOffset, isCUPS, streamSheetsCompleted, &pagesPrinted, &sheetsPrinted) {
 				cancelJob()
 				return
 			}
-			sheetsPrinted = targetSheets
-			c.sendProgress(jobCtx, evt)
 
 			if !c.isHardwareFaultActive() && !faultHandled.Load() {
 				_ = c.renderScreen(ui_ipc.ScreenState{
@@ -2870,29 +2821,45 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 				printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
 			}
 		} else {
-			hooks := &printer.CUPSPrintHooks{
-				OnSubmitting: func() error {
-					return c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID)
-				},
-				OnSubmitted: func(cupsJobID string) error {
-					cupsJobIDMu.Lock()
-					activeCUPSJobID = cupsJobID
-					cupsJobIDMu.Unlock()
-
-					c.cupsJobsMu.Lock()
-					if c.cupsJobIDs == nil {
-						c.cupsJobIDs = make(map[string]string)
-					}
-					c.cupsJobIDs[cmd.JobID] = cupsJobID
-					c.cupsJobsMu.Unlock()
-
-					return c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
-				},
-				SNMPConfig:          c.getSNMPConfig(),
-				TelemetryPoller:     c.snmpPoller,
-				PreserveJobOnCancel: preserveCUPSJob.Load,
+			var ownershipErr error
+			if c.cfg.CUPSRunner == nil {
+				ownershipErr = printer.VerifyNoUnrelatedActiveCUPSJob(jobCtx, nil, c.cfg.CUPSQueue, "")
 			}
-			printErr = printer.PrintPDFWithCUPSHooksCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, streamCmd, printPath, onPage, 500*time.Millisecond, hooks)
+			if ownershipErr != nil {
+				printErr = fmt.Errorf("pre-submission printer ownership check failed: %w", ownershipErr)
+			} else {
+				hooks := &printer.CUPSPrintHooks{
+					OnSubmittingWithBaseline: func(baseline printer.CounterBaseline) error {
+						return c.cfg.StateStore.MarkJobSubmittingWithBaseline(
+							jobCtx,
+							cmd.JobID,
+							baseline.HasBaseline,
+							baseline.Value,
+							baseline.Index,
+							baseline.Unit,
+							baseline.ObservedAt,
+						)
+					},
+					OnSubmitted: func(cupsJobID string) error {
+						cupsJobIDMu.Lock()
+						activeCUPSJobID = cupsJobID
+						cupsJobIDMu.Unlock()
+
+						c.cupsJobsMu.Lock()
+						if c.cupsJobIDs == nil {
+							c.cupsJobIDs = make(map[string]string)
+						}
+						c.cupsJobIDs[cmd.JobID] = cupsJobID
+						c.cupsJobsMu.Unlock()
+
+						return c.cfg.StateStore.RecordJobSubmission(jobCtx, cmd.JobID, cupsJobID)
+					},
+					SNMPConfig:          c.getSNMPConfig(),
+					TelemetryPoller:     c.snmpPoller,
+					PreserveJobOnCancel: preserveCUPSJob.Load,
+				}
+				printErr = printer.PrintPDFWithCUPSHooksCustom(jobCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, streamCmd, printPath, onPage, 500*time.Millisecond, hooks)
+			}
 		}
 	} else {
 		log.Printf("[SPOOLER] Streaming job %s to PJL printer %s", cmd.JobID, c.cfg.PrinterAddr)
@@ -2971,6 +2938,61 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		log.Printf("[SPOOLER] Job %s: %s", cmd.JobID, reason)
 		c.handleJobError(ctx, cmd, curPages, curSheets, reason)
 	}
+}
+
+// recordPhysicalSheetProgress is the single shared accounting implementation used by both
+// initial execution and resumed monitoring to commit atomic SQLite progress and inventory updates.
+func (c *Client) recordPhysicalSheetProgress(
+	jobCtx context.Context,
+	cmd contracts.PrintJobCommand,
+	docDetail string,
+	startPage int,
+	initialSheetsOffset int,
+	isCUPS bool,
+	streamSheetsCompleted int,
+	pagesPrinted *int,
+	sheetsPrinted *int,
+) bool {
+	targetSheets := initialSheetsOffset + streamSheetsCompleted
+	if isCUPS {
+		targetSheets = streamSheetsCompleted
+	}
+	if targetSheets > cmd.TotalSheets {
+		targetSheets = cmd.TotalSheets
+	}
+	if targetSheets < *sheetsPrinted {
+		targetSheets = *sheetsPrinted
+	}
+
+	nextPages := *pagesPrinted
+	if cmd.Duplex == contracts.DuplexSimplex {
+		nextPages = (startPage - 1) + streamSheetsCompleted/cmd.Copies
+	} else {
+		nextPages = (startPage - 1) + (streamSheetsCompleted*2)/cmd.Copies
+	}
+	if nextPages > cmd.TotalPages {
+		nextPages = cmd.TotalPages
+	}
+	if nextPages < *pagesPrinted {
+		nextPages = *pagesPrinted
+	}
+
+	evt := contracts.JobProgressEvent{
+		JobID:         cmd.JobID,
+		KioskID:       cmd.KioskID,
+		Status:        contracts.JobStatusPrinting,
+		PagesPrinted:  nextPages,
+		SheetsPrinted: targetSheets,
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := c.cfg.StateStore.RecordSheetProgress(jobCtx, evt); err != nil {
+		log.Printf("[SPOOLER] RecordSheetProgress error for job %s: %v", cmd.JobID, err)
+		return false
+	}
+	*pagesPrinted = nextPages
+	*sheetsPrinted = targetSheets
+	c.sendProgress(jobCtx, evt)
+	return true
 }
 
 func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand) {

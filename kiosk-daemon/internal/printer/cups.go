@@ -426,13 +426,117 @@ func shouldPreserveCUPSJob(ctx context.Context) bool {
 	return false
 }
 
+// CounterBaseline captures durable pre-submission hardware counter evidence.
+type CounterBaseline struct {
+	HasBaseline bool
+	Value       int64
+	Index       string
+	Unit        int64
+	ObservedAt  time.Time
+}
+
+// ExpectedCounterDelta returns the expected hardware counter delta for the job given its unit.
+// For RFC 3805 unit 7 (impressions) on simplex, 1 impression equals 1 sheet.
+// For unit 8 (sheets) or uncalibrated mock unit 0, expected delta equals TotalSheets.
+func ExpectedCounterDelta(cmd contracts.PrintJobCommand, unit int64) int {
+	if cmd.Duplex == contracts.DuplexSimplex {
+		return cmd.TotalSheets
+	}
+	if unit == 7 && cmd.TotalPages > 0 && cmd.Copies > 0 {
+		return cmd.TotalPages * cmd.Copies
+	}
+	return cmd.TotalSheets
+}
+
+// ImpressionsToSheets converts attributable hardware counter delta into physical sheets.
+func ImpressionsToSheets(cmd contracts.PrintJobCommand, unit int64, delta int64) int {
+	if delta <= 0 {
+		return 0
+	}
+	if cmd.Duplex == contracts.DuplexSimplex || unit != 7 {
+		if int(delta) > cmd.TotalSheets {
+			return cmd.TotalSheets
+		}
+		return int(delta)
+	}
+	sheets := int((delta + 1) / 2)
+	if sheets > cmd.TotalSheets {
+		return cmd.TotalSheets
+	}
+	return sheets
+}
+
+func isValidPageCounterReading(telem HardwareTelemetry) error {
+	if !telem.Online {
+		return errors.New("printer telemetry offline")
+	}
+	if !telem.HasLife || telem.LifeCount < 0 {
+		return errors.New("missing or negative hardware counter reading")
+	}
+	if telem.HasCounterMeta || telem.CounterUnit != 0 {
+		if _, valid := FormatMarkerCounterUnit(telem.CounterUnit); !valid {
+			return fmt.Errorf("unsupported hardware counter unit %d (%s)", telem.CounterUnit, telem.CounterUnitName)
+		}
+	}
+	if !telem.ObservedAt.IsZero() && time.Since(telem.ObservedAt) > 10*time.Second {
+		return fmt.Errorf("stale hardware counter reading (age %s)", time.Since(telem.ObservedAt).Round(time.Millisecond))
+	}
+	return nil
+}
+
+func isPrinterQuiescent(telem HardwareTelemetry) bool {
+	st := strings.ToUpper(strings.TrimSpace(telem.StatusState))
+	return st == "" || st == "IDLE" || st == "READY"
+}
+
+func hasBlockingTelemetryFlags(telem HardwareTelemetry) (bool, string) {
+	if !telem.HasFlags {
+		return false, ""
+	}
+	if telem.Flags.Jammed {
+		return true, "paper feed jam detected in printer"
+	}
+	if telem.Flags.DoorOpen {
+		return true, "printer cover is open"
+	}
+	if telem.Flags.NoPaper || telem.Flags.InputTrayEmpty {
+		return true, "printer paper tray is empty"
+	}
+	return false, ""
+}
+
+// VerifyNoUnrelatedActiveCUPSJob checks lpstat -W not-completed for unrelated active jobs on queue.
+func VerifyNoUnrelatedActiveCUPSJob(ctx context.Context, runner CommandRunner, queue, allowedCUPSJobID string) error {
+	if runner == nil || strings.TrimSpace(queue) == "" {
+		return nil
+	}
+	out, err := runner(ctx, "lpstat", "-W", "not-completed", "-o", queue)
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return nil
+	}
+	prefix := queue + "-"
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		jid := fields[0]
+		if strings.HasPrefix(jid, prefix) && (allowedCUPSJobID == "" || jid != allowedCUPSJobID) {
+			return fmt.Errorf("unrelated active CUPS job %s present on queue %q", jid, queue)
+		}
+	}
+	return nil
+}
+
 // CUPSPrintHooks provides optional callbacks and SNMP configuration during CUPS submission and lifecycle.
 type CUPSPrintHooks struct {
-	OnSubmitting        func() error
-	OnSubmitted         func(cupsJobID string) error
-	SNMPConfig          *SNMPConfig
-	TelemetryPoller     func(ctx context.Context) HardwareTelemetry
-	PreserveJobOnCancel func() bool
+	OnSubmitting             func() error
+	OnSubmittingWithBaseline func(baseline CounterBaseline) error
+	OnSubmitted              func(cupsJobID string) error
+	SNMPConfig               *SNMPConfig
+	TelemetryPoller          func(ctx context.Context) HardwareTelemetry
+	InitialBaseline          *CounterBaseline
+	PreserveJobOnCancel      func() bool
 }
 
 // PrintPDFWithCUPS submits a PDF file to the specified CUPS queue via the lp command
@@ -508,22 +612,72 @@ func PrintPDFWithCUPSHooksCustom(
 		lpArgs = append(lpArgs, "-o", "sides=two-sided-long-edge")
 	case contracts.DuplexShortEdge:
 		lpArgs = append(lpArgs, "-o", "sides=two-sided-short-edge")
+	default:
+		lpArgs = append(lpArgs, "-o", "sides=one-sided")
 	}
 
 	colorMode := strings.ToUpper(strings.TrimSpace(cmd.ColorMode))
 	if colorMode == "COLOR" {
 		lpArgs = append(lpArgs, "-o", "print-color-mode=color")
-	} else if colorMode == "BW" || colorMode == "MONOCHROME" {
+	} else {
 		lpArgs = append(lpArgs, "-o", "print-color-mode=monochrome")
 	}
+	lpArgs = append(lpArgs, "-o", "media=A4")
 
 	lpArgs = append(lpArgs, pdfPath)
 
+	var snmpCfg *SNMPConfig
+	var telemPoller func(context.Context) HardwareTelemetry
+	if hooks != nil {
+		snmpCfg = hooks.SNMPConfig
+		telemPoller = hooks.TelemetryPoller
+		if hooks.PreserveJobOnCancel != nil {
+			ctx = ContextWithPreserveChecker(ctx, hooks.PreserveJobOnCancel)
+		}
+	}
+	if telemPoller == nil && snmpCfg != nil {
+		cfgCopy := *snmpCfg
+		telemPoller = func(pCtx context.Context) HardwareTelemetry {
+			return PollHardwareTelemetry(pCtx, cfgCopy)
+		}
+	}
+
+	var baseline CounterBaseline
+	if hooks != nil && hooks.InitialBaseline != nil && hooks.InitialBaseline.HasBaseline {
+		baseline = *hooks.InitialBaseline
+	} else if telemPoller != nil {
+		initialTelem := telemPoller(ctx)
+		if err := isValidPageCounterReading(initialTelem); err != nil {
+			return fmt.Errorf("pre-submission counter baseline acquisition failed for job %s: %w", cmd.JobID, err)
+		}
+		if fault, reason := hasBlockingTelemetryFlags(initialTelem); fault {
+			return fmt.Errorf("pre-submission hardware fault blocks submission for job %s: %s", cmd.JobID, reason)
+		}
+		obsAt := initialTelem.ObservedAt
+		if obsAt.IsZero() {
+			obsAt = time.Now().UTC()
+		}
+		baseline = CounterBaseline{
+			HasBaseline: true,
+			Value:       initialTelem.LifeCount,
+			Index:       initialTelem.CounterIndex,
+			Unit:        initialTelem.CounterUnit,
+			ObservedAt:  obsAt,
+		}
+		log.Printf("[CUPS-SNMP] Pre-submission baseline counter for job %s: %d (index=%q, unit=%d)", cmd.JobID, baseline.Value, baseline.Index, baseline.Unit)
+	}
+
 	log.Printf("[CUPS] Submitting print job %s to queue %q: lp %s", cmd.JobID, queue, strings.Join(lpArgs, " "))
 
-	if hooks != nil && hooks.OnSubmitting != nil {
-		if err := hooks.OnSubmitting(); err != nil {
-			return fmt.Errorf("pre-submission hook failed; submission not attempted for job %s: %w", cmd.JobID, err)
+	if hooks != nil {
+		if hooks.OnSubmittingWithBaseline != nil {
+			if err := hooks.OnSubmittingWithBaseline(baseline); err != nil {
+				return fmt.Errorf("pre-submission hook failed; submission not attempted for job %s: %w", cmd.JobID, err)
+			}
+		} else if hooks.OnSubmitting != nil {
+			if err := hooks.OnSubmitting(); err != nil {
+				return fmt.Errorf("pre-submission hook failed; submission not attempted for job %s: %w", cmd.JobID, err)
+			}
 		}
 	}
 
@@ -547,21 +701,8 @@ func PrintPDFWithCUPSHooksCustom(
 		}
 	}
 
-	var snmpCfg *SNMPConfig
-	var telemPoller func(context.Context) HardwareTelemetry
-	if hooks != nil {
-		snmpCfg = hooks.SNMPConfig
-		telemPoller = hooks.TelemetryPoller
-		if hooks.PreserveJobOnCancel != nil {
-			ctx = ContextWithPreserveChecker(ctx, hooks.PreserveJobOnCancel)
-		}
-	}
-
-	// 3. Monitor CUPS job until completed, failed, or context canceled
-	if telemPoller != nil {
-		return MonitorCUPSJobWithTelemetryCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, telemPoller)
-	}
-	return MonitorCUPSJobWithSNMPCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, snmpCfg)
+	// 3. Monitor CUPS job using the original pre-submission baseline
+	return MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, telemPoller, baseline)
 }
 
 // MonitorCUPSJobCustom monitors an active or queued CUPS job until completion, failure, or context cancellation.
@@ -608,6 +749,22 @@ func MonitorCUPSJobWithTelemetryCustom(
 	pollInterval time.Duration,
 	telemetryPoller func(ctx context.Context) HardwareTelemetry,
 ) error {
+	return MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, queue, cmd, cupsJobID, onPage, pollInterval, telemetryPoller, CounterBaseline{})
+}
+
+// MonitorCUPSJobWithTelemetryBaselineCustom monitors a CUPS job using a pre-captured original counter baseline
+// and enforces combined-evidence completion (CUPS completed + attributable impressions + healthy + quiescent).
+func MonitorCUPSJobWithTelemetryBaselineCustom(
+	ctx context.Context,
+	runner CommandRunner,
+	queue string,
+	cmd contracts.PrintJobCommand,
+	cupsJobID string,
+	onPage func(sheetsCompleted int),
+	pollInterval time.Duration,
+	telemetryPoller func(ctx context.Context) HardwareTelemetry,
+	baseline CounterBaseline,
+) error {
 	if ctx == nil {
 		return errors.New("context cannot be nil")
 	}
@@ -621,17 +778,66 @@ func MonitorCUPSJobWithTelemetryCustom(
 		pollInterval = 500 * time.Millisecond
 	}
 
-	var initialLife int64 = -1
-	var lastOdometerSheets int = 0
-	hasOdometer := false
+	expectedDelta := ExpectedCounterDelta(cmd, baseline.Unit)
+	var lastOdometerSheets int
+	var lastValidLife int64 = -1
+	hasOdometer := baseline.HasBaseline
 
-	if telemetryPoller != nil {
+	if hasOdometer {
+		lastValidLife = baseline.Value
+		log.Printf("[CUPS-SNMP] Using pre-submission baseline counter for job %s: %d (index=%q, unit=%d)", cmd.JobID, baseline.Value, baseline.Index, baseline.Unit)
+	} else if telemetryPoller != nil {
 		initialTelem := telemetryPoller(ctx)
-		if initialTelem.Online && initialTelem.HasLife {
-			initialLife = initialTelem.LifeCount
+		if err := isValidPageCounterReading(initialTelem); err == nil {
+			baseline = CounterBaseline{
+				HasBaseline: true,
+				Value:       initialTelem.LifeCount,
+				Index:       initialTelem.CounterIndex,
+				Unit:        initialTelem.CounterUnit,
+				ObservedAt:  initialTelem.ObservedAt,
+			}
 			hasOdometer = true
-			log.Printf("[CUPS-SNMP] Baseline hardware odometer for job %s: %d sheets", cmd.JobID, initialLife)
+			lastValidLife = baseline.Value
+			expectedDelta = ExpectedCounterDelta(cmd, baseline.Unit)
+			log.Printf("[CUPS-SNMP] Baseline hardware counter for job %s: %d", cmd.JobID, baseline.Value)
 		}
+	}
+
+	validateAndTrackCounter := func(telem HardwareTelemetry) (int64, error) {
+		if err := isValidPageCounterReading(telem); err != nil {
+			return 0, err
+		}
+		if baseline.Index != "" && telem.CounterIndex != "" && telem.CounterIndex != baseline.Index {
+			return 0, fmt.Errorf("counter anomaly: marker identity changed from %q to %q", baseline.Index, telem.CounterIndex)
+		}
+		if baseline.Unit != 0 && telem.CounterUnit != 0 && telem.CounterUnit != baseline.Unit {
+			return 0, fmt.Errorf("counter anomaly: unit changed from %d to %d", baseline.Unit, telem.CounterUnit)
+		}
+		if telem.LifeCount < baseline.Value {
+			return 0, fmt.Errorf("counter anomaly: hardware counter decreased/reset from %d to %d", baseline.Value, telem.LifeCount)
+		}
+		if lastValidLife >= 0 && telem.LifeCount < lastValidLife {
+			return 0, fmt.Errorf("counter anomaly: hardware counter regressed from %d to %d", lastValidLife, telem.LifeCount)
+		}
+		effUnit := baseline.Unit
+		if effUnit == 0 {
+			effUnit = telem.CounterUnit
+		}
+		expectedDelta = ExpectedCounterDelta(cmd, effUnit)
+		lastValidLife = telem.LifeCount
+		delta := telem.LifeCount - baseline.Value
+		if delta > int64(expectedDelta) {
+			return 0, fmt.Errorf("counter anomaly: unexpected counter increase %d exceeds expected %d", delta, expectedDelta)
+		}
+		curSheets := ImpressionsToSheets(cmd, effUnit, delta)
+		if curSheets > lastOdometerSheets && curSheets <= cmd.TotalSheets {
+			lastOdometerSheets = curSheets
+			log.Printf("[CUPS-SNMP] Attributable hardware counter delta for job %s: %d/%d (%d/%d sheets)", cmd.JobID, delta, expectedDelta, curSheets, cmd.TotalSheets)
+			if onPage != nil {
+				onPage(curSheets)
+			}
+		}
+		return delta, nil
 	}
 
 	ticker := time.NewTicker(pollInterval)
@@ -659,62 +865,35 @@ func MonitorCUPSJobWithTelemetryCustom(
 				}
 				return ctx.Err()
 			}
-			// Attempt to cancel the job in CUPS on timeout or context cancel
 			cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 2*time.Second)
 			_, _ = runner(cancelCtx, "cancel", cupsJobID)
 			cancelTimeout()
 			return ctx.Err()
 
 		case <-ticker.C:
-			// 1. If hardware telemetry monitoring is active, check real-time hardware status
+			var tickTelem HardwareTelemetry
+			haveTickTelem := false
 			if telemetryPoller != nil {
-				telem := telemetryPoller(ctx)
-				if telem.Online && telem.HasFlags {
-					if telem.Flags.Jammed {
-						log.Printf("[CUPS-SNMP] Hardware paper jam detected (error 0x04) during job %s; placing job on hold in CUPS", cupsJobID)
-						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-						holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
-						holdTimeout()
-						if holdRes.HoldErr != nil {
-							log.Printf("[CUPS-SNMP] Warning: hold request failed during jam for job %s: %v", cupsJobID, holdRes.HoldErr)
-						}
-						return errors.New("hardware interruption: paper feed jam detected in printer")
+				tickTelem = telemetryPoller(ctx)
+				haveTickTelem = true
+				if fault, reason := hasBlockingTelemetryFlags(tickTelem); fault {
+					log.Printf("[CUPS-SNMP] Hardware fault (%s) during job %s; placing job on hold in CUPS", reason, cupsJobID)
+					holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
+					holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
+					holdTimeout()
+					if holdRes.HoldErr != nil {
+						log.Printf("[CUPS-SNMP] Warning: hold request failed during fault for job %s: %v", cupsJobID, holdRes.HoldErr)
 					}
-					if telem.Flags.DoorOpen {
-						log.Printf("[CUPS-SNMP] Hardware cover open detected during job %s; placing job on hold in CUPS", cupsJobID)
-						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-						holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
-						holdTimeout()
-						if holdRes.HoldErr != nil {
-							log.Printf("[CUPS-SNMP] Warning: hold request failed during cover-open for job %s: %v", cupsJobID, holdRes.HoldErr)
-						}
-						return errors.New("hardware interruption: printer cover is open")
-					}
-					if telem.Flags.NoPaper || telem.Flags.InputTrayEmpty {
-						log.Printf("[CUPS-SNMP] Hardware out of paper detected during job %s; placing job on hold in CUPS", cupsJobID)
-						holdCtx, holdTimeout := context.WithTimeout(context.Background(), 2*time.Second)
-						holdRes := HoldAndVerifyCUPSJob(holdCtx, runner, queue, cupsJobID)
-						holdTimeout()
-						if holdRes.HoldErr != nil {
-							log.Printf("[CUPS-SNMP] Warning: hold request failed during paper-empty for job %s: %v", cupsJobID, holdRes.HoldErr)
-						}
-						return errors.New("hardware interruption: printer paper tray is empty")
-					}
+					return fmt.Errorf("hardware interruption: %s", reason)
 				}
 
-				if telem.Online && telem.HasLife && hasOdometer {
-					curSheets := int(telem.LifeCount - initialLife)
-					if curSheets > lastOdometerSheets && curSheets <= cmd.TotalSheets {
-						lastOdometerSheets = curSheets
-						log.Printf("[CUPS-SNMP] Verified physical sheets ejected via odometer: %d/%d", curSheets, cmd.TotalSheets)
-						if onPage != nil {
-							onPage(curSheets)
-						}
+				if hasOdometer && tickTelem.Online && tickTelem.HasLife {
+					if _, cErr := validateAndTrackCounter(tickTelem); cErr != nil {
+						return cErr
 					}
 				}
 			}
 
-			// 2. Query CUPS job state
 			info, err := QueryCUPSJobInfo(ctx, runner, queue, cupsJobID)
 			if err != nil {
 				consecutivePollErrors++
@@ -734,41 +913,65 @@ func MonitorCUPSJobWithTelemetryCustom(
 			switch info.State {
 			case CUPSJobStatePending, CUPSJobStateHeld:
 				consecutiveUnknown = 0
-				// Queued in CUPS; do not report synthetic progress.
 
 			case CUPSJobStateProcessing:
 				consecutiveUnknown = 0
-				// Physical progress is driven solely by hardware odometer (telem.HasLife && hasOdometer).
-				// Unverified CUPS IPP sheets completed counters must NEVER enter onPage callback.
 				if !hasOdometer {
 					if info.SheetsCompleted > lastSheetsReported && info.SheetsCompleted <= cmd.TotalSheets {
 						lastSheetsReported = info.SheetsCompleted
-						log.Printf("[CUPS] Job %s processing in CUPS queue (CUPS counter: %d/%d sheets, physical output unverified)", cmd.JobID, info.SheetsCompleted, cmd.TotalSheets)
+						log.Printf("[CUPS] Job %s processing in CUPS queue (CUPS counter: %d/%d sheets, hardware counter unverified)", cmd.JobID, info.SheetsCompleted, cmd.TotalSheets)
 					}
 				}
 
 			case CUPSJobStateProcessingStopped:
 				consecutiveUnknown = 0
-				// Recoverable printer pause (e.g. out of paper, paper jam, door open)
 				log.Printf("[CUPS] Job %s printer paused/stopped (recoverable): %s. Waiting for printer recovery...", cupsJobID, strings.Join(info.Reasons, ", "))
 
 			case CUPSJobStateCompleted:
-				log.Printf("[CUPS] Job %s (CUPS ID %s) confirmed completed by CUPS (CUPS counter: %d sheets)", cmd.JobID, cupsJobID, info.SheetsCompleted)
-				// Capture final hardware odometer reading upon CUPS completion confirmation
-				if telemetryPoller != nil && hasOdometer {
-					telem := telemetryPoller(ctx)
-					if telem.Online && telem.HasLife {
-						curSheets := int(telem.LifeCount - initialLife)
-						if curSheets > lastOdometerSheets && curSheets <= cmd.TotalSheets {
-							lastOdometerSheets = curSheets
-							log.Printf("[CUPS-SNMP] Final verified physical sheets ejected via odometer: %d/%d", curSheets, cmd.TotalSheets)
-							if onPage != nil {
-								onPage(curSheets)
-							}
-						}
+				log.Printf("[CUPS] Job %s (CUPS ID %s) reported completed by CUPS (CUPS counter: %d sheets); running post-completion verification", cmd.JobID, cupsJobID, info.SheetsCompleted)
+				if telemetryPoller == nil {
+					return nil
+				}
+				if !hasOdometer {
+					return errors.New("completion rejected: hardware counter baseline unavailable")
+				}
+				verifyBudget := 3 * pollInterval
+				if verifyBudget > 1500*time.Millisecond {
+					verifyBudget = 1500 * time.Millisecond
+				}
+				verifyDeadline := time.Now().Add(verifyBudget)
+				var lastVerifyErr error
+				for {
+					var telem HardwareTelemetry
+					if haveTickTelem {
+						telem = tickTelem
+						haveTickTelem = false
+					} else {
+						telem = telemetryPoller(ctx)
+					}
+					if fault, reason := hasBlockingTelemetryFlags(telem); fault {
+						return fmt.Errorf("hardware interruption on completion: %s", reason)
+					}
+					delta, cErr := validateAndTrackCounter(telem)
+					if cErr != nil {
+						lastVerifyErr = cErr
+					} else if delta < int64(expectedDelta) {
+						lastVerifyErr = fmt.Errorf("physical output incomplete (attributable impressions %d/%d, verified physical: %d/%d)", delta, expectedDelta, lastOdometerSheets, cmd.TotalSheets)
+					} else if !isPrinterQuiescent(telem) {
+						lastVerifyErr = fmt.Errorf("completion verification incomplete: printer state %q not quiescent", telem.StatusState)
+					} else {
+						return nil
+					}
+
+					if !time.Now().Before(verifyDeadline) {
+						return fmt.Errorf("combined completion verification failed for job %s: %w", cmd.JobID, lastVerifyErr)
+					}
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(pollInterval):
 					}
 				}
-				return nil
 
 			case CUPSJobStateCanceled:
 				reason := strings.Join(info.Reasons, ", ")

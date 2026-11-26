@@ -152,7 +152,7 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 		t.Fatalf("expected at least 2 commands executed, got %d", len(executedCommands))
 	}
 
-	if !strings.Contains(executedCommands[0], "lp -d DCPT310 -n 2 -t job-xyz -o sides=two-sided-long-edge /var/kiosk/job-xyz.pdf") {
+	if !strings.Contains(executedCommands[0], "lp -d DCPT310 -n 2 -t job-xyz -o sides=two-sided-long-edge -o print-color-mode=monochrome -o media=A4 /var/kiosk/job-xyz.pdf") {
 		t.Errorf("unexpected lp invocation: %s", executedCommands[0])
 	}
 
@@ -191,9 +191,9 @@ func TestPrintPDFWithCUPS_ColorModes(t *testing.T) {
 			wantFlag:  "-o print-color-mode=monochrome",
 		},
 		{
-			name:         "empty default color mode",
-			colorMode:    "",
-			dontWantFlag: "print-color-mode",
+			name:      "empty default color mode",
+			colorMode: "",
+			wantFlag:  "-o print-color-mode=monochrome",
 		},
 	}
 

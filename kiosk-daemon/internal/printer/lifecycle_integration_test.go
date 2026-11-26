@@ -283,8 +283,8 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 	// Execute real CUPS submission and monitoring
 	pollInterval := 100 * time.Millisecond
 	printErr := PrintPDFWithCUPSHooksCustom(ctx, nil, queueName, cmd, samplePDF, onPage, pollInterval, hooks)
-	if printErr != nil {
-		t.Fatalf("PrintPDFWithCUPSHooksCustom failed: %v", printErr)
+	if printErr == nil || !strings.Contains(printErr.Error(), "attributable impressions 0/1") {
+		t.Fatalf("expected PrintPDFWithCUPSHooksCustom to reject CUPS-only completion without SNMP impressions, got: %v", printErr)
 	}
 
 	// Requirement 6 & 11: Assert exactly one submission attempt via hooks

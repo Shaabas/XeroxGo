@@ -2378,7 +2378,7 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		return fmt.Errorf("update job progress: kiosk ID mismatch: event has %q, order belongs to %q", event.KioskID, orderKioskID)
 	}
 
-	// 3. Verify progress bounds
+	// 3. Verify progress bounds and explicit completion counts
 	if isRecovery {
 		if event.PagesPrinted > recRemainingPages {
 			return fmt.Errorf("update job progress: pages_printed (%d) exceeds recovery remaining_pages (%d)", event.PagesPrinted, recRemainingPages)
@@ -2386,12 +2386,20 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		if event.SheetsPrinted > recRemainingSheets {
 			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds recovery remaining_sheets (%d)", event.SheetsPrinted, recRemainingSheets)
 		}
+		if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != recRemainingPages || event.SheetsPrinted != recRemainingSheets) {
+			return fmt.Errorf("update job progress: inconsistent recovery completion counts (pages=%d/%d, sheets=%d/%d)",
+				event.PagesPrinted, recRemainingPages, event.SheetsPrinted, recRemainingSheets)
+		}
 	} else {
 		if event.PagesPrinted > totalPages {
 			return fmt.Errorf("update job progress: pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
 		}
 		if event.SheetsPrinted > totalSheets {
 			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
+		}
+		if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != totalPages || event.SheetsPrinted != totalSheets) {
+			return fmt.Errorf("update job progress: inconsistent completion counts (pages=%d/%d, sheets=%d/%d)",
+				event.PagesPrinted, totalPages, event.SheetsPrinted, totalSheets)
 		}
 	}
 
@@ -2411,14 +2419,20 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		}
 	}
 
-	// 4. Check existing progress timestamp to reject older/stale events
+	// 4. Check existing progress timestamp & completed non-regression
+	var existingStatus string
 	var existingTimestampNS int64
-	err = tx.QueryRowContext(ctx, s.rebind("SELECT timestamp_ns FROM job_progress WHERE job_id = ?;"), targetJobID).Scan(&existingTimestampNS)
+	err = tx.QueryRowContext(ctx, s.rebind("SELECT status, timestamp_ns FROM job_progress WHERE job_id = ?;"), targetJobID).Scan(&existingStatus, &existingTimestampNS)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("update job progress: query existing progress: %w", err)
 	}
-	if err == nil && eventNS < existingTimestampNS {
-		return fmt.Errorf("update job progress: rejected stale event timestamp (%d < %d)", eventNS, existingTimestampNS)
+	if err == nil {
+		if existingStatus == string(contracts.JobStatusCompleted) && event.Status != contracts.JobStatusCompleted {
+			return fmt.Errorf("update job progress: cannot regress completed job %s to %s", targetJobID, event.Status)
+		}
+		if eventNS < existingTimestampNS {
+			return fmt.Errorf("update job progress: rejected stale event timestamp (%d < %d)", eventNS, existingTimestampNS)
+		}
 	}
 
 	// 5. Upsert latest progress row

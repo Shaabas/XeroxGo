@@ -29,14 +29,19 @@ func (s *Store) TrayCapacity() int {
 }
 
 type StoredJob struct {
-	Command            contracts.PrintJobCommand
-	Status             contracts.JobStatus
-	PagesPrinted       int
-	SheetsPrinted      int
-	ErrorReason        string
-	CUPSJobID          string
-	SubmittedToPrinter bool
-	UpdatedAt          time.Time
+	Command              contracts.PrintJobCommand
+	Status               contracts.JobStatus
+	PagesPrinted         int
+	SheetsPrinted        int
+	ErrorReason          string
+	CUPSJobID            string
+	SubmittedToPrinter   bool
+	BaselineCounterSet   bool
+	BaselineCounterValue int64
+	BaselineCounterIndex string
+	BaselineCounterUnit  int64
+	BaselineObservedAt   time.Time
+	UpdatedAt            time.Time
 }
 
 func isValidStatus(status contracts.JobStatus) bool {
@@ -147,6 +152,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_reason TEXT NOT NULL DEFAULT '',
     cups_job_id TEXT NOT NULL DEFAULT '',
     submitted_to_printer INTEGER NOT NULL DEFAULT 0,
+    baseline_counter_set INTEGER NOT NULL DEFAULT 0,
+    baseline_counter_value INTEGER NOT NULL DEFAULT 0,
+    baseline_counter_index TEXT NOT NULL DEFAULT '',
+    baseline_counter_unit INTEGER NOT NULL DEFAULT 0,
+    baseline_observed_at_ns INTEGER NOT NULL DEFAULT 0,
     updated_at_ns INTEGER NOT NULL
 );
 
@@ -518,14 +528,23 @@ WHERE job_id = ?;`
 		return fmt.Errorf("failed to query job %s: %w", event.JobID, err)
 	}
 
-	targetSheets := event.SheetsPrinted
-	if event.Status == contracts.JobStatusCompleted && targetSheets == 0 {
-		targetSheets = totalSheets
+	if event.Status == contracts.JobStatusCompleted {
+		if event.SheetsPrinted != totalSheets {
+			return fmt.Errorf("inconsistent completion sheets_printed: got %d, want %d", event.SheetsPrinted, totalSheets)
+		}
+		if event.PagesPrinted != totalPages {
+			return fmt.Errorf("inconsistent completion pages_printed: got %d, want %d", event.PagesPrinted, totalPages)
+		}
 	}
+	if currentStatus == string(contracts.JobStatusCompleted) && event.Status != contracts.JobStatusCompleted {
+		return fmt.Errorf("cannot regress completed job %s to status %s", event.JobID, event.Status)
+	}
+
+	targetSheets := event.SheetsPrinted
 	if targetSheets > totalSheets {
 		targetSheets = totalSheets
 	}
-	// Monotonicity clamp: never regress sheets_printed
+	// Monotonicity clamp: delayed observations must not regress sheets_printed
 	if targetSheets < currentSheets {
 		targetSheets = currentSheets
 	}
@@ -551,9 +570,6 @@ WHERE id = 1
 	}
 
 	targetPages := event.PagesPrinted
-	if event.Status == contracts.JobStatusCompleted && targetPages == 0 {
-		targetPages = totalPages
-	}
 	if targetPages > totalPages {
 		targetPages = totalPages
 	}
@@ -597,6 +613,20 @@ func (s *Store) MarkJobSubmitting(
 	ctx context.Context,
 	jobID string,
 ) error {
+	return s.MarkJobSubmittingWithBaseline(ctx, jobID, false, 0, "", 0, time.Time{})
+}
+
+// MarkJobSubmittingWithBaseline atomically marks a job as submitted_to_printer = 1
+// and persists the original pre-submission hardware counter baseline before lp runs.
+func (s *Store) MarkJobSubmittingWithBaseline(
+	ctx context.Context,
+	jobID string,
+	baselineSet bool,
+	baselineValue int64,
+	baselineIndex string,
+	baselineUnit int64,
+	baselineObservedAt time.Time,
+) error {
 	if s == nil || s.db == nil {
 		return errors.New("store is not open")
 	}
@@ -611,14 +641,28 @@ func (s *Store) MarkJobSubmitting(
 	}
 
 	nowNS := time.Now().UTC().UnixNano()
+	setInt := 0
+	if baselineSet {
+		setInt = 1
+	}
+	obsNS := int64(0)
+	if !baselineObservedAt.IsZero() {
+		obsNS = baselineObservedAt.UTC().UnixNano()
+	}
+
 	query := `
 UPDATE jobs
 SET submitted_to_printer = 1,
     status = 'PRINTING',
+    baseline_counter_set = CASE WHEN baseline_counter_set = 1 THEN 1 ELSE ? END,
+    baseline_counter_value = CASE WHEN baseline_counter_set = 1 THEN baseline_counter_value ELSE ? END,
+    baseline_counter_index = CASE WHEN baseline_counter_set = 1 THEN baseline_counter_index ELSE ? END,
+    baseline_counter_unit = CASE WHEN baseline_counter_set = 1 THEN baseline_counter_unit ELSE ? END,
+    baseline_observed_at_ns = CASE WHEN baseline_counter_set = 1 THEN baseline_observed_at_ns ELSE ? END,
     updated_at_ns = ?
 WHERE job_id = ?;`
 
-	res, err := s.db.ExecContext(ctx, query, nowNS, jobID)
+	res, err := s.db.ExecContext(ctx, query, setInt, baselineValue, baselineIndex, baselineUnit, obsNS, nowNS, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to mark job %s submitting: %w", jobID, err)
 	}
@@ -678,6 +722,8 @@ func scanStoredJob(scan func(dest ...any) error) (*StoredJob, error) {
 	var statusStr string
 	var updatedAtNS int64
 	var submittedInt int
+	var baselineSetInt int
+	var baselineObsNS int64
 
 	err := scan(
 		&job.Command.JobID,
@@ -701,6 +747,11 @@ func scanStoredJob(scan func(dest ...any) error) (*StoredJob, error) {
 		&job.ErrorReason,
 		&job.CUPSJobID,
 		&submittedInt,
+		&baselineSetInt,
+		&job.BaselineCounterValue,
+		&job.BaselineCounterIndex,
+		&job.BaselineCounterUnit,
+		&baselineObsNS,
 		&updatedAtNS,
 	)
 	if err != nil {
@@ -710,6 +761,10 @@ func scanStoredJob(scan func(dest ...any) error) (*StoredJob, error) {
 	job.Command.Duplex = contracts.DuplexMode(duplexStr)
 	job.Status = contracts.JobStatus(statusStr)
 	job.SubmittedToPrinter = submittedInt != 0
+	job.BaselineCounterSet = baselineSetInt != 0
+	if baselineObsNS > 0 {
+		job.BaselineObservedAt = time.Unix(0, baselineObsNS).UTC()
+	}
 	job.UpdatedAt = time.Unix(0, updatedAtNS).UTC()
 
 	if strings.TrimSpace(job.Command.OrderID) == "" {
@@ -737,7 +792,9 @@ SELECT job_id, order_id, document_index, total_documents, original_filename, col
        kiosk_id, display_code, download_url, sha256_checksum,
        total_pages, total_sheets, copies, duplex, start_from_page,
        status, pages_printed, sheets_printed, error_reason,
-       cups_job_id, submitted_to_printer, updated_at_ns
+       cups_job_id, submitted_to_printer,
+       baseline_counter_set, baseline_counter_value, baseline_counter_index, baseline_counter_unit, baseline_observed_at_ns,
+       updated_at_ns
 FROM jobs
 WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
 ORDER BY updated_at_ns DESC, job_id ASC
@@ -773,7 +830,9 @@ SELECT job_id, order_id, document_index, total_documents, original_filename, col
        kiosk_id, display_code, download_url, sha256_checksum,
        total_pages, total_sheets, copies, duplex, start_from_page,
        status, pages_printed, sheets_printed, error_reason,
-       cups_job_id, submitted_to_printer, updated_at_ns
+       cups_job_id, submitted_to_printer,
+       baseline_counter_set, baseline_counter_value, baseline_counter_index, baseline_counter_unit, baseline_observed_at_ns,
+       updated_at_ns
 FROM jobs
 WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
 ORDER BY order_id ASC, document_index ASC, updated_at_ns ASC;`
@@ -817,7 +876,9 @@ SELECT job_id, order_id, document_index, total_documents, original_filename, col
        kiosk_id, display_code, download_url, sha256_checksum,
        total_pages, total_sheets, copies, duplex, start_from_page,
        status, pages_printed, sheets_printed, error_reason,
-       cups_job_id, submitted_to_printer, updated_at_ns
+       cups_job_id, submitted_to_printer,
+       baseline_counter_set, baseline_counter_value, baseline_counter_index, baseline_counter_unit, baseline_observed_at_ns,
+       updated_at_ns
 FROM jobs
 WHERE job_id = ?;`
 
@@ -856,7 +917,9 @@ SELECT job_id, order_id, document_index, total_documents, original_filename, col
        kiosk_id, display_code, download_url, sha256_checksum,
        total_pages, total_sheets, copies, duplex, start_from_page,
        status, pages_printed, sheets_printed, error_reason,
-       cups_job_id, submitted_to_printer, updated_at_ns
+       cups_job_id, submitted_to_printer,
+       baseline_counter_set, baseline_counter_value, baseline_counter_index, baseline_counter_unit, baseline_observed_at_ns,
+       updated_at_ns
 FROM jobs
 WHERE order_id = ? OR (order_id = '' AND job_id = ?)
 ORDER BY document_index ASC;`
