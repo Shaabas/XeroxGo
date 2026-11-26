@@ -1319,15 +1319,15 @@ func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 	}))
 	defer fileServer.Close()
 
-	lpCalled := false
-	lpstatCalls := 0
+	var lpCalled atomic.Bool
+	var lpstatCalls atomic.Int32
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		if name == "lp" {
-			lpCalled = true
+			lpCalled.Store(true)
 			return []byte("request id is TestQueue-99 (1 file(s))\n"), nil
 		}
 		if name == "lpstat" {
-			lpstatCalls++
+			lpstatCalls.Add(1)
 			if len(args) > 1 && args[1] == "completed" {
 				return []byte("TestQueue-99 username 1024 Tue Nov 3 20:30:00 2026\n\tAlerts: job-completed-successfully\n\tqueued for TestQueue\n"), nil
 			}
@@ -1337,15 +1337,18 @@ func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 	}
 
 	client, err := NewClient(ClientConfig{
-		CloudURL:      strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
-		KioskID:       "kiosk-existing-cups",
-		StateStore:    store,
-		DownloadDir:   tmpDir,
-		IdleQRContent: "https://example.com/qr",
-		ScreenSink:    func(*image.RGBA) error { return nil },
-		HTTPClient:    fileServer.Client(),
-		CUPSQueue:     "TestQueue",
-		CUPSRunner:    runner,
+		CloudURL:       strings.Replace(fileServer.URL, "http://", "ws://", 1) + "/ws",
+		KioskID:        "kiosk-existing-cups",
+		StateStore:     store,
+		DownloadDir:    tmpDir,
+		IdleQRContent:  "https://example.com/qr",
+		ScreenSink:     func(*image.RGBA) error { return nil },
+		HTTPClient:     fileServer.Client(),
+		CUPSQueue:      "TestQueue",
+		CUPSRunner:     runner,
+		MockCUPSHealth: testHealthyCUPSHealth,
+		MockIPPState:   testHealthyIPPState,
+		MockSNMPHealth: testHealthySNMPHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -1375,11 +1378,11 @@ func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 	client.processJob(ctx, cmd)
 
 	// lp must NOT have been called!
-	if lpCalled {
+	if lpCalled.Load() {
 		t.Fatalf("lp submission was called second time for existing CUPS job %s!", cmd.JobID)
 	}
 	// lpstat must have been called to resume monitoring
-	if lpstatCalls == 0 {
+	if lpstatCalls.Load() == 0 {
 		t.Fatalf("expected lpstat monitoring to be called, got 0 calls")
 	}
 }
@@ -1728,6 +1731,7 @@ func TestMultiDoc_DeferredOrder_Sequencing(t *testing.T) {
 		ScreenSink:    func(*image.RGBA) error { return nil },
 		HTTPClient:    fileServer.Client(),
 		CUPSQueue:     "MockQueue",
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -1868,6 +1872,7 @@ func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
 		CUPSQueue:     "MockQueue",
 		CUPSRunner:    mockRunner,
 		MockCUPSPrint: mockCUPS,
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -2189,6 +2194,7 @@ func TestMultiDoc_OrdersLargerThanQueueCapacity(t *testing.T) {
 		CUPSQueue:     "MockQueue",
 		CUPSRunner:    mockRunner,
 		MockCUPSPrint: mockCUPS,
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -2303,6 +2309,7 @@ func TestMultiDoc_QueueFullArrivalOfFinalDocument(t *testing.T) {
 		CUPSQueue:     "MockQueue",
 		CUPSRunner:    mockRunner,
 		MockCUPSPrint: mockCUPS,
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -2497,6 +2504,7 @@ func TestMultiDoc_LargerThanQueueCapacity_RestartReconnect(t *testing.T) {
 		CUPSQueue:     "MockQueue",
 		CUPSRunner:    mockRunner,
 		MockCUPSPrint: mockCUPS,
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -2643,9 +2651,12 @@ func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 		IdleQRContent: "https://example.com/qr",
 		ScreenSink:    func(*image.RGBA) error { return nil },
 		HTTPClient:    fileServer.Client(),
-		CUPSQueue:     "MockQueue",
-		CUPSRunner:    mockRunner,
-		SNMPPoller:    snmpPoller,
+		CUPSQueue:      "MockQueue",
+		CUPSRunner:     mockRunner,
+		SNMPPoller:     snmpPoller,
+		MockCUPSHealth: testHealthyCUPSHealth,
+		MockIPPState:   testHealthyIPPState,
+		MockSNMPHealth: testHealthySNMPHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)

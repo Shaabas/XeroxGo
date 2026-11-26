@@ -559,12 +559,12 @@ func TestReconcilePrinterHealth_IPPReasonSeverityAndIndependentConfirmation(t *t
 		UpdatedAt:         freshTime,
 	}
 
-	t.Run("unconfirmed_media_jam_warning_is_nonblocking", func(t *testing.T) {
+	t.Run("media_jam_warning_is_blocking_by_keyword_semantics", func(t *testing.T) {
 		ipp := IPPPrinterStateResult{
-			Source:            CapabilitySourceCUPSQueue,
-			Queue:             "BrotherQueue",
-			State:             IPPPrinterStateIdle,
-			RawReasons:        []string{"media-jam-warning"},
+			Source:        CapabilitySourceCUPSQueue,
+			Queue:         "BrotherQueue",
+			State:         IPPPrinterStateIdle,
+			RawReasons:    []string{"media-jam-warning"},
 			ParsedReasons: []IPPPrinterReason{
 				{Raw: "media-jam-warning", Keyword: "media-jam", Severity: SeverityWarning},
 			},
@@ -575,26 +575,22 @@ func TestReconcilePrinterHealth_IPPReasonSeverityAndIndependentConfirmation(t *t
 
 		res := ReconcilePrinterHealth(baseCUPS, ipp, baseSNMP, evalTime)
 
-		// Not blocking, so state remains IDLE
-		if res.EffectiveState != "IDLE" {
-			t.Errorf("EffectiveState = %q, want IDLE (unconfirmed warning is nonblocking)", res.EffectiveState)
+		if res.EffectiveState != "ERROR" {
+			t.Errorf("EffectiveState = %q, want ERROR (media-jam is blocking regardless of -warning suffix)", res.EffectiveState)
 		}
-		if res.HasBlockingFaults() {
-			t.Errorf("expected no blocking faults, got %v", res.BlockingFaults)
-		}
-		if !sliceHasItemContaining(res.NonblockingWarnings, "media-jam") {
-			t.Errorf("expected media-jam in NonblockingWarnings, got %v", res.NonblockingWarnings)
+		if !res.HasBlockingFaults() {
+			t.Errorf("expected blocking faults, got none")
 		}
 	})
 
-	t.Run("unconfirmed_media_jam_report_is_nonblocking", func(t *testing.T) {
+	t.Run("media_empty_report_is_blocking_by_keyword_semantics", func(t *testing.T) {
 		ipp := IPPPrinterStateResult{
-			Source:            CapabilitySourceCUPSQueue,
-			Queue:             "BrotherQueue",
-			State:             IPPPrinterStateIdle,
-			RawReasons:        []string{"media-jam-report"},
+			Source:        CapabilitySourceCUPSQueue,
+			Queue:         "BrotherQueue",
+			State:         IPPPrinterStateIdle,
+			RawReasons:    []string{"media-empty-report"},
 			ParsedReasons: []IPPPrinterReason{
-				{Raw: "media-jam-report", Keyword: "media-jam", Severity: SeverityReport},
+				{Raw: "media-empty-report", Keyword: "media-empty", Severity: SeverityReport},
 			},
 			EndpointReachable: true,
 			QueueAccessible:   true,
@@ -603,11 +599,14 @@ func TestReconcilePrinterHealth_IPPReasonSeverityAndIndependentConfirmation(t *t
 
 		res := ReconcilePrinterHealth(baseCUPS, ipp, baseSNMP, evalTime)
 
-		if res.EffectiveState != "IDLE" {
-			t.Errorf("EffectiveState = %q, want IDLE", res.EffectiveState)
+		if res.EffectiveState != "ERROR" {
+			t.Errorf("EffectiveState = %q, want ERROR", res.EffectiveState)
 		}
-		if res.HasBlockingFaults() {
-			t.Errorf("expected no blocking faults, got %v", res.BlockingFaults)
+		if res.EvaluatedHealth != contracts.EvaluatedHealthFault {
+			t.Errorf("EvaluatedHealth = %q, want FAULT", res.EvaluatedHealth)
+		}
+		if !res.HasBlockingFaults() || res.PaperTrayStatus != "EMPTY" {
+			t.Errorf("expected paper empty blocking fault, got tray=%s faults=%v", res.PaperTrayStatus, res.BlockingFaults)
 		}
 	})
 

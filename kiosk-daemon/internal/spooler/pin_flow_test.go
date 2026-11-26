@@ -871,6 +871,7 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 		KioskSecret:              "secret-deadlock",
 		StateStore:               st,
 		PrinterAddr:              printerLn.Addr().String(),
+		MockHealth:               testHealthyMockHealth,
 		DownloadDir:              filepath.Join(tempDir, "downloads"),
 		IdleQRContent:            "https://kiosk-deadlock",
 		ScreenSink:               func(img *image.RGBA) error { return nil },

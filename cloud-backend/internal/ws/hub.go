@@ -9,11 +9,20 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"xeroxgo/cloud-backend/internal/store"
 	"xeroxgo/pkg/contracts"
+)
+
+const (
+	// DefaultTelemetryFreshnessWindow is the canonical maximum age (6s) for both
+	// printer observation UpdatedAt and cloud server receipt time.
+	DefaultTelemetryFreshnessWindow = 6 * time.Second
+	// FutureHealthTimestampTolerance bounds acceptable clock skew on incoming timestamps.
+	FutureHealthTimestampTolerance = 5 * time.Second
 )
 
 type wireMessage struct {
@@ -26,23 +35,30 @@ type wireMessage struct {
 	Error    string                      `json:"error,omitempty"`
 }
 
+type sessionHealthEntry struct {
+	health     contracts.PrinterHealth
+	receivedAt time.Time
+}
+
 type kioskSession struct {
 	kioskID string
 	conn    *websocket.Conn
 	sendMu  sync.Mutex
 	closed  chan struct{}
+
+	healthMu     sync.Mutex
+	latestHealth *sessionHealthEntry
+
+	dispatchMu sync.Mutex
 }
 
 // Hub manages active WebSocket connections from kiosks and relays jobs,
-// progress events, and printer health observations.
+// progress events, and connection-bound canonical printer health telemetry.
 type Hub struct {
 	db          *store.Store
 	mu          sync.RWMutex
 	sessions    map[string]*kioskSession
 	kioskSecret []byte
-
-	healthMu sync.RWMutex
-	health   map[string]contracts.PrinterHealth
 }
 
 // NewHub creates and initializes a new cloud WebSocket hub.
@@ -50,7 +66,6 @@ func NewHub(db *store.Store) *Hub {
 	return &Hub{
 		db:       db,
 		sessions: make(map[string]*kioskSession),
-		health:   make(map[string]contracts.PrinterHealth),
 	}
 }
 
@@ -59,6 +74,16 @@ func (h *Hub) SetKioskSecret(secret []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.kioskSecret = secret
+}
+
+func (h *Hub) isActiveSession(kioskID string, sess *kioskSession) bool {
+	if h == nil || sess == nil {
+		return false
+	}
+	h.mu.RLock()
+	cur := h.sessions[kioskID]
+	h.mu.RUnlock()
+	return cur == sess
 }
 
 // ServeHTTP handles incoming WebSocket connection upgrades at /ws?kiosk_id=<id>.
@@ -103,29 +128,40 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadLimit(1024 * 1024)
 
+	// New connections begin strictly unverified (latestHealth == nil).
 	sess := &kioskSession{
 		kioskID: kioskID,
 		conn:    conn,
 		closed:  make(chan struct{}),
 	}
 
+	var replacedOld *kioskSession
 	h.mu.Lock()
 	if old, exists := h.sessions[kioskID]; exists {
-		_ = old.conn.Close(websocket.StatusPolicyViolation, "replaced by new connection")
+		replacedOld = old
 	}
 	h.sessions[kioskID] = sess
 	h.mu.Unlock()
-	log.Printf("[HUB] Kiosk connected: %q (client IP: %s)", kioskID, r.RemoteAddr)
+	if replacedOld != nil && replacedOld.conn != nil {
+		go func(c *websocket.Conn) {
+			_ = c.Close(websocket.StatusPolicyViolation, "replaced by new connection")
+		}(replacedOld.conn)
+	}
+	log.Printf("[HUB] Kiosk connected (unverified readiness): %q (client IP: %s)", kioskID, r.RemoteAddr)
 
 	defer func() {
+		var wasActive bool
 		h.mu.Lock()
 		if h.sessions[kioskID] == sess {
 			delete(h.sessions, kioskID)
+			wasActive = true
 		}
 		h.mu.Unlock()
 		close(sess.closed)
-		log.Printf("[HUB] Kiosk disconnected: %q", kioskID)
-		if h.db != nil {
+		log.Printf("[HUB] Kiosk disconnected: %q (active=%v)", kioskID, wasActive)
+		// Only reset unacknowledged intents if this was still the active session;
+		// an old replaced session must never invalidate a newer connection's state.
+		if wasActive && h.db != nil {
 			_ = h.db.ResetUnacknowledgedDispatchIntents(context.Background(), kioskID)
 		}
 		_ = conn.Close(websocket.StatusNormalClosure, "session ended")
@@ -134,23 +170,13 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Proactively sync active ads to newly connected kiosk
+	// Sync active ads on connection; pending dispatch intents intentionally wait until
+	// verified healthy and execution-safe telemetry arrives on this exact session.
 	if h.db != nil {
 		if activeAds, err := h.db.GetActiveAds(ctx); err == nil && len(activeAds) > 0 {
+			sess.sendMu.Lock()
 			_ = wsjson.Write(ctx, conn, wireMessage{Type: "sync_ads", Ads: activeAds})
-		}
-		// Reconcile pending dispatch intents for this kiosk (crash/disconnect recovery)
-		_ = h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID)
-		if pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID); err == nil && len(pendingJobs) > 0 {
-			log.Printf("[HUB] Reconciling %d pending dispatch orders for kiosk %s", len(pendingJobs), kioskID)
-			for _, jobCmd := range pendingJobs {
-				if err := h.SendJob(ctx, jobCmd); err != nil {
-					log.Printf("[HUB] Failed to dispatch pending job %s to kiosk %s: %v", jobCmd.JobID, kioskID, err)
-					break
-				}
-				_ = h.db.MarkDispatchIntentSent(ctx, jobCmd.JobID)
-				log.Printf("[HUB] Reconciled and dispatched pending job %s to kiosk %s", jobCmd.JobID, kioskID)
-			}
+			sess.sendMu.Unlock()
 		}
 	}
 
@@ -163,7 +189,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 		case "heartbeat":
-			// Maintain liveness
+			// Maintain connection liveness only; heartbeats never extend health readiness.
 		case "ack", "job_ack":
 			jobID := ""
 			if msg.Progress != nil {
@@ -179,11 +205,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		case "progress":
-			if msg.Progress == nil {
-				continue
-			}
-			if msg.Progress.KioskID != kioskID {
-				// Reject mismatched kiosk progress
+			if msg.Progress == nil || msg.Progress.KioskID != kioskID {
 				continue
 			}
 			if strings.TrimSpace(msg.Progress.JobID) == "" || !isValidJobStatus(msg.Progress.Status) || msg.Progress.Timestamp.IsZero() {
@@ -193,28 +215,187 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
 			}
 		case "health":
-			if msg.Health == nil {
-				continue
-			}
-			if !isValidHealthState(msg.Health.State) || !isValidTrayState(msg.Health.PaperTrayStatus) {
-				continue
-			}
-			if msg.Health.TonerLevelPercent < 0 || msg.Health.TonerLevelPercent > 100 ||
-				msg.Health.DrumLifePercent < 0 || msg.Health.DrumLifePercent > 100 {
-				continue
-			}
-			h.healthMu.Lock()
-			h.health[kioskID] = *msg.Health
-			h.healthMu.Unlock()
+			h.handleHealthMessage(ctx, kioskID, sess, msg.Health)
 		case "error":
 			// Operational error
 		default:
-			// Ignore unexpected type
+			// Ignore unexpected message type
 		}
 	}
 }
 
-// SendJob dispatches a PrintJobCommand envelope to the connected kiosk.
+func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kioskSession, incoming *contracts.PrinterHealth) {
+	if !h.isActiveSession(kioskID, sess) || incoming == nil {
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := validateHealthPayload(incoming, now); err != nil {
+		log.Printf("[HUB] Ignoring malformed health telemetry from kiosk %q: %v", kioskID, err)
+		return
+	}
+
+	snapshot := cloneHealth(*incoming)
+
+	sess.healthMu.Lock()
+	if !h.isActiveSession(kioskID, sess) {
+		sess.healthMu.Unlock()
+		return
+	}
+	if sess.latestHealth != nil {
+		prev := sess.latestHealth
+		if snapshot.UpdatedAt.Before(prev.health.UpdatedAt) {
+			sess.healthMu.Unlock()
+			return
+		}
+		// Repeated/replayed identical UpdatedAt must NOT extend server-side freshness.
+		if snapshot.UpdatedAt.Equal(prev.health.UpdatedAt) {
+			sess.healthMu.Unlock()
+			return
+		}
+	}
+	entry := &sessionHealthEntry{
+		health:     snapshot,
+		receivedAt: now,
+	}
+	sess.latestHealth = entry
+	ready, _ := isHealthEntryReady(entry, now)
+	sess.healthMu.Unlock()
+
+	if ready {
+		h.reconcilePendingDispatchOrders(ctx, kioskID, sess)
+	}
+}
+
+func (h *Hub) reconcilePendingDispatchOrders(ctx context.Context, kioskID string, sess *kioskSession) {
+	if h.db == nil || !h.isActiveSession(kioskID, sess) {
+		return
+	}
+
+	sess.dispatchMu.Lock()
+	defer sess.dispatchMu.Unlock()
+
+	if ready, _ := h.IsKioskReadyForDispatch(kioskID); !ready || !h.isActiveSession(kioskID, sess) {
+		return
+	}
+
+	_ = h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID)
+	pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID)
+	if err != nil || len(pendingJobs) == 0 {
+		return
+	}
+
+	log.Printf("[HUB] Reconciling %d pending dispatch orders for verified ready kiosk %s", len(pendingJobs), kioskID)
+	for _, jobCmd := range pendingJobs {
+		if ready, reason := h.IsKioskReadyForDispatch(kioskID); !ready || !h.isActiveSession(kioskID, sess) {
+			log.Printf("[HUB] Halting pending dispatch reconciliation for kiosk %s (%s)", kioskID, reason)
+			break
+		}
+		if err := h.SendJob(ctx, jobCmd); err != nil {
+			log.Printf("[HUB] Failed to dispatch pending job %s to kiosk %s: %v", jobCmd.JobID, kioskID, err)
+			break
+		}
+		_ = h.db.MarkDispatchIntentSent(ctx, jobCmd.JobID)
+		log.Printf("[HUB] Reconciled and dispatched pending job %s to kiosk %s", jobCmd.JobID, kioskID)
+	}
+}
+
+func validateHealthPayload(h *contracts.PrinterHealth, now time.Time) error {
+	if h == nil {
+		return errors.New("nil health payload")
+	}
+	if !isValidHealthState(h.State) {
+		return fmt.Errorf("invalid operational state %q", h.State)
+	}
+	if !isValidEvaluatedHealth(h.EvaluatedHealth) {
+		return fmt.Errorf("invalid evaluated_health %q", h.EvaluatedHealth)
+	}
+	if !isValidTrayState(h.PaperTrayStatus) {
+		return fmt.Errorf("invalid paper_tray_status %q", h.PaperTrayStatus)
+	}
+	if h.UpdatedAt.IsZero() {
+		return errors.New("updated_at must be non-zero")
+	}
+	if h.UpdatedAt.After(now.Add(FutureHealthTimestampTolerance)) {
+		return fmt.Errorf("updated_at %s is in the future", h.UpdatedAt.Format(time.RFC3339))
+	}
+	if h.TonerLevelKnown {
+		if h.TonerLevelPercent < 0 || h.TonerLevelPercent > 100 {
+			return fmt.Errorf("toner_level_percent %d out of range [0,100]", h.TonerLevelPercent)
+		}
+	} else if h.TonerLevelPercent < -1 || h.TonerLevelPercent > 100 {
+		return fmt.Errorf("unknown toner_level_percent %d invalid", h.TonerLevelPercent)
+	}
+	if h.DrumLifeKnown {
+		if h.DrumLifePercent < 0 || h.DrumLifePercent > 100 {
+			return fmt.Errorf("drum_life_percent %d out of range [0,100]", h.DrumLifePercent)
+		}
+	} else if h.DrumLifePercent < -1 || h.DrumLifePercent > 100 {
+		return fmt.Errorf("unknown drum_life_percent %d invalid", h.DrumLifePercent)
+	}
+	if h.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+		if !h.Online || h.State == "ERROR" || h.State == "OFFLINE" || h.State == "UNKNOWN" ||
+			h.CoverOpen || h.PaperJam || h.OutputBinFull || h.PaperTrayStatus == "EMPTY" || len(h.BlockingReasons) > 0 {
+			return errors.New("contradictory HEALTHY claim with active fault or non-ready state")
+		}
+	}
+	return nil
+}
+
+func isHealthEntryReady(entry *sessionHealthEntry, now time.Time) (bool, string) {
+	if entry == nil {
+		return false, "no telemetry received on active connection"
+	}
+	h := entry.health
+	if h.UpdatedAt.IsZero() || h.UpdatedAt.After(now.Add(FutureHealthTimestampTolerance)) {
+		return false, "invalid telemetry timestamp"
+	}
+	if now.Sub(entry.receivedAt) > DefaultTelemetryFreshnessWindow {
+		return false, "server receipt freshness expired (>6s)"
+	}
+	if now.Sub(h.UpdatedAt) > DefaultTelemetryFreshnessWindow {
+		return false, "observation timestamp expired (>6s)"
+	}
+	if h.EvaluatedHealth != contracts.EvaluatedHealthHealthy {
+		return false, fmt.Sprintf("evaluated health is %s", h.EvaluatedHealth)
+	}
+	if !h.ExecutionSafe {
+		return false, firstNonEmpty(h.ExecutionSafetyReason, "local execution safety barrier active")
+	}
+	if !h.Online || h.State == "ERROR" || h.State == "OFFLINE" || h.State == "UNKNOWN" ||
+		h.PaperJam || h.CoverOpen || h.OutputBinFull || h.PaperTrayStatus == "EMPTY" || len(h.BlockingReasons) > 0 {
+		return false, firstNonEmpty(h.ErrorMessage, "printer reported blocking condition")
+	}
+	return true, ""
+}
+
+// IsKioskReadyForDispatch returns true iff the kiosk has an active session whose latest valid
+// telemetry is fresh within 6s (both observation and server receipt), HEALTHY, and ExecutionSafe.
+func (h *Hub) IsKioskReadyForDispatch(kioskID string) (bool, string) {
+	if h == nil {
+		return false, "hub is nil"
+	}
+	h.mu.RLock()
+	sess, ok := h.sessions[kioskID]
+	h.mu.RUnlock()
+	if !ok || sess == nil {
+		return false, "kiosk not connected"
+	}
+
+	sess.healthMu.Lock()
+	entry := sess.latestHealth
+	var copied *sessionHealthEntry
+	if entry != nil {
+		c := cloneHealth(entry.health)
+		copied = &sessionHealthEntry{health: c, receivedAt: entry.receivedAt}
+	}
+	sess.healthMu.Unlock()
+
+	return isHealthEntryReady(copied, time.Now().UTC())
+}
+
+// SendJob dispatches a PrintJobCommand envelope ONLY when the kiosk is connected and currently
+// passes connection-bound canonical readiness and execution-safety gating.
 func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error {
 	if h == nil {
 		return fmt.Errorf("send job: hub is nil")
@@ -254,9 +435,12 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 	h.mu.RLock()
 	sess, ok := h.sessions[cmd.KioskID]
 	h.mu.RUnlock()
-
 	if !ok || sess == nil {
 		return fmt.Errorf("send job: kiosk %q not connected", cmd.KioskID)
+	}
+
+	if ready, reason := h.IsKioskReadyForDispatch(cmd.KioskID); !ready {
+		return fmt.Errorf("send job: kiosk %q not ready (%s)", cmd.KioskID, reason)
 	}
 
 	msg := wireMessage{
@@ -266,6 +450,10 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 
 	sess.sendMu.Lock()
 	defer sess.sendMu.Unlock()
+
+	if !h.isActiveSession(cmd.KioskID, sess) {
+		return fmt.Errorf("send job: kiosk %q connection replaced", cmd.KioskID)
+	}
 
 	if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
 		return fmt.Errorf("send job: write to kiosk %q: %w", cmd.KioskID, err)
@@ -285,21 +473,91 @@ func (h *Hub) IsConnected(kioskID string) bool {
 	return ok && sess != nil
 }
 
-// LatestHealth returns the most recent cached printer health observation for a kiosk.
+// LatestHealth returns the connection-bound printer health observation for an active kiosk session.
+// If the kiosk is disconnected or no telemetry has arrived on this session, ok is false.
+// If stored telemetry is older than 6s (observation or server receipt), EvaluatedHealth is expired to UNVERIFIED.
 func (h *Hub) LatestHealth(kioskID string) (contracts.PrinterHealth, bool) {
 	if h == nil {
 		return contracts.PrinterHealth{}, false
 	}
-	h.healthMu.RLock()
-	defer h.healthMu.RUnlock()
+	h.mu.RLock()
+	sess, ok := h.sessions[kioskID]
+	h.mu.RUnlock()
+	if !ok || sess == nil {
+		return contracts.PrinterHealth{}, false
+	}
 
-	health, ok := h.health[kioskID]
-	return health, ok
+	sess.healthMu.Lock()
+	entry := sess.latestHealth
+	var copied contracts.PrinterHealth
+	var receivedAt time.Time
+	hasEntry := entry != nil
+	if hasEntry {
+		copied = cloneHealth(entry.health)
+		receivedAt = entry.receivedAt
+	}
+	sess.healthMu.Unlock()
+
+	if !hasEntry {
+		return contracts.PrinterHealth{}, false
+	}
+
+	now := time.Now().UTC()
+	if now.Sub(receivedAt) > DefaultTelemetryFreshnessWindow ||
+		now.Sub(copied.UpdatedAt) > DefaultTelemetryFreshnessWindow ||
+		copied.UpdatedAt.After(now.Add(FutureHealthTimestampTolerance)) {
+		copied.Online = false
+		if copied.EvaluatedHealth != contracts.EvaluatedHealthFault {
+			copied.EvaluatedHealth = contracts.EvaluatedHealthUnverified
+		}
+		if copied.EvidenceFreshness != nil {
+			ef := *copied.EvidenceFreshness
+			ef.CUPS.Fresh = false
+			ef.NativeIPP.Fresh = false
+			ef.SNMP.Fresh = false
+			copied.EvidenceFreshness = &ef
+		}
+		if copied.ErrorMessage == "" {
+			copied.ErrorMessage = "printer health telemetry expired"
+		}
+	}
+	return copied, true
+}
+
+func cloneHealth(h contracts.PrinterHealth) contracts.PrinterHealth {
+	cp := h
+	if len(h.BlockingReasons) > 0 {
+		cp.BlockingReasons = append([]contracts.HealthReason(nil), h.BlockingReasons...)
+	}
+	if len(h.Warnings) > 0 {
+		cp.Warnings = append([]contracts.HealthReason(nil), h.Warnings...)
+	}
+	if h.EvidenceFreshness != nil {
+		ef := *h.EvidenceFreshness
+		cp.EvidenceFreshness = &ef
+	}
+	return cp
+}
+
+func firstNonEmpty(a, b string) string {
+	if t := strings.TrimSpace(a); t != "" {
+		return t
+	}
+	return strings.TrimSpace(b)
 }
 
 func isValidHealthState(state string) bool {
 	switch state {
-	case "IDLE", "PRINTING", "WARMING_UP", "ERROR", "OFFLINE":
+	case "IDLE", "PRINTING", "WARMING_UP", "ERROR", "OFFLINE", "UNKNOWN":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidEvaluatedHealth(status contracts.EvaluatedHealthStatus) bool {
+	switch status {
+	case contracts.EvaluatedHealthHealthy, contracts.EvaluatedHealthFault, contracts.EvaluatedHealthUnverified:
 		return true
 	default:
 		return false

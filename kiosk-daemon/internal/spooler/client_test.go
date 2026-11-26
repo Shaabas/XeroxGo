@@ -460,9 +460,18 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 	client.heartbeatInterval = 50 * time.Millisecond
 	client.healthPoller = func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		return contracts.PrinterHealth{
-			State:             "IDLE",
-			PaperTrayStatus:   "OK",
-			TonerLevelPercent: 90,
+			Online:              true,
+			State:               "IDLE",
+			EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+			PaperTrayStatus:     "OK",
+			EstimatedSheets:     sheets,
+			TonerLevelPercent:   90,
+			TonerLevelKnown:     true,
+			DrumLifePercent:     95,
+			DrumLifeKnown:       true,
+			InventoryCalibrated: true,
+			ExecutionSafe:       true,
+			UpdatedAt:           time.Now().UTC(),
 		}
 	}
 
@@ -632,6 +641,7 @@ func TestClientPersistsStateWhenCloudDisconnects(t *testing.T) {
 		DownloadDir:   tmpDir,
 		IdleQRContent: "https://example.com/kiosk-e",
 		ScreenSink:    noopSink,
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -909,9 +919,18 @@ func TestClientRefill_OverWebSocket(t *testing.T) {
 	client.heartbeatInterval = 20 * time.Millisecond
 	client.healthPoller = func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		return contracts.PrinterHealth{
-			State:           "IDLE",
-			PaperTrayStatus: "OK",
-			EstimatedSheets: sheets,
+			Online:              true,
+			State:               "IDLE",
+			EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+			PaperTrayStatus:     "OK",
+			EstimatedSheets:     sheets,
+			TonerLevelPercent:   80,
+			TonerLevelKnown:     true,
+			DrumLifePercent:     90,
+			DrumLifeKnown:       true,
+			InventoryCalibrated: true,
+			ExecutionSafe:       true,
+			UpdatedAt:           time.Now().UTC(),
 		}
 	}
 
@@ -1123,6 +1142,7 @@ func TestClientDuplicateJobDoesNotPrintTwice(t *testing.T) {
 		DownloadDir:   tmpDir,
 		IdleQRContent: "https://example.com/kiosk-i",
 		ScreenSink:    noopSink,
+		MockHealth:    testHealthyMockHealth,
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -1230,6 +1250,7 @@ func TestClientStartupRecovery(t *testing.T) {
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://example.com/kiosk-j",
 			ScreenSink:    noopSink,
+			MockHealth:    testHealthyMockHealth,
 			OnJobCompleted: func(jobID string) {
 				completedCh <- jobID
 			},
@@ -1337,6 +1358,7 @@ func TestClientStartupRecovery(t *testing.T) {
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://example.com/kiosk-j",
 			ScreenSink:    noopSink,
+			MockHealth:    testHealthyMockHealth,
 		})
 		if err != nil {
 			t.Fatalf("NewClient failed: %v", err)
@@ -2330,7 +2352,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 					}
 					receivedAck <- msg
 				}
-				if msg.Type == "health" {
+				if msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 200 {
 					close(doneSync)
 					return
 				}
@@ -2513,6 +2535,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-c",
 			ScreenSink:    noopSink,
+			MockHealth:    testHealthyMockHealth,
 		})
 		if err != nil {
 			t.Fatalf("NewClient failed: %v", err)
@@ -3179,6 +3202,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-h",
 			ScreenSink:    noopSink,
+			MockHealth:    testHealthyMockHealth,
 		})
 		if err != nil {
 			t.Fatalf("NewClient failed: %v", err)
@@ -3265,7 +3289,7 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 				msgMu.Lock()
 				receivedMessages = append(receivedMessages, msg)
 				msgMu.Unlock()
-				if msg.Type == "health" {
+				if msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 200 {
 					close(doneSync)
 					return
 				}
@@ -3552,9 +3576,7 @@ job-media-sheets-completed (integer) = 1
 			CUPSQueue:  "DCPT310",
 			CUPSRunner: runner,
 			SNMPPoller: snmpPoller,
-			MockHealth: func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
-				return contracts.PrinterHealth{Online: true}
-			},
+			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-b",
 			ScreenSink:    noopSink,
@@ -3648,6 +3670,7 @@ job-media-sheets-completed (integer) = 1
 			StateStore:    store,
 			CUPSQueue:     "DCPT310",
 			CUPSRunner:    runner,
+			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-c",
 			ScreenSink:    noopSink,
@@ -3727,6 +3750,7 @@ job-media-sheets-completed (integer) = 1
 			StateStore:    store,
 			CUPSQueue:     "DCPT310",
 			CUPSRunner:    runner,
+			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-d",
 			ScreenSink:    noopSink,
@@ -3804,6 +3828,7 @@ job-media-sheets-completed (integer) = 1
 			StateStore:    store,
 			CUPSQueue:     "DCPT310",
 			CUPSRunner:    runner,
+			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-e",
 			ScreenSink:    noopSink,
@@ -4200,6 +4225,7 @@ func TestCUPSHoldOutcomeHandling(t *testing.T) {
 				StateStore:    store,
 				CUPSQueue:     "DCPT310",
 				CUPSRunner:    runner,
+				MockHealth:    testHealthyMockHealth,
 				DownloadDir:   tmpDir,
 				IdleQRContent: "https://kiosk-hold-test",
 				ScreenSink:    noopSink,
@@ -5176,5 +5202,69 @@ func TestClient_IncompleteJobSync_ReconnectWhileSendMuLocked(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("client.Run did not terminate promptly after context cancel")
+	}
+}
+
+func testHealthyMockHealth(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+	now := time.Now().UTC()
+	return contracts.PrinterHealth{
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "OK",
+		EstimatedSheets:        estimatedSheets,
+		TonerLevelPercent:      80,
+		TonerLevelKnown:        true,
+		DrumLifePercent:        90,
+		DrumLifeKnown:          true,
+		InputTrayLevel:         150,
+		InputTrayLevelKnown:    true,
+		InputTrayCapacity:      250,
+		InputTrayCapacityKnown: true,
+		ExecutionSafe:          true,
+		UpdatedAt:              now,
+	}
+}
+
+func testHealthyCUPSHealth(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+	return contracts.PrinterHealth{
+		Online:          true,
+		State:           "IDLE",
+		EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus: "OK",
+		EstimatedSheets: estimatedSheets,
+		UpdatedAt:       time.Now().UTC(),
+	}
+}
+
+func testHealthyIPPState(ctx context.Context, queue string) (printer.IPPPrinterStateResult, error) {
+	return printer.IPPPrinterStateResult{
+		Source:            printer.CapabilitySourceNativeIPP,
+		Queue:             queue,
+		State:             printer.IPPPrinterStateIdle,
+		RawState:          "idle",
+		AcceptingJobs:     printer.AcceptingJobsAccepting,
+		EndpointReachable: true,
+		QueueAccessible:   true,
+		ObservedAt:        time.Now().UTC(),
+	}, nil
+}
+
+func testHealthySNMPHealth(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
+	return contracts.PrinterHealth{
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "OK",
+		EstimatedSheets:        estimatedSheets,
+		TonerLevelPercent:      80,
+		TonerLevelKnown:        true,
+		DrumLifePercent:        90,
+		DrumLifeKnown:          true,
+		InputTrayLevel:         150,
+		InputTrayLevelKnown:    true,
+		InputTrayCapacity:      250,
+		InputTrayCapacityKnown: true,
+		UpdatedAt:              time.Now().UTC(),
 	}
 }

@@ -88,13 +88,28 @@ func NewRealDynamicSNMPSession(ctx context.Context, cfg SNMPConfig) (DynamicSNMP
 	return &RealDynamicSNMPSession{client: client}, nil
 }
 
-// SNMPPrinterDevice represents an entry from RFC 2790 hrPrinterTable.
+// SNMPPrinterDevice represents an entry from RFC 2790 hrPrinterTable and hrDeviceTable.
 type SNMPPrinterDevice struct {
-	Index      string            `json:"index"` // hrDeviceIndex
-	Status     int               `json:"status"`
-	StatusDesc string            `json:"status_desc"`
-	ErrorRaw   []byte            `json:"error_raw,omitempty"`
-	ErrorFlags PrinterErrorFlags `json:"error_flags"`
+	Index            string            `json:"index"` // hrDeviceIndex
+	DeviceStatus     int               `json:"device_status,omitempty"`
+	DeviceStatusDesc string            `json:"device_status_desc,omitempty"`
+	Status           int               `json:"status"`
+	StatusDesc       string            `json:"status_desc"`
+	ErrorRaw         []byte            `json:"error_raw,omitempty"`
+	ErrorFlags       PrinterErrorFlags `json:"error_flags"`
+}
+
+// SNMPInputTray represents an entry from RFC 3805 prtInputTable.
+type SNMPInputTray struct {
+	Index         string `json:"index"` // hrDeviceIndex.inputIndex
+	Name          string `json:"name,omitempty"`
+	Description   string `json:"description,omitempty"`
+	Unit          int64  `json:"unit,omitempty"`
+	MaxCapacity   int64  `json:"max_capacity"`  // -1=other, -2=unknown, >0=capacity
+	CurrentLevel  int64  `json:"current_level"` // -1=other, -2=unknown, -3=atLeastOneUnit, >=0=level
+	Status        int64  `json:"status,omitempty"`
+	LevelKnown    bool   `json:"level_known"`
+	CapacityKnown bool   `json:"capacity_known"`
 }
 
 // SNMPCover represents an entry from RFC 3805 prtCoverTable.
@@ -159,6 +174,7 @@ type SNMPProbeResult struct {
 	PrinterName   string              `json:"printer_name,omitempty"`
 	Printers      []SNMPPrinterDevice `json:"printers,omitempty"`
 	Covers        []SNMPCover         `json:"covers,omitempty"`
+	Inputs        []SNMPInputTray     `json:"inputs,omitempty"`
 	Markers       []SNMPMarker        `json:"markers,omitempty"`
 	Supplies      []SNMPSupply        `json:"supplies,omitempty"`
 	Alerts        []SNMPAlert         `json:"alerts,omitempty"`
@@ -220,6 +236,16 @@ func DiscoverSNMPDynamic(ctx context.Context, session DynamicSNMPSession, host s
 	// If the initial table walk timed out, the SNMP agent is not responding to Walk (GetNext).
 	// Immediately stop attempting subsequent walks and proceed to standard GET fallback.
 	if !isTimeoutError(errHR) {
+		// Walk hrDeviceTable hrDeviceStatus (1.3.6.1.2.1.25.3.2.1.5) and join onto hrPrinterTable devices
+		if devStatuses, errDev := walkHRDeviceStatus(session); errDev == nil && len(devStatuses) > 0 {
+			for i := range res.Printers {
+				if ds, ok := devStatuses[res.Printers[i].Index]; ok {
+					res.Printers[i].DeviceStatus = int(ds)
+					res.Printers[i].DeviceStatusDesc = FormatHRDeviceStatus(ds)
+				}
+			}
+		}
+
 		// Walk prtGeneralTable (1.3.6.1.2.1.43.5.1.1)
 		prtName := walkPrtGeneralTable(session)
 		if prtName != "" {
@@ -230,6 +256,13 @@ func DiscoverSNMPDynamic(ctx context.Context, session DynamicSNMPSession, host s
 		covers, errCover := walkPrtCoverTable(session)
 		if errCover == nil && len(covers) > 0 {
 			res.Covers = covers
+			walkCount++
+		}
+
+		// Walk prtInputTable (1.3.6.1.2.1.43.8.2.1)
+		inputs, errInputs := walkPrtInputTable(session)
+		if errInputs == nil && len(inputs) > 0 {
+			res.Inputs = inputs
 			walkCount++
 		}
 
@@ -289,7 +322,13 @@ func walkHRPrinterTable(session DynamicSNMPSession) ([]SNMPPrinterDevice, error)
 	statusMap := make(map[string]int)
 	errorMap := make(map[string][]byte)
 
+	const maxAlertWalkPDUs = 512
+	walkPDUs := 0
 	err := session.Walk(root, func(pdu gosnmp.SnmpPDU) error {
+		walkPDUs++
+		if walkPDUs > maxAlertWalkPDUs {
+			return fmt.Errorf("SNMP table walk exceeded %d PDUs", maxAlertWalkPDUs)
+		}
 		norm := normalizeOID(pdu.Name)
 		col, idx, ok := parseTableOID(norm, root)
 		if !ok {
@@ -336,6 +375,121 @@ func walkHRPrinterTable(session DynamicSNMPSession) ([]SNMPPrinterDevice, error)
 	return devices, nil
 }
 
+// walkHRDeviceStatus discovers hrDeviceStatus (column 5 of hrDeviceTable: 1.3.6.1.2.1.25.3.2.1.5).
+func walkHRDeviceStatus(session DynamicSNMPSession) (map[string]int64, error) {
+	root := "1.3.6.1.2.1.25.3.2.1"
+	statusMap := make(map[string]int64)
+	err := session.Walk(root+".5", func(pdu gosnmp.SnmpPDU) error {
+		norm := normalizeOID(pdu.Name)
+		col, idx, ok := parseTableOID(norm, root)
+		if !ok || col != 5 {
+			return nil
+		}
+		if val, ok := pduToInt64(pdu); ok {
+			statusMap[idx] = val
+		}
+		return nil
+	})
+	if err != nil && len(statusMap) == 0 {
+		return nil, err
+	}
+	return statusMap, nil
+}
+
+// walkPrtInputTable discovers prtInputTable rows (RFC 3805: 1.3.6.1.2.1.43.8.2.1).
+// Columns: 8=CapacityUnit, 9=MaxCapacity, 10=CurrentLevel, 11=Status, 13=Name, 18=Description.
+func walkPrtInputTable(session DynamicSNMPSession) ([]SNMPInputTray, error) {
+	root := "1.3.6.1.2.1.43.8.2.1"
+	unitMap := make(map[string]int64)
+	maxMap := make(map[string]int64)
+	lvlMap := make(map[string]int64)
+	statusMap := make(map[string]int64)
+	nameMap := make(map[string]string)
+	descMap := make(map[string]string)
+
+	const maxAlertWalkPDUs = 512
+	walkPDUs := 0
+	err := session.Walk(root, func(pdu gosnmp.SnmpPDU) error {
+		walkPDUs++
+		if walkPDUs > maxAlertWalkPDUs {
+			return fmt.Errorf("SNMP table walk exceeded %d PDUs", maxAlertWalkPDUs)
+		}
+		norm := normalizeOID(pdu.Name)
+		col, idx, ok := parseTableOID(norm, root)
+		if !ok {
+			return nil
+		}
+		switch col {
+		case 8:
+			if v, ok := pduToInt64(pdu); ok {
+				unitMap[idx] = v
+			}
+		case 9:
+			if v, ok := pduToInt64(pdu); ok {
+				maxMap[idx] = v
+			}
+		case 10:
+			if v, ok := pduToInt64(pdu); ok {
+				lvlMap[idx] = v
+			}
+		case 11:
+			if v, ok := pduToInt64(pdu); ok {
+				statusMap[idx] = v
+			}
+		case 13:
+			if s, ok := pduToString(pdu); ok {
+				nameMap[idx] = s
+			}
+		case 18:
+			if s, ok := pduToString(pdu); ok {
+				descMap[idx] = s
+			}
+		}
+		return nil
+	})
+	if err != nil && len(lvlMap) == 0 && len(maxMap) == 0 && len(nameMap) == 0 {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	for idx := range lvlMap {
+		seen[idx] = true
+	}
+	for idx := range maxMap {
+		seen[idx] = true
+	}
+	for idx := range nameMap {
+		seen[idx] = true
+	}
+	for idx := range descMap {
+		seen[idx] = true
+	}
+
+	var inputs []SNMPInputTray
+	for _, idx := range sortedKeys(seen) {
+		maxCap, hasMax := maxMap[idx]
+		if !hasMax {
+			maxCap = -2
+		}
+		curLvl, hasLvl := lvlMap[idx]
+		if !hasLvl {
+			curLvl = -2
+		}
+		inputs = append(inputs, SNMPInputTray{
+			Index:         idx,
+			Name:          nameMap[idx],
+			Description:   descMap[idx],
+			Unit:          unitMap[idx],
+			MaxCapacity:   maxCap,
+			CurrentLevel:  curLvl,
+			Status:        statusMap[idx],
+			LevelKnown:    hasLvl && curLvl >= 0,
+			CapacityKnown: hasMax && maxCap > 0,
+		})
+	}
+	return inputs, nil
+}
+
 // walkPrtGeneralTable queries prtGeneralPrinterName (RFC 3805 prtGeneralTable).
 // Column 16 = prtGeneralPrinterName
 func walkPrtGeneralTable(session DynamicSNMPSession) string {
@@ -361,7 +515,13 @@ func walkPrtCoverTable(session DynamicSNMPSession) ([]SNMPCover, error) {
 	descMap := make(map[string]string)
 	statusMap := make(map[string]int)
 
+	const maxAlertWalkPDUs = 512
+	walkPDUs := 0
 	err := session.Walk(root, func(pdu gosnmp.SnmpPDU) error {
+		walkPDUs++
+		if walkPDUs > maxAlertWalkPDUs {
+			return fmt.Errorf("SNMP table walk exceeded %d PDUs", maxAlertWalkPDUs)
+		}
 		norm := normalizeOID(pdu.Name)
 		col, idx, ok := parseTableOID(norm, root)
 		if !ok {
@@ -411,7 +571,13 @@ func walkPrtMarkerTable(session DynamicSNMPSession) ([]SNMPMarker, error) {
 	lifeMap := make(map[string]int64)
 	powerMap := make(map[string]int64)
 
+	const maxAlertWalkPDUs = 512
+	walkPDUs := 0
 	err := session.Walk(root, func(pdu gosnmp.SnmpPDU) error {
+		walkPDUs++
+		if walkPDUs > maxAlertWalkPDUs {
+			return fmt.Errorf("SNMP table walk exceeded %d PDUs", maxAlertWalkPDUs)
+		}
 		norm := normalizeOID(pdu.Name)
 		col, idx, ok := parseTableOID(norm, root)
 		if !ok {
@@ -494,7 +660,13 @@ func walkPrtMarkerSuppliesTable(session DynamicSNMPSession) ([]SNMPSupply, error
 	maxMap := make(map[string]int64)
 	lvlMap := make(map[string]int64)
 
+	const maxAlertWalkPDUs = 512
+	walkPDUs := 0
 	err := session.Walk(root, func(pdu gosnmp.SnmpPDU) error {
+		walkPDUs++
+		if walkPDUs > maxAlertWalkPDUs {
+			return fmt.Errorf("SNMP table walk exceeded %d PDUs", maxAlertWalkPDUs)
+		}
 		norm := normalizeOID(pdu.Name)
 		col, idx, ok := parseTableOID(norm, root)
 		if !ok {
@@ -588,7 +760,13 @@ func walkPrtAlertTable(session DynamicSNMPSession) ([]SNMPAlert, error) {
 	dscMap := make(map[string]string)
 	timMap := make(map[string]uint32)
 
+	const maxAlertWalkPDUs = 512
+	walkPDUs := 0
 	err := session.Walk(root, func(pdu gosnmp.SnmpPDU) error {
+		walkPDUs++
+		if walkPDUs > maxAlertWalkPDUs {
+			return fmt.Errorf("SNMP table walk exceeded %d PDUs", maxAlertWalkPDUs)
+		}
 		norm := normalizeOID(pdu.Name)
 		col, idx, ok := parseTableOID(norm, root)
 		if !ok {
@@ -942,6 +1120,124 @@ func calculateSupplyLevel(lvl int64, maxVal int64, unit int64) (string, *float64
 }
 
 // RFC 3805 / RFC 2790 formatting decoders
+
+// SNMPDiscoveryPlan stores dynamically discovered SNMP indexes and supply metadata
+// so recurring health acquisition executes bounded targeted GETs rather than full MIB walks.
+type SNMPDiscoveryPlan struct {
+	TargetHost       string                    `json:"target_host"`
+	TargetPort       int                       `json:"target_port"`
+	DiscoveryMode    string                    `json:"discovery_mode"`
+	PrinterIndex     string                    `json:"printer_index,omitempty"`
+	MarkerIndex      string                    `json:"marker_index,omitempty"`
+	TonerSupplyIndex string                    `json:"toner_supply_index,omitempty"`
+	DrumSupplyIndex  string                    `json:"drum_supply_index,omitempty"`
+	SupplyMeta       map[string]SNMPSupplyMeta `json:"supply_meta,omitempty"`
+	InputTrayIndexes []string                  `json:"input_tray_indexes,omitempty"`
+	DiscoveredAt     time.Time                 `json:"discovered_at"`
+}
+
+// SNMPSupplyMeta captures immutable supply metadata discovered during startup table walk.
+type SNMPSupplyMeta struct {
+	Description string `json:"description,omitempty"`
+	Type        int64  `json:"type"`
+	Class       int64  `json:"class"`
+	Unit        int64  `json:"unit"`
+}
+
+// BuildSNMPDiscoveryPlan derives an SNMPDiscoveryPlan from a dynamic SNMP probe result.
+// Fixed indexes such as .1.1 or .1.2 are never assumed when table indexes are discovered.
+func BuildSNMPDiscoveryPlan(res *SNMPProbeResult) *SNMPDiscoveryPlan {
+	if res == nil {
+		return nil
+	}
+	plan := &SNMPDiscoveryPlan{
+		TargetHost:    res.TargetHost,
+		TargetPort:    res.TargetPort,
+		DiscoveryMode: res.DiscoveryMode,
+		SupplyMeta:    make(map[string]SNMPSupplyMeta),
+		DiscoveredAt:  time.Now().UTC(),
+	}
+
+	if len(res.Printers) > 0 {
+		plan.PrinterIndex = res.Printers[0].Index
+	}
+	for _, m := range res.Markers {
+		if m.IsPageCounter && m.HasLifeCount {
+			plan.MarkerIndex = m.Index
+			break
+		}
+	}
+	if plan.MarkerIndex == "" && len(res.Markers) > 0 {
+		plan.MarkerIndex = res.Markers[0].Index
+	}
+
+	for _, s := range res.Supplies {
+		plan.SupplyMeta[s.Index] = SNMPSupplyMeta{
+			Description: s.Description,
+			Type:        s.Type,
+			Class:       s.Class,
+			Unit:        s.Unit,
+		}
+		if plan.TonerSupplyIndex == "" && isTonerOrInkSupply(s) {
+			plan.TonerSupplyIndex = s.Index
+		} else if plan.DrumSupplyIndex == "" && isDrumOrOPCSupply(s) {
+			plan.DrumSupplyIndex = s.Index
+		}
+	}
+
+	for i, tray := range res.Inputs {
+		if i >= 4 {
+			break
+		}
+		plan.InputTrayIndexes = append(plan.InputTrayIndexes, tray.Index)
+	}
+
+	return plan
+}
+
+func isTonerOrInkSupply(s SNMPSupply) bool {
+	// RFC 3805 PrtMarkerSuppliesTypeTC:
+	// 3=toner, 5=ink, 6=inkCartridge, 21=tonerCartridge, 22=inkRibbon
+	// Explicitly exclude 4=wasteToner, 7=inkRibbon?, 8=wasteInk, 9=opc
+	switch s.Type {
+	case 3, 5, 6, 21, 22:
+		return true
+	case 4, 8, 9, 10, 15, 20:
+		return false
+	}
+	desc := strings.ToLower(s.Description)
+	if strings.Contains(desc, "waste") || strings.Contains(desc, "drum") || strings.Contains(desc, "opc") || strings.Contains(desc, "imaging") {
+		return false
+	}
+	return strings.Contains(desc, "toner") || strings.Contains(desc, "ink") || strings.Contains(desc, "cartridge")
+}
+
+func isDrumOrOPCSupply(s SNMPSupply) bool {
+	// RFC 3805 PrtMarkerSuppliesTypeTC: 9=opc (organic photoconductor / drum), 20=fuser/drum unit in some devices
+	if s.Type == 9 {
+		return true
+	}
+	desc := strings.ToLower(s.Description)
+	return strings.Contains(desc, "drum") || strings.Contains(desc, "opc") || strings.Contains(desc, "photoconductor") || strings.Contains(desc, "imaging")
+}
+
+// FormatHRDeviceStatus decodes RFC 2790 hrDeviceStatus.
+func FormatHRDeviceStatus(status int64) string {
+	switch status {
+	case 1:
+		return "unknown"
+	case 2:
+		return "running"
+	case 3:
+		return "warning"
+	case 4:
+		return "testing"
+	case 5:
+		return "down"
+	default:
+		return fmt.Sprintf("unknown(%d)", status)
+	}
+}
 
 func FormatHRPrinterStatus(status int64) string {
 	switch status {

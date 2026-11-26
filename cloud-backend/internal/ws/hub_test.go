@@ -88,6 +88,37 @@ func connectTestKiosk(t *testing.T, hub *Hub, serverURL, kioskID string) (*webso
 	return conn, cancel
 }
 
+func sendTestReadyHealth(ctx context.Context, t *testing.T, hub *Hub, conn *websocket.Conn, kioskID string) {
+	t.Helper()
+	h := contracts.PrinterHealth{
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     250,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   90,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     95,
+		DrumLifeKnown:       true,
+		InputTrayLevel:      -1,
+		InputTrayCapacity:   -1,
+		UpdatedAt:           time.Now().UTC(),
+	}
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &h}); err != nil {
+		t.Fatalf("failed to write test ready health: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready, _ := hub.IsKioskReadyForDispatch(kioskID); ready {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("kiosk %s did not become ready after sending valid health", kioskID)
+}
+
 func readJobMessage(ctx context.Context, t *testing.T, conn *websocket.Conn) wireMessage {
 	t.Helper()
 	for {
@@ -110,6 +141,9 @@ func TestHubRegistersAndSendsJob(t *testing.T) {
 	defer server.Close()
 
 	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-001")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sendTestReadyHealth(ctx, t, hub, conn, "kiosk-001")
 
 	cmd := contracts.PrintJobCommand{
 		JobID:          "job-test-001",
@@ -123,9 +157,6 @@ func TestHubRegistersAndSendsJob(t *testing.T) {
 		Duplex:         contracts.DuplexLongEdge,
 		StartFromPage:  1,
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
 
 	if err := hub.SendJob(ctx, cmd); err != nil {
 		t.Fatalf("hub.SendJob failed: %v", err)
@@ -256,24 +287,35 @@ func TestHubTracksLatestHealth(t *testing.T) {
 
 	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-health-1")
 
+	t1 := time.Now().UTC()
 	health1 := contracts.PrinterHealth{
-		Online:            true,
-		State:             "IDLE",
-		PaperTrayStatus:   "OK",
-		EstimatedSheets:   200,
-		TonerLevelPercent: 85,
-		DrumLifePercent:   90,
-		UpdatedAt:         time.Now().UTC(),
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     200,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   85,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     90,
+		DrumLifeKnown:       true,
+		UpdatedAt:           t1,
 	}
 
 	health2 := contracts.PrinterHealth{
-		Online:            true,
-		State:             "PRINTING",
-		PaperTrayStatus:   "LOW",
-		EstimatedSheets:   190,
-		TonerLevelPercent: 84,
-		DrumLifePercent:   89,
-		UpdatedAt:         time.Now().UTC(),
+		Online:              true,
+		State:               "PRINTING",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "LOW",
+		EstimatedSheets:     190,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   84,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     89,
+		DrumLifeKnown:       true,
+		UpdatedAt:           t1.Add(time.Millisecond),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -352,6 +394,7 @@ func TestHubConnectionCleanup(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	sendTestReadyHealth(ctx, t, hub, conn, "kiosk-cleanup-1")
 
 	// Verify job can be sent while connected
 	if err := hub.SendJob(ctx, cmd); err != nil {
@@ -387,6 +430,8 @@ func TestHubConcurrentConnections(t *testing.T) {
 
 	conn1, _ := connectTestKiosk(t, hub, server.URL, "kiosk-A")
 	conn2, _ := connectTestKiosk(t, hub, server.URL, "kiosk-B")
+	sendTestReadyHealth(context.Background(), t, hub, conn1, "kiosk-A")
+	sendTestReadyHealth(context.Background(), t, hub, conn2, "kiosk-B")
 
 	cmdA := contracts.PrintJobCommand{
 		JobID:         "job-A",

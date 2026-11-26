@@ -359,17 +359,25 @@ func TestHealthScreen_SNMPTimeout_CUPSReasonsPreserved(t *testing.T) {
 		return []byte(out), nil
 	}
 
-	// SNMP target on unused port to simulate timeout / unreachable
-	snmpCfg := printer.SNMPConfig{
+	cupsHealth, cupsErr := printer.QueryCUPSHealthDiagnostic(context.Background(), cupsRunner, "HPTank", 100)
+	if cupsErr != nil {
+		t.Fatalf("unexpected CUPS error: %v", cupsErr)
+	}
+	// SNMP target unreachable
+	snmpHealth := printer.PollHealthConfig(context.Background(), printer.SNMPConfig{
 		Target:  "127.0.0.1",
 		Port:    54321,
 		Timeout: 50 * time.Millisecond,
 		Retries: 0,
-	}
+	}, 100)
 
-	health := printer.PollCombinedHealth(context.Background(), cupsRunner, "HPTank", snmpCfg, 100)
-	if health.State != "ERROR" {
-		t.Fatalf("health.State = %s, want ERROR (CUPS reason must be preserved when SNMP is unreachable)", health.State)
+	reconciled := printer.ReconcilePrinterHealth(cupsHealth, printer.IPPPrinterStateResult{}, snmpHealth, time.Now().UTC(), printer.SourceValidity{
+		CUPSValid: true,
+		SNMPValid: false,
+	})
+	health := reconciled.ToContract(100, true, true, "")
+	if health.State != "ERROR" || health.EvaluatedHealth != contracts.EvaluatedHealthFault {
+		t.Fatalf("health = (%s, %s), want (ERROR, FAULT) when CUPS reports jam and SNMP is unreachable", health.State, health.EvaluatedHealth)
 	}
 	if !health.PaperJam {
 		t.Error("expected PaperJam = true from CUPS media-jam-error")
@@ -936,7 +944,11 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 	defer wsServer.Close()
 
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-printStarted:
+			time.Sleep(15 * time.Millisecond)
+		case <-time.After(1 * time.Second):
+		}
 		jamReported.Store(true)
 	}()
 
@@ -950,6 +962,8 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 		HealthPollInterval: 15 * time.Millisecond,
 		ScreenSink:         func(*image.RGBA) error { return nil },
 		CUPSRunner:         customRunner,
+		MockIPPState:       testHealthyIPPState,
+		MockSNMPHealth:     testHealthySNMPHealth,
 	}
 
 	client, err := NewClient(cfg)
@@ -2511,6 +2525,9 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 		ScreenSink:          func(*image.RGBA) error { return nil },
 		CUPSRunner:          runner,
 		SNMPPoller:          poller,
+		MockCUPSHealth:      testHealthyCUPSHealth,
+		MockIPPState:        testHealthyIPPState,
+		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
 	}
 
@@ -2630,6 +2647,9 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 		ScreenSink:          func(*image.RGBA) error { return nil },
 		CUPSRunner:          runner,
 		SNMPPoller:          nil, // MISSING ODONOMETER
+		MockCUPSHealth:      testHealthyCUPSHealth,
+		MockIPPState:        testHealthyIPPState,
+		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
 	}
 
@@ -2745,6 +2765,9 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 		IdleQRContent:       "https://kiosk.test/ready",
 		ScreenSink:          func(*image.RGBA) error { return nil },
 		CUPSRunner:          runner,
+		MockCUPSHealth:      testHealthyCUPSHealth,
+		MockIPPState:        testHealthyIPPState,
+		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
 	}
 
@@ -2879,6 +2902,9 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 		ScreenSink:          func(*image.RGBA) error { return nil },
 		CUPSRunner:          runner,
 		SNMPPoller:          poller,
+		MockCUPSHealth:      testHealthyCUPSHealth,
+		MockIPPState:        testHealthyIPPState,
+		MockSNMPHealth:      testHealthySNMPHealth,
 		EnableCloudRecovery: true,
 	}
 

@@ -884,6 +884,15 @@ func TestPaymentSafety_DispatchIntentReconciliation_OnKioskReconnect(t *testing.
 	}
 	defer wsConn.CloseNow()
 
+	// New connections start unverified: verify pending order is NOT dispatched until verified healthy telemetry arrives.
+	time.Sleep(80 * time.Millisecond)
+	pPre, _ := st.GetPendingDispatchOrders(context.Background(), kioskID)
+	if len(pPre) == 0 {
+		t.Fatalf("expected pending dispatch intent NOT to be dispatched before health verification")
+	}
+
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
+
 	// Wait for reconciliation: hub sends pending job command and marks intent SENT
 	deadline := time.Now().Add(3 * time.Second)
 	reconciled := false
@@ -1004,6 +1013,7 @@ func TestPaymentSafety_ReleaseRequiresExplicitSessionID(t *testing.T) {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
 	defer wsConn.CloseNow()
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// Call release with empty session_id -> MUST return 400 Bad Request
 	relURL := fmt.Sprintf("%s/api/k/%s/orders/%s/release", ts.URL, kioskID, orderID)
@@ -1081,6 +1091,7 @@ func TestPaymentSafety_ReconnectSkipsCanceledOrExpiredSessionJob(t *testing.T) {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
 	defer wsConn.CloseNow()
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// Give the hub a moment to run reconciliation
 	time.Sleep(100 * time.Millisecond)
@@ -1138,6 +1149,7 @@ func TestPaymentSafety_KioskAckTransitionsIntentToAcknowledged(t *testing.T) {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
 	defer wsConn.CloseNow()
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// Claim order
 	claimReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, orderID), nil)
@@ -1275,6 +1287,7 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
 	defer wsConn.CloseNow()
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// 4. Payment Captured via Signed Razorpay Webhook
 	paymentID := "pay_e2e_evt_999"
@@ -1838,6 +1851,7 @@ func TestPaymentPhase1_Webhook_FullLifecycleAndDispatch(t *testing.T) {
 		t.Fatalf("kiosk websocket dial failed: %v", err)
 	}
 	defer wsConn.Close(websocket.StatusNormalClosure, "done")
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// Wait for kiosk to register with hub
 	time.Sleep(50 * time.Millisecond)

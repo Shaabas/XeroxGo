@@ -1081,6 +1081,7 @@ func TestMultiDoc_E2E_CrashRecovery_PhysicallyUncertain_RequiresReconciliation(t
 	// Launch daemon 1 configured with our controlled mock printer listener
 	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
 	cmd1 := exec.Command(binPath,
+		"--mock-printer",
 		"--printer-addr="+printerAddr,
 		"--cloud-url="+wsURL,
 		"--kiosk-id="+kioskID,

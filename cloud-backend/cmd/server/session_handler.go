@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"xeroxgo/cloud-backend/internal/store"
+	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -119,8 +120,8 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
-	// Telemetry freshness check: within 60s
-	if time.Since(health.UpdatedAt) > 60*time.Second {
+	// Telemetry freshness check: within canonical 6s window
+	if time.Since(health.UpdatedAt) > ws.DefaultTelemetryFreshnessWindow {
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
 			Code:       "TELEMETRY_STALE",
@@ -128,7 +129,57 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
-	// Hardware error / fault check
+	// Canonical evaluated readiness check
+	switch health.EvaluatedHealth {
+	case contracts.EvaluatedHealthFault:
+		msg := "printer hardware error or offline"
+		if health.PaperJam {
+			msg = "printer has a paper jam"
+		} else if health.CoverOpen {
+			msg = "printer cover is open"
+		} else if health.OutputBinFull {
+			msg = "printer output bin is full"
+		} else if health.ErrorMessage != "" {
+			msg = fmt.Sprintf("printer error: %s", health.ErrorMessage)
+		}
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "PRINTER_ERROR",
+			Message:    msg,
+		}
+	case contracts.EvaluatedHealthUnverified:
+		msg := "printer telemetry readiness is unverified"
+		if health.ErrorMessage != "" {
+			msg = health.ErrorMessage
+		}
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "TELEMETRY_UNVERIFIED",
+			Message:    msg,
+		}
+	case contracts.EvaluatedHealthHealthy:
+		// ok, continue checks
+	default:
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "TELEMETRY_UNVERIFIED",
+			Message:    "printer telemetry readiness is unverified",
+		}
+	}
+
+	if !health.ExecutionSafe {
+		msg := "printer local execution-safety barrier is active"
+		if health.ExecutionSafetyReason != "" {
+			msg = health.ExecutionSafetyReason
+		}
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "EXECUTION_UNSAFE",
+			Message:    msg,
+		}
+	}
+
+	// Operational fault safety net
 	if !health.Online || health.State == "ERROR" || health.State == "OFFLINE" ||
 		health.PaperJam || health.CoverOpen || health.OutputBinFull {
 		msg := "printer hardware error or offline"
@@ -148,9 +199,9 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
-	// Paper tray status check
+	// Existing inventory and calibration check
 	tray := strings.ToUpper(strings.TrimSpace(health.PaperTrayStatus))
-	if tray == "UNKNOWN" {
+	if tray == "UNKNOWN" || !health.InventoryCalibrated {
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
 			Code:       "PAPER_UNKNOWN",

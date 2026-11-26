@@ -196,7 +196,7 @@ printer-state-reasons (keyword) = marker-waste-full-error
 			},
 		},
 		{
-			name:  "marker-waste-full-warning sets OtherError but NOT HasHardwareFault",
+			name:  "marker-waste-full-warning sets HasHardwareFault and OtherError",
 			queue: "WasteWarningQueue",
 			output: `
 status-code = successful-ok
@@ -208,8 +208,8 @@ printer-state-reasons (keyword) = marker-waste-full-warning
 				if !res.OtherError {
 					t.Errorf("expected OtherError true for marker-waste-full-warning")
 				}
-				if res.HasHardwareFault {
-					t.Errorf("expected HasHardwareFault false for warning severity")
+				if !res.HasHardwareFault {
+					t.Errorf("expected HasHardwareFault true for marker-waste-full-warning")
 				}
 				if len(res.ParsedReasons) != 1 {
 					t.Fatalf("expected 1 parsed reason, got %d", len(res.ParsedReasons))
@@ -220,7 +220,7 @@ printer-state-reasons (keyword) = marker-waste-full-warning
 			},
 		},
 		{
-			name:  "marker-waste-full-report sets OtherError but NOT HasHardwareFault",
+			name:  "marker-waste-full-report sets HasHardwareFault and OtherError",
 			queue: "WasteReportQueue",
 			output: `
 status-code = successful-ok
@@ -232,8 +232,8 @@ printer-state-reasons (keyword) = marker-waste-full-report
 				if !res.OtherError {
 					t.Errorf("expected OtherError true for marker-waste-full-report")
 				}
-				if res.HasHardwareFault {
-					t.Errorf("expected HasHardwareFault false for report severity")
+				if !res.HasHardwareFault {
+					t.Errorf("expected HasHardwareFault true for marker-waste-full-report")
 				}
 				if len(res.ParsedReasons) != 1 {
 					t.Fatalf("expected 1 parsed reason, got %d", len(res.ParsedReasons))
@@ -244,7 +244,7 @@ printer-state-reasons (keyword) = marker-waste-full-report
 			},
 		},
 		{
-			name:  "report severity suffix does not flag blocking hardware fault",
+			name:  "physical fault keywords block even with report suffix while toner-low remains warning",
 			queue: "ReportQueue",
 			output: `
 status-code = successful-ok
@@ -259,8 +259,8 @@ printer-state-reasons (keyword) = media-jam-report,toner-low-warning
 				if !res.MarkerLow {
 					t.Errorf("expected MarkerLow true for toner-low-warning")
 				}
-				if res.HasHardwareFault {
-					t.Errorf("expected HasHardwareFault false when reason is only report/warning")
+				if !res.HasHardwareFault {
+					t.Errorf("expected HasHardwareFault true for media-jam-report")
 				}
 			},
 		},

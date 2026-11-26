@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
@@ -376,39 +377,47 @@ func pollHealthWithFactory(
 
 	// 4. prtMarkerSuppliesLevel & MaxCapacity (Supply 1 - Toner)
 	tonerPercent := 0
+	tonerKnown := false
 	pduTonerLevel, okTL := findPDU(packet, oidPrtMarkerSuppliesLevel1, 3)
 	pduTonerMax, okTM := findPDU(packet, oidPrtMarkerSuppliesMax1, 4)
 	if okTL && okTM {
 		if pct, valid := calcSupplyPercentage(pduTonerLevel, pduTonerMax); valid {
 			tonerPercent = pct
+			tonerKnown = true
 		}
 	}
 
 	// 5. prtMarkerSuppliesLevel & MaxCapacity (Supply 2 - Drum Unit)
 	drumPercent := 0
+	drumKnown := false
 	pduDrumLevel, okDL := findPDU(packet, oidPrtMarkerSuppliesLevel2, 5)
 	pduDrumMax, okDM := findPDU(packet, oidPrtMarkerSuppliesMax2, 6)
 	if okDL && okDM {
 		if pct, valid := calcSupplyPercentage(pduDrumLevel, pduDrumMax); valid {
 			drumPercent = pct
+			drumKnown = true
 		}
 	}
 
 	// Distinguish actual communication failure from missing individual metrics.
 	// If the SNMP agent responded but returned zero recognizable metrics, report UNKNOWN.
-	if !statusFound && !errorFlagsFound && !markerFound && tonerPercent == 0 && drumPercent == 0 {
+	if !statusFound && !errorFlagsFound && !markerFound && !tonerKnown && !drumKnown {
 		return contracts.PrinterHealth{
-			Online:            true,
-			State:             "UNKNOWN",
-			PaperTrayStatus:   "UNKNOWN",
-			EstimatedSheets:   estimatedSheets,
-			TonerLevelPercent: 0,
-			DrumLifePercent:   0,
-			CoverOpen:         false,
-			PaperJam:          false,
-			OutputBinFull:     false,
-			ErrorMessage:      "SNMP responded but returned no supported printer metrics",
-			UpdatedAt:         time.Now().UTC(),
+			Online:             true,
+			State:              "UNKNOWN",
+			PaperTrayStatus:    "UNKNOWN",
+			EstimatedSheets:    estimatedSheets,
+			TonerLevelPercent:  0,
+			TonerLevelKnown:    false,
+			DrumLifePercent:    0,
+			DrumLifeKnown:      false,
+			InputTrayLevel:     -1,
+			InputTrayCapacity:  -1,
+			CoverOpen:          false,
+			PaperJam:           false,
+			OutputBinFull:      false,
+			ErrorMessage:       "SNMP responded but returned no supported printer metrics",
+			UpdatedAt:          time.Now().UTC(),
 		}
 	}
 
@@ -495,7 +504,11 @@ func pollHealthWithFactory(
 		PaperTrayStatus:   paperTrayStatus,
 		EstimatedSheets:   estimatedSheets,
 		TonerLevelPercent: tonerPercent,
+		TonerLevelKnown:   tonerKnown,
 		DrumLifePercent:   drumPercent,
+		DrumLifeKnown:     drumKnown,
+		InputTrayLevel:    -1,
+		InputTrayCapacity: -1,
 		CoverOpen:         flags.DoorOpen,
 		PaperJam:          flags.Jammed,
 		OutputBinFull:     flags.OutputFull,
@@ -530,6 +543,640 @@ func PollHealth(
 	estimatedSheets int,
 ) contracts.PrinterHealth {
 	return PollHealthTarget(ctx, defaultTarget, estimatedSheets)
+}
+
+// DynamicSessionFactory constructs a DynamicSNMPSession for target inspection and polling.
+type DynamicSessionFactory func(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error)
+
+// SNMPObservation captures normalized RFC 2790/3805 physical printer telemetry from one SNMP cycle.
+type SNMPObservation struct {
+	Available              bool                     `json:"available"`
+	ObservedAt             time.Time                `json:"observed_at"`
+	TargetHost             string                   `json:"target_host"`
+	DiscoveryMode          string                   `json:"discovery_mode,omitempty"`
+	DeviceStatus           int64                    `json:"device_status"`
+	PrinterStatus          int64                    `json:"printer_status"`
+	HasErrorFlags          bool                     `json:"has_error_flags"`
+	ErrorFlags             PrinterErrorFlags        `json:"error_flags"`
+	Alerts                 []SNMPAlert              `json:"alerts,omitempty"`
+	TonerPercent           int                      `json:"toner_percent"`
+	TonerKnown             bool                     `json:"toner_known"`
+	DrumPercent            int                      `json:"drum_percent"`
+	DrumKnown              bool                     `json:"drum_known"`
+	InputTrayLevel         int                      `json:"input_tray_level"`
+	InputTrayLevelKnown    bool                     `json:"input_tray_level_known"`
+	InputTrayCapacity      int                      `json:"input_tray_capacity"`
+	InputTrayCapacityKnown bool                     `json:"input_tray_capacity_known"`
+	HasBlockingFault       bool                     `json:"has_blocking_fault"`
+	BlockingFaults         []contracts.HealthReason `json:"blocking_faults,omitempty"`
+	Warnings               []contracts.HealthReason `json:"warnings,omitempty"`
+	Error                  string                   `json:"error,omitempty"`
+	Health                 contracts.PrinterHealth  `json:"health"`
+}
+
+// SNMPHealthMonitor caches dynamically discovered SNMP indexes and executes bounded targeted
+// health queries on recurring telemetry cycles without performing full hardware fingerprints each tick.
+type SNMPHealthMonitor struct {
+	mu      sync.Mutex
+	cfg     SNMPConfig
+	factory DynamicSessionFactory
+	plan    *SNMPDiscoveryPlan
+}
+
+// NewSNMPMonitor creates a reusable dynamic SNMP health monitor.
+func NewSNMPMonitor(cfg SNMPConfig, factory DynamicSessionFactory) *SNMPHealthMonitor {
+	if factory == nil {
+		factory = NewRealDynamicSNMPSession
+	}
+	return &SNMPHealthMonitor{
+		cfg:     cfg,
+		factory: factory,
+	}
+}
+
+// ResetPlan clears cached SNMP discovery indexes (e.g. if target changes).
+func (m *SNMPHealthMonitor) ResetPlan() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.plan = nil
+}
+
+// Poll executes one bounded dynamic SNMP acquisition cycle, discovering table indexes at startup
+// (or rediscovering if cached indexes fail or become stale).
+func (m *SNMPHealthMonitor) Poll(ctx context.Context, estimatedSheets int) SNMPObservation {
+	now := time.Now().UTC()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return unavailableSNMPObservation(m.cfg.Target, estimatedSheets, now, fmt.Sprintf("context canceled: %v", err))
+	}
+
+	m.mu.Lock()
+	cfg := m.cfg
+	plan := m.plan
+	factory := m.factory
+	m.mu.Unlock()
+
+	if strings.TrimSpace(cfg.Target) == "" {
+		return unavailableSNMPObservation("", estimatedSheets, now, "SNMP target is empty")
+	}
+	if cfg.Port <= 0 {
+		cfg.Port = defaultPort
+	}
+	if cfg.Community == "" {
+		cfg.Community = defaultCommunity
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
+	}
+
+	pollCtx, cancel := context.WithTimeout(ctx, cfg.Timeout+time.Second)
+	defer cancel()
+
+	session, err := factory(pollCtx, cfg)
+	if err != nil {
+		return unavailableSNMPObservation(cfg.Target, estimatedSheets, time.Now().UTC(), fmt.Sprintf("SNMP connect failed: %v", err))
+	}
+	defer session.Close()
+
+	if plan == nil {
+		return m.discoverAndSaveLocked(pollCtx, session, cfg, estimatedSheets)
+	}
+
+	probe, err := m.pollTargetedWithPlan(pollCtx, session, cfg, plan)
+	if err != nil {
+		// Invalidate cached indexes once and retry discovery in case dynamic indexes shifted or walk fallback is needed.
+		m.mu.Lock()
+		m.plan = nil
+		m.mu.Unlock()
+		return m.discoverAndSaveLocked(pollCtx, session, cfg, estimatedSheets)
+	}
+
+	return EvaluateSNMPProbe(probe, estimatedSheets, time.Now().UTC())
+}
+
+func (m *SNMPHealthMonitor) discoverAndSaveLocked(
+	ctx context.Context,
+	session DynamicSNMPSession,
+	cfg SNMPConfig,
+	estimatedSheets int,
+) SNMPObservation {
+	probe, err := DiscoverSNMPDynamic(ctx, session, cfg.Target, cfg.Port)
+	if err != nil || probe == nil {
+		errMsg := "SNMP dynamic discovery failed"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		return unavailableSNMPObservation(cfg.Target, estimatedSheets, time.Now().UTC(), errMsg)
+	}
+	obs := EvaluateSNMPProbe(probe, estimatedSheets, time.Now().UTC())
+	if obs.Available {
+		plan := BuildSNMPDiscoveryPlan(probe)
+		m.mu.Lock()
+		m.plan = plan
+		m.mu.Unlock()
+	}
+	return obs
+}
+
+func (m *SNMPHealthMonitor) pollTargetedWithPlan(
+	ctx context.Context,
+	session DynamicSNMPSession,
+	cfg SNMPConfig,
+	plan *SNMPDiscoveryPlan,
+) (*SNMPProbeResult, error) {
+	printerIdx := plan.PrinterIndex
+	if printerIdx == "" {
+		return nil, fmt.Errorf("cached SNMP plan lacks printer index")
+	}
+
+	oidDevStatus := "1.3.6.1.2.1.25.3.2.1.5." + printerIdx
+	oidPrtStatus := "1.3.6.1.2.1.25.3.5.1.1." + printerIdx
+	oidPrtErr := "1.3.6.1.2.1.25.3.5.1.2." + printerIdx
+
+	oids := []string{oidDevStatus, oidPrtStatus, oidPrtErr}
+
+	if plan.TonerSupplyIndex != "" {
+		oids = append(oids,
+			"1.3.6.1.2.1.43.11.1.1.7."+plan.TonerSupplyIndex,
+			"1.3.6.1.2.1.43.11.1.1.8."+plan.TonerSupplyIndex,
+			"1.3.6.1.2.1.43.11.1.1.9."+plan.TonerSupplyIndex,
+		)
+	}
+	if plan.DrumSupplyIndex != "" {
+		oids = append(oids,
+			"1.3.6.1.2.1.43.11.1.1.7."+plan.DrumSupplyIndex,
+			"1.3.6.1.2.1.43.11.1.1.8."+plan.DrumSupplyIndex,
+			"1.3.6.1.2.1.43.11.1.1.9."+plan.DrumSupplyIndex,
+		)
+	}
+	for _, trayIdx := range plan.InputTrayIndexes {
+		oids = append(oids,
+			"1.3.6.1.2.1.43.8.2.1.9."+trayIdx,
+			"1.3.6.1.2.1.43.8.2.1.10."+trayIdx,
+		)
+	}
+
+	packet, err := session.Get(oids)
+	if err != nil || packet == nil || packet.Error != gosnmp.NoError {
+		// Fall back to essential printer OIDs before declaring targeted poll failure (strict/v1 agents)
+		essential := []string{oidPrtStatus, oidPrtErr}
+		packet, err = session.Get(essential)
+		if err != nil || packet == nil || packet.Error != gosnmp.NoError {
+			if err == nil {
+				err = fmt.Errorf("SNMP packet error: %v", packet)
+			}
+			return nil, err
+		}
+	}
+
+	probe := &SNMPProbeResult{
+		TargetHost:    cfg.Target,
+		TargetPort:    cfg.Port,
+		DiscoveryMode: "SNMP_TARGETED_PLAN",
+	}
+
+	var devStatus, prtStatus int64
+	var prtErrBytes []byte
+	var hasPrtStatus, hasPrtErr bool
+
+	if pdu, ok := findPDU(packet, oidDevStatus, -1); ok && isValidPDU(pdu) {
+		if v, okV := pduToInt64(pdu); okV {
+			devStatus = v
+		}
+	}
+	if pdu, ok := findPDU(packet, oidPrtStatus, -1); ok && isValidPDU(pdu) {
+		if v, okV := pduToInt64(pdu); okV {
+			prtStatus = v
+			hasPrtStatus = true
+		}
+	}
+	if pdu, ok := findPDU(packet, oidPrtErr, -1); ok && isValidPDU(pdu) {
+		if b, okB := pduToBytes(pdu); okB {
+			prtErrBytes = b
+			hasPrtErr = true
+		}
+	}
+
+	if !hasPrtStatus && !hasPrtErr {
+		return nil, fmt.Errorf("targeted SNMP GET lacked printer status and error state for index %q", printerIdx)
+	}
+
+	probe.Printers = []SNMPPrinterDevice{{
+		Index:            printerIdx,
+		DeviceStatus:     int(devStatus),
+		DeviceStatusDesc: FormatHRDeviceStatus(devStatus),
+		Status:           int(prtStatus),
+		StatusDesc:       FormatHRPrinterStatus(prtStatus),
+		ErrorRaw:         prtErrBytes,
+		ErrorFlags:       DecodeErrorBitmask(prtErrBytes),
+	}}
+
+	extractSupply := func(idx string) {
+		if idx == "" {
+			return
+		}
+		meta := plan.SupplyMeta[idx]
+		unit := meta.Unit
+		var maxCap, lvl int64 = -2, -2
+		var hasAny bool
+		if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.7."+idx, -1); ok && isValidPDU(pdu) {
+			if v, okV := pduToInt64(pdu); okV {
+				unit = v
+			}
+		}
+		if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.8."+idx, -1); ok && isValidPDU(pdu) {
+			if v, okV := pduToInt64(pdu); okV {
+				maxCap = v
+				hasAny = true
+			}
+		}
+		if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.9."+idx, -1); ok && isValidPDU(pdu) {
+			if v, okV := pduToInt64(pdu); okV {
+				lvl = v
+				hasAny = true
+			}
+		}
+		if !hasAny {
+			return
+		}
+		lvlDesc, pct := calculateSupplyLevel(lvl, maxCap, unit)
+		probe.Supplies = append(probe.Supplies, SNMPSupply{
+			Index:       idx,
+			Description: meta.Description,
+			Type:        meta.Type,
+			TypeName:    FormatSupplyType(meta.Type),
+			Class:       meta.Class,
+			ClassName:   FormatSupplyClass(meta.Class),
+			Unit:        unit,
+			UnitName:    FormatSupplyUnit(unit),
+			MaxCapacity: maxCap,
+			Level:       lvl,
+			LevelDesc:   lvlDesc,
+			Percent:     pct,
+		})
+	}
+
+	extractSupply(plan.TonerSupplyIndex)
+	extractSupply(plan.DrumSupplyIndex)
+
+	for _, trayIdx := range plan.InputTrayIndexes {
+		var maxCap, lvl int64 = -2, -2
+		var hasMax, hasLvl bool
+		if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.8.2.1.9."+trayIdx, -1); ok && isValidPDU(pdu) {
+			if v, okV := pduToInt64(pdu); okV {
+				maxCap = v
+				hasMax = true
+			}
+		}
+		if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.8.2.1.10."+trayIdx, -1); ok && isValidPDU(pdu) {
+			if v, okV := pduToInt64(pdu); okV {
+				lvl = v
+				hasLvl = true
+			}
+		}
+		if hasMax || hasLvl {
+			probe.Inputs = append(probe.Inputs, SNMPInputTray{
+				Index:         trayIdx,
+				MaxCapacity:   maxCap,
+				CurrentLevel:  lvl,
+				LevelKnown:    hasLvl && lvl >= 0,
+				CapacityKnown: hasMax && maxCap > 0,
+			})
+		}
+	}
+
+	// Bounded walk of prtAlertTable for active critical alerts (skip on fallback-only agents)
+	if plan.DiscoveryMode != "SNMP_GET_FALLBACK" && ctx.Err() == nil {
+		if alerts, aErr := walkPrtAlertTable(session); aErr == nil && len(alerts) > 0 {
+			probe.Alerts = alerts
+		} else if aErr != nil && isTimeoutError(aErr) {
+			return nil, fmt.Errorf("SNMP alert table walk timed out: %w", aErr)
+		}
+	}
+
+	return probe, nil
+}
+
+func unavailableSNMPObservation(target string, estimatedSheets int, now time.Time, errMsg string) SNMPObservation {
+	h := offlineHealth(estimatedSheets, errMsg)
+	h.UpdatedAt = now
+	h.TonerLevelPercent = -1
+	h.DrumLifePercent = -1
+	h.InputTrayLevel = -1
+	h.InputTrayCapacity = -1
+	return SNMPObservation{
+		Available:         false,
+		ObservedAt:        now,
+		TargetHost:        target,
+		TonerPercent:      -1,
+		DrumPercent:       -1,
+		InputTrayLevel:    -1,
+		InputTrayCapacity: -1,
+		Error:             errMsg,
+		Health:            h,
+	}
+}
+
+// EvaluateSNMPProbe translates a dynamic SNMPProbeResult into a canonical RFC 2790/3805
+// SNMPObservation and contracts.PrinterHealth.
+func EvaluateSNMPProbe(probe *SNMPProbeResult, estimatedSheets int, now time.Time) SNMPObservation {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if probe == nil {
+		return unavailableSNMPObservation("", estimatedSheets, now, "nil SNMP probe result")
+	}
+	if len(probe.Printers) == 0 && len(probe.Alerts) == 0 && len(probe.Supplies) == 0 && len(probe.Inputs) == 0 {
+		msg := probe.ProbeError
+		if msg == "" {
+			msg = "SNMP probe returned no printer metrics"
+		}
+		return unavailableSNMPObservation(probe.TargetHost, estimatedSheets, now, msg)
+	}
+
+	obs := SNMPObservation{
+		Available:         true,
+		ObservedAt:        now,
+		TargetHost:        probe.TargetHost,
+		DiscoveryMode:     probe.DiscoveryMode,
+		Alerts:            append([]SNMPAlert(nil), probe.Alerts...),
+		TonerPercent:      -1,
+		DrumPercent:       -1,
+		InputTrayLevel:    -1,
+		InputTrayCapacity: -1,
+	}
+
+	var devStatus int64
+	var prtStatus int64
+	var flags PrinterErrorFlags
+	var hasFlags bool
+	if len(probe.Printers) > 0 {
+		p := probe.Printers[0]
+		devStatus = int64(p.DeviceStatus)
+		prtStatus = int64(p.Status)
+		flags = p.ErrorFlags
+		hasFlags = len(p.ErrorRaw) > 0
+	}
+	obs.DeviceStatus = devStatus
+	obs.PrinterStatus = prtStatus
+	obs.ErrorFlags = flags
+	obs.HasErrorFlags = hasFlags
+
+	// Dynamic supply classification (toner & drum indexes resolved dynamically, never hardcoded .1.1/.1.2)
+	plan := BuildSNMPDiscoveryPlan(probe)
+	for _, s := range probe.Supplies {
+		if plan != nil && s.Index == plan.TonerSupplyIndex && s.Percent != nil && s.Level >= 0 {
+			pct := int(*s.Percent + 0.5)
+			if pct < 0 {
+				pct = 0
+			} else if pct > 100 {
+				pct = 100
+			}
+			obs.TonerPercent = pct
+			obs.TonerKnown = true
+		}
+		if plan != nil && s.Index == plan.DrumSupplyIndex && s.Percent != nil && s.Level >= 0 {
+			// RFC 3805: treat verified positive or explicit percentage drum measurements as known,
+			// while unverified/missing units or capacity leave DrumKnown=false. Zero drum alone never blocks.
+			if s.Level > 0 || (s.Unit == 19 && s.MaxCapacity > 0) {
+				pct := int(*s.Percent + 0.5)
+				if pct < 0 {
+					pct = 0
+				} else if pct > 100 {
+					pct = 100
+				}
+				obs.DrumPercent = pct
+				obs.DrumKnown = true
+			}
+		}
+	}
+
+	// Dynamic input tray levels (RFC 3805: -2 unknown is NEVER coerced to 0)
+	trayEmptyConfirmed := false
+	for _, tray := range probe.Inputs {
+		if tray.CapacityKnown && !obs.InputTrayCapacityKnown {
+			obs.InputTrayCapacity = int(tray.MaxCapacity)
+			obs.InputTrayCapacityKnown = true
+		}
+		if tray.LevelKnown && !obs.InputTrayLevelKnown {
+			obs.InputTrayLevel = int(tray.CurrentLevel)
+			obs.InputTrayLevelKnown = true
+		}
+		if tray.LevelKnown && tray.CurrentLevel == 0 {
+			trayEmptyConfirmed = true
+		}
+	}
+
+	// Cover status from prtCoverTable
+	coverOpen := flags.DoorOpen
+	for _, cov := range probe.Covers {
+		if cov.Status == 3 || cov.Status == 5 { // RFC 3805: 3=coverOpen, 5=interlockOpen
+			coverOpen = true
+		}
+	}
+
+	paperJam := flags.Jammed
+	outputFull := flags.OutputFull
+	paperEmpty := flags.NoPaper || flags.InputTrayEmpty || flags.InputTrayMissing || trayEmptyConfirmed
+	tonerEmpty := flags.NoToner
+	paperLow := flags.LowPaper
+	tonerLow := flags.LowToner || (obs.TonerKnown && obs.TonerPercent <= 10 && obs.TonerPercent > 0)
+
+	addFault := func(code, msg string) {
+		obs.HasBlockingFault = true
+		obs.BlockingFaults = append(obs.BlockingFaults, contracts.HealthReason{
+			Code:    code,
+			Source:  "snmp",
+			Message: msg,
+		})
+	}
+	addWarning := func(code, msg string) {
+		obs.Warnings = append(obs.Warnings, contracts.HealthReason{
+			Code:    code,
+			Source:  "snmp",
+			Message: msg,
+		})
+	}
+
+	// RFC 2790 hrDeviceStatus == 5 (down)
+	if devStatus == 5 {
+		addFault("snmp_device_down", "SNMP hrDeviceStatus reports device down (5)")
+	}
+	if flags.Offline || prtStatus == 7 {
+		addFault("snmp_offline", "SNMP reports printer offline")
+	}
+	if flags.ServiceRequested {
+		addFault("snmp_service_requested", "SNMP reports service requested")
+	}
+	if flags.MarkerSupplyMissing {
+		addFault("marker_supply_missing", "SNMP reports marker supply missing")
+	}
+
+	// RFC 3805 prtAlertTable critical alerts (severity == 3)
+	for _, al := range probe.Alerts {
+		descLower := strings.ToLower(al.Description)
+		switch al.Severity {
+		case 3: // critical / criticalBinaryChangeEvent
+			switch {
+			case al.Code == 8 || strings.Contains(descLower, "jam"):
+				paperJam = true
+				addFault("paper_jam", fmt.Sprintf("SNMP critical alert: %s", firstNonEmpty(al.Description, al.CodeName)))
+			case al.Code == 18 || al.Code == 11 ||
+				strings.Contains(descLower, "tray empty") ||
+				strings.Contains(descLower, "out of paper") ||
+				strings.Contains(descLower, "no paper") ||
+				strings.Contains(descLower, "media empty") ||
+				strings.Contains(descLower, "paper empty"):
+				paperEmpty = true
+				addFault("paper_empty", fmt.Sprintf("SNMP critical alert: %s", firstNonEmpty(al.Description, al.CodeName)))
+			case al.Code == 3 || al.Code == 5 || al.Code == 9 ||
+				strings.Contains(descLower, "cover open") ||
+				strings.Contains(descLower, "door open") ||
+				strings.Contains(descLower, "interlock open"):
+				coverOpen = true
+				addFault("cover_open", fmt.Sprintf("SNMP critical alert: %s", firstNonEmpty(al.Description, al.CodeName)))
+			case al.Code == 22 || al.Code == 20 || (strings.Contains(descLower, "output") && strings.Contains(descLower, "full")):
+				outputFull = true
+				addFault("output_bin_full", fmt.Sprintf("SNMP critical alert: %s", firstNonEmpty(al.Description, al.CodeName)))
+			case al.Code == 25 || al.Code == 28 || strings.Contains(descLower, "toner empty"):
+				tonerEmpty = true
+				addFault("toner_empty", fmt.Sprintf("SNMP critical alert: %s", firstNonEmpty(al.Description, al.CodeName)))
+			default:
+				addFault("snmp_critical_alert", fmt.Sprintf("SNMP critical alert (%s/%s): %s", al.GroupName, al.CodeName, al.Description))
+			}
+		case 4, 5: // warnings
+			switch al.Code {
+			case 17:
+				paperLow = true
+				addWarning("paper_low", firstNonEmpty(al.Description, "input media supply low"))
+			case 26:
+				tonerLow = true
+				addWarning("toner_low", firstNonEmpty(al.Description, "toner low"))
+			case 21:
+				addWarning("output_bin_near_full", firstNonEmpty(al.Description, "output bin near full"))
+			}
+		}
+	}
+
+	if paperJam {
+		addFault("paper_jam", "SNMP detected paper jam")
+	}
+	if coverOpen {
+		addFault("cover_open", "SNMP detected cover/door open")
+	}
+	if outputFull {
+		addFault("output_bin_full", "SNMP detected output bin full")
+	}
+	if paperEmpty {
+		addFault("paper_empty", "SNMP detected paper empty")
+	}
+	if tonerEmpty {
+		addFault("toner_empty", "SNMP detected toner empty")
+	}
+	if paperLow {
+		addWarning("paper_low", "SNMP detected low paper")
+	}
+	if tonerLow {
+		addWarning("toner_low", "SNMP detected low toner")
+	}
+	if flags.OutputNearFull {
+		addWarning("output_bin_near_full", "SNMP detected output bin near full")
+	}
+
+	// Deduplicate reasons while preserving order
+	obs.BlockingFaults = dedupeHealthReasons(obs.BlockingFaults)
+	obs.Warnings = dedupeHealthReasons(obs.Warnings)
+
+	// Derive operational state & paper tray status
+	state := "UNKNOWN"
+	switch prtStatus {
+	case 3:
+		state = "IDLE"
+	case 4:
+		state = "PRINTING"
+	case 5:
+		state = "WARMING_UP"
+	case 6:
+		state = "ERROR"
+	case 7:
+		state = "OFFLINE"
+	}
+	online := true
+	if flags.Offline || prtStatus == 7 {
+		online = false
+		state = "OFFLINE"
+	} else if obs.HasBlockingFault {
+		state = "ERROR"
+	}
+
+	trayStatus := "UNKNOWN"
+	if paperEmpty {
+		trayStatus = "EMPTY"
+	} else if paperLow {
+		trayStatus = "LOW"
+	} else if len(probe.Printers) > 0 && hasFlags {
+		trayStatus = "OK"
+	}
+
+	var errMsgs []string
+	for _, r := range obs.BlockingFaults {
+		if r.Message != "" {
+			errMsgs = append(errMsgs, r.Message)
+		} else {
+			errMsgs = append(errMsgs, r.Code)
+		}
+	}
+
+	obs.Health = contracts.PrinterHealth{
+		Online:                 online,
+		State:                  state,
+		PaperTrayStatus:        trayStatus,
+		EstimatedSheets:        estimatedSheets,
+		TonerLevelPercent:      obs.TonerPercent,
+		TonerLevelKnown:        obs.TonerKnown,
+		DrumLifePercent:        obs.DrumPercent,
+		DrumLifeKnown:          obs.DrumKnown,
+		InputTrayLevel:         obs.InputTrayLevel,
+		InputTrayLevelKnown:    obs.InputTrayLevelKnown,
+		InputTrayCapacity:      obs.InputTrayCapacity,
+		InputTrayCapacityKnown: obs.InputTrayCapacityKnown,
+		CoverOpen:              coverOpen,
+		PaperJam:               paperJam,
+		OutputBinFull:          outputFull,
+		BlockingReasons:        obs.BlockingFaults,
+		Warnings:               obs.Warnings,
+		ErrorMessage:           strings.Join(errMsgs, "; "),
+		UpdatedAt:              now,
+	}
+	return obs
+}
+
+func dedupeHealthReasons(in []contracts.HealthReason) []contracts.HealthReason {
+	if len(in) <= 1 {
+		return in
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]contracts.HealthReason, 0, len(in))
+	for _, r := range in {
+		key := r.Source + ":" + r.Code
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if t := strings.TrimSpace(v); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // HardwareTelemetry encapsulates physical hardware readings from SNMP.

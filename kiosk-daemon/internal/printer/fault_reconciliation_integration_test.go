@@ -644,7 +644,9 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if ippHealth.State != IPPPrinterStateIdle {
 			t.Errorf("IPP State = %q, want idle", ippHealth.State)
 		}
@@ -700,7 +702,9 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if !ippHealth.PaperJam {
 			t.Errorf("expected IPP PaperJam = true, got %v (reasons: %v)", ippHealth.PaperJam, ippHealth.RawReasons)
 		}
@@ -751,7 +755,9 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if !ippHealth.MediaEmpty {
 			t.Errorf("expected IPP MediaEmpty = true, got %v (reasons: %v)", ippHealth.MediaEmpty, ippHealth.RawReasons)
 		}
@@ -859,7 +865,9 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed after recovery: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if ippHealth.State != IPPPrinterStateIdle {
 			t.Errorf("IPP State = %q, want idle after recovery", ippHealth.State)
 		}
