@@ -74,9 +74,11 @@ type kioskSession struct {
 const maxInvalidationRetries = 20
 
 type invalidationState struct {
-	nextGen    uint64
-	pendingGen uint64
-	retryTimer *time.Timer
+	nextGen       uint64
+	pendingGen    uint64
+	retryTimer    *time.Timer
+	inFlight      bool
+	lastAttemptAt time.Time
 }
 
 // Hub manages active WebSocket connections from kiosks and relays jobs,
@@ -418,6 +420,8 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 
 	if !availOK {
 		h.triggerUnpaidInvalidation(kioskID)
+	} else {
+		h.retryPendingInvalidationIfIdle(kioskID)
 	}
 
 	if !ready || !h.isActiveSession(kioskID, sess) {
@@ -923,6 +927,8 @@ func (h *Hub) handleRefillAck(kioskID string, sess *kioskSession, msg wireMessag
 	sess.healthMu.Unlock()
 	if !availOK {
 		h.triggerUnpaidInvalidation(kioskID)
+	} else {
+		h.retryPendingInvalidationIfIdle(kioskID)
 	}
 	notify(nil)
 }
@@ -1131,6 +1137,14 @@ func (h *Hub) runUnpaidInvalidationWithLock(kioskID string, gen uint64, attempt 
 		return
 	}
 
+	h.invalidationMu.Lock()
+	if st := h.invalidations[kioskID]; st != nil && st.pendingGen == gen {
+		st.inFlight = true
+		st.lastAttemptAt = time.Now()
+		st.retryTimer = nil
+	}
+	h.invalidationMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	err := h.db.CancelActiveUnpaidSessionsForKiosk(ctx, kioskID, time.Now().UTC())
 	cancel()
@@ -1140,8 +1154,12 @@ func (h *Hub) runUnpaidInvalidationWithLock(kioskID string, gen uint64, attempt 
 	defer h.invalidationMu.Unlock()
 	st := h.invalidations[kioskID]
 	if st == nil || st.pendingGen != gen {
+		if st != nil {
+			st.inFlight = false
+		}
 		return
 	}
+	st.inFlight = false
 	if err == nil {
 		st.pendingGen = 0
 		if st.retryTimer != nil {
@@ -1157,6 +1175,31 @@ func (h *Hub) runUnpaidInvalidationWithLock(kioskID string, gen uint64, attempt 
 	st.retryTimer = time.AfterFunc(150*time.Millisecond, func() {
 		h.runUnpaidInvalidation(kioskID, gen, attempt+1)
 	})
+}
+
+// retryPendingInvalidationIfIdle re-triggers one bounded retry of an existing pending
+// invalidation operation (e.g. after a prolonged database outage exhausted the initial retry
+// budget) when a subsequent kiosk lifecycle event arrives.
+func (h *Hub) retryPendingInvalidationIfIdle(kioskID string) {
+	if h == nil || h.db == nil || h.closed.Load() {
+		return
+	}
+	h.invalidationMu.Lock()
+	st := h.invalidations[kioskID]
+	if st == nil || st.pendingGen == 0 || st.inFlight || st.retryTimer != nil {
+		h.invalidationMu.Unlock()
+		return
+	}
+	if !st.lastAttemptAt.IsZero() && time.Since(st.lastAttemptAt) < 150*time.Millisecond {
+		h.invalidationMu.Unlock()
+		return
+	}
+	gen := st.pendingGen
+	st.inFlight = true
+	st.lastAttemptAt = time.Now()
+	h.invalidationMu.Unlock()
+
+	go h.runUnpaidInvalidation(kioskID, gen, 0)
 }
 
 func (h *Hub) onSessionTelemetryExpired(kioskID string, sess *kioskSession, timerGen uint64) {

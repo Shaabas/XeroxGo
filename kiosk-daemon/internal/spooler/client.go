@@ -161,9 +161,11 @@ type Client struct {
 	renderHistoryMu sync.Mutex
 	renderHistory   []ui_ipc.ScreenState
 
-	currentModeMu sync.Mutex
-	currentMode   ui_ipc.ScreenMode
-	adSlideIndex  int
+	currentModeMu   sync.Mutex
+	currentMode     ui_ipc.ScreenMode
+	lastErrorMsg    string
+	lastErrorDetail string
+	adSlideIndex    int
 
 	faultMu               sync.Mutex
 	hardwareFault         bool
@@ -1024,7 +1026,7 @@ func (c *Client) Run(ctx context.Context) error {
 	hasActiveAtBoot := len(c.activeJobs) > 0
 	c.activeMu.Unlock()
 	if !hasActiveAtBoot && (c.pinController == nil || !c.pinController.HasActiveTransaction()) {
-		c.syncIdleOrBlockedScreen(ctx)
+		c.syncCustomerServiceState(ctx)
 	}
 
 	// 3. Start sequential job processing worker
@@ -3979,6 +3981,10 @@ func (c *Client) syncCustomerServiceState(ctx context.Context) {
 		c.pinController.SetAvailability(pinReady, pinReason)
 	}
 
+	if ctx.Err() != nil {
+		return
+	}
+
 	if hasActiveJobs {
 		return
 	}
@@ -3990,6 +3996,8 @@ func (c *Client) syncCustomerServiceState(ctx context.Context) {
 
 	c.currentModeMu.Lock()
 	currentMode := c.currentMode
+	lastErrMsg := c.lastErrorMsg
+	lastErrDetail := c.lastErrorDetail
 	c.currentModeMu.Unlock()
 
 	if ready {
@@ -4013,10 +4021,14 @@ func (c *Client) syncCustomerServiceState(ctx context.Context) {
 	} else if !snap.ExecutionSafe {
 		msg = "Manual check required before printing"
 	}
+	detail := firstNonEmptyString(snap.ExecutionSafetyReason, snap.ErrorMessage, reason, "Please try again shortly.")
+	if currentMode == ui_ipc.ModeError && lastErrMsg == msg && lastErrDetail == detail {
+		return
+	}
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:    ui_ipc.ModeError,
 		Message: msg,
-		Detail:  firstNonEmptyString(snap.ExecutionSafetyReason, snap.ErrorMessage, reason, "Please try again shortly."),
+		Detail:  detail,
 	})
 }
 
@@ -4410,6 +4422,8 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 
 	c.currentModeMu.Lock()
 	currentMode := c.currentMode
+	lastErrMsg := c.lastErrorMsg
+	lastErrDetail := c.lastErrorDetail
 	c.currentModeMu.Unlock()
 
 	isFault := c.isHardwareFaultActive()
@@ -4420,9 +4434,11 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 		return nil
 	}
 
-	// Prevent redundant ModeError renders when an active hardware fault screen is already shown
-	if state.Mode == ui_ipc.ModeError && currentMode == ui_ipc.ModeError && isFault {
-		log.Printf("[SPOOLER] Suppressing duplicate ModeError render: screen already in ModeError (%s)", c.getFaultReason())
+	// Prevent redundant ModeError renders when an active hardware fault or identical unavailable screen is already shown
+	if state.Mode == ui_ipc.ModeError && currentMode == ui_ipc.ModeError && (isFault || (state.Message == lastErrMsg && state.Detail == lastErrDetail)) {
+		if isFault {
+			log.Printf("[SPOOLER] Suppressing duplicate ModeError render: screen already in ModeError (%s)", c.getFaultReason())
+		}
 		return nil
 	}
 
@@ -4452,6 +4468,13 @@ func (c *Client) renderScreen(state ui_ipc.ScreenState) error {
 
 	c.currentModeMu.Lock()
 	c.currentMode = state.Mode
+	if state.Mode == ui_ipc.ModeError {
+		c.lastErrorMsg = state.Message
+		c.lastErrorDetail = state.Detail
+	} else {
+		c.lastErrorMsg = ""
+		c.lastErrorDetail = ""
+	}
 	c.currentModeMu.Unlock()
 
 	targetW, targetH := ui_ipc.GetTargetResolution()

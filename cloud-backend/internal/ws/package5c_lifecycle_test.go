@@ -178,3 +178,65 @@ func TestPackage5C_DatabaseFailurePreservesBarrierUntilRetrySucceeds(t *testing.
 		t.Fatalf("expected kiosk ready after retry succeeded, got ready=false (%s)", reasonAfter)
 	}
 }
+
+func TestPackage5C_ProlongedDatabaseOutageRecoversAfterRetryBudgetExhausted(t *testing.T) {
+	db := newTestStore(t)
+	hub := NewHub(db)
+	defer hub.Close()
+	kioskID := "kiosk-5c-prolonged-db"
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	conn, _ := connectTestKiosk(t, hub, srv.URL, kioskID)
+	defer conn.CloseNow()
+	sendTestReadyHealth(ctx, t, hub, conn, kioskID)
+
+	sess := seedTestUnpaidOrderAndSession(t, db, kioskID, "ord-5c-prolonged-db")
+
+	// Force CancelActiveUnpaidSessionsForKiosk to fail, then exhaust the retry budget immediately
+	// at the final attempt boundary so no background retry timer remains active.
+	if _, err := db.DB().Exec(`CREATE TRIGGER fail_cancel_prolonged BEFORE UPDATE ON kiosk_sessions WHEN NEW.status = 'CANCELED' BEGIN SELECT RAISE(ABORT, 'forced prolonged outage'); END;`); err != nil {
+		t.Fatalf("failed creating trigger: %v", err)
+	}
+
+	hub.invalidationMu.Lock()
+	gen := hub.bumpInvalidationLocked(kioskID)
+	hub.invalidationMu.Unlock()
+	hub.runUnpaidInvalidation(kioskID, gen, maxInvalidationRetries-1)
+
+	if !hub.hasPendingInvalidation(kioskID) {
+		t.Fatalf("expected pending invalidation preserved after retry budget exhaustion")
+	}
+	hub.invalidationMu.Lock()
+	st := hub.invalidations[kioskID]
+	hasTimer := st != nil && st.retryTimer != nil
+	if st != nil {
+		// Allow immediate lifecycle-driven retry once DB recovers.
+		st.lastAttemptAt = time.Now().Add(-time.Second)
+	}
+	hub.invalidationMu.Unlock()
+	if hasTimer {
+		t.Fatalf("expected no active retry timer after retry budget exhausted")
+	}
+
+	// Database recovers later: drop trigger and send healthy telemetry lifecycle event.
+	if _, err := db.DB().Exec(`DROP TRIGGER fail_cancel_prolonged;`); err != nil {
+		t.Fatalf("failed dropping trigger: %v", err)
+	}
+
+	sendTestReadyHealth(ctx, t, hub, conn, kioskID)
+
+	if hub.hasPendingInvalidation(kioskID) {
+		t.Fatalf("expected pending invalidation cleared after DB recovery + telemetry lifecycle event")
+	}
+	gotSess, _ := db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+	if gotSess == nil || gotSess.Status != store.KioskSessionCanceled {
+		t.Fatalf("expected unpaid session canceled after DB recovery, got %+v", gotSess)
+	}
+	_, _, _, ready, reason := hub.EvaluateKioskReadiness(kioskID)
+	if !ready {
+		t.Fatalf("expected kiosk ready after prolonged DB outage recovery, got ready=false (%s)", reason)
+	}
+}
