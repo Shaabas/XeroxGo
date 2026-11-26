@@ -53,6 +53,7 @@ const (
 	ContradictionJobState       = "CONTRADICTION_JOB_STATE"
 	ContradictionHardwareFault  = "CONTRADICTION_HARDWARE_FAULT"
 	ContradictionOnlineStatus   = "CONTRADICTION_ONLINE_STATUS"
+	ContradictionTrayCapacity   = "CONTRADICTION_TRAY_CAPACITY"
 	ObservationMismatchHardware = "OBSERVATION_MISMATCH_HARDWARE"
 )
 
@@ -254,8 +255,9 @@ type CanonicalHealthInput struct {
 	RequireIPP       bool
 	RequireCUPS      bool
 
-	EvalTime     time.Time
-	MaxSourceAge time.Duration
+	EvalTime               time.Time
+	MaxSourceAge           time.Duration
+	ConfiguredTrayCapacity int
 }
 
 // EvaluateCanonicalPrinterHealth evaluates CUPS, native IPP, and SNMP evidence with strict
@@ -788,6 +790,15 @@ func (e *evaluatorState) detectContradictions(paperJam, coverOpen, outputFull, p
 		if !e.in.CUPS.Online && e.snmpHealth.Online {
 			record(ContradictionOnlineStatus, "observation mismatch: CUPS reports queue offline while SNMP device communication is online")
 		}
+	}
+
+	if e.snmpValid && e.snmpHealth.Online && e.snmpHealth.InputTrayCapacityKnown &&
+		e.in.ConfiguredTrayCapacity > 0 && e.snmpHealth.InputTrayCapacity > 0 &&
+		e.snmpHealth.InputTrayCapacity != e.in.ConfiguredTrayCapacity {
+		msg := fmt.Sprintf("contradiction: SNMP-reported tray capacity (%d) differs from configured tray capacity (%d)", e.snmpHealth.InputTrayCapacity, e.in.ConfiguredTrayCapacity)
+		record(ContradictionTrayCapacity, msg)
+		e.nonblockingWarnings = appendUnique(e.nonblockingWarnings, msg)
+		e.warningsReasons = append(e.warningsReasons, contracts.HealthReason{Code: "tray_capacity_contradiction", Source: "reconciler", Message: msg})
 	}
 }
 

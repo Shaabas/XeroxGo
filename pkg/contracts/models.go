@@ -64,6 +64,7 @@ type PrinterHealth struct {
 	EvaluatedHealth        EvaluatedHealthStatus    `json:"evaluated_health"`          // Canonical readiness: "HEALTHY", "FAULT", "UNVERIFIED"
 	PaperTrayStatus        string                   `json:"paper_tray_status"`         // "OK", "LOW", "EMPTY", "UNKNOWN"
 	EstimatedSheets        int                      `json:"estimated_sheets"`          // Tracked remaining sheets in tray
+	ConfiguredTrayCapacity int                      `json:"configured_tray_capacity,omitempty"` // Configured physical tray capacity on the kiosk
 	InventoryCalibrated    bool                     `json:"inventory_calibrated"`      // Existing SQLite inventory calibration validity
 	ExecutionSafe          bool                     `json:"execution_safe"`            // Local durable execution-safety readiness
 	ExecutionSafetyReason  string                   `json:"execution_safety_reason,omitempty"`

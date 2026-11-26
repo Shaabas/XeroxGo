@@ -20,7 +20,7 @@ import (
 func TestClientCloudRecovery_Success(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_cloud_rec.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestClientCloudRecovery_Success(t *testing.T) {
 func TestClientCloudRecovery_UncertainOutputBlocked(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_cloud_rec_unc.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestClientCloudRecovery_UncertainOutputBlocked(t *testing.T) {
 func TestClientCloudRecovery_StartupInterruptionMarkedPausedError(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_cloud_rec_startup.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestClientCloudRecovery_StartupInterruptionMarkedPausedError(t *testing.T) 
 func TestClientCloudRecovery_ZeroSheetsInterruptionCanRetry(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "kiosk_cloud_rec_zero.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("failed to open store: %v", err)
 	}

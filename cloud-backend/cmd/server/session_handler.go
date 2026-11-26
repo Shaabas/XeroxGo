@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,7 +87,7 @@ func (e *printerConditionError) Error() string {
 func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditionError) {
 	if s.hub == nil {
 		if s.cfg != nil && s.cfg.devMode {
-			return 250, nil
+			return 150, nil
 		}
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
@@ -98,7 +99,7 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 	connected, health, hasHealth, ready, readyReason := s.hub.EvaluateKioskReadiness(kioskID)
 	if !connected {
 		if s.cfg != nil && s.cfg.devMode && !hasHealth {
-			return 250, nil
+			return 150, nil
 		}
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
@@ -109,7 +110,7 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 
 	if !hasHealth {
 		if s.cfg != nil && s.cfg.devMode {
-			return 250, nil
+			return 150, nil
 		}
 		return 0, &printerConditionError{
 			StatusCode: http.StatusConflict,
@@ -894,14 +895,49 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Sheets int `json:"sheets"`
+	if r.Body == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "request body with integer sheets count is required",
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+
+	var raw struct {
+		Sheets json.RawMessage `json:"sheets"`
 	}
-	if req.Sheets <= 0 || req.Sheets > 250 {
-		req.Sheets = 250
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&raw); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("malformed refill JSON payload: %v", err),
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
+	}
+
+	sheetsStr := strings.TrimSpace(string(raw.Sheets))
+	if sheetsStr == "" || sheetsStr == "null" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "sheets count is required",
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
+	}
+	sheets, err := strconv.Atoi(sheetsStr)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("sheets must be an integer, got %s", sheetsStr),
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
 	}
 
 	if s.hub == nil {
@@ -909,11 +945,27 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.hub.SendRefill(r.Context(), kioskID, req.Sheets); err != nil {
+	configuredCapacity := 150
+	if _, health, hasHealth, _, _ := s.hub.EvaluateKioskReadiness(kioskID); hasHealth && health.ConfiguredTrayCapacity > 0 {
+		configuredCapacity = health.ConfiguredTrayCapacity
+	}
+	if sheets < 0 || sheets > configuredCapacity {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("sheets must be between 0 and %d inclusive, got %d", configuredCapacity, sheets),
+			"code":  "INVALID_REFILL_COUNT",
+		})
+		return
+	}
+
+	refillCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := s.hub.SendRefill(refillCtx, kioskID, sheets); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": fmt.Sprintf("failed to send refill command to kiosk: %v", err),
+			"error": fmt.Sprintf("refill calibration not confirmed by kiosk: %v", err),
 			"code":  "REFILL_FAILED",
 		})
 		return
@@ -922,9 +974,10 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":       true,
-		"kiosk_id": kioskID,
-		"sheets":   req.Sheets,
+		"ok":         true,
+		"calibrated": true,
+		"kiosk_id":   kioskID,
+		"sheets":     sheets,
 	})
 }
 

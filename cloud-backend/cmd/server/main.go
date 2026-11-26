@@ -35,6 +35,7 @@ type serverConfig struct {
 	dbPath         string
 	jobsDir        string
 	devMode        bool
+	duplexEnabled  bool
 	downloadSecret []byte
 	kioskSecret    []byte
 }
@@ -351,11 +352,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			docNum = 0
 		}
 
+		duplexEnabled := s.cfg != nil && s.cfg.duplexEnabled
 		var docOpts docPrintOptions
 		if idx < len(metaItems) {
-			docOpts, err = parseMetadataPrintOptions(metaItems[idx], colorEnabled, docNum)
+			docOpts, err = parseMetadataPrintOptions(metaItems[idx], colorEnabled, duplexEnabled, docNum)
 		} else {
-			docOpts, err = parseFormPrintOptions(r, colorEnabled, docNum)
+			docOpts, err = parseFormPrintOptions(r, colorEnabled, duplexEnabled, docNum)
 		}
 		if err != nil {
 			_ = f.Close()
@@ -737,7 +739,8 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, 0)
+	duplexEnabled := s.cfg != nil && s.cfg.duplexEnabled
+	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, duplexEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

@@ -39,6 +39,7 @@ func setupPreviewTestServer(t *testing.T) (*appServer, *http.ServeMux) {
 		jobsDir:        jobsDir,
 		downloadSecret: []byte("test_secret_key_1234567890"),
 		devMode:        true,
+		duplexEnabled:  true,
 	}
 
 	hub := ws.NewHub(s)

@@ -40,7 +40,7 @@ type docPrintOptions struct {
 
 // parseFormPrintOptions parses and validates print options from standard HTTP multipart form values.
 // If docIndex > 0, error messages format with "in document <docIndex>" for multi-file requests.
-func parseFormPrintOptions(r *http.Request, colorEnabled bool, docIndex int) (docPrintOptions, error) {
+func parseFormPrintOptions(r *http.Request, colorEnabled bool, duplexEnabled bool, docIndex int) (docPrintOptions, error) {
 	opts := docPrintOptions{
 		Copies:        1,
 		Duplex:        contracts.DuplexSimplex,
@@ -72,6 +72,19 @@ func parseFormPrintOptions(r *http.Request, colorEnabled bool, docIndex int) (do
 			return opts, errors.New("invalid duplex mode")
 		}
 	}
+	if opts.Duplex != contracts.DuplexSimplex && !duplexEnabled {
+		if docIndex > 0 {
+			return opts, fmt.Errorf("double-sided (duplex) printing is not supported in document %d", docIndex)
+		}
+		return opts, errors.New("double-sided (duplex) printing is not supported by this printer")
+	}
+
+	if paperSize := strings.TrimSpace(r.FormValue("paper_size")); paperSize != "" && !strings.EqualFold(paperSize, "A4") {
+		if docIndex > 0 {
+			return opts, fmt.Errorf("unsupported paper_size %q in document %d: only A4 is supported", paperSize, docIndex)
+		}
+		return opts, fmt.Errorf("unsupported paper_size %q: only A4 is supported", paperSize)
+	}
 
 	rawOrient := r.FormValue("orientation")
 	orientationStr := strings.ToUpper(strings.TrimSpace(rawOrient))
@@ -100,30 +113,76 @@ func parseFormPrintOptions(r *http.Request, colorEnabled bool, docIndex int) (do
 		opts.PagesPerSheet = n
 	}
 
-	if strings.EqualFold(r.FormValue("color_mode"), "COLOR") && colorEnabled {
+	colorMode := strings.ToUpper(strings.TrimSpace(r.FormValue("color_mode")))
+	if colorMode == "COLOR" {
+		if !colorEnabled {
+			if docIndex > 0 {
+				return opts, fmt.Errorf("color printing is not supported in document %d", docIndex)
+			}
+			return opts, errors.New("color printing is not supported by this printer")
+		}
 		opts.ColorMode = "COLOR"
+	} else if colorMode != "" && colorMode != "BW" && colorMode != "B&W" && colorMode != "MONOCHROME" {
+		if docIndex > 0 {
+			return opts, fmt.Errorf("invalid color_mode %q in document %d", r.FormValue("color_mode"), docIndex)
+		}
+		return opts, fmt.Errorf("invalid color_mode %q", r.FormValue("color_mode"))
 	}
 
 	return opts, nil
 }
 
 // parseMetadataPrintOptions parses and validates print options from a multi-file metadata item.
-func parseMetadataPrintOptions(meta docItemMeta, colorEnabled bool, docIndex int) (docPrintOptions, error) {
+func parseMetadataPrintOptions(meta docItemMeta, colorEnabled bool, duplexEnabled bool, docIndex int) (docPrintOptions, error) {
 	opts := docPrintOptions{
 		Copies:        1,
-		Duplex:        parseDuplex(meta.Duplex),
+		Duplex:        contracts.DuplexSimplex,
 		ColorMode:     "BW",
 		PageRange:     strings.TrimSpace(meta.PageRange),
 		Orientation:   "AUTO",
 		PagesPerSheet: 1,
 	}
 
+	if meta.Duplex != nil {
+		switch v := meta.Duplex.(type) {
+		case bool:
+			if v {
+				opts.Duplex = contracts.DuplexLongEdge
+			}
+		case string:
+			trimmed := strings.TrimSpace(v)
+			if trimmed != "" {
+				switch strings.ToUpper(trimmed) {
+				case string(contracts.DuplexSimplex), "SINGLE", "SINGLE-SIDED", "FALSE":
+					opts.Duplex = contracts.DuplexSimplex
+				case string(contracts.DuplexLongEdge), "LONG_EDGE", "DUPLEX", "DOUBLE", "DOUBLE-SIDED", "TRUE":
+					opts.Duplex = contracts.DuplexLongEdge
+				case string(contracts.DuplexShortEdge), "SHORT_EDGE":
+					opts.Duplex = contracts.DuplexShortEdge
+				default:
+					return opts, fmt.Errorf("invalid duplex mode %q in document %d", v, docIndex)
+				}
+			}
+		default:
+			return opts, fmt.Errorf("invalid duplex mode in document %d", docIndex)
+		}
+	}
+	if opts.Duplex != contracts.DuplexSimplex && !duplexEnabled {
+		return opts, fmt.Errorf("double-sided (duplex) printing is not supported in document %d", docIndex)
+	}
+
 	if meta.Copies >= 1 && meta.Copies <= 999 {
 		opts.Copies = meta.Copies
 	}
 
-	if strings.EqualFold(meta.ColorMode, "COLOR") && colorEnabled {
+	colorMode := strings.ToUpper(strings.TrimSpace(meta.ColorMode))
+	if colorMode == "COLOR" {
+		if !colorEnabled {
+			return opts, fmt.Errorf("color printing is not supported in document %d", docIndex)
+		}
 		opts.ColorMode = "COLOR"
+	} else if colorMode != "" && colorMode != "BW" && colorMode != "B&W" && colorMode != "MONOCHROME" {
+		return opts, fmt.Errorf("invalid color_mode %q in document %d", meta.ColorMode, docIndex)
 	}
 
 	if meta.Orientation != "" {

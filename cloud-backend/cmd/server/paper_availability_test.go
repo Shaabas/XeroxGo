@@ -424,24 +424,35 @@ func TestPaperAvailability_Refill_Endpoint(t *testing.T) {
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}()
 
-	// Background reader for kiosk WebSocket to receive the refill command
+	// Background reader for kiosk WebSocket to receive the refill command and send refill_ack
 	receivedRefill := make(chan wireMsg, 1)
 	go func() {
 		for {
-			var msg wireMsg
+			var msg struct {
+				Type      string `json:"type"`
+				Sheets    int    `json:"sheets,omitempty"`
+				RequestID string `json:"request_id,omitempty"`
+			}
 			if err := wsjson.Read(context.Background(), conn, &msg); err != nil {
 				return
 			}
 			if msg.Type == "refill" {
-				receivedRefill <- msg
+				_ = wsjson.Write(context.Background(), conn, map[string]interface{}{
+					"type":       "refill_ack",
+					"request_id": msg.RequestID,
+					"ok":         true,
+					"calibrated": true,
+					"sheets":     msg.Sheets,
+				})
+				receivedRefill <- wireMsg{Type: msg.Type, Sheets: msg.Sheets}
 				return
 			}
 		}
 	}()
 
-	// Call POST /api/k/{kiosk_id}/refill with {"sheets": 250}
+	// Call POST /api/k/{kiosk_id}/refill with {"sheets": 140}
 	refillURL := fmt.Sprintf("%s/api/k/%s/refill", server.URL, kioskID)
-	reqBody := bytes.NewReader([]byte(`{"sheets": 250}`))
+	reqBody := bytes.NewReader([]byte(`{"sheets": 140}`))
 	req, _ := http.NewRequest(http.MethodPost, refillURL, reqBody)
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
@@ -456,14 +467,14 @@ func TestPaperAvailability_Refill_Endpoint(t *testing.T) {
 
 	var resData map[string]interface{}
 	_ = json.NewDecoder(res.Body).Decode(&resData)
-	if resData["ok"] != true || resData["sheets"] != float64(250) {
+	if resData["ok"] != true || resData["sheets"] != float64(140) || resData["calibrated"] != true {
 		t.Errorf("unexpected refill response: %v", resData)
 	}
 
 	select {
 	case msg := <-receivedRefill:
-		if msg.Type != "refill" || msg.Sheets != 250 {
-			t.Errorf("expected wire message {Type: refill, Sheets: 250}, got %+v", msg)
+		if msg.Type != "refill" || msg.Sheets != 140 {
+			t.Errorf("expected wire message {Type: refill, Sheets: 140}, got %+v", msg)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for kiosk to receive refill wire message")

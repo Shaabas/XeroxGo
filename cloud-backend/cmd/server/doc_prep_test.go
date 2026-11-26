@@ -17,7 +17,7 @@ import (
 func TestDocPrep_ParseFormPrintOptions_Valid(t *testing.T) {
 	// 1. Defaults when empty
 	reqEmpty, _ := http.NewRequest("POST", "/upload", nil)
-	opts, err := parseFormPrintOptions(reqEmpty, false, 0)
+	opts, err := parseFormPrintOptions(reqEmpty, false, false, 0)
 	if err != nil {
 		t.Fatalf("unexpected error parsing empty form: %v", err)
 	}
@@ -25,7 +25,7 @@ func TestDocPrep_ParseFormPrintOptions_Valid(t *testing.T) {
 		t.Fatalf("unexpected defaults: %+v", opts)
 	}
 
-	// 2. Custom valid options with color enabled
+	// 2. Custom valid options with color and duplex enabled
 	form := url.Values{}
 	form.Set("copies", "5")
 	form.Set("duplex", "LONG_EDGE")
@@ -38,7 +38,7 @@ func TestDocPrep_ParseFormPrintOptions_Valid(t *testing.T) {
 	reqCustom.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	_ = reqCustom.ParseForm()
 
-	optsCustom, err := parseFormPrintOptions(reqCustom, true, 0)
+	optsCustom, err := parseFormPrintOptions(reqCustom, true, true, 0)
 	if err != nil {
 		t.Fatalf("unexpected error parsing custom form: %v", err)
 	}
@@ -47,13 +47,14 @@ func TestDocPrep_ParseFormPrintOptions_Valid(t *testing.T) {
 		t.Fatalf("unexpected custom options: %+v", optsCustom)
 	}
 
-	// 3. Color mode fallback when colorDisabled
-	optsNoColor, err := parseFormPrintOptions(reqCustom, false, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// 3. Color mode rejected (no silent BW conversion) when color disabled
+	if _, err := parseFormPrintOptions(reqCustom, false, true, 0); err == nil || !strings.Contains(err.Error(), "color printing is not supported") {
+		t.Fatalf("expected color rejection when color disabled, got %v", err)
 	}
-	if optsNoColor.ColorMode != "BW" {
-		t.Fatalf("expected BW fallback when color disabled, got %s", optsNoColor.ColorMode)
+
+	// 3b. Duplex mode rejected (no silent simplex conversion) when duplex disabled
+	if _, err := parseFormPrintOptions(reqCustom, true, false, 0); err == nil || !strings.Contains(err.Error(), "duplex") {
+		t.Fatalf("expected duplex rejection when duplex disabled, got %v", err)
 	}
 
 	// 4. Duplex synonyms
@@ -76,7 +77,7 @@ func TestDocPrep_ParseFormPrintOptions_Valid(t *testing.T) {
 		r, _ := http.NewRequest("POST", "/upload", strings.NewReader(f.Encode()))
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		_ = r.ParseForm()
-		o, err := parseFormPrintOptions(r, false, 0)
+		o, err := parseFormPrintOptions(r, false, true, 0)
 		if err != nil {
 			t.Fatalf("failed parsing duplex synonym %s: %v", syn.val, err)
 		}
@@ -112,7 +113,7 @@ func TestDocPrep_ParseFormPrintOptions_Errors(t *testing.T) {
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			_ = req.ParseForm()
 
-			_, err := parseFormPrintOptions(req, true, tc.docIdx)
+			_, err := parseFormPrintOptions(req, true, true, tc.docIdx)
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.wantErrSub)
 			}
@@ -133,7 +134,7 @@ func TestDocPrep_ParseMetadataPrintOptions(t *testing.T) {
 		Orientation:   "PORTRAIT",
 		PagesPerSheet: 4,
 	}
-	opts, err := parseMetadataPrintOptions(meta, true, 1)
+	opts, err := parseMetadataPrintOptions(meta, true, true, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,19 +143,20 @@ func TestDocPrep_ParseMetadataPrintOptions(t *testing.T) {
 		t.Fatalf("unexpected parsed options: %+v", opts)
 	}
 
-	// Gated color
-	optsNoColor, err := parseMetadataPrintOptions(meta, false, 1)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// Gated color rejected without silent conversion
+	if _, err := parseMetadataPrintOptions(meta, false, true, 1); err == nil || !strings.Contains(err.Error(), "color printing is not supported in document 1") {
+		t.Fatalf("expected color rejection in document 1, got %v", err)
 	}
-	if optsNoColor.ColorMode != "BW" {
-		t.Fatalf("expected BW when color disabled, got %s", optsNoColor.ColorMode)
+
+	// Gated duplex rejected without silent conversion
+	if _, err := parseMetadataPrintOptions(meta, true, false, 1); err == nil || !strings.Contains(err.Error(), "duplex") {
+		t.Fatalf("expected duplex rejection in document 1, got %v", err)
 	}
 
 	// Invalid orientation
 	metaInvalidOrient := meta
 	metaInvalidOrient.Orientation = "UPSIDE_DOWN"
-	_, err = parseMetadataPrintOptions(metaInvalidOrient, true, 2)
+	_, err = parseMetadataPrintOptions(metaInvalidOrient, true, true, 2)
 	if err == nil || !strings.Contains(err.Error(), "invalid orientation \"UPSIDE_DOWN\" in document 2") {
 		t.Fatalf("expected orientation error, got %v", err)
 	}
@@ -162,7 +164,7 @@ func TestDocPrep_ParseMetadataPrintOptions(t *testing.T) {
 	// Invalid nup
 	metaInvalidNup := meta
 	metaInvalidNup.PagesPerSheet = 8
-	_, err = parseMetadataPrintOptions(metaInvalidNup, true, 4)
+	_, err = parseMetadataPrintOptions(metaInvalidNup, true, true, 4)
 	if err == nil || !strings.Contains(err.Error(), "invalid pages_per_sheet 8 in document 4") {
 		t.Fatalf("expected pages_per_sheet error, got %v", err)
 	}

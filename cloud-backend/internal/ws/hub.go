@@ -27,13 +27,23 @@ const (
 )
 
 type wireMessage struct {
-	Type     string                      `json:"type"`
-	Job      *contracts.PrintJobCommand  `json:"job,omitempty"`
-	Progress *contracts.JobProgressEvent `json:"progress,omitempty"`
-	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
-	Ads      []contracts.AdItem          `json:"ads,omitempty"`
-	Sheets   int                         `json:"sheets,omitempty"`
-	Error    string                      `json:"error,omitempty"`
+	Type       string                      `json:"type"`
+	Job        *contracts.PrintJobCommand  `json:"job,omitempty"`
+	Progress   *contracts.JobProgressEvent `json:"progress,omitempty"`
+	Health     *contracts.PrinterHealth    `json:"health,omitempty"`
+	Ads        []contracts.AdItem          `json:"ads,omitempty"`
+	Sheets     *int                        `json:"sheets,omitempty"`
+	RequestID  string                      `json:"request_id,omitempty"`
+	OK         bool                        `json:"ok,omitempty"`
+	Calibrated bool                        `json:"calibrated,omitempty"`
+	Error      string                      `json:"error,omitempty"`
+}
+
+type refillAckResult struct {
+	ok         bool
+	sheets     int
+	calibrated bool
+	errMsg     string
 }
 
 type sessionHealthEntry struct {
@@ -59,18 +69,22 @@ type kioskSession struct {
 // Hub manages active WebSocket connections from kiosks and relays jobs,
 // progress events, and connection-bound canonical printer health telemetry.
 type Hub struct {
-	db          *store.Store
-	mu          sync.RWMutex
-	resetMu     sync.Mutex
-	sessions    map[string]*kioskSession
-	kioskSecret []byte
+	db            *store.Store
+	mu            sync.RWMutex
+	resetMu       sync.Mutex
+	sessions      map[string]*kioskSession
+	kioskSecret   []byte
+	refillMu      sync.Mutex
+	refillWaiters map[string]chan refillAckResult
+	refillSeq     atomic.Uint64
 }
 
 // NewHub creates and initializes a new cloud WebSocket hub.
 func NewHub(db *store.Store) *Hub {
 	return &Hub{
-		db:       db,
-		sessions: make(map[string]*kioskSession),
+		db:            db,
+		sessions:      make(map[string]*kioskSession),
+		refillWaiters: make(map[string]chan refillAckResult),
 	}
 }
 
@@ -220,6 +234,30 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "health":
 			h.handleHealthMessage(ctx, kioskID, sess, msg.Health)
+		case "refill_ack":
+			if strings.TrimSpace(msg.RequestID) != "" {
+				sheetsVal := 0
+				if msg.Sheets != nil {
+					sheetsVal = *msg.Sheets
+				}
+				h.refillMu.Lock()
+				ch, exists := h.refillWaiters[msg.RequestID]
+				if exists {
+					delete(h.refillWaiters, msg.RequestID)
+				}
+				h.refillMu.Unlock()
+				if exists && ch != nil {
+					select {
+					case ch <- refillAckResult{
+						ok:         msg.OK,
+						sheets:     sheetsVal,
+						calibrated: msg.Calibrated,
+						errMsg:     msg.Error,
+					}:
+					default:
+					}
+				}
+			}
 		case "error":
 			// Operational error
 		default:
@@ -699,25 +737,65 @@ func (h *Hub) BroadcastSyncAds(ctx context.Context, ads []contracts.AdItem) {
 	}
 }
 
-// SendRefill sends an authenticated operator paper refill command to the connected kiosk.
+// SendRefill sends an authenticated operator paper refill command to the connected kiosk
+// and waits for confirmed durable application from the Pi.
 func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error {
 	if h == nil {
 		return errors.New("hub is nil")
 	}
+	if sheets < 0 {
+		return fmt.Errorf("sheets must be non-negative, got %d", sheets)
+	}
 	h.mu.RLock()
 	sess, ok := h.sessions[kioskID]
 	h.mu.RUnlock()
-	if !ok || sess == nil {
+	if !ok || sess == nil || !h.isActiveSession(kioskID, sess) {
 		return errors.New("kiosk not connected")
 	}
 
+	reqID := fmt.Sprintf("refill-%d-%d", time.Now().UnixNano(), h.refillSeq.Add(1))
+	ackCh := make(chan refillAckResult, 1)
+
+	h.refillMu.Lock()
+	if h.refillWaiters == nil {
+		h.refillWaiters = make(map[string]chan refillAckResult)
+	}
+	h.refillWaiters[reqID] = ackCh
+	h.refillMu.Unlock()
+
+	defer func() {
+		h.refillMu.Lock()
+		delete(h.refillWaiters, reqID)
+		h.refillMu.Unlock()
+	}()
+
+	s := sheets
 	msg := wireMessage{
-		Type:   "refill",
-		Sheets: sheets,
+		Type:      "refill",
+		Sheets:    &s,
+		RequestID: reqID,
 	}
 	sess.sendMu.Lock()
-	defer sess.sendMu.Unlock()
-	return wsjson.Write(ctx, sess.conn, msg)
+	writeErr := wsjson.Write(ctx, sess.conn, msg)
+	sess.sendMu.Unlock()
+	if writeErr != nil {
+		return fmt.Errorf("failed to transmit refill command: %w", writeErr)
+	}
+
+	select {
+	case res := <-ackCh:
+		if !res.ok {
+			if strings.TrimSpace(res.errMsg) != "" {
+				return errors.New(res.errMsg)
+			}
+			return errors.New("kiosk rejected refill calibration")
+		}
+		return nil
+	case <-sess.closed:
+		return errors.New("kiosk disconnected before confirming refill calibration")
+	case <-ctx.Done():
+		return fmt.Errorf("timed out waiting for kiosk refill confirmation: %w", ctx.Err())
+	}
 }
 
 // ConnectedKiosksCount returns the number of currently connected kiosks.

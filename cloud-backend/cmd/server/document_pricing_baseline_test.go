@@ -42,6 +42,7 @@ func setupDocPricingBaselineServer(t *testing.T) (*appServer, *http.ServeMux) {
 		jobsDir:        jobsDir,
 		downloadSecret: []byte("test_secret_key_1234567890"),
 		devMode:        true,
+		duplexEnabled:  true,
 	}
 
 	hub := ws.NewHub(s)
@@ -500,22 +501,31 @@ func TestDocumentPricing_FourTierIntegerPaiseAndColorFallback(t *testing.T) {
 		t.Errorf("Color Duplex price = %d, want 1800", pColDup)
 	}
 
-	// 5. Disable Color in DB: test graceful fallback to B&W rates
+	// 5. Disable Color in DB: requesting COLOR must be rejected cleanly without silent B&W fallback
 	if err := app.db.SetDetailedPricing(context.Background(), 250, 175, 1250, 900, false); err != nil {
 		t.Fatalf("failed to update pricing to color disabled: %v", err)
 	}
 
-	// Request Color Simplex with Color disabled -> should be charged BW Simplex (1000 paise)
-	pFallbackSimp := uploadTest("COLOR", "SIMPLEX", 1)
-	if pFallbackSimp != 1000 {
-		t.Errorf("Color disabled Simplex price = %d, want BW fallback 1000", pFallbackSimp)
-	}
+	uploadExpectReject := func(colorMode, duplex string) {
+		body := &bytes.Buffer{}
+		writer := multipart.NewWriter(body)
+		part, _ := writer.CreateFormFile("file", "tier_doc.pdf")
+		_, _ = part.Write(doc4Bytes)
+		_ = writer.WriteField("copies", "1")
+		_ = writer.WriteField("duplex", duplex)
+		_ = writer.WriteField("color_mode", colorMode)
+		_ = writer.Close()
 
-	// Request Color Duplex with Color disabled -> should be charged BW Duplex (350 paise)
-	pFallbackDup := uploadTest("COLOR", "DUPLEX_LONG_EDGE", 1)
-	if pFallbackDup != 350 {
-		t.Errorf("Color disabled Duplex price = %d, want BW fallback 350", pFallbackDup)
+		req := httptest.NewRequest(http.MethodPost, "/api/k/kiosk_tier/upload", body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for unsupported %s/%s, got %d: %s", colorMode, duplex, rec.Code, rec.Body.String())
+		}
 	}
+	uploadExpectReject("COLOR", "SIMPLEX")
+	uploadExpectReject("COLOR", "DUPLEX_LONG_EDGE")
 }
 
 // TestDocumentPricing_PriceImmutabilityPostCreation verifies that an agreed order price

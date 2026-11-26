@@ -16,6 +16,7 @@
   let rateColorSimplexPaise = null;
   let rateColorDuplexPaise = null;
   let kioskColorEnabled = false;
+  let kioskDuplexEnabled = false;
   let pricingLoaded = false;
 
   // --- Configuration from DOM ---
@@ -56,6 +57,7 @@
       rateColorSimplexPaise = tariff.color_simplex_price_paise;
       rateColorDuplexPaise = tariff.color_duplex_price_paise;
       kioskColorEnabled = Boolean(tariff.color_enabled);
+      kioskDuplexEnabled = Boolean(tariff.duplex_enabled);
       pricingLoaded = true;
     } else {
       rateBWSimplexPaise = null;
@@ -63,16 +65,18 @@
       rateColorSimplexPaise = null;
       rateColorDuplexPaise = null;
       kioskColorEnabled = false;
+      kioskDuplexEnabled = false;
       pricingLoaded = false;
     }
 
     if (typeof document !== 'undefined') {
       if (cardModeColor) {
-        if (!kioskColorEnabled) {
-          cardModeColor.classList.add('hidden');
-        } else {
-          cardModeColor.classList.remove('hidden');
-        }
+        cardModeColor.classList.toggle('hidden', !kioskColorEnabled);
+        cardModeColor.disabled = !kioskColorEnabled;
+      }
+      if (cardSideDouble) {
+        cardSideDouble.classList.toggle('hidden', !kioskDuplexEnabled);
+        cardSideDouble.disabled = !kioskDuplexEnabled;
       }
       renderCart();
     }
@@ -1292,10 +1296,16 @@
     if (copiesCountDisplay) copiesCountDisplay.textContent = draftSettings.copies;
 
     // 3. Print Mode
+    if (!kioskColorEnabled && draftSettings.mode === 'Color') {
+      draftSettings.mode = 'B&W';
+    }
     cardModeBw.classList.toggle('active', draftSettings.mode === 'B&W');
     cardModeColor.classList.toggle('active', draftSettings.mode === 'Color');
 
     // 4. Print Sides
+    if (!kioskDuplexEnabled && draftSettings.sides === 'Double-sided') {
+      draftSettings.sides = 'Single-sided';
+    }
     cardSideSingle.classList.toggle('active', draftSettings.sides === 'Single-sided');
     cardSideDouble.classList.toggle('active', draftSettings.sides === 'Double-sided');
 
@@ -1539,6 +1549,7 @@
     });
 
     cardModeColor.addEventListener('click', () => {
+      if (!kioskColorEnabled) return;
       draftSettings.mode = 'Color';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (doc) {
@@ -1560,6 +1571,7 @@
     });
 
     cardSideDouble.addEventListener('click', () => {
+      if (!kioskDuplexEnabled) return;
       draftSettings.sides = 'Double-sided';
       const doc = cartItems.find(d => d.id === activeSettingsDocId);
       if (doc) {

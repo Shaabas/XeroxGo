@@ -35,13 +35,16 @@ import (
 )
 
 type wireMessage struct {
-	Type     string                      `json:"type"`
-	Job      *contracts.PrintJobCommand  `json:"job,omitempty"`
-	Progress *contracts.JobProgressEvent `json:"progress,omitempty"`
-	Health   *contracts.PrinterHealth    `json:"health,omitempty"`
-	Sheets   int                         `json:"sheets,omitempty"`
-	Error    string                      `json:"error,omitempty"`
-	Ads      []contracts.AdItem          `json:"ads,omitempty"`
+	Type       string                      `json:"type"`
+	Job        *contracts.PrintJobCommand  `json:"job,omitempty"`
+	Progress   *contracts.JobProgressEvent `json:"progress,omitempty"`
+	Health     *contracts.PrinterHealth    `json:"health,omitempty"`
+	Sheets     *int                        `json:"sheets,omitempty"`
+	RequestID  string                      `json:"request_id,omitempty"`
+	OK         bool                        `json:"ok,omitempty"`
+	Calibrated bool                        `json:"calibrated,omitempty"`
+	Error      string                      `json:"error,omitempty"`
+	Ads        []contracts.AdItem          `json:"ads,omitempty"`
 }
 
 // StateStore defines the persistence interface required by the spooler client.
@@ -59,6 +62,8 @@ type StateStore interface {
 	GetEstimatedSheets(ctx context.Context) (int, error)
 	GetPaperSupply(ctx context.Context) (int, bool, error)
 	ResetPaperTray(ctx context.Context, sheets int) error
+	CalibratePaperTray(ctx context.Context, sheets int) error
+	TrayCapacity() int
 }
 
 // ClientConfig holds the runtime dependencies and parameters for the kiosk spooler client.
@@ -67,6 +72,9 @@ type ClientConfig struct {
 	KioskID                      string
 	KioskSecret                  string
 	StateStore                   StateStore
+	ConfiguredTrayCapacity       int
+	CapabilityPolicy             *printer.PrinterCapabilityPolicy
+	MockCapabilities             *printer.PrinterCapabilities
 	PrinterAddr                  string
 	SNMPTarget                   string
 	SNMPCommunity                string
@@ -124,6 +132,7 @@ type Client struct {
 	activeMu      sync.Mutex
 	activeJobs    map[string]bool
 	monitoredJobs map[string]bool
+	calibrationMu sync.Mutex
 
 	deferredMu   sync.Mutex
 	deferredJobs []contracts.PrintJobCommand
@@ -1161,17 +1170,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 		} else if msg.Type == "sync_ads" && len(msg.Ads) > 0 {
 			c.handleSyncAds(msg.Ads)
 		} else if msg.Type == "refill" {
-			sheets := msg.Sheets
-			if sheets <= 0 || sheets > 250 {
-				sheets = 250
-			}
-			if err := c.cfg.StateStore.ResetPaperTray(connCtx, sheets); err != nil {
-				log.Printf("[SPOOLER] Failed to reset paper tray on refill message: %v", err)
-			} else {
-				log.Printf("[SPOOLER] Successfully refilled paper tray inventory to %d sheets", sheets)
-				h := c.updateSnapshotInventory(connCtx, sheets, true)
-				_ = c.sendWire(connCtx, conn, wireMessage{Type: "health", Health: &h})
-			}
+			c.handleRefillMessage(connCtx, conn, msg)
 		}
 	}
 
@@ -2490,8 +2489,10 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		}
 	}
 
+	c.calibrationMu.Lock()
 	estimatedSheets, err := c.cfg.StateStore.GetEstimatedSheets(ctx)
 	if err != nil || estimatedSheets < orderRemainingSheets {
+		c.calibrationMu.Unlock()
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, "paper tray supply insufficient for remaining print job")
 		return
 	}
@@ -2499,21 +2500,30 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	// 5b. Canonical printer readiness and durable execution-safety admission gate
 	admHealth := c.ensureOrCurrentHealthSnapshot(ctx)
 	if c.isHardwareFaultActive() {
+		c.calibrationMu.Unlock()
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, firstNonEmptyString(c.getFaultReason(), "active printer hardware fault blocks physical submission"))
 		return
 	}
 	if isFault, reason, _ := isBlockingHardwareFault(admHealth); isFault {
+		c.calibrationMu.Unlock()
 		c.setHardwareFault(true, reason, "")
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
 		return
 	}
 	if admHealth.EvaluatedHealth != contracts.EvaluatedHealthHealthy {
+		c.calibrationMu.Unlock()
 		reason := firstNonEmptyString(admHealth.ErrorMessage, fmt.Sprintf("printer readiness is %s", admHealth.EvaluatedHealth))
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer readiness gate rejected submission: %s", reason))
 		return
 	}
 	if safe, safeReason := c.computeExecutionSafety(ctx, cmd.JobID); !safe {
+		c.calibrationMu.Unlock()
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("execution-safety barrier blocks submission: %s", safeReason))
+		return
+	}
+	if capErr := c.validateJobCapabilities(ctx, cmd); capErr != nil {
+		c.calibrationMu.Unlock()
+		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer capability validation rejected submission: %v", capErr))
 		return
 	}
 
@@ -2523,6 +2533,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 
 	// 7. Update progress: PRINTING and register genuine live physical monitoring
 	c.setMonitoredJob(cmd.JobID, true)
+	c.calibrationMu.Unlock()
 	defer c.setMonitoredJob(cmd.JobID, false)
 	printEvt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
@@ -3444,8 +3455,9 @@ func (c *Client) acquireTelemetryCycleLocked(ctx context.Context) (contracts.Pri
 			State:                 "UNKNOWN",
 			EvaluatedHealth:       contracts.EvaluatedHealthUnverified,
 			PaperTrayStatus:       "UNKNOWN",
-			EstimatedSheets:       sheets,
-			InventoryCalibrated:   calibrated,
+			EstimatedSheets:        sheets,
+			ConfiguredTrayCapacity: c.configuredTrayCapacity(),
+			InventoryCalibrated:    calibrated,
 			ExecutionSafe:         execSafe,
 			ExecutionSafetyReason: execReason,
 			TonerLevelPercent:     -1,
@@ -3589,14 +3601,120 @@ func (c *Client) acquireTelemetryCycleLocked(ctx context.Context) (contracts.Pri
 			SNMPValid:        snmpValidPtr,
 			SNMPQueried:      (c.snmpMonitor != nil || c.cfg.MockSNMPHealth != nil),
 			RequireSNMP:      true,
-			EvalTime:         time.Now().UTC(),
-			MaxSourceAge:     DefaultTelemetryMaxAge,
+			EvalTime:               time.Now().UTC(),
+			MaxSourceAge:           DefaultTelemetryMaxAge,
+			ConfiguredTrayCapacity: c.configuredTrayCapacity(),
 		})
 		h = rec.ToContract(sheets, calibrated, execSafe, execReason)
+		h.ConfiguredTrayCapacity = c.configuredTrayCapacity()
 		rawTrayStatus = rec.PaperTrayStatus
 	}
 
+	if h.ConfiguredTrayCapacity <= 0 {
+		h.ConfiguredTrayCapacity = c.configuredTrayCapacity()
+	}
 	return h, rec, rawTrayStatus, seq, time.Now().UTC()
+}
+
+func (c *Client) capabilityPolicy() printer.PrinterCapabilityPolicy {
+	if c != nil && c.cfg.CapabilityPolicy != nil {
+		return *c.cfg.CapabilityPolicy
+	}
+	return printer.DefaultDemoCapabilityPolicy()
+}
+
+func (c *Client) validateJobCapabilities(ctx context.Context, cmd contracts.PrintJobCommand) error {
+	policy := c.capabilityPolicy()
+	var hwPtr *printer.PrinterCapabilities
+	if c != nil && c.cfg.MockCapabilities != nil {
+		hwCopy := *c.cfg.MockCapabilities
+		hwPtr = &hwCopy
+	} else if c != nil {
+		hwCaps := c.Capabilities()
+		if hwCaps.Source == "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" &&
+			c.cfg.MockHealth == nil && !(c.cfg.CUPSRunner == nil && c.cfg.MockCUPSPrint != nil) {
+			hwCaps = c.DiscoverStartupCapabilities(ctx)
+		}
+		if hwCaps.HasCapabilityAttributes() {
+			hwPtr = &hwCaps
+		}
+	}
+	return printer.ValidateJobAgainstPolicyAndHardware(cmd, policy, hwPtr)
+}
+
+func (c *Client) configuredTrayCapacity() int {
+	if c != nil && c.cfg.ConfiguredTrayCapacity > 0 {
+		return c.cfg.ConfiguredTrayCapacity
+	}
+	if c != nil && c.cfg.StateStore != nil {
+		if cap := c.cfg.StateStore.TrayCapacity(); cap > 0 {
+			return cap
+		}
+	}
+	return state.DefaultTrayCapacity
+}
+
+func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, msg wireMessage) {
+	sendAck := func(ok bool, sheetsVal int, errMsg string) {
+		if conn == nil || strings.TrimSpace(msg.RequestID) == "" {
+			return
+		}
+		var sheetsPtr *int
+		if ok {
+			s := sheetsVal
+			sheetsPtr = &s
+		}
+		_ = c.sendWire(ctx, conn, wireMessage{
+			Type:       "refill_ack",
+			RequestID:  msg.RequestID,
+			OK:         ok,
+			Calibrated: ok,
+			Sheets:     sheetsPtr,
+			Error:      errMsg,
+		})
+	}
+
+	if msg.Sheets == nil {
+		errMsg := "missing sheets value in refill command"
+		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
+		sendAck(false, 0, errMsg)
+		return
+	}
+	sheets := *msg.Sheets
+	cap := c.configuredTrayCapacity()
+	if sheets < 0 || sheets > cap {
+		errMsg := fmt.Sprintf("refill sheets %d outside configured tray capacity [0, %d]", sheets, cap)
+		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
+		sendAck(false, 0, errMsg)
+		return
+	}
+
+	c.calibrationMu.Lock()
+	defer c.calibrationMu.Unlock()
+
+	c.activeMu.Lock()
+	activeCount := len(c.activeJobs)
+	monitoredCount := len(c.monitoredJobs)
+	c.activeMu.Unlock()
+	if activeCount > 0 || monitoredCount > 0 {
+		errMsg := "cannot calibrate paper tray while active print job is in progress"
+		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
+		sendAck(false, 0, errMsg)
+		return
+	}
+
+	if err := c.cfg.StateStore.CalibratePaperTray(ctx, sheets); err != nil {
+		log.Printf("[SPOOLER] Failed to calibrate paper tray on refill message: %v", err)
+		sendAck(false, 0, err.Error())
+		return
+	}
+
+	log.Printf("[SPOOLER] Successfully refilled paper tray inventory to %d sheets (capacity %d)", sheets, cap)
+	h := c.updateSnapshotInventory(ctx, sheets, true)
+	sendAck(true, sheets, "")
+	if conn != nil {
+		_ = c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h})
+	}
 }
 
 // CurrentHealthSnapshot reads the shared canonical health snapshot without triggering
@@ -3625,8 +3743,9 @@ func (c *Client) CurrentHealthSnapshot(ctx context.Context) contracts.PrinterHea
 			State:                 "UNKNOWN",
 			EvaluatedHealth:       contracts.EvaluatedHealthUnverified,
 			PaperTrayStatus:       "UNKNOWN",
-			EstimatedSheets:       sheets,
-			InventoryCalibrated:   calibrated,
+			EstimatedSheets:        sheets,
+			ConfiguredTrayCapacity: c.configuredTrayCapacity(),
+			InventoryCalibrated:    calibrated,
 			ExecutionSafe:         execSafe,
 			ExecutionSafetyReason: execReason,
 			TonerLevelPercent:     -1,
@@ -3639,6 +3758,7 @@ func (c *Client) CurrentHealthSnapshot(ctx context.Context) contracts.PrinterHea
 
 	h := clonePrinterHealth(snap.Health)
 	h.EstimatedSheets = sheets
+	h.ConfiguredTrayCapacity = c.configuredTrayCapacity()
 	h.InventoryCalibrated = calibrated
 	h.ExecutionSafe = execSafe
 	h.ExecutionSafetyReason = execReason

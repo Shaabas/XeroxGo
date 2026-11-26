@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"xeroxgo/pkg/contracts"
 )
 
 // CapabilityStatus represents the tri-state support level of a printer feature.
@@ -347,6 +349,20 @@ func isIPPFailureStatus(statusCode string) bool {
 	return false
 }
 
+// HasCapabilityAttributes returns true when at least one capability attribute
+// (media, sides, color, or PDL format) was explicitly parsed from the IPP response.
+func (c PrinterCapabilities) HasCapabilityAttributes() bool {
+	return len(c.SidesSupported) > 0 ||
+		len(c.DocumentFormatSupported) > 0 ||
+		(c.A4Support != "" && c.A4Support != CapabilityUnknown) ||
+		(c.SimplexSupport != "" && c.SimplexSupport != CapabilityUnknown) ||
+		(c.DuplexLongEdgeSupport != "" && c.DuplexLongEdgeSupport != CapabilityUnknown) ||
+		(c.DuplexShortEdgeSupport != "" && c.DuplexShortEdgeSupport != CapabilityUnknown) ||
+		(c.ColorSupport != "" && c.ColorSupport != CapabilityUnknown) ||
+		(c.MonochromeSupport != "" && c.MonochromeSupport != CapabilityUnknown) ||
+		(c.PDFSupport != "" && c.PDFSupport != CapabilityUnknown)
+}
+
 func splitIPPValues(val string) []string {
 	return splitIPPValuesWithQuotes(val, false)
 }
@@ -394,4 +410,99 @@ func hasA4Media(mediaList []string) bool {
 		}
 	}
 	return false
+}
+
+// PrinterCapabilityPolicy defines the explicitly configured product capability policy for a kiosk printer.
+type PrinterCapabilityPolicy struct {
+	AllowColor     bool
+	AllowDuplex    bool
+	RequireA4      bool
+	AllowMultiCopy bool
+}
+
+// DefaultDemoCapabilityPolicy returns the canonical capability policy for the HP LaserJet Tank 1020w demo kiosk:
+// A4 paper, B&W monochrome, Simplex (one-sided), multi-copy, and cloud-imposed N-up.
+func DefaultDemoCapabilityPolicy() PrinterCapabilityPolicy {
+	return PrinterCapabilityPolicy{
+		AllowColor:     false,
+		AllowDuplex:    false,
+		RequireA4:      true,
+		AllowMultiCopy: true,
+	}
+}
+
+// ValidateJobAgainstPolicyAndHardware enforces both the configured product capability policy and
+// discovered printer hardware capabilities before physical submission without silent substitution.
+// Note: native printer PDFSupport is NOT required when CUPS driverless queue conversion handles PDF submission.
+func ValidateJobAgainstPolicyAndHardware(cmd contracts.PrintJobCommand, policy PrinterCapabilityPolicy, hw *PrinterCapabilities) error {
+	colorMode := strings.ToUpper(strings.TrimSpace(cmd.ColorMode))
+	if colorMode == "" {
+		colorMode = "BW"
+	}
+	if colorMode != "BW" && colorMode != "COLOR" {
+		return fmt.Errorf("unsupported color mode %q", cmd.ColorMode)
+	}
+	if colorMode == "COLOR" && !policy.AllowColor {
+		return errors.New("color printing is not supported by configured printer policy")
+	}
+
+	duplex := cmd.Duplex
+	if duplex == "" {
+		duplex = contracts.DuplexSimplex
+	}
+	switch duplex {
+	case contracts.DuplexSimplex:
+	case contracts.DuplexLongEdge, contracts.DuplexShortEdge:
+		if !policy.AllowDuplex {
+			return fmt.Errorf("duplex mode %s is not supported by configured printer policy", duplex)
+		}
+	default:
+		return fmt.Errorf("unsupported duplex mode %q", cmd.Duplex)
+	}
+
+	if cmd.Copies < 1 {
+		return fmt.Errorf("invalid copies count %d", cmd.Copies)
+	}
+	if cmd.Copies > 1 && !policy.AllowMultiCopy {
+		return errors.New("multi-copy printing is not supported by configured printer policy")
+	}
+
+	if hw == nil {
+		return nil
+	}
+
+	if policy.RequireA4 {
+		switch hw.A4Support {
+		case CapabilityUnsupported:
+			return errors.New("printer hardware does not support A4 paper")
+		case CapabilityUnknown:
+			return errors.New("printer A4 paper capability is unknown/unverified")
+		}
+	}
+
+	if duplex == contracts.DuplexSimplex {
+		if hw.SimplexSupport == CapabilityUnsupported {
+			return errors.New("printer hardware does not support simplex (one-sided) printing")
+		}
+	} else if duplex == contracts.DuplexLongEdge {
+		if hw.DuplexLongEdgeSupport != CapabilitySupported {
+			return fmt.Errorf("printer hardware does not support duplex mode %s", duplex)
+		}
+	} else if duplex == contracts.DuplexShortEdge {
+		if hw.DuplexShortEdgeSupport != CapabilitySupported {
+			return fmt.Errorf("printer hardware does not support duplex mode %s", duplex)
+		}
+	}
+
+	if colorMode == "COLOR" {
+		if hw.ColorSupport != CapabilitySupported {
+			return errors.New("printer hardware does not support color printing")
+		}
+	} else {
+		if hw.MonochromeSupport == CapabilityUnsupported {
+			return errors.New("printer hardware does not support monochrome printing")
+		}
+	}
+
+	return nil
 }

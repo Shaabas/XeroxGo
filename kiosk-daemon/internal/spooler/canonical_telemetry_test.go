@@ -397,7 +397,8 @@ func TestSpoolerCanonical_RefillPreservesPhysicalEmptyFault_AndHeartbeatPassive(
 		defer c.CloseNow()
 
 		// Send refill command
-		_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: 200})
+		s200 := 120
+		_ = wsjson.Write(r.Context(), c, wireMessage{Type: "refill", Sheets: &s200})
 
 		for {
 			var msg wireMessage
@@ -407,7 +408,7 @@ func TestSpoolerCanonical_RefillPreservesPhysicalEmptyFault_AndHeartbeatPassive(
 			if msg.Type == "heartbeat" {
 				heartbeats.Add(1)
 			}
-			if msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 200 {
+			if msg.Type == "health" && msg.Health != nil && msg.Health.EstimatedSheets == 120 {
 				wsMu.Lock()
 				// Physical EMPTY fault MUST NOT be overwritten with PaperTrayStatus="OK"
 				refillOK = msg.Health.PaperTrayStatus == "EMPTY" &&

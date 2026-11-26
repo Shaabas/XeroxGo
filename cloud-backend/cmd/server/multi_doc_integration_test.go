@@ -59,6 +59,7 @@ func setupMultiDocCloudTestServerCustom(t *testing.T, wrapHandler func(http.Hand
 		kioskSecret:    []byte(kioskSecret),
 		downloadSecret: downloadSecret,
 		devMode:        true,
+		duplexEnabled:  true,
 	}
 
 	hub := ws.NewHub(st)

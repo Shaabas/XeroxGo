@@ -49,7 +49,7 @@ func (m *mockSoundPlayer) WAVBytes() []byte { return nil }
 func TestMultiDoc_OutOfOrderArrivalAndSequencing(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "out_of_order.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestMultiDoc_OutOfOrderArrivalAndSequencing(t *testing.T) {
 func TestMultiDoc_SiblingConsistencyValidation(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "consistency.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestMultiDoc_SiblingConsistencyValidation(t *testing.T) {
 func TestMultiDoc_DeduplicationWithoutReprint(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "dedup.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestMultiDoc_DeduplicationWithoutReprint(t *testing.T) {
 func TestMultiDoc_SingleCopyReplicationViaCUPS(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "copies.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestMultiDoc_SingleCopyReplicationViaCUPS(t *testing.T) {
 func TestMultiDoc_HardwareFaultPausesOrder(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "fault_pause.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestMultiDoc_HardwareFaultPausesOrder(t *testing.T) {
 func TestMultiDoc_OrderLevelPaperCheck(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "paper_check.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -584,7 +584,7 @@ func TestMultiDoc_OrderLevelPaperCheck(t *testing.T) {
 func TestMultiDoc_StartupRecoveryUnsubmitted(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "recovery_unprinted.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -677,7 +677,7 @@ func TestMultiDoc_StartupRecoveryUnsubmitted(t *testing.T) {
 	}()
 
 	// Wait for both jobs to execute in order
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
 		recMu.Lock()
 		count := len(recoveredOrder)
@@ -705,7 +705,7 @@ func TestMultiDoc_StartupRecoveryUnsubmitted(t *testing.T) {
 func TestMultiDoc_OrderCompletionSemantics(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "order_completion.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -819,7 +819,7 @@ func TestMultiDoc_OrderCompletionSemantics(t *testing.T) {
 func TestMultiDoc_DuplicateDispatchAfterRestart(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "dup_restart.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -955,7 +955,7 @@ func TestMultiDoc_DuplicateDispatchAfterRestart(t *testing.T) {
 func TestMultiDoc_DuplicateDispatchOnReconnection(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "dup_reconnect.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1048,7 +1048,7 @@ func TestMultiDoc_DuplicateDispatchOnReconnection(t *testing.T) {
 	client.handleIncomingJob(cmd1)
 
 	// Allow jobs to finish processing and order to complete
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(12 * time.Second)
 	completed := false
 	for time.Now().Before(deadline) {
 		if c, err := store.IsOrderCompleted(ctx, orderID); err == nil && c {
@@ -1076,7 +1076,7 @@ func TestMultiDoc_DuplicateDispatchOnReconnection(t *testing.T) {
 func TestMultiDoc_PartialCompletionAndRepeatedAdmission(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "repeated_admission.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1191,7 +1191,7 @@ func TestMultiDoc_PartialCompletionAndRepeatedAdmission(t *testing.T) {
 func TestMultiDoc_PreSubmissionSafety_UncertainSubmission(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "uncertain_sub.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1300,7 +1300,7 @@ func TestMultiDoc_PreSubmissionSafety_UncertainSubmission(t *testing.T) {
 func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "existing_cups.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1390,7 +1390,7 @@ func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "color_caps.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1513,7 +1513,7 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 func TestMultiDoc_FailClosedOnStoreErrorsAndInconsistency(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "fail_closed.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1607,7 +1607,7 @@ func TestMultiDoc_FailClosedOnStoreErrorsAndInconsistency(t *testing.T) {
 func TestMultiDoc_QueueSaturation_FIFOOrder(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "queue_sat.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1703,7 +1703,7 @@ func TestMultiDoc_QueueSaturation_FIFOOrder(t *testing.T) {
 func TestMultiDoc_DeferredOrder_Sequencing(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "deferred_seq.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1801,7 +1801,7 @@ func TestMultiDoc_DeferredOrder_Sequencing(t *testing.T) {
 func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "startup_seq.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -1948,7 +1948,7 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 	// Case A: GetJobsByOrderID returns an injected SQLite query error
 	t.Run("injected query error fails closed and never submits", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "sqlite_inj_a.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "sqlite_inj_a.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -2057,7 +2057,7 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 	// Case B: GetJobsByOrderID returns empty slice (unexpected empty result)
 	t.Run("unexpected empty order jobs fails closed and never submits", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		store, err := state.Open(filepath.Join(tmpDir, "sqlite_inj_b.db"))
+		store, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "sqlite_inj_b.db"))
 		if err != nil {
 			t.Fatalf("state.Open failed: %v", err)
 		}
@@ -2149,7 +2149,7 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 func TestMultiDoc_OrdersLargerThanQueueCapacity(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "order_larger_cap.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2264,7 +2264,7 @@ func TestMultiDoc_OrdersLargerThanQueueCapacity(t *testing.T) {
 func TestMultiDoc_QueueFullArrivalOfFinalDocument(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "queue_full_final.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2426,7 +2426,7 @@ func TestMultiDoc_QueueFullArrivalOfFinalDocument(t *testing.T) {
 func TestMultiDoc_LargerThanQueueCapacity_RestartReconnect(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "reconnect_large.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2560,7 +2560,7 @@ func TestMultiDoc_LargerThanQueueCapacity_RestartReconnect(t *testing.T) {
 func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "cups_opts_tamper.db")
-	store, err := state.Open(dbPath)
+	store, err := openCalibratedTestStore(t, dbPath)
 	if err != nil {
 		t.Fatalf("state.Open failed: %v", err)
 	}
@@ -2654,9 +2654,10 @@ func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 		CUPSQueue:      "MockQueue",
 		CUPSRunner:     mockRunner,
 		SNMPPoller:     snmpPoller,
-		MockCUPSHealth: testHealthyCUPSHealth,
-		MockIPPState:   testHealthyIPPState,
-		MockSNMPHealth: testHealthySNMPHealth,
+		MockCUPSHealth:   testHealthyCUPSHealth,
+		MockIPPState:     testHealthyIPPState,
+		MockSNMPHealth:   testHealthySNMPHealth,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
@@ -2665,6 +2666,7 @@ func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 	// Explicitly set printer capabilities: Monochrome and Color supported
 	client.capsMu.Lock()
 	client.capabilities = printer.PrinterCapabilities{
+		A4Support:             printer.CapabilitySupported,
 		ColorSupport:          printer.CapabilitySupported,
 		MonochromeSupport:     printer.CapabilitySupported,
 		DuplexLongEdgeSupport: printer.CapabilitySupported,

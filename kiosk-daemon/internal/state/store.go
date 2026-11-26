@@ -13,8 +13,19 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
+const DefaultTrayCapacity = 150
+
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	trayCapacity int
+}
+
+// TrayCapacity returns the configured physical tray capacity for this store.
+func (s *Store) TrayCapacity() int {
+	if s == nil || s.trayCapacity <= 0 {
+		return DefaultTrayCapacity
+	}
+	return s.trayCapacity
 }
 
 type StoredJob struct {
@@ -58,8 +69,16 @@ func isValidDuplex(duplex contracts.DuplexMode) bool {
 }
 
 func Open(dbPath string) (*Store, error) {
+	return OpenWithCapacity(dbPath, DefaultTrayCapacity)
+}
+
+// OpenWithCapacity opens the SQLite state store with a validated positive tray capacity.
+func OpenWithCapacity(dbPath string, trayCapacity int) (*Store, error) {
 	if dbPath == "" {
 		return nil, errors.New("database path cannot be empty")
+	}
+	if trayCapacity <= 0 {
+		return nil, fmt.Errorf("tray capacity must be positive, got %d", trayCapacity)
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -134,7 +153,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS printer_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     estimated_sheets INTEGER NOT NULL
-        CHECK (estimated_sheets >= 0 AND estimated_sheets <= 250),
+        CHECK (estimated_sheets >= 0),
     is_calibrated INTEGER NOT NULL DEFAULT 0
 );
 `
@@ -256,13 +275,32 @@ CREATE TABLE IF NOT EXISTS printer_state (
 		}
 	}
 
+	var printerTableSQL string
+	if err := tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='printer_state';").Scan(&printerTableSQL); err == nil {
+		if strings.Contains(printerTableSQL, "<= 250") {
+			if _, err := tx.ExecContext(ctx, `
+CREATE TABLE printer_state_new (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    estimated_sheets INTEGER NOT NULL CHECK (estimated_sheets >= 0),
+    is_calibrated INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO printer_state_new (id, estimated_sheets, is_calibrated)
+    SELECT id, estimated_sheets, is_calibrated FROM printer_state;
+DROP TABLE printer_state;
+ALTER TABLE printer_state_new RENAME TO printer_state;`); err != nil {
+				cleanup()
+				return nil, fmt.Errorf("migrate printer_state remove hardcoded 250 check: %w", err)
+			}
+		}
+	}
+
 	var stateCount int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(1) FROM printer_state WHERE id = 1;").Scan(&stateCount); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("check printer_state record: %w", err)
 	}
 	if stateCount == 0 {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO printer_state (id, estimated_sheets, is_calibrated) VALUES (1, 250, 0);"); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO printer_state (id, estimated_sheets, is_calibrated) VALUES (1, 0, 0);"); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("initialize default printer state: %w", err)
 		}
@@ -273,7 +311,7 @@ CREATE TABLE IF NOT EXISTS printer_state (
 		return nil, fmt.Errorf("commit migration tx: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, trayCapacity: trayCapacity}, nil
 }
 
 func (s *Store) Close() error {
@@ -971,6 +1009,10 @@ func (s *Store) GetEstimatedSheets(
 	if err != nil {
 		return 0, fmt.Errorf("failed to query estimated sheets: %w", err)
 	}
+	cap := s.TrayCapacity()
+	if sheets < 0 || sheets > cap {
+		return 0, fmt.Errorf("stored estimated_sheets %d outside configured capacity bounds [0, %d]", sheets, cap)
+	}
 
 	return sheets, nil
 }
@@ -1034,6 +1076,10 @@ func (s *Store) GetPaperSupply(
 	if err != nil {
 		return 0, false, fmt.Errorf("failed to query paper supply: %w", err)
 	}
+	cap := s.TrayCapacity()
+	if est < 0 || est > cap {
+		return 0, false, fmt.Errorf("stored estimated_sheets %d outside configured capacity bounds [0, %d]", est, cap)
+	}
 
 	return est, calib == 1, nil
 }
@@ -1051,8 +1097,9 @@ func (s *Store) ResetPaperTray(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if sheets < 0 || sheets > 250 {
-		return fmt.Errorf("sheets must be between 0 and 250 inclusive, got %d", sheets)
+	cap := s.TrayCapacity()
+	if sheets < 0 || sheets > cap {
+		return fmt.Errorf("sheets must be between 0 and %d inclusive, got %d", cap, sheets)
 	}
 
 	query := `UPDATE printer_state SET estimated_sheets = ?, is_calibrated = 1 WHERE id = 1;`
@@ -1070,4 +1117,63 @@ func (s *Store) ResetPaperTray(
 	}
 
 	return nil
+}
+
+// CalibratePaperTray atomically calibrates paper tray inventory to sheets within [0, TrayCapacity],
+// rejecting calibration while any job is actively spooling/printing or has unresolved physical uncertainty.
+func (s *Store) CalibratePaperTray(
+	ctx context.Context,
+	sheets int,
+) error {
+	if s == nil || s.db == nil {
+		return errors.New("store is not open")
+	}
+	if ctx == nil {
+		return errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cap := s.TrayCapacity()
+	if sheets < 0 || sheets > cap {
+		return fmt.Errorf("sheets must be between 0 and %d inclusive, got %d", cap, sheets)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin calibration tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var blockingCount int
+	err = tx.QueryRowContext(ctx, `
+SELECT COUNT(1) FROM jobs
+WHERE status IN (?, ?)
+   OR (status NOT IN (?, ?) AND (submitted_to_printer = 1 OR cups_job_id != '' OR sheets_printed > 0 OR status = ?));`,
+		contracts.JobStatusSpooling,
+		contracts.JobStatusPrinting,
+		contracts.JobStatusCompleted,
+		contracts.JobStatusFailedRefundable,
+		contracts.JobStatusPausedError,
+	).Scan(&blockingCount)
+	if err != nil {
+		return fmt.Errorf("check active or uncertain jobs before calibration: %w", err)
+	}
+	if blockingCount > 0 {
+		return fmt.Errorf("cannot calibrate paper tray while %d active or unresolved physical job(s) exist", blockingCount)
+	}
+
+	res, err := tx.ExecContext(ctx, `UPDATE printer_state SET estimated_sheets = ?, is_calibrated = 1 WHERE id = 1;`, sheets)
+	if err != nil {
+		return fmt.Errorf("failed to calibrate paper tray: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check affected rows during calibration: %w", err)
+	}
+	if rows == 0 {
+		return errors.New("printer_state record not found")
+	}
+
+	return tx.Commit()
 }
