@@ -338,10 +338,7 @@ func TestCloudHub_Correction3And4_FreshnessResetCadenceAndSendTimeCheck(t *testi
 	if msg.Job == nil || msg.Job.JobID != "job-c4-01" {
 		t.Fatalf("expected job-c4-01 on first ready frame, got %+v", msg)
 	}
-	intentStatus, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-c4-01")
-	if intentStatus != "SENT" {
-		t.Fatalf("expected dispatch intent SENT after reconciliation, got %s", intentStatus)
-	}
+	waitForIntentStatus(ctx, t, db, "job-c4-01", "SENT")
 
 	// Subsequent routine HEALTHY telemetry frames while session stays healthy MUST NOT call
 	// ResetUnacknowledgedDispatchIntents and revert unacknowledged SENT intents back to PENDING!
@@ -525,10 +522,7 @@ func TestCloudHub_PendingDispatchRetry_WithoutReconnection(t *testing.T) {
 	if msg.Job == nil || msg.Job.JobID != "job-retry-01" {
 		t.Fatalf("expected pending dispatch retry to deliver job-retry-01 without reconnection, got %+v", msg)
 	}
-	intentAfter, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-retry-01")
-	if intentAfter != "SENT" {
-		t.Fatalf("expected intent status SENT after retry, got %s", intentAfter)
-	}
+	waitForIntentStatus(ctx, t, db, "job-retry-01", "SENT")
 }
 
 func TestCloudHub_EqualTimestampInvalidation_NeverRestores(t *testing.T) {
@@ -725,5 +719,225 @@ func TestCloudHub_ConcurrentReplacement_ActiveSessionIsolation(t *testing.T) {
 	conn, _, hasH, ready, reason := hub.EvaluateKioskReadiness("kiosk-iso")
 	if !conn || !hasH || !ready {
 		t.Fatalf("expected active replacement session ready, got conn=%v hasH=%v ready=%v reason=%s", conn, hasH, ready, reason)
+	}
+}
+
+func TestCloudHub_ReconcileDispatch_SendFailureNoDeadlockAndRetries(t *testing.T) {
+	db := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	hub := NewHub(db)
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	conn, _ := connectTestKiosk(t, hub, srv.URL, "kiosk-reconcile-deadlock")
+	sendTestReadyHealth(ctx, t, hub, conn, "kiosk-reconcile-deadlock")
+
+	// Seed paid pending order.
+	now := time.Now().UTC()
+	ord := store.Order{
+		OrderID: "ord-rec-dl-01",
+		Command: contracts.PrintJobCommand{
+			JobID:       "job-rec-dl-01",
+			KioskID:     "kiosk-reconcile-deadlock",
+			DisplayCode: "6060",
+		},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  500,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-rec-dl-01",
+				OrderID:          "ord-rec-dl-01",
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "https://cloud.test/rec-dl.pdf",
+				SHA256Checksum:   "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+				TotalPages:       1,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           contracts.DuplexSimplex,
+				ColorMode:        "BW",
+				PricePaise:       500,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := db.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	kSess, err := db.CreateOrGetKioskSessionWithPaperCheck(ctx, "kiosk-reconcile-deadlock", ord.OrderID, 10, 10*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+	if _, err := db.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID:   "pay-rec-dl-01",
+		OrderID:     ord.OrderID,
+		KioskID:     "kiosk-reconcile-deadlock",
+		SessionID:   kSess.SessionID,
+		AmountPaise: 500,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}, now); err != nil {
+		t.Fatalf("CapturePaymentAndCheckDispatch failed: %v", err)
+	}
+
+	hub.mu.RLock()
+	sess := hub.sessions["kiosk-reconcile-deadlock"]
+	hub.mu.RUnlock()
+
+	// Hold sendMu while reconcilePendingDispatchOrders enters sendJobToSession (holding dispatchMu),
+	// then expire telemetry so sendJobToSession's sendMu-guarded readiness check rejects the send.
+	// Before the fix, sendJobToSession attempted to acquire dispatchMu again and deadlocked.
+	sess.sendMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		hub.reconcilePendingDispatchOrders(ctx, "kiosk-reconcile-deadlock", sess)
+		close(done)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	sess.healthMu.Lock()
+	expired := cloneHealth(sess.latestHealth.health)
+	expired.UpdatedAt = time.Now().UTC().Add(-10 * time.Second)
+	sess.latestHealth = &sessionHealthEntry{health: expired, receivedAt: sess.latestHealth.receivedAt}
+	sess.healthMu.Unlock()
+	sess.sendMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcilePendingDispatchOrders deadlocked when sendJobToSession rejected readiness")
+	}
+
+	if !sess.reconcileRetryNeeded.Load() {
+		t.Fatal("expected reconcileRetryNeeded=true after sendJobToSession rejection inside reconciliation")
+	}
+	st, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-rec-dl-01")
+	if st != "PENDING" {
+		t.Fatalf("expected failed reconciliation send to leave intent PENDING, got %s", st)
+	}
+
+	// Fresh verified telemetry on the same active connection retries and delivers job-rec-dl-01.
+	tNext := time.Now().UTC().Add(20 * time.Millisecond)
+	nextH := contracts.PrinterHealth{
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     100,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   90,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     90,
+		DrumLifeKnown:       true,
+		UpdatedAt:           tNext,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(tNext, DefaultTelemetryFreshnessWindow),
+	}
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &nextH}); err != nil {
+		t.Fatalf("write next healthy frame failed: %v", err)
+	}
+	msg := readJobMessage(ctx, t, conn)
+	if msg.Job == nil || msg.Job.JobID != "job-rec-dl-01" {
+		t.Fatalf("expected retry to deliver job-rec-dl-01, got %+v", msg)
+	}
+	waitForIntentStatus(ctx, t, db, "job-rec-dl-01", "SENT")
+}
+
+func waitForIntentStatus(ctx context.Context, t *testing.T, db *store.Store, jobID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		got, _, _ = db.GetJobDispatchIntentStatus(ctx, jobID)
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected dispatch intent %s status %s, got %s", jobID, want, got)
+}
+
+func TestCloudHub_InitialResetSerializedWithReplacement(t *testing.T) {
+	db := newTestStore(t)
+	hub := NewHub(db)
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Seed paid order with SENT intent.
+	now := time.Now().UTC()
+	ord := store.Order{
+		OrderID: "ord-reset-ser",
+		Command: contracts.PrintJobCommand{
+			JobID:       "job-reset-ser",
+			KioskID:     "kiosk-reset-ser",
+			DisplayCode: "7171",
+		},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  500,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-reset-ser",
+				OrderID:          "ord-reset-ser",
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "https://cloud.test/reset-ser.pdf",
+				SHA256Checksum:   "1111111111111111111111111111111111111111111111111111111111111111",
+				TotalPages:       1,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           contracts.DuplexSimplex,
+				ColorMode:        "BW",
+				PricePaise:       500,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	_ = db.CreateOrder(ctx, ord)
+	kSess, _ := db.CreateOrGetKioskSessionWithPaperCheck(ctx, "kiosk-reset-ser", ord.OrderID, 10, 10*time.Minute, now)
+	_, _ = db.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID:   "pay-reset-ser",
+		OrderID:     ord.OrderID,
+		KioskID:     "kiosk-reset-ser",
+		SessionID:   kSess.SessionID,
+		AmountPaise: 500,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}, now)
+
+	// Connect session 1, verify ready, then mark job-reset-ser SENT.
+	conn1, _ := connectTestKiosk(t, hub, srv.URL, "kiosk-reset-ser")
+	sendTestReadyHealth(ctx, t, hub, conn1, "kiosk-reset-ser")
+	msg1 := readJobMessage(ctx, t, conn1)
+	if msg1.Job == nil || msg1.Job.JobID != "job-reset-ser" {
+		t.Fatalf("expected initial dispatch of job-reset-ser, got %+v", msg1)
+	}
+
+	hub.mu.RLock()
+	sess1 := hub.sessions["kiosk-reset-ser"]
+	hub.mu.RUnlock()
+
+	// Simulate sess1 being replaced by conn2 while sess1 attempts initial reconciliation.
+	conn2, _ := connectTestKiosk(t, hub, srv.URL, "kiosk-reset-ser")
+	defer conn2.CloseNow()
+	_ = conn1.CloseNow()
+
+	sess1.initialReconnectDone.Store(false)
+	_ = db.MarkDispatchIntentAcknowledged(ctx, "job-reset-ser")
+	hub.reconcilePendingDispatchOrders(ctx, "kiosk-reset-ser", sess1)
+
+	st, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-reset-ser")
+	if st != "ACKNOWLEDGED" {
+		t.Fatalf("replaced session must not reset successor session intent, got %s", st)
 	}
 }

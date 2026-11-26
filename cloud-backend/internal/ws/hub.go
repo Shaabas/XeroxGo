@@ -51,8 +51,8 @@ type kioskSession struct {
 	latestHealth *sessionHealthEntry
 
 	dispatchMu           sync.Mutex
-	initialReconnectDone bool
-	reconcileRetryNeeded bool
+	initialReconnectDone atomic.Bool
+	reconcileRetryNeeded atomic.Bool
 	inactive             atomic.Bool
 }
 
@@ -61,6 +61,7 @@ type kioskSession struct {
 type Hub struct {
 	db          *store.Store
 	mu          sync.RWMutex
+	resetMu     sync.Mutex
 	sessions    map[string]*kioskSession
 	kioskSecret []byte
 }
@@ -140,6 +141,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var replacedOld *kioskSession
+	h.resetMu.Lock()
 	h.mu.Lock()
 	if old, exists := h.sessions[kioskID]; exists {
 		old.inactive.Store(true)
@@ -147,6 +149,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.sessions[kioskID] = sess
 	h.mu.Unlock()
+	h.resetMu.Unlock()
 	if replacedOld != nil && replacedOld.conn != nil {
 		go func(c *websocket.Conn) {
 			_ = c.Close(websocket.StatusPolicyViolation, "replaced by new connection")
@@ -275,10 +278,7 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 		return
 	}
 
-	sess.dispatchMu.Lock()
-	shouldReconcile := !sess.inactive.Load() && (!wasReady || !sess.initialReconnectDone || sess.reconcileRetryNeeded)
-	sess.dispatchMu.Unlock()
-	if shouldReconcile {
+	if !sess.inactive.Load() && (!wasReady || !sess.initialReconnectDone.Load() || sess.reconcileRetryNeeded.Load()) {
 		h.reconcilePendingDispatchOrders(ctx, kioskID, sess)
 	}
 }
@@ -295,39 +295,50 @@ func (h *Hub) reconcilePendingDispatchOrders(ctx context.Context, kioskID string
 		return
 	}
 
-	if !sess.initialReconnectDone {
-		if !h.isActiveSession(kioskID, sess) {
+	if !sess.initialReconnectDone.Load() {
+		h.resetMu.Lock()
+		active := h.isActiveSession(kioskID, sess)
+		var resetErr error
+		if active {
+			resetCtx, resetCancel := context.WithTimeout(ctx, 2*time.Second)
+			resetErr = h.db.ResetUnacknowledgedDispatchIntents(resetCtx, kioskID)
+			resetCancel()
+		}
+		h.resetMu.Unlock()
+		if !active {
 			return
 		}
-		if err := h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID); err != nil {
-			sess.reconcileRetryNeeded = true
-			log.Printf("[HUB] Failed resetting unacknowledged dispatch intents for kiosk %s: %v", kioskID, err)
+		if resetErr != nil {
+			sess.reconcileRetryNeeded.Store(true)
+			log.Printf("[HUB] Failed resetting unacknowledged dispatch intents for kiosk %s: %v", kioskID, resetErr)
 			return
 		}
-		sess.initialReconnectDone = true
+		sess.initialReconnectDone.Store(true)
 	}
+
+	// Clear retry flag before loading/sending so concurrent SendJob failures during this
+	// loop are preserved and never overwritten.
+	sess.reconcileRetryNeeded.Store(false)
 
 	pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID)
 	if err != nil {
-		sess.reconcileRetryNeeded = true
+		sess.reconcileRetryNeeded.Store(true)
 		log.Printf("[HUB] Failed loading pending dispatch orders for kiosk %s: %v", kioskID, err)
 		return
 	}
 	if len(pendingJobs) == 0 {
-		sess.reconcileRetryNeeded = false
 		return
 	}
 
 	log.Printf("[HUB] Reconciling %d pending dispatch orders for verified ready kiosk %s", len(pendingJobs), kioskID)
-	sess.reconcileRetryNeeded = false
 	for _, jobCmd := range pendingJobs {
 		if ready, reason := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready || !h.isActiveSession(kioskID, sess) {
-			sess.reconcileRetryNeeded = true
+			sess.reconcileRetryNeeded.Store(true)
 			log.Printf("[HUB] Halting pending dispatch reconciliation for kiosk %s (%s)", kioskID, reason)
 			break
 		}
 		if err := h.sendJobToSession(ctx, sess, jobCmd); err != nil {
-			sess.reconcileRetryNeeded = true
+			sess.reconcileRetryNeeded.Store(true)
 			log.Printf("[HUB] Failed to dispatch pending job %s to kiosk %s: %v", jobCmd.JobID, kioskID, err)
 			break
 		}
@@ -337,7 +348,7 @@ func (h *Hub) reconcilePendingDispatchOrders(ctx context.Context, kioskID string
 			retryErr := h.db.MarkDispatchIntentSent(bgCtx, jobCmd.JobID)
 			bgCancel()
 			if retryErr != nil {
-				sess.reconcileRetryNeeded = true
+				sess.reconcileRetryNeeded.Store(true)
 				log.Printf("[HUB] Warning: failed to mark reconciled job %s SENT: %v", jobCmd.JobID, retryErr)
 				break
 			}
@@ -546,16 +557,12 @@ func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd cont
 		return fmt.Errorf("send job: kiosk %q connection replaced", cmd.KioskID)
 	}
 	if ready, reason := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready {
-		sess.dispatchMu.Lock()
-		sess.reconcileRetryNeeded = true
-		sess.dispatchMu.Unlock()
+		sess.reconcileRetryNeeded.Store(true)
 		return fmt.Errorf("send job: kiosk %q not ready (%s)", cmd.KioskID, reason)
 	}
 
 	if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
-		sess.dispatchMu.Lock()
-		sess.reconcileRetryNeeded = true
-		sess.dispatchMu.Unlock()
+		sess.reconcileRetryNeeded.Store(true)
 		return fmt.Errorf("send job: write to kiosk %q: %w", cmd.KioskID, err)
 	}
 
@@ -574,9 +581,7 @@ func (h *Hub) MarkDispatchRetryNeeded(kioskID string) {
 	if !ok || sess == nil || sess.inactive.Load() {
 		return
 	}
-	sess.dispatchMu.Lock()
-	sess.reconcileRetryNeeded = true
-	sess.dispatchMu.Unlock()
+	sess.reconcileRetryNeeded.Store(true)
 }
 
 // IsConnected returns whether the specified kiosk currently has an active WebSocket session.
