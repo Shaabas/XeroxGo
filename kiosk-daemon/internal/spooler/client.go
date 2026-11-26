@@ -2490,10 +2490,14 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	}
 
 	c.calibrationMu.Lock()
-	estimatedSheets, err := c.cfg.StateStore.GetEstimatedSheets(ctx)
-	if err != nil || estimatedSheets < orderRemainingSheets {
+	estimatedSheets, isCalibrated, err := c.cfg.StateStore.GetPaperSupply(ctx)
+	if err != nil || !isCalibrated || estimatedSheets < orderRemainingSheets || estimatedSheets <= 0 {
 		c.calibrationMu.Unlock()
-		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, "paper tray supply insufficient for remaining print job")
+		reason := "paper tray supply insufficient for remaining print job"
+		if err == nil && !isCalibrated {
+			reason = "printer paper supply is uncalibrated; tray calibration required before submission"
+		}
+		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
 		return
 	}
 
@@ -3623,16 +3627,39 @@ func (c *Client) capabilityPolicy() printer.PrinterCapabilityPolicy {
 	return printer.DefaultDemoCapabilityPolicy()
 }
 
+func (c *Client) isSimulationMode() bool {
+	if c == nil {
+		return false
+	}
+	return c.cfg.MockCapabilities != nil ||
+		c.cfg.MockHealth != nil ||
+		c.cfg.MockCUPSPrint != nil ||
+		c.cfg.MockCUPSHealth != nil ||
+		c.cfg.MockIPPState != nil ||
+		c.cfg.MockSNMPHealth != nil ||
+		c.healthPoller != nil
+}
+
 func (c *Client) validateJobCapabilities(ctx context.Context, cmd contracts.PrintJobCommand) error {
 	policy := c.capabilityPolicy()
 	var hwPtr *printer.PrinterCapabilities
 	if c != nil && c.cfg.MockCapabilities != nil {
 		hwCopy := *c.cfg.MockCapabilities
 		hwPtr = &hwCopy
+	} else if c != nil && c.isSimulationMode() {
+		synth := printer.SyntheticDemoCapabilities()
+		if policy.AllowColor {
+			synth.ColorSupport = printer.CapabilitySupported
+		}
+		if policy.AllowDuplex {
+			synth.DuplexLongEdgeSupport = printer.CapabilitySupported
+			synth.DuplexShortEdgeSupport = printer.CapabilitySupported
+			synth.SidesSupported = append(synth.SidesSupported, "two-sided-long-edge", "two-sided-short-edge")
+		}
+		hwPtr = &synth
 	} else if c != nil {
 		hwCaps := c.Capabilities()
-		if hwCaps.Source == "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" &&
-			c.cfg.MockHealth == nil && !(c.cfg.CUPSRunner == nil && c.cfg.MockCUPSPrint != nil) {
+		if hwCaps.Source == "" && strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 			hwCaps = c.DiscoverStartupCapabilities(ctx)
 		}
 		if hwCaps.HasCapabilityAttributes() {

@@ -20,11 +20,14 @@ func TestPackage03_InitiatePayment_PaperCommitmentQueryError_FailsClosed(t *test
 
 	// 1. Connect kiosk with healthy printer and ample paper stock (500 sheets)
 	_, cancelKiosk := connectKioskWithHealth(t, srv.URL, kioskID, contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "OK",
-		EstimatedSheets: 500,
-		UpdatedAt:       time.Now().UTC(),
+		Online:                 true,
+		State:                  "IDLE",
+		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:        "OK",
+		EstimatedSheets:        500,
+		ConfiguredTrayCapacity: 500,
+		InventoryCalibrated:    true,
+		UpdatedAt:              time.Now().UTC(),
 	})
 	defer cancelKiosk()
 

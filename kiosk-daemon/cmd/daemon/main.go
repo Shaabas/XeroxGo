@@ -357,12 +357,15 @@ func main() {
 	}
 
 	if simulatedStockSet {
+		if !*mockPrinter {
+			log.Fatalf("Fatal: --simulated-stock requires --mock-printer; cannot mutate production inventory without explicit simulation mode")
+		}
 		if *simulatedStock < 0 || *simulatedStock > *trayCapacity {
 			log.Fatalf("Fatal: --simulated-stock must be between 0 and %d inclusive, got %d", *trayCapacity, *simulatedStock)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := stateStore.ResetPaperTray(ctx, *simulatedStock); err != nil {
+		if err := stateStore.CalibratePaperTray(ctx, *simulatedStock); err != nil {
 			log.Fatalf("Fatal: failed to set simulated paper stock: %v", err)
 		}
 		log.Printf("Initialized simulated paper tray to %d sheets (capacity %d)", *simulatedStock, *trayCapacity)
@@ -559,6 +562,21 @@ func main() {
 	demoPolicy := printer.DefaultDemoCapabilityPolicy()
 	demoPolicy.AllowColor = *allowColor
 	demoPolicy.AllowDuplex = *allowDuplex
+
+	var mockCaps *printer.PrinterCapabilities
+	if *mockPrinter {
+		synth := printer.SyntheticDemoCapabilities()
+		if *allowColor {
+			synth.ColorSupport = printer.CapabilitySupported
+		}
+		if *allowDuplex {
+			synth.DuplexLongEdgeSupport = printer.CapabilitySupported
+			synth.DuplexShortEdgeSupport = printer.CapabilitySupported
+			synth.SidesSupported = append(synth.SidesSupported, "two-sided-long-edge", "two-sided-short-edge")
+		}
+		mockCaps = &synth
+	}
+
 	clientCfg := spooler.ClientConfig{
 		CloudURL:                 *cloudURL,
 		KioskID:                  *kioskID,
@@ -566,6 +584,7 @@ func main() {
 		StateStore:               stateStore,
 		ConfiguredTrayCapacity:   *trayCapacity,
 		CapabilityPolicy:         &demoPolicy,
+		MockCapabilities:         mockCaps,
 		PrinterAddr:              actualPrinterAddr,
 		SNMPTarget:               *snmpTarget,
 		SNMPCommunity:            *snmpCommunity,

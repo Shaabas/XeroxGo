@@ -175,6 +175,22 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
+	// Validate configured capacity and estimated stock consistently
+	if health.ConfiguredTrayCapacity <= 0 {
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "MALFORMED_TELEMETRY",
+			Message:    "kiosk reported invalid or non-positive tray capacity",
+		}
+	}
+	if health.EstimatedSheets < 0 || health.EstimatedSheets > health.ConfiguredTrayCapacity {
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "MALFORMED_TELEMETRY",
+			Message:    fmt.Sprintf("kiosk estimated sheets %d out of bounds [0, %d]", health.EstimatedSheets, health.ConfiguredTrayCapacity),
+		}
+	}
+
 	// Existing inventory and calibration check
 	tray := strings.ToUpper(strings.TrimSpace(health.PaperTrayStatus))
 	if tray == "UNKNOWN" || !health.InventoryCalibrated {
@@ -192,7 +208,54 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
-	return health.EstimatedSheets, nil
+	effectiveStock := health.EstimatedSheets
+	// Conservative capacity enforcement: contradictory physical capacity must not permit
+	// inventory or reservations above the verified physical limit.
+	if health.InputTrayCapacityKnown && health.InputTrayCapacity > 0 && effectiveStock > health.InputTrayCapacity {
+		effectiveStock = health.InputTrayCapacity
+	}
+
+	return effectiveStock, nil
+}
+
+func validateOrderAgainstPolicy(ord *store.Order, policy contracts.ProductCapabilityPolicy) *printerConditionError {
+	if ord == nil {
+		return nil
+	}
+	if len(ord.Documents) > 0 {
+		for _, doc := range ord.Documents {
+			if doc.Duplex != contracts.DuplexSimplex && !policy.AllowDuplex {
+				return &printerConditionError{
+					StatusCode: http.StatusBadRequest,
+					Code:       "CAPABILITY_UNSUPPORTED",
+					Message:    fmt.Sprintf("document %d requires duplex printing which is not supported by this kiosk", doc.DocumentIndex),
+				}
+			}
+			if strings.EqualFold(doc.ColorMode, "COLOR") && !policy.AllowColor {
+				return &printerConditionError{
+					StatusCode: http.StatusBadRequest,
+					Code:       "CAPABILITY_UNSUPPORTED",
+					Message:    fmt.Sprintf("document %d requires color printing which is not supported by this kiosk", doc.DocumentIndex),
+				}
+			}
+		}
+	} else {
+		if ord.Command.Duplex != contracts.DuplexSimplex && !policy.AllowDuplex {
+			return &printerConditionError{
+				StatusCode: http.StatusBadRequest,
+				Code:       "CAPABILITY_UNSUPPORTED",
+				Message:    "order requires duplex printing which is not supported by this kiosk",
+			}
+		}
+		if strings.EqualFold(ord.ColorMode, "COLOR") && !policy.AllowColor {
+			return &printerConditionError{
+				StatusCode: http.StatusBadRequest,
+				Code:       "CAPABILITY_UNSUPPORTED",
+				Message:    "order requires color printing which is not supported by this kiosk",
+			}
+		}
+	}
+	return nil
 }
 
 func firstNonEmptySessionErr(vals ...string) string {
@@ -260,6 +323,21 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": condErr.Message,
 			"code":  condErr.Code,
+		})
+		return
+	}
+
+	ord, oErr := s.db.GetOrder(r.Context(), orderID)
+	if oErr != nil || ord == nil {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(polErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": polErr.Message,
+			"code":  polErr.Code,
 		})
 		return
 	}
@@ -492,6 +570,15 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		http.Error(w, "order not found", http.StatusNotFound)
 		return
 	}
+	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(polErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": polErr.Message,
+			"code":  polErr.Code,
+		})
+		return
+	}
 
 	// Revalidate printer condition and fresh stock before initiating payment
 	stock, condErr := s.checkPrinterCondition(kioskID)
@@ -671,6 +758,21 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": condErr.Message,
 			"code":  condErr.Code,
+		})
+		return
+	}
+
+	ord, oErr := s.db.GetOrder(r.Context(), orderID)
+	if oErr != nil || ord == nil {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(polErr.StatusCode)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": polErr.Message,
+			"code":  polErr.Code,
 		})
 		return
 	}

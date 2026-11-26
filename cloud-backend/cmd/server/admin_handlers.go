@@ -24,6 +24,7 @@ func (app *appServer) handlePublicPricing(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	policy := app.policy()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		BWSimplexPricePaise    int64     `json:"bw_simplex_price_paise"`
@@ -39,9 +40,9 @@ func (app *appServer) handlePublicPricing(w http.ResponseWriter, r *http.Request
 		BWDuplexPricePaise:     pricingConfig.BWDuplexPricePaise,
 		ColorSimplexPricePaise: pricingConfig.ColorSimplexPricePaise,
 		ColorDuplexPricePaise:  pricingConfig.ColorDuplexPricePaise,
-		ColorEnabled:           pricingConfig.ColorEnabled,
-		DuplexEnabled:          app.cfg != nil && app.cfg.duplexEnabled,
-		PaperSize:              "A4",
+		ColorEnabled:           pricingConfig.ColorEnabled && policy.AllowColor,
+		DuplexEnabled:          policy.AllowDuplex,
+		PaperSize:              policy.PaperSize,
 		UpdatedAt:              pricingConfig.UpdatedAt,
 	})
 }

@@ -36,6 +36,8 @@ type serverConfig struct {
 	jobsDir        string
 	devMode        bool
 	duplexEnabled  bool
+	colorEnabled   bool
+	policy         *contracts.ProductCapabilityPolicy
 	downloadSecret []byte
 	kioskSecret    []byte
 }
@@ -46,6 +48,22 @@ type appServer struct {
 	hub        *ws.Hub
 	convWake   chan struct{}
 	pinLimiter *PINRateLimiter
+}
+
+func (app *appServer) policy() contracts.ProductCapabilityPolicy {
+	if app != nil && app.cfg != nil && app.cfg.policy != nil {
+		return *app.cfg.policy
+	}
+	pol := contracts.DefaultDemoProductPolicy()
+	if app != nil && app.cfg != nil {
+		if app.cfg.duplexEnabled {
+			pol.AllowDuplex = true
+		}
+		if app.cfg.colorEnabled {
+			pol.AllowColor = true
+		}
+	}
+	return pol
 }
 
 func (s *appServer) getBaseURL(r *http.Request) string {
@@ -301,7 +319,9 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "pricing unavailable: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	colorEnabled := pricing.ColorEnabled
+	productPolicy := s.policy()
+	colorEnabled := pricing.ColorEnabled && productPolicy.AllowColor
+	duplexEnabled := productPolicy.AllowDuplex
 
 	orderHex, err := randomHex(12)
 	if err != nil {
@@ -352,7 +372,6 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 			docNum = 0
 		}
 
-		duplexEnabled := s.cfg != nil && s.cfg.duplexEnabled
 		var docOpts docPrintOptions
 		if idx < len(metaItems) {
 			docOpts, err = parseMetadataPrintOptions(metaItems[idx], colorEnabled, duplexEnabled, docNum)
@@ -739,8 +758,10 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	duplexEnabled := s.cfg != nil && s.cfg.duplexEnabled
-	opts, err := parseFormPrintOptions(r, pricing.ColorEnabled, duplexEnabled, 0)
+	productPolicy := s.policy()
+	colorEnabled := pricing.ColorEnabled && productPolicy.AllowColor
+	duplexEnabled := productPolicy.AllowDuplex
+	opts, err := parseFormPrintOptions(r, colorEnabled, duplexEnabled, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

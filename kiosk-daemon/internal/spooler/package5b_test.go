@@ -191,3 +191,134 @@ func TestPackage5B_PiEnforcesCapabilitiesBeforeSubmission(t *testing.T) {
 		t.Fatalf("expected 0 physical submissions for unsupported COLOR/DUPLEX jobs, got %d", submitted)
 	}
 }
+
+func TestPackage5B_UncalibratedInventoryPreventsPhysicalSubmission(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "uncalibrated.db")
+	st, err := state.OpenWithCapacity(dbPath, 150)
+	if err != nil {
+		t.Fatalf("OpenWithCapacity failed: %v", err)
+	}
+	defer st.Close()
+
+	// Initial store starts with estimated_sheets=0, is_calibrated=0
+	sheets, calib, err := st.GetPaperSupply(context.Background())
+	if err != nil || calib || sheets != 0 {
+		t.Fatalf("expected uncalibrated 0 sheets, got sheets=%d calib=%v err=%v", sheets, calib, err)
+	}
+
+	pdfBytes := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+	sum := sha256.Sum256(pdfBytes)
+	checksum := hex.EncodeToString(sum[:])
+
+	pdfSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write(pdfBytes)
+	}))
+	defer pdfSrv.Close()
+
+	submitted := 0
+	client, err := NewClient(ClientConfig{
+		CloudURL:       "ws://127.0.0.1:8080/ws",
+		KioskID:        "kiosk-5b-uncalib",
+		StateStore:     st,
+		CUPSQueue:      "HPTank1020w",
+		DownloadDir:    tmpDir,
+		IdleQRContent:  "https://kiosk.test",
+		ScreenSink:     func(*image.RGBA) error { return nil },
+		MockCUPSHealth: testHealthyCUPSHealth,
+		MockIPPState:   testHealthyIPPState,
+		MockSNMPHealth: testHealthySNMPHealth,
+		MockCapabilities: &printer.PrinterCapabilities{
+			Source:            printer.CapabilitySourceCUPSQueue,
+			A4Support:         printer.CapabilitySupported,
+			SimplexSupport:    printer.CapabilitySupported,
+			MonochromeSupport: printer.CapabilitySupported,
+			PDFSupport:        printer.CapabilityUnsupported,
+		},
+		MockCUPSPrint: func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(int)) error {
+			submitted++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	ctx := context.Background()
+	cmd := contracts.PrintJobCommand{
+		JobID:          "job-uncalibrated",
+		KioskID:        "kiosk-5b-uncalib",
+		DisplayCode:    "2222",
+		DownloadURL:    pdfSrv.URL + "/doc.pdf",
+		SHA256Checksum: checksum,
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		ColorMode:      "BW",
+		StartFromPage:  1,
+	}
+	client.processJob(ctx, cmd)
+
+	if submitted != 0 {
+		t.Fatalf("expected 0 physical submissions when inventory is uncalibrated, got %d", submitted)
+	}
+}
+
+func TestPackage5B_SimulationCannotBypassProductionCalibration(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "sim_bypass.db")
+	st, err := state.OpenWithCapacity(dbPath, 150)
+	if err != nil {
+		t.Fatalf("OpenWithCapacity failed: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Initial calibration succeeds
+	if err := st.CalibratePaperTray(ctx, 100); err != nil {
+		t.Fatalf("CalibratePaperTray(100) failed: %v", err)
+	}
+
+	// Insert an active PRINTING job
+	cmd := contracts.PrintJobCommand{
+		JobID:         "job-active-print",
+		OrderID:       "ord-active",
+		KioskID:       "kiosk-sim-bypass",
+		TotalPages:    1,
+		TotalSheets:   1,
+		Copies:        1,
+		StartFromPage: 1,
+		Duplex:        contracts.DuplexSimplex,
+		ColorMode:     "BW",
+	}
+	if err := st.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	// Both CalibratePaperTray and ResetPaperTray MUST reject calibration while active job exists
+	if err := st.CalibratePaperTray(ctx, 120); err == nil {
+		t.Fatal("expected CalibratePaperTray to reject while PRINTING job is active")
+	}
+	if err := st.ResetPaperTray(ctx, 120); err == nil {
+		t.Fatal("expected ResetPaperTray to reject while PRINTING job is active (cannot bypass durable calibration safety)")
+	}
+
+	// Move job to PAUSED_ERROR (physically unresolved uncertainty)
+	if err := st.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID:  "job-active-print",
+		Status: contracts.JobStatusPausedError,
+	}); err != nil {
+		t.Fatalf("UpdateProgress failed: %v", err)
+	}
+
+	// Both CalibratePaperTray and ResetPaperTray MUST reject calibration while unresolved job exists
+	if err := st.CalibratePaperTray(ctx, 130); err == nil {
+		t.Fatal("expected CalibratePaperTray to reject while unresolved physical job exists")
+	}
+	if err := st.ResetPaperTray(ctx, 130); err == nil {
+		t.Fatal("expected ResetPaperTray to reject while unresolved physical job exists")
+	}
+}

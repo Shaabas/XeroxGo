@@ -114,3 +114,24 @@ type JobProgressEvent struct {
 	ErrorReason   string    `json:"error_reason,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
 }
+
+// ProductCapabilityPolicy defines the configured product policy for supported print options.
+type ProductCapabilityPolicy struct {
+	AllowColor     bool   `json:"allow_color"`
+	AllowDuplex    bool   `json:"allow_duplex"`
+	RequireA4      bool   `json:"require_a4"`
+	PaperSize      string `json:"paper_size"`
+	AllowMultiCopy bool   `json:"allow_multi_copy"`
+}
+
+// DefaultDemoProductPolicy returns the canonical product capability policy for the HP LaserJet Tank 1020w demo kiosk:
+// A4 paper only, BW (monochrome) only, Simplex (single-sided) only, multi-copy allowed.
+func DefaultDemoProductPolicy() ProductCapabilityPolicy {
+	return ProductCapabilityPolicy{
+		AllowColor:     false,
+		AllowDuplex:    false,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	}
+}

@@ -200,12 +200,19 @@ func (r ReconciledHealthResult) ToContract(
 		updatedAt = r.EvaluatedAt
 	}
 
+	effectiveSheets := estimatedSheets
+	// Conservative capacity enforcement: contradictory physical capacity must not permit
+	// inventory above verified physical limit.
+	if r.InputTrayCapacityKnown && r.InputTrayCapacity > 0 && effectiveSheets > r.InputTrayCapacity {
+		effectiveSheets = r.InputTrayCapacity
+	}
+
 	return contracts.PrinterHealth{
 		Online:                 r.EvaluatedHealth == contracts.EvaluatedHealthHealthy,
 		State:                  state,
 		EvaluatedHealth:        r.EvaluatedHealth,
 		PaperTrayStatus:        trayStatus,
-		EstimatedSheets:        estimatedSheets,
+		EstimatedSheets:        effectiveSheets,
 		InventoryCalibrated:    inventoryCalibrated,
 		ExecutionSafe:          executionSafe,
 		ExecutionSafetyReason:  strings.TrimSpace(executionSafetyReason),

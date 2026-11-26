@@ -145,6 +145,10 @@ func TestCrashRecoveryAfterReopen(t *testing.T) {
 	cmd.Duplex = contracts.DuplexShortEdge
 	cmd.StartFromPage = 2
 
+	if err := store1.ResetPaperTray(ctx, 150); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
 	if err := store1.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
 	}
@@ -162,10 +166,6 @@ func TestCrashRecoveryAfterReopen(t *testing.T) {
 
 	if err := store1.UpdateProgress(ctx, progress); err != nil {
 		t.Fatalf("UpdateProgress failed: %v", err)
-	}
-
-	if err := store1.ResetPaperTray(ctx, 150); err != nil {
-		t.Fatalf("ResetPaperTray failed: %v", err)
 	}
 
 	if err := store1.DecrementSheets(ctx, 3); err != nil {
@@ -908,13 +908,13 @@ func TestRecordSheetProgress_AtomicityAndRollbackOnInsufficientSupply(t *testing
 	cmd.TotalPages = 10
 	cmd.TotalSheets = 5
 
-	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
-
 	// Set tray stock to exactly 2 sheets
 	if err := s.ResetPaperTray(ctx, 2); err != nil {
 		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	// 1. Progress by 1 sheet (stock 2 -> 1, sheets_printed 0 -> 1)
@@ -974,11 +974,11 @@ func TestRecordSheetProgress_MonotonicityAndDuplicateIdempotency(t *testing.T) {
 	cmd.TotalPages = 10
 	cmd.TotalSheets = 5
 
-	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
 	if err := s.ResetPaperTray(ctx, 20); err != nil {
 		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	// Initial progress: sheet 1
@@ -1057,11 +1057,11 @@ func TestRecordSheetProgress_CompletionDeductionAndDuplicateCompletion(t *testin
 	cmd.TotalPages = 10
 	cmd.TotalSheets = 5
 
-	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
 	if err := s.ResetPaperTray(ctx, 50); err != nil {
 		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	// 1. Partial print: 2 sheets

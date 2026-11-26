@@ -39,8 +39,16 @@ type wireMessage struct {
 	Error      string                      `json:"error,omitempty"`
 }
 
+type refillWaiter struct {
+	ch      chan refillAckResult
+	sess    *kioskSession
+	conn    *websocket.Conn
+	kioskID string
+}
+
 type refillAckResult struct {
 	ok         bool
+	hasSheets  bool
 	sheets     int
 	calibrated bool
 	errMsg     string
@@ -75,7 +83,7 @@ type Hub struct {
 	sessions      map[string]*kioskSession
 	kioskSecret   []byte
 	refillMu      sync.Mutex
-	refillWaiters map[string]chan refillAckResult
+	refillWaiters map[string]refillWaiter
 	refillSeq     atomic.Uint64
 }
 
@@ -84,7 +92,7 @@ func NewHub(db *store.Store) *Hub {
 	return &Hub{
 		db:            db,
 		sessions:      make(map[string]*kioskSession),
-		refillWaiters: make(map[string]chan refillAckResult),
+		refillWaiters: make(map[string]refillWaiter),
 	}
 }
 
@@ -237,19 +245,26 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "refill_ack":
 			if strings.TrimSpace(msg.RequestID) != "" {
 				sheetsVal := 0
+				hasSheets := false
 				if msg.Sheets != nil {
 					sheetsVal = *msg.Sheets
+					hasSheets = true
 				}
 				h.refillMu.Lock()
-				ch, exists := h.refillWaiters[msg.RequestID]
+				waiter, exists := h.refillWaiters[msg.RequestID]
 				if exists {
-					delete(h.refillWaiters, msg.RequestID)
+					if waiter.sess == sess && waiter.conn == sess.conn {
+						delete(h.refillWaiters, msg.RequestID)
+					} else {
+						exists = false
+					}
 				}
 				h.refillMu.Unlock()
-				if exists && ch != nil {
+				if exists && waiter.ch != nil {
 					select {
-					case ch <- refillAckResult{
+					case waiter.ch <- refillAckResult{
 						ok:         msg.OK,
+						hasSheets:  hasSheets,
 						sheets:     sheetsVal,
 						calibrated: msg.Calibrated,
 						errMsg:     msg.Error,
@@ -758,9 +773,14 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 
 	h.refillMu.Lock()
 	if h.refillWaiters == nil {
-		h.refillWaiters = make(map[string]chan refillAckResult)
+		h.refillWaiters = make(map[string]refillWaiter)
 	}
-	h.refillWaiters[reqID] = ackCh
+	h.refillWaiters[reqID] = refillWaiter{
+		ch:      ackCh,
+		sess:    sess,
+		conn:    sess.conn,
+		kioskID: kioskID,
+	}
 	h.refillMu.Unlock()
 
 	defer func() {
@@ -784,15 +804,38 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 
 	select {
 	case res := <-ackCh:
+		if !h.isActiveSession(kioskID, sess) {
+			return errors.New("kiosk session replaced or disconnected before confirming refill calibration")
+		}
 		if !res.ok {
 			if strings.TrimSpace(res.errMsg) != "" {
 				return errors.New(res.errMsg)
 			}
 			return errors.New("kiosk rejected refill calibration")
 		}
+		if !res.calibrated {
+			return errors.New("kiosk did not confirm durable calibration flag")
+		}
+		if !res.hasSheets || res.sheets != sheets {
+			return fmt.Errorf("returned sheet count %d does not match requested count %d", res.sheets, sheets)
+		}
+
+		// Downward calibration must immediately update cached kiosk inventory to prevent
+		// cloud reservations from using obsolete larger inventory.
+		// Preserve telemetry freshness and existing health snapshot synchronization.
+		sess.healthMu.Lock()
+		if sess.latestHealth != nil {
+			sess.latestHealth.health.EstimatedSheets = sheets
+			sess.latestHealth.health.InventoryCalibrated = true
+			if sess.latestHealth.health.PaperTrayStatus == "EMPTY" && sheets > 0 {
+				sess.latestHealth.health.PaperTrayStatus = "OK"
+			}
+		}
+		sess.healthMu.Unlock()
+
 		return nil
 	case <-sess.closed:
-		return errors.New("kiosk disconnected before confirming refill calibration")
+		return errors.New("kiosk session replaced or disconnected before confirming refill calibration")
 	case <-ctx.Done():
 		return fmt.Errorf("timed out waiting for kiosk refill confirmation: %w", ctx.Err())
 	}

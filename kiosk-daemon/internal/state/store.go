@@ -275,25 +275,6 @@ CREATE TABLE IF NOT EXISTS printer_state (
 		}
 	}
 
-	var printerTableSQL string
-	if err := tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='printer_state';").Scan(&printerTableSQL); err == nil {
-		if strings.Contains(printerTableSQL, "<= 250") {
-			if _, err := tx.ExecContext(ctx, `
-CREATE TABLE printer_state_new (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    estimated_sheets INTEGER NOT NULL CHECK (estimated_sheets >= 0),
-    is_calibrated INTEGER NOT NULL DEFAULT 0
-);
-INSERT INTO printer_state_new (id, estimated_sheets, is_calibrated)
-    SELECT id, estimated_sheets, is_calibrated FROM printer_state;
-DROP TABLE printer_state;
-ALTER TABLE printer_state_new RENAME TO printer_state;`); err != nil {
-				cleanup()
-				return nil, fmt.Errorf("migrate printer_state remove hardcoded 250 check: %w", err)
-			}
-		}
-	}
-
 	var stateCount int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(1) FROM printer_state WHERE id = 1;").Scan(&stateCount); err != nil {
 		cleanup()
@@ -1084,39 +1065,13 @@ func (s *Store) GetPaperSupply(
 	return est, calib == 1, nil
 }
 
+// ResetPaperTray delegates directly to CalibratePaperTray to ensure all inventory updates
+// pass through durable calibration safety validation and reject active or unresolved physical jobs.
 func (s *Store) ResetPaperTray(
 	ctx context.Context,
 	sheets int,
 ) error {
-	if s == nil || s.db == nil {
-		return errors.New("store is not open")
-	}
-	if ctx == nil {
-		return errors.New("context cannot be nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	cap := s.TrayCapacity()
-	if sheets < 0 || sheets > cap {
-		return fmt.Errorf("sheets must be between 0 and %d inclusive, got %d", cap, sheets)
-	}
-
-	query := `UPDATE printer_state SET estimated_sheets = ?, is_calibrated = 1 WHERE id = 1;`
-	res, err := s.db.ExecContext(ctx, query, sheets)
-	if err != nil {
-		return fmt.Errorf("failed to reset paper tray: %w", err)
-	}
-
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to check affected rows during reset: %w", err)
-	}
-	if rows == 0 {
-		return errors.New("printer_state record not found")
-	}
-
-	return nil
+	return s.CalibratePaperTray(ctx, sheets)
 }
 
 // CalibratePaperTray atomically calibrates paper tray inventory to sheets within [0, TrayCapacity],

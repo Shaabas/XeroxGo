@@ -22,6 +22,7 @@ type docItemMeta struct {
 	Copies        int         `json:"copies"`
 	Duplex        interface{} `json:"duplex"`
 	ColorMode     string      `json:"color_mode"`
+	PaperSize     string      `json:"paper_size"`
 	PageRange     string      `json:"page_range"`
 	Orientation   string      `json:"orientation"`
 	PagesPerSheet int         `json:"pages_per_sheet"`
@@ -173,6 +174,11 @@ func parseMetadataPrintOptions(meta docItemMeta, colorEnabled bool, duplexEnable
 
 	if meta.Copies >= 1 && meta.Copies <= 999 {
 		opts.Copies = meta.Copies
+	}
+
+	paperSize := strings.TrimSpace(meta.PaperSize)
+	if paperSize != "" && !strings.EqualFold(paperSize, "A4") {
+		return opts, fmt.Errorf("unsupported paper_size %q in document %d: only A4 is supported", meta.PaperSize, docIndex)
 	}
 
 	colorMode := strings.ToUpper(strings.TrimSpace(meta.ColorMode))

@@ -1956,13 +1956,13 @@ func TestJobPDFCleanup(t *testing.T) {
 			StartFromPage: 1,
 			Duplex:        contracts.DuplexSimplex,
 		}
-		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
-			t.Fatalf("SaveJob failed: %v", err)
-		}
-
 		// Arrange for persistence failure by exhausting paper inventory to 0 while job requires 2 sheets
 		if err := store.ResetPaperTray(ctx, 0); err != nil {
 			t.Fatalf("ResetPaperTray failed: %v", err)
+		}
+
+		if err := store.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+			t.Fatalf("SaveJob failed: %v", err)
 		}
 
 		pdfPath := jobPDFPath(tmpDir, cmd.JobID)

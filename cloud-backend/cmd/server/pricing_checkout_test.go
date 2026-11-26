@@ -44,6 +44,7 @@ func setupPricingTestServer(t *testing.T) (*appServer, *http.ServeMux, string) {
 		downloadSecret: []byte("test_secret_key_1234567890"),
 		devMode:        true,
 		duplexEnabled:  true,
+		colorEnabled:   true,
 	}
 
 	hub := ws.NewHub(s)
