@@ -422,3 +422,308 @@ func TestCloudHub_Correction3And4_FreshnessResetCadenceAndSendTimeCheck(t *testi
 		t.Fatal("sendJobToSession must return error when write fails on closed connection")
 	}
 }
+
+func TestCloudHub_PendingDispatchRetry_WithoutReconnection(t *testing.T) {
+	db := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	hub := NewHub(db)
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	conn, _ := connectTestKiosk(t, hub, srv.URL, "kiosk-retry")
+	sendTestReadyHealth(ctx, t, hub, conn, "kiosk-retry")
+
+	// Seed paid order after session is already connected & ready.
+	now := time.Now().UTC()
+	ord := store.Order{
+		OrderID: "ord-retry-01",
+		Command: contracts.PrintJobCommand{
+			JobID:       "job-retry-01",
+			KioskID:     "kiosk-retry",
+			DisplayCode: "7777",
+		},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  500,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-retry-01",
+				OrderID:          "ord-retry-01",
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "https://cloud.test/retry.pdf",
+				SHA256Checksum:   "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+				TotalPages:       1,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           contracts.DuplexSimplex,
+				ColorMode:        "BW",
+				PricePaise:       500,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := db.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	kSess, err := db.CreateOrGetKioskSessionWithPaperCheck(ctx, "kiosk-retry", ord.OrderID, 10, 10*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+	capRes, err := db.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID:   "pay-retry-01",
+		OrderID:     ord.OrderID,
+		KioskID:     "kiosk-retry",
+		SessionID:   kSess.SessionID,
+		AmountPaise: 500,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}, now)
+	if err != nil || !capRes.DispatchEligible || capRes.Command == nil {
+		t.Fatalf("CapturePaymentAndCheckDispatch failed: err=%v eligible=%v", err, capRes.DispatchEligible)
+	}
+
+	// Simulate transient SendJob failure while kiosk stays connected & healthy (e.g., transient canceled write ctx).
+	expiredCtx, expiredCancel := context.WithCancel(ctx)
+	expiredCancel()
+	if err := hub.SendJob(expiredCtx, *capRes.Command); err == nil {
+		t.Fatal("expected SendJob with canceled context to fail")
+	}
+	hub.MarkDispatchRetryNeeded("kiosk-retry")
+
+	intentSt, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-retry-01")
+	if intentSt != "PENDING" {
+		t.Fatalf("expected failed SendJob to leave intent PENDING, got %s", intentSt)
+	}
+
+	// Next routine HEALTHY telemetry frame on the SAME connection retries & delivers without reconnect!
+	tNext := time.Now().UTC().Add(10 * time.Millisecond)
+	nextH := contracts.PrinterHealth{
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     100,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   90,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     90,
+		DrumLifeKnown:       true,
+		UpdatedAt:           tNext,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(tNext, DefaultTelemetryFreshnessWindow),
+	}
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &nextH}); err != nil {
+		t.Fatalf("write next healthy frame failed: %v", err)
+	}
+
+	msg := readJobMessage(ctx, t, conn)
+	if msg.Job == nil || msg.Job.JobID != "job-retry-01" {
+		t.Fatalf("expected pending dispatch retry to deliver job-retry-01 without reconnection, got %+v", msg)
+	}
+	intentAfter, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-retry-01")
+	if intentAfter != "SENT" {
+		t.Fatalf("expected intent status SENT after retry, got %s", intentAfter)
+	}
+}
+
+func TestCloudHub_EqualTimestampInvalidation_NeverRestores(t *testing.T) {
+	hub := NewHub(nil)
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _ := connectTestKiosk(t, hub, srv.URL, "kiosk-eqts")
+
+	t1 := time.Now().UTC()
+	healthyT1 := contracts.PrinterHealth{
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     100,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   90,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     90,
+		DrumLifeKnown:       true,
+		UpdatedAt:           t1,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(t1, DefaultTelemetryFreshnessWindow),
+	}
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &healthyT1}); err != nil {
+		t.Fatalf("write healthyT1 failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready, _ := hub.IsKioskReadyForDispatch("kiosk-eqts"); ready {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ready, _ := hub.IsKioskReadyForDispatch("kiosk-eqts"); !ready {
+		t.Fatal("expected healthyT1 to establish readiness")
+	}
+
+	// Equal-timestamp unsafe update revokes readiness immediately.
+	unsafeT1 := healthyT1
+	unsafeT1.ExecutionSafe = false
+	unsafeT1.ExecutionSafetyReason = "paused job barrier"
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &unsafeT1}); err != nil {
+		t.Fatalf("write unsafeT1 failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready, _ := hub.IsKioskReadyForDispatch("kiosk-eqts"); !ready {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ready, _ := hub.IsKioskReadyForDispatch("kiosk-eqts"); ready {
+		t.Fatal("equal-timestamp ExecutionSafe=false must revoke readiness immediately")
+	}
+
+	// Replay of original healthyT1 at the SAME timestamp MUST NOT restore readiness.
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &healthyT1}); err != nil {
+		t.Fatalf("write replay healthyT1 failed: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if ready, _ := hub.IsKioskReadyForDispatch("kiosk-eqts"); ready {
+		t.Fatal("equal-timestamp HEALTHY replay must NEVER restore previously revoked readiness")
+	}
+
+	// Fresh verified evidence (T2 > T1) restores readiness cleanly.
+	t2 := t1.Add(20 * time.Millisecond)
+	healthyT2 := healthyT1
+	healthyT2.UpdatedAt = t2
+	healthyT2.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(t2, DefaultTelemetryFreshnessWindow)
+	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &healthyT2}); err != nil {
+		t.Fatalf("write healthyT2 failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready, _ := hub.IsKioskReadyForDispatch("kiosk-eqts"); ready {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("expected fresh verified T2 telemetry to restore readiness")
+}
+
+func TestCloudHub_ConcurrentReplacement_ActiveSessionIsolation(t *testing.T) {
+	db := newTestStore(t)
+	hub := NewHub(db)
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Seed an order and mark its intent SENT so old session disconnect must NOT reset it.
+	now := time.Now().UTC()
+	ord := store.Order{
+		OrderID: "ord-repl-iso",
+		Command: contracts.PrintJobCommand{
+			JobID:       "job-repl-iso",
+			KioskID:     "kiosk-iso",
+			DisplayCode: "5151",
+		},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  500,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-repl-iso",
+				OrderID:          "ord-repl-iso",
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "https://cloud.test/iso.pdf",
+				SHA256Checksum:   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+				TotalPages:       1,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           contracts.DuplexSimplex,
+				ColorMode:        "BW",
+				PricePaise:       500,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	_ = db.CreateOrder(ctx, ord)
+	kSess, _ := db.CreateOrGetKioskSessionWithPaperCheck(ctx, "kiosk-iso", ord.OrderID, 10, 10*time.Minute, now)
+	_, _ = db.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID:   "pay-iso",
+		OrderID:     ord.OrderID,
+		KioskID:     "kiosk-iso",
+		SessionID:   kSess.SessionID,
+		AmountPaise: 500,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}, now)
+	_ = db.MarkDispatchIntentSent(ctx, "job-repl-iso")
+
+	u, _ := url.Parse(srv.URL)
+	u.Scheme = "ws"
+	u.Path = "/ws"
+	q := u.Query()
+	q.Set("kiosk_id", "kiosk-iso")
+	u.RawQuery = q.Encode()
+
+	// Concurrent EvaluateKioskReadiness readers while rapidly replacing connections.
+	stopReaders := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				conn, _, hasH, ready, _ := hub.EvaluateKioskReadiness("kiosk-iso")
+				if !conn && (hasH || ready) {
+					t.Errorf("EvaluateKioskReadiness returned disconnected yet hasH=%v ready=%v", hasH, ready)
+				}
+			}
+		}
+	}()
+
+	var lastConn *websocket.Conn
+	for i := 0; i < 6; i++ {
+		c, _, err := websocket.Dial(ctx, u.String(), nil)
+		if err != nil {
+			t.Fatalf("dial %d failed: %v", i, err)
+		}
+		if lastConn != nil {
+			_ = lastConn.CloseNow()
+		}
+		lastConn = c
+		time.Sleep(15 * time.Millisecond)
+	}
+	close(stopReaders)
+	<-readerDone
+
+	if lastConn != nil {
+		defer lastConn.CloseNow()
+	}
+
+	// Disconnect cleanup of replaced sessions must NOT reset SENT intent on active session.
+	st, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-repl-iso")
+	if st != "SENT" {
+		t.Fatalf("replaced-session disconnect must not reset SENT intent, got %s", st)
+	}
+
+	// Verify final active session still receives verified readiness cleanly.
+	sendTestReadyHealth(ctx, t, hub, lastConn, "kiosk-iso")
+	conn, _, hasH, ready, reason := hub.EvaluateKioskReadiness("kiosk-iso")
+	if !conn || !hasH || !ready {
+		t.Fatalf("expected active replacement session ready, got conn=%v hasH=%v ready=%v reason=%s", conn, hasH, ready, reason)
+	}
+}

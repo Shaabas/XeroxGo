@@ -121,8 +121,9 @@ type Client struct {
 	sendMu sync.Mutex
 
 	jobQueue   chan contracts.PrintJobCommand
-	activeMu   sync.Mutex
-	activeJobs map[string]bool
+	activeMu      sync.Mutex
+	activeJobs    map[string]bool
+	monitoredJobs map[string]bool
 
 	deferredMu   sync.Mutex
 	deferredJobs []contracts.PrintJobCommand
@@ -404,6 +405,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		safeURL:               safeURL,
 		jobQueue:              make(chan contracts.PrintJobCommand, queueCap),
 		activeJobs:            make(map[string]bool),
+		monitoredJobs:         make(map[string]bool),
 		deferredJobs:          make([]contracts.PrintJobCommand, 0),
 		pendingQueue:          make([]contracts.PrintJobCommand, 0),
 		runCtx:                runCtx,
@@ -1747,7 +1749,9 @@ func (c *Client) getSNMPConfig() *printer.SNMPConfig {
 }
 
 func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob) {
+	c.setMonitoredJob(job.Command.JobID, true)
 	defer func() {
+		c.setMonitoredJob(job.Command.JobID, false)
 		c.activeMu.Lock()
 		delete(c.activeJobs, job.Command.JobID)
 		c.activeMu.Unlock()
@@ -2517,7 +2521,9 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	printPath := finalPath
 	streamCmd := cmd
 
-	// 7. Update progress: PRINTING
+	// 7. Update progress: PRINTING and register genuine live physical monitoring
+	c.setMonitoredJob(cmd.JobID, true)
+	defer c.setMonitoredJob(cmd.JobID, false)
 	printEvt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
@@ -3694,12 +3700,28 @@ func (c *Client) updateSnapshotInventory(ctx context.Context, sheets int, calibr
 	return c.CurrentHealthSnapshot(ctx)
 }
 
-func (c *Client) isActivelyMonitoredJob(jobID string) bool {
+func (c *Client) setMonitoredJob(jobID string, active bool) {
+	if strings.TrimSpace(jobID) == "" {
+		return
+	}
+	c.activeMu.Lock()
+	if c.monitoredJobs == nil {
+		c.monitoredJobs = make(map[string]bool)
+	}
+	if active {
+		c.monitoredJobs[jobID] = true
+	} else {
+		delete(c.monitoredJobs, jobID)
+	}
+	c.activeMu.Unlock()
+}
+
+func (c *Client) isLiveMonitoredJob(jobID string) bool {
 	if strings.TrimSpace(jobID) == "" {
 		return false
 	}
 	c.activeMu.Lock()
-	active := c.activeJobs[jobID]
+	active := c.monitoredJobs[jobID]
 	c.activeMu.Unlock()
 	return active
 }
@@ -3771,10 +3793,10 @@ func (c *Client) computeExecutionSafety(ctx context.Context, excludeJobID string
 			return false, fmt.Sprintf("unresolved paused job %s requires reconciliation", j.Command.JobID)
 		}
 		if j.SubmittedToPrinter || j.CUPSJobID != "" || j.SheetsPrinted > 0 {
-			// Healthy actively-monitored print owned by this daemon preserves order-prep ExecutionSafe=true
+			// Healthy live-monitored print owned by this daemon preserves order-prep ExecutionSafe=true
 			// when evaluating kiosk readiness (excludeJobID == ""); physical submission serialization still
-			// blocks other jobs via excludeJobID != "".
-			if excludeJobID == "" && !c.isHardwareFaultActive() && c.isActivelyMonitoredJob(j.Command.JobID) {
+			// blocks other jobs via excludeJobID != "", and queued-only activeJobs entries never qualify.
+			if excludeJobID == "" && !c.isHardwareFaultActive() && c.isLiveMonitoredJob(j.Command.JobID) {
 				continue
 			}
 			return false, fmt.Sprintf("unresolved physical job %s (%s) has uncertain output", j.Command.JobID, j.Status)

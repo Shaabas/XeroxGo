@@ -812,12 +812,18 @@ func TestSpoolerCanonical_Correction2_ScreenSafetyAndActiveHealthyPrint(t *testi
 	client.activeJobs[activeCmd.JobID] = true
 	client.activeMu.Unlock()
 
+	if safeQueued, _ := client.computeExecutionSafety(ctx, ""); safeQueued {
+		t.Fatal("queued-only job in activeJobs without live monitoring must NOT bypass execution-safety barrier")
+	}
+
+	client.setMonitoredJob(activeCmd.JobID, true)
 	if safe, reason := client.computeExecutionSafety(ctx, ""); !safe {
-		t.Fatalf("healthy actively-monitored print must keep ExecutionSafe=true for order prep, got false (%s)", reason)
+		t.Fatalf("healthy live-monitored print must keep ExecutionSafe=true for order prep, got false (%s)", reason)
 	}
 	if safeOther, _ := client.computeExecutionSafety(ctx, "job-second"); safeOther {
 		t.Fatal("concurrent physical submission check (excludeJobID != \"\") must stay serialized/blocked")
 	}
+	client.setMonitoredJob(activeCmd.JobID, false)
 }
 
 func TestSpoolerCanonical_Correction3And5_StaggeredExpiryAndCachedIPPURI(t *testing.T) {

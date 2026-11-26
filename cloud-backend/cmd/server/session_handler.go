@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
@@ -200,6 +201,31 @@ func firstNonEmptySessionErr(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func (s *appServer) dispatchAuthorizedCommands(ctx context.Context, tag string, cmds []contracts.PrintJobCommand) {
+	if s == nil || s.hub == nil {
+		return
+	}
+	for _, cmd := range cmds {
+		if err := s.hub.SendJob(ctx, cmd); err != nil {
+			log.Printf("%s Warning: failed to send job %s to kiosk %s: %v", tag, cmd.JobID, cmd.KioskID, err)
+			s.hub.MarkDispatchRetryNeeded(cmd.KioskID)
+			break
+		}
+		if s.db != nil {
+			if err := s.db.MarkDispatchIntentSent(ctx, cmd.JobID); err != nil {
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				retryErr := s.db.MarkDispatchIntentSent(bgCtx, cmd.JobID)
+				bgCancel()
+				if retryErr != nil {
+					log.Printf("%s Warning: failed to mark job %s SENT: %v", tag, cmd.JobID, retryErr)
+					s.hub.MarkDispatchRetryNeeded(cmd.KioskID)
+					break
+				}
+			}
+		}
+	}
 }
 
 // handleOrderClaim creates or retrieves an active transaction session for a kiosk order.
@@ -697,20 +723,13 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 	// Dispatch job to kiosk physical printer
 	if s.hub != nil {
 		if len(order.Documents) > 0 {
+			cmds := make([]contracts.PrintJobCommand, 0, len(order.Documents))
 			for _, doc := range order.Documents {
-				jobCmd := doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents))
-				if err := s.hub.SendJob(r.Context(), jobCmd); err != nil {
-					log.Printf("[RELEASE] Warning: failed to send child job %s to kiosk %s: %v", doc.JobID, kioskID, err)
-					break
-				}
-				_ = s.db.MarkDispatchIntentSent(r.Context(), doc.JobID)
+				cmds = append(cmds, doc.Command(order.Command.KioskID, order.Command.DisplayCode, len(order.Documents)))
 			}
+			s.dispatchAuthorizedCommands(r.Context(), "[RELEASE]", cmds)
 		} else {
-			if err := s.hub.SendJob(r.Context(), order.Command); err != nil {
-				log.Printf("[RELEASE] Warning: failed to send job %s to kiosk %s: %v", order.Command.JobID, kioskID, err)
-			} else {
-				_ = s.db.MarkDispatchIntentSent(r.Context(), order.Command.JobID)
-			}
+			s.dispatchAuthorizedCommands(r.Context(), "[RELEASE]", []contracts.PrintJobCommand{order.Command})
 		}
 	}
 
