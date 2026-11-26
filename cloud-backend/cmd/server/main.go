@@ -505,9 +505,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ClaimToken:   claimToken,
 	}
 
-	// Validate fresh kiosk/printer health and estimated paper stock before issuing PIN
+	// Validate fresh kiosk/printer health and estimated paper stock before issuing PIN,
+	// serialized per kiosk against downward calibration until durable order/PIN reservation completes.
+	unlockReserve := s.lockKioskReservation(kioskID)
 	availableStock, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(condErr.StatusCode)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -517,7 +520,12 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.beforeReserveCommitFn != nil {
+		s.beforeReserveCommitFn()
+	}
+
 	if err := s.createOrderWithPINRetryAndPaperCheck(r.Context(), &order, 25, availableStock); err != nil {
+		unlockReserve()
 		if errors.Is(err, store.ErrInsufficientPaper) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
@@ -531,6 +539,7 @@ func (s *appServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to reserve paper and issue PIN", http.StatusInternalServerError)
 		return
 	}
+	unlockReserve()
 	success = true
 	displayCode := order.Command.DisplayCode
 

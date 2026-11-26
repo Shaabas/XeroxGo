@@ -1302,3 +1302,117 @@ func TestPackage5B_ReservationTransactionAndCalibrationAtomicOrdering(t *testing
 		t.Fatalf("expected 409 Conflict for 50-sheet order after calibration to 2 sheets, got %d", resp2.StatusCode)
 	}
 }
+
+func TestPackage5B_UploadPINReservationAndCalibrationAtomicOrdering(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5b-upload-atomic"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	type refillReqMsg struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+		Sheets    *int   `json:"sheets"`
+	}
+	refillCh := make(chan refillReqMsg, 10)
+	go func() {
+		for {
+			var msg refillReqMsg
+			if err := wsjson.Read(ctx, conn, &msg); err != nil {
+				return
+			}
+			if msg.Type == "refill" {
+				refillCh <- msg
+			}
+		}
+	}()
+
+	now := time.Now().UTC()
+	h0 := makeHealthyHealth(100, 150, now)
+	h0.InventorySeq = 1
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": h0})
+	time.Sleep(40 * time.Millisecond)
+
+	tmpDir := t.TempDir()
+	pdfPath := createTestPDFWithPages(t, tmpDir, 2)
+	pdfBytes, err := os.ReadFile(pdfPath)
+	if err != nil {
+		t.Fatalf("read test pdf failed: %v", err)
+	}
+
+	postUpload := func(copies string) int {
+		body := &bytes.Buffer{}
+		w := multipart.NewWriter(body)
+		part, _ := w.CreateFormFile("file", "doc.pdf")
+		_, _ = part.Write(pdfBytes)
+		_ = w.WriteField("copies", copies)
+		_ = w.WriteField("duplex", "SIMPLEX")
+		_ = w.WriteField("color_mode", "BW")
+		_ = w.Close()
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/upload", ts.URL, kioskID), body)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("upload failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	readDone := make(chan struct{})
+	proceedCommit := make(chan struct{})
+	app.beforeReserveCommitFn = func() {
+		close(readDone)
+		<-proceedCommit
+	}
+
+	uploadStatusCh := make(chan int, 1)
+	go func() {
+		uploadStatusCh <- postUpload("25") // 2 pages * 25 copies = 50 sheets
+	}()
+
+	<-readDone
+	// Upload read 100 sheets and is paused before CreateOrderWithPaperCheck. Start downward calibration to 2 sheets.
+	refillErrCh := make(chan error, 1)
+	go func() {
+		refillErrCh <- app.hub.SendRefill(ctx, kioskID, 2)
+	}()
+
+	// Calibration MUST NOT transmit while upload reservation boundary is held
+	select {
+	case unexpected := <-refillCh:
+		t.Fatalf("calibration transmitted before upload/PIN reservation committed: %+v", unexpected)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(proceedCommit)
+	app.beforeReserveCommitFn = nil
+	if code := <-uploadStatusCh; code != http.StatusOK {
+		t.Fatalf("expected upload that started before calibration to commit with 200 OK, got %d", code)
+	}
+
+	// Calibration now transmits and completes to 2 sheets
+	reqRefill := <-refillCh
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":          "refill_ack",
+		"request_id":    reqRefill.RequestID,
+		"ok":            true,
+		"calibrated":    true,
+		"sheets":        2,
+		"inventory_seq": 2,
+	})
+	if err := <-refillErrCh; err != nil {
+		t.Fatalf("SendRefill(2) failed: %v", err)
+	}
+
+	// Subsequent 50-sheet upload MUST be rejected (409 INSUFFICIENT_PAPER) against calibrated 2 sheets
+	if code := postUpload("25"); code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for 50-sheet upload after calibration to 2 sheets, got %d", code)
+	}
+}
