@@ -1,6 +1,10 @@
 package contracts
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 type JobStatus string
 
@@ -66,6 +70,7 @@ type PrinterHealth struct {
 	EstimatedSheets        int                      `json:"estimated_sheets"`          // Tracked remaining sheets in tray
 	ConfiguredTrayCapacity int                      `json:"configured_tray_capacity,omitempty"` // Configured physical tray capacity on the kiosk
 	InventoryCalibrated    bool                     `json:"inventory_calibrated"`      // Existing SQLite inventory calibration validity
+	InventorySeq           uint64                   `json:"inventory_seq,omitempty"`   // Monotonic calibration sequence from kiosk
 	ExecutionSafe          bool                     `json:"execution_safe"`            // Local durable execution-safety readiness
 	ExecutionSafetyReason  string                   `json:"execution_safety_reason,omitempty"`
 	TonerLevelPercent      int                      `json:"toner_level_percent"` // 0 - 100 when TonerLevelKnown is true; -1 when unknown
@@ -134,4 +139,61 @@ func DefaultDemoProductPolicy() ProductCapabilityPolicy {
 		PaperSize:      "A4",
 		AllowMultiCopy: true,
 	}
+}
+
+// EffectiveTrayCapacity returns the conservative upper bound on tray capacity using
+// the configured capacity and any valid smaller known physical tray capacity.
+// Unknown physical capacity does not restrict configured capacity.
+func EffectiveTrayCapacity(configuredCapacity, physicalCapacity int, physicalCapacityKnown bool) int {
+	if configuredCapacity <= 0 {
+		return 0
+	}
+	limit := configuredCapacity
+	if physicalCapacityKnown && physicalCapacity > 0 && physicalCapacity < limit {
+		limit = physicalCapacity
+	}
+	return limit
+}
+
+// EffectiveInventorySheets computes the conservative effective sheet inventory from
+// calibrated stock, configured capacity, and any valid smaller known physical capacity.
+func EffectiveInventorySheets(calibratedSheets, configuredCapacity, physicalCapacity int, physicalCapacityKnown bool) int {
+	if calibratedSheets <= 0 {
+		return 0
+	}
+	limit := EffectiveTrayCapacity(configuredCapacity, physicalCapacity, physicalCapacityKnown)
+	if limit <= 0 {
+		return 0
+	}
+	if calibratedSheets > limit {
+		return limit
+	}
+	return calibratedSheets
+}
+
+// ValidatePrintModeAgainstPolicy validates duplex and color mode against the configured product policy.
+// Fails closed on invalid or unsupported print modes.
+func ValidatePrintModeAgainstPolicy(duplex DuplexMode, colorMode string, policy ProductCapabilityPolicy) error {
+	switch duplex {
+	case DuplexSimplex:
+	case DuplexLongEdge, DuplexShortEdge:
+		if !policy.AllowDuplex {
+			return fmt.Errorf("duplex printing (%s) is not supported by this kiosk", duplex)
+		}
+	default:
+		return fmt.Errorf("invalid duplex mode %q", duplex)
+	}
+
+	cm := strings.ToUpper(strings.TrimSpace(colorMode))
+	switch cm {
+	case "", "BW":
+	case "COLOR":
+		if !policy.AllowColor {
+			return fmt.Errorf("color printing is not supported by this kiosk")
+		}
+	default:
+		return fmt.Errorf("invalid color mode %q", colorMode)
+	}
+
+	return nil
 }

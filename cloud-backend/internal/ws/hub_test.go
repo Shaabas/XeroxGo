@@ -139,6 +139,12 @@ func readJobMessage(ctx context.Context, t *testing.T, conn *websocket.Conn) wir
 func TestHubRegistersAndSendsJob(t *testing.T) {
 	db := newTestStore(t)
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
@@ -181,6 +187,12 @@ func TestHubRegistersAndSendsJob(t *testing.T) {
 func TestHubPersistsProgress(t *testing.T) {
 	db := newTestStore(t)
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	server := httptest.NewServer(hub)
 	defer server.Close()
 
@@ -236,6 +248,12 @@ func TestHubPersistsProgress(t *testing.T) {
 func TestHubRejectsMismatchedKioskProgress(t *testing.T) {
 	db := newTestStore(t)
 	hub := NewHub(db)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex:    true,
+		RequireA4:      true,
+		PaperSize:      "A4",
+		AllowMultiCopy: true,
+	})
 	server := httptest.NewServer(hub)
 	defer server.Close()
 

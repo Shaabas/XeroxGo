@@ -575,3 +575,316 @@ func TestPackage5B_ConservativeCapacityAdmissionValidation(t *testing.T) {
 		t.Fatalf("expected effective stock to be conservatively capped to physical capacity 30, got %d", stock)
 	}
 }
+
+func TestPackage5B_RefillPreservesFaultAndHandlesConcurrentAndStaleAndTimeout(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5b-refill-consistency"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// 1. Preservation of physical fault state (EMPTY must NOT become OK on refill_ack)
+	t0 := time.Now().UTC()
+	faultHealth := makeHealthyHealth(0, 150, t0)
+	faultHealth.Online = false
+	faultHealth.State = "ERROR"
+	faultHealth.EvaluatedHealth = contracts.EvaluatedHealthFault
+	faultHealth.PaperTrayStatus = "EMPTY"
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":   "health",
+		"health": faultHealth,
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	type refillReqMsg struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+		Sheets    *int   `json:"sheets"`
+	}
+	refillCh := make(chan refillReqMsg, 10)
+	go func() {
+		for {
+			var msg refillReqMsg
+			if err := wsjson.Read(ctx, conn, &msg); err != nil {
+				return
+			}
+			if msg.Type == "refill" {
+				refillCh <- msg
+			}
+		}
+	}()
+
+	// Helper to send ack for next refill
+	sendAck := func(req refillReqMsg, sheets int) {
+		_ = wsjson.Write(ctx, conn, map[string]interface{}{
+			"type":       "refill_ack",
+			"request_id": req.RequestID,
+			"ok":         true,
+			"calibrated": true,
+			"sheets":     sheets,
+		})
+	}
+
+	go func() {
+		req := <-refillCh
+		sendAck(req, *req.Sheets)
+	}()
+	if err := app.hub.SendRefill(ctx, kioskID, 50); err != nil {
+		t.Fatalf("SendRefill(50) failed: %v", err)
+	}
+	hAfterFaultRefill, ok := app.hub.LatestHealth(kioskID)
+	if !ok {
+		t.Fatal("expected LatestHealth to be present")
+	}
+	if hAfterFaultRefill.EstimatedSheets != 50 || !hAfterFaultRefill.InventoryCalibrated {
+		t.Fatalf("expected EstimatedSheets=50, calibrated=true; got %d, %v", hAfterFaultRefill.EstimatedSheets, hAfterFaultRefill.InventoryCalibrated)
+	}
+	if hAfterFaultRefill.PaperTrayStatus != "EMPTY" || hAfterFaultRefill.EvaluatedHealth != contracts.EvaluatedHealthFault {
+		t.Fatalf("expected physical fault state EMPTY/FAULT preserved after refill, got %s/%s", hAfterFaultRefill.PaperTrayStatus, hAfterFaultRefill.EvaluatedHealth)
+	}
+	if !hAfterFaultRefill.UpdatedAt.Equal(t0) {
+		t.Fatalf("expected UpdatedAt preserved (%v), got %v", t0, hAfterFaultRefill.UpdatedAt)
+	}
+
+	// 2. Old telemetry acquisition overlapping downward calibration cannot overwrite confirmed count
+	t1 := time.Now().UTC()
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":   "health",
+		"health": makeHealthyHealth(100, 150, t1),
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	go func() {
+		req := <-refillCh
+		sendAck(req, *req.Sheets)
+	}()
+	if err := app.hub.SendRefill(ctx, kioskID, 10); err != nil {
+		t.Fatalf("SendRefill(10) failed: %v", err)
+	}
+
+	// Now an older telemetry frame (acquired before refill confirmation, e.g. t1 + 1ms < lastRefillConfirmedAt) arrives
+	staleFrame := makeHealthyHealth(100, 150, t1.Add(time.Millisecond))
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":   "health",
+		"health": staleFrame,
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	hAfterStale, _ := app.hub.LatestHealth(kioskID)
+	if hAfterStale.EstimatedSheets != 10 {
+		t.Fatalf("expected stale pre-calibration frame not to overwrite confirmed 10 sheets, got %d", hAfterStale.EstimatedSheets)
+	}
+
+	// 3. Concurrent refill requests are serialized and do not interleave
+	errCh1 := make(chan error, 1)
+	errCh2 := make(chan error, 1)
+	go func() { errCh1 <- app.hub.SendRefill(ctx, kioskID, 40) }()
+	go func() { errCh2 <- app.hub.SendRefill(ctx, kioskID, 15) }()
+
+	var order []int
+	for i := 0; i < 2; i++ {
+		req := <-refillCh
+		order = append(order, *req.Sheets)
+		sendAck(req, *req.Sheets)
+	}
+	if e1 := <-errCh1; e1 != nil {
+		t.Fatalf("concurrent SendRefill 1 failed: %v", e1)
+	}
+	if e2 := <-errCh2; e2 != nil {
+		t.Fatalf("concurrent SendRefill 2 failed: %v", e2)
+	}
+	hConcurrent, _ := app.hub.LatestHealth(kioskID)
+	if hConcurrent.EstimatedSheets != order[1] {
+		t.Fatalf("expected final cached sheets %d to match last serialized refill, got %d", order[1], hConcurrent.EstimatedSheets)
+	}
+
+	// 4. Timeout after possible durable application blocks reservations using obsolete larger stock
+	t2 := time.Now().UTC()
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":   "health",
+		"health": makeHealthyHealth(100, 150, t2),
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	shortCtx, shortCancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer shortCancel()
+	if err := app.hub.SendRefill(shortCtx, kioskID, 5); err == nil {
+		t.Fatal("expected timeout error from SendRefill")
+	}
+	<-refillCh // drain un-acked refill message
+
+	// While calibration outcome is unconfirmed, checkPrinterCondition must NOT authorize reservations using obsolete 100 sheets
+	if stock, condErr := app.checkPrinterCondition(kioskID); condErr == nil {
+		t.Fatalf("expected reservation admission to block while calibration outcome is unconfirmed, got stock=%d", stock)
+	}
+
+	// Fresh telemetry arriving after the unconfirmed refill clears uncertainty
+	t3 := time.Now().UTC().Add(100 * time.Millisecond)
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":   "health",
+		"health": makeHealthyHealth(5, 150, t3),
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	stock, condErr := app.checkPrinterCondition(kioskID)
+	if condErr != nil || stock != 5 {
+		t.Fatalf("expected fresh telemetry to restore admission with 5 sheets, got stock=%d err=%+v", stock, condErr)
+	}
+}
+
+func TestPackage5B_RefillRejectsUnavailableConfiguredCapacity(t *testing.T) {
+	_, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5b-no-cap"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// No health telemetry received yet -> configured capacity unavailable -> must reject without 150 fallback
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/refill", ts.URL, kioskID), strings.NewReader(`{"sheets": 100}`))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST refill failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when configured tray capacity is unavailable, got %d", resp.StatusCode)
+	}
+
+	// Send telemetry with ConfiguredTrayCapacity=150 and smaller physical InputTrayCapacity=40
+	now := time.Now().UTC()
+	h := makeHealthyHealth(10, 150, now)
+	h.InputTrayCapacity = 40
+	h.InputTrayCapacityKnown = true
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":   "health",
+		"health": h,
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	reqOver, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/refill", ts.URL, kioskID), strings.NewReader(`{"sheets": 50}`))
+	reqOver.Header.Set("Authorization", "Bearer "+secret)
+	reqOver.Header.Set("Content-Type", "application/json")
+	respOver, err := http.DefaultClient.Do(reqOver)
+	if err != nil {
+		t.Fatalf("POST refill failed: %v", err)
+	}
+	respOver.Body.Close()
+	if respOver.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when refill (50) exceeds smaller physical capacity (40), got %d", respOver.StatusCode)
+	}
+}
+
+func TestPackage5B_DemoPayAndDispatchPolicyValidation(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5b-demopay-policy"
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// 1. Missing order data fails closed in policy validation and handleDemoPaymentSubmit
+	if polErr := validateOrderAgainstPolicy(nil, app.policy()); polErr == nil {
+		t.Fatal("expected validateOrderAgainstPolicy(nil) to fail closed")
+	}
+
+	// 2. Unsupported print mode (DUPLEX_LONG_EDGE) fails closed before payment capture
+	badOrdID := "ord-bad-duplex"
+	badOrd := store.Order{
+		OrderID:     badOrdID,
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  300,
+		TotalPages:  2,
+		TotalSheets: 1,
+		ColorMode:   "BW",
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-bad-duplex",
+				OrderID:          badOrdID,
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "http://example.com/doc.pdf",
+				SHA256Checksum:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				Duplex:           contracts.DuplexLongEdge,
+				ColorMode:        "BW",
+				TotalPages:       2,
+				TotalSheets:      1,
+				Copies:           1,
+				PricePaise:       300,
+			},
+		},
+		Command: contracts.PrintJobCommand{
+			JobID:          "job-bad-duplex",
+			OrderID:        badOrdID,
+			KioskID:        kioskID,
+			DisplayCode:    "9991",
+			DownloadURL:    "http://example.com/doc.pdf",
+			SHA256Checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			TotalPages:     2,
+			TotalSheets:    1,
+			Copies:         1,
+			Duplex:         contracts.DuplexLongEdge,
+			ColorMode:      "BW",
+			StartFromPage:  1,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := app.db.CreateOrder(ctx, badOrd); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, badOrdID, 100, 10*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+	badAtt := store.PaymentAttempt{
+		AttemptID:      "att-bad-duplex",
+		DemoToken:      "tok-bad-duplex",
+		OrderID:        badOrdID,
+		SessionID:      sess.SessionID,
+		KioskID:        kioskID,
+		Provider:       "mock",
+		AmountPaise:    300,
+		Currency:       "INR",
+		Status:         "ACTIVE",
+		IdempotencyKey: "idem-bad-duplex",
+		ExpiresAt:      now.Add(5 * time.Minute),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := app.db.CreatePaymentAttempt(ctx, badAtt); err != nil {
+		t.Fatalf("CreatePaymentAttempt failed: %v", err)
+	}
+	reqBad, _ := http.NewRequest(http.MethodPost, ts.URL+"/pay/tok-bad-duplex", nil)
+	reqBad.Header.Set("Accept", "application/json")
+	respBad, err := http.DefaultClient.Do(reqBad)
+	if err != nil {
+		t.Fatalf("POST /pay failed: %v", err)
+	}
+	respBad.Body.Close()
+	if respBad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for unsupported duplex order on demo pay, got %d", respBad.StatusCode)
+	}
+
+	// 3. Reconnect reconciliation cannot bypass configured product policy
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// SendJob directly with DUPLEX_LONG_EDGE must be rejected by Hub policy
+	if err := app.hub.SendJob(ctx, badOrd.Command); err == nil {
+		t.Fatal("expected Hub.SendJob to reject command violating configured product policy")
+	}
+}

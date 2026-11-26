@@ -486,7 +486,7 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	order, _ := s.db.GetOrder(r.Context(), att.OrderID)
+	order, orderErr := s.db.GetOrder(r.Context(), att.OrderID)
 
 	// Idempotency: if already marked paid, return success immediately
 	if att.Status == "PAID" {
@@ -503,6 +503,39 @@ func (s *appServer) handleDemoPaymentSubmit(w http.ResponseWriter, r *http.Reque
 		}
 		s.renderDemoSuccessPage(w, att, order, "already_processed")
 		return
+	}
+
+	if orderErr != nil || order == nil {
+		if isJSONRequest(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "order data is missing or unavailable",
+				"code":  "MISSING_ORDER_DATA",
+			})
+			return
+		}
+		s.renderDemoErrorPage(w, http.StatusBadRequest, "Order Not Found", "Order data is missing or unavailable.")
+		return
+	}
+
+	alreadyPaidOrder := order.Status == contracts.JobStatusPaidWaiting ||
+		order.Status == contracts.JobStatusDispatched ||
+		order.Status == contracts.JobStatusCompleted
+	if !alreadyPaidOrder {
+		if polErr := validateOrderAgainstPolicy(order, s.policy()); polErr != nil {
+			if isJSONRequest(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(polErr.StatusCode)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": polErr.Message,
+					"code":  polErr.Code,
+				})
+				return
+			}
+			s.renderDemoErrorPage(w, polErr.StatusCode, "Unsupported Print Options", polErr.Message)
+			return
+		}
 	}
 
 	// Capture payment atomically

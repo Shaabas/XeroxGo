@@ -65,8 +65,13 @@ type kioskSession struct {
 	sendMu  sync.Mutex
 	closed  chan struct{}
 
-	healthMu     sync.Mutex
-	latestHealth *sessionHealthEntry
+	healthMu              sync.Mutex
+	latestHealth          *sessionHealthEntry
+	refillMu              sync.Mutex
+	calibrationUncertain  bool
+	inventorySeq          uint64
+	lastRefillSentAt      time.Time
+	lastRefillConfirmedAt time.Time
 
 	dispatchMu           sync.Mutex
 	initialReconnectDone atomic.Bool
@@ -82,6 +87,8 @@ type Hub struct {
 	resetMu       sync.Mutex
 	sessions      map[string]*kioskSession
 	kioskSecret   []byte
+	policyMu      sync.RWMutex
+	policy        contracts.ProductCapabilityPolicy
 	refillMu      sync.Mutex
 	refillWaiters map[string]refillWaiter
 	refillSeq     atomic.Uint64
@@ -92,8 +99,29 @@ func NewHub(db *store.Store) *Hub {
 	return &Hub{
 		db:            db,
 		sessions:      make(map[string]*kioskSession),
+		policy:        contracts.DefaultDemoProductPolicy(),
 		refillWaiters: make(map[string]refillWaiter),
 	}
+}
+
+// SetProductPolicy sets the canonical product capability policy enforced during dispatch and reconciliation.
+func (h *Hub) SetProductPolicy(policy contracts.ProductCapabilityPolicy) {
+	if h == nil {
+		return
+	}
+	h.policyMu.Lock()
+	h.policy = policy
+	h.policyMu.Unlock()
+}
+
+func (h *Hub) productPolicy() contracts.ProductCapabilityPolicy {
+	if h == nil {
+		return contracts.DefaultDemoProductPolicy()
+	}
+	h.policyMu.RLock()
+	p := h.policy
+	h.policyMu.RUnlock()
+	return p
 }
 
 // SetKioskSecret sets the pre-shared secret used to authenticate kiosk connections.
@@ -319,6 +347,22 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 			recvAt = prev.receivedAt
 		}
 	}
+	if sess.calibrationUncertain {
+		if (!sess.lastRefillSentAt.IsZero() && !snapshot.UpdatedAt.Before(sess.lastRefillSentAt)) ||
+			(snapshot.InventorySeq > 0 && snapshot.InventorySeq > sess.inventorySeq) {
+			sess.calibrationUncertain = false
+		}
+	}
+	// Prevent an older telemetry acquisition started before calibration from overwriting confirmed newer inventory.
+	staleInventory := (snapshot.InventorySeq > 0 && sess.inventorySeq > 0 && snapshot.InventorySeq < sess.inventorySeq) ||
+		(snapshot.InventorySeq == 0 && !sess.lastRefillConfirmedAt.IsZero() && snapshot.UpdatedAt.Before(sess.lastRefillConfirmedAt))
+	if staleInventory && sess.latestHealth != nil {
+		snapshot.EstimatedSheets = sess.latestHealth.health.EstimatedSheets
+		snapshot.InventoryCalibrated = sess.latestHealth.health.InventoryCalibrated
+		snapshot.InventorySeq = sess.latestHealth.health.InventorySeq
+	} else if snapshot.InventorySeq > sess.inventorySeq {
+		sess.inventorySeq = snapshot.InventorySeq
+	}
 	entry := &sessionHealthEntry{
 		health:     snapshot,
 		receivedAt: recvAt,
@@ -498,11 +542,15 @@ func (h *Hub) EvaluateKioskReadiness(kioskID string) (connected bool, health con
 		sess.healthMu.Lock()
 		inactive := sess.inactive.Load()
 		entry := sess.latestHealth
+		calUncertain := sess.calibrationUncertain
 		var copied contracts.PrinterHealth
 		var receivedAt time.Time
 		hasEntry := entry != nil
 		if !inactive && hasEntry {
 			copied = cloneHealth(entry.health)
+			if calUncertain {
+				copied.InventoryCalibrated = false
+			}
 			receivedAt = entry.receivedAt
 		}
 		sess.healthMu.Unlock()
@@ -593,6 +641,9 @@ func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd cont
 	}
 	if !isValidDuplex(cmd.Duplex) {
 		return fmt.Errorf("send job: invalid duplex mode %q", cmd.Duplex)
+	}
+	if err := contracts.ValidatePrintModeAgainstPolicy(cmd.Duplex, cmd.ColorMode, h.productPolicy()); err != nil {
+		return fmt.Errorf("send job: %w", err)
 	}
 	if cmd.StartFromPage < 1 || cmd.StartFromPage > cmd.TotalPages {
 		return fmt.Errorf("send job: invalid start from page %d", cmd.StartFromPage)
@@ -758,6 +809,12 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 	if h == nil {
 		return errors.New("hub is nil")
 	}
+	if ctx == nil {
+		return errors.New("context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if sheets < 0 {
 		return fmt.Errorf("sheets must be non-negative, got %d", sheets)
 	}
@@ -765,6 +822,16 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 	sess, ok := h.sessions[kioskID]
 	h.mu.RUnlock()
 	if !ok || sess == nil || !h.isActiveSession(kioskID, sess) {
+		return errors.New("kiosk not connected")
+	}
+
+	sess.refillMu.Lock()
+	defer sess.refillMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !h.isActiveSession(kioskID, sess) {
 		return errors.New("kiosk not connected")
 	}
 
@@ -789,6 +856,11 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 		h.refillMu.Unlock()
 	}()
 
+	sess.healthMu.Lock()
+	sess.calibrationUncertain = true
+	sess.lastRefillSentAt = time.Now().UTC()
+	sess.healthMu.Unlock()
+
 	s := sheets
 	msg := wireMessage{
 		Type:      "refill",
@@ -808,6 +880,9 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 			return errors.New("kiosk session replaced or disconnected before confirming refill calibration")
 		}
 		if !res.ok {
+			sess.healthMu.Lock()
+			sess.calibrationUncertain = false
+			sess.healthMu.Unlock()
 			if strings.TrimSpace(res.errMsg) != "" {
 				return errors.New(res.errMsg)
 			}
@@ -820,16 +895,16 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 			return fmt.Errorf("returned sheet count %d does not match requested count %d", res.sheets, sheets)
 		}
 
-		// Downward calibration must immediately update cached kiosk inventory to prevent
-		// cloud reservations from using obsolete larger inventory.
-		// Preserve telemetry freshness and existing health snapshot synchronization.
+		// Confirmed calibration updates cached kiosk inventory only; physical fault state,
+		// PaperTrayStatus, and observation timestamps are never overwritten or cleared.
 		sess.healthMu.Lock()
+		sess.calibrationUncertain = false
+		sess.lastRefillConfirmedAt = time.Now().UTC()
+		sess.inventorySeq++
 		if sess.latestHealth != nil {
 			sess.latestHealth.health.EstimatedSheets = sheets
 			sess.latestHealth.health.InventoryCalibrated = true
-			if sess.latestHealth.health.PaperTrayStatus == "EMPTY" && sheets > 0 {
-				sess.latestHealth.health.PaperTrayStatus = "OK"
-			}
+			sess.latestHealth.health.InventorySeq = sess.inventorySeq
 		}
 		sess.healthMu.Unlock()
 

@@ -425,11 +425,13 @@ func TestPaperAvailability_Refill_Endpoint(t *testing.T) {
 	kioskID := "kiosk-refill-test"
 
 	conn, cancel := connectKioskWithHealth(t, server.URL, kioskID, contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "EMPTY",
-		EstimatedSheets: 0,
-		UpdatedAt:       time.Now().UTC(),
+		Online:                 false,
+		State:                  "ERROR",
+		EvaluatedHealth:        contracts.EvaluatedHealthFault,
+		PaperTrayStatus:        "EMPTY",
+		EstimatedSheets:        0,
+		ConfiguredTrayCapacity: 150,
+		UpdatedAt:              time.Now().UTC(),
 	})
 	defer func() {
 		cancel()

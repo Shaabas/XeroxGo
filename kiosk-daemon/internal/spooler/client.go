@@ -193,6 +193,7 @@ type Client struct {
 	resolvedIPPURI  string
 	acqMu           sync.Mutex
 	acqSeq          uint64
+	calibrationSeq  uint64
 	lastRecoverySeq uint64
 	snapshotMu      sync.RWMutex
 	latestSnap      telemetrySnapshot
@@ -288,7 +289,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	cfg.HTTPClient = httpClient
 
 	poller := cfg.MockHealth
-	if poller == nil && cfg.MockCUPSPrint != nil && cfg.CUPSRunner == nil {
+	if poller == nil && cfg.MockCUPSPrint != nil && cfg.CUPSRunner == nil &&
+		cfg.MockCUPSHealth == nil && cfg.MockCUPSHealthDiag == nil && cfg.MockSNMPHealth == nil && cfg.MockIPPState == nil {
 		// Explicit mock CUPS test mode
 		poller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
 			now := time.Now().UTC()
@@ -2489,20 +2491,30 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		}
 	}
 
+	// 5b. Acquire or refresh canonical health snapshot before acquiring calibrationMu
+	// so CheckPrinterHealth never runs while calibrationMu is held.
+	_ = c.ensureOrCurrentHealthSnapshot(ctx)
+
 	c.calibrationMu.Lock()
 	estimatedSheets, isCalibrated, err := c.cfg.StateStore.GetPaperSupply(ctx)
-	if err != nil || !isCalibrated || estimatedSheets < orderRemainingSheets || estimatedSheets <= 0 {
+	admHealth := c.CurrentHealthSnapshot(ctx)
+	effectiveSheets := contracts.EffectiveInventorySheets(
+		estimatedSheets,
+		c.configuredTrayCapacity(),
+		admHealth.InputTrayCapacity,
+		admHealth.InputTrayCapacityKnown,
+	)
+	if err != nil || !isCalibrated || effectiveSheets < orderRemainingSheets || effectiveSheets <= 0 {
 		c.calibrationMu.Unlock()
 		reason := "paper tray supply insufficient for remaining print job"
 		if err == nil && !isCalibrated {
 			reason = "printer paper supply is uncalibrated; tray calibration required before submission"
+		} else if err == nil && isCalibrated && effectiveSheets < orderRemainingSheets && estimatedSheets >= orderRemainingSheets {
+			reason = fmt.Sprintf("effective verified tray capacity (%d sheets) insufficient for remaining print job (%d sheets)", effectiveSheets, orderRemainingSheets)
 		}
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, reason)
 		return
 	}
-
-	// 5b. Canonical printer readiness and durable execution-safety admission gate
-	admHealth := c.ensureOrCurrentHealthSnapshot(ctx)
 	if c.isHardwareFaultActive() {
 		c.calibrationMu.Unlock()
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, firstNonEmptyString(c.getFaultReason(), "active printer hardware fault blocks physical submission"))
@@ -3311,6 +3323,35 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 		}
 	}
 
+	c.calibrationMu.Lock()
+	// Re-read durable paper supply after hardware acquisition so a calibration completed
+	// while telemetry was in-flight is never overwritten by an obsolete count.
+	latestSheets, latestCalibrated, supplyErr := c.cfg.StateStore.GetPaperSupply(ctx)
+	if supplyErr != nil {
+		latestSheets, _ = c.cfg.StateStore.GetEstimatedSheets(ctx)
+		latestCalibrated = false
+	}
+	trayCap := c.configuredTrayCapacity()
+	effectiveH.ConfiguredTrayCapacity = trayCap
+	effectiveH.InventoryCalibrated = latestCalibrated
+	effectiveH.InventorySeq = c.calibrationSeq
+	effectiveH.EstimatedSheets = contracts.EffectiveInventorySheets(
+		latestSheets,
+		trayCap,
+		effectiveH.InputTrayCapacity,
+		effectiveH.InputTrayCapacityKnown,
+	)
+	if !latestCalibrated && effectiveH.PaperTrayStatus != "EMPTY" {
+		effectiveH.PaperTrayStatus = "UNKNOWN"
+	} else if latestCalibrated &&
+		!effectiveH.PaperJam &&
+		!effectiveH.CoverOpen &&
+		!effectiveH.OutputBinFull &&
+		effectiveH.PaperTrayStatus == "UNKNOWN" &&
+		rawTrayStatus == "OK" {
+		effectiveH.PaperTrayStatus = "OK"
+	}
+
 	c.snapshotMu.Lock()
 	prevHasSample := c.latestSnap.HasSample
 	prevHealthEval := c.latestSnap.Health.EvaluatedHealth
@@ -3325,6 +3366,7 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	c.snapshotMu.Unlock()
 
 	c.publishHealthSnapshot(ctx, effectiveH)
+	c.calibrationMu.Unlock()
 	c.acqMu.Unlock()
 
 	c.activeMu.Lock()
@@ -3709,6 +3751,15 @@ func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, 
 	}
 	sheets := *msg.Sheets
 	cap := c.configuredTrayCapacity()
+	c.snapshotMu.RLock()
+	if c.latestSnap.HasSample {
+		cap = contracts.EffectiveTrayCapacity(
+			cap,
+			c.latestSnap.Health.InputTrayCapacity,
+			c.latestSnap.Health.InputTrayCapacityKnown,
+		)
+	}
+	c.snapshotMu.RUnlock()
 	if sheets < 0 || sheets > cap {
 		errMsg := fmt.Sprintf("refill sheets %d outside configured tray capacity [0, %d]", sheets, cap)
 		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
@@ -3784,8 +3835,14 @@ func (c *Client) CurrentHealthSnapshot(ctx context.Context) contracts.PrinterHea
 	}
 
 	h := clonePrinterHealth(snap.Health)
-	h.EstimatedSheets = sheets
-	h.ConfiguredTrayCapacity = c.configuredTrayCapacity()
+	trayCap := c.configuredTrayCapacity()
+	h.ConfiguredTrayCapacity = trayCap
+	h.EstimatedSheets = contracts.EffectiveInventorySheets(
+		sheets,
+		trayCap,
+		h.InputTrayCapacity,
+		h.InputTrayCapacityKnown,
+	)
 	h.InventoryCalibrated = calibrated
 	h.ExecutionSafe = execSafe
 	h.ExecutionSafetyReason = execReason
@@ -3821,16 +3878,26 @@ func (c *Client) ensureOrCurrentHealthSnapshot(ctx context.Context) contracts.Pr
 }
 
 func (c *Client) updateSnapshotInventory(ctx context.Context, sheets int, calibrated bool) contracts.PrinterHealth {
+	c.calibrationSeq++
+	calSeq := c.calibrationSeq
 	execSafe, execReason := c.computeExecutionSafety(ctx, "")
 	sheetsVal, calibVal, err := c.cfg.StateStore.GetPaperSupply(ctx)
 	if err == nil {
 		sheets = sheetsVal
 		calibrated = calibVal
 	}
+	trayCap := c.configuredTrayCapacity()
 	c.snapshotMu.Lock()
 	if c.latestSnap.HasSample {
-		c.latestSnap.Health.EstimatedSheets = sheets
+		c.latestSnap.Health.ConfiguredTrayCapacity = trayCap
+		c.latestSnap.Health.EstimatedSheets = contracts.EffectiveInventorySheets(
+			sheets,
+			trayCap,
+			c.latestSnap.Health.InputTrayCapacity,
+			c.latestSnap.Health.InputTrayCapacityKnown,
+		)
 		c.latestSnap.Health.InventoryCalibrated = calibrated
+		c.latestSnap.Health.InventorySeq = calSeq
 		c.latestSnap.Health.ExecutionSafe = execSafe
 		c.latestSnap.Health.ExecutionSafetyReason = execReason
 		// Publish inventory calibration without re-polling hardware or overwriting active physical faults.

@@ -208,50 +208,49 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
-	effectiveStock := health.EstimatedSheets
 	// Conservative capacity enforcement: contradictory physical capacity must not permit
 	// inventory or reservations above the verified physical limit.
-	if health.InputTrayCapacityKnown && health.InputTrayCapacity > 0 && effectiveStock > health.InputTrayCapacity {
-		effectiveStock = health.InputTrayCapacity
-	}
+	effectiveStock := contracts.EffectiveInventorySheets(
+		health.EstimatedSheets,
+		health.ConfiguredTrayCapacity,
+		health.InputTrayCapacity,
+		health.InputTrayCapacityKnown,
+	)
 
 	return effectiveStock, nil
 }
 
 func validateOrderAgainstPolicy(ord *store.Order, policy contracts.ProductCapabilityPolicy) *printerConditionError {
 	if ord == nil {
-		return nil
+		return &printerConditionError{
+			StatusCode: http.StatusBadRequest,
+			Code:       "MISSING_ORDER_DATA",
+			Message:    "order data is missing or unavailable",
+		}
 	}
 	if len(ord.Documents) > 0 {
 		for _, doc := range ord.Documents {
-			if doc.Duplex != contracts.DuplexSimplex && !policy.AllowDuplex {
+			if err := contracts.ValidatePrintModeAgainstPolicy(doc.Duplex, doc.ColorMode, policy); err != nil {
 				return &printerConditionError{
 					StatusCode: http.StatusBadRequest,
 					Code:       "CAPABILITY_UNSUPPORTED",
-					Message:    fmt.Sprintf("document %d requires duplex printing which is not supported by this kiosk", doc.DocumentIndex),
-				}
-			}
-			if strings.EqualFold(doc.ColorMode, "COLOR") && !policy.AllowColor {
-				return &printerConditionError{
-					StatusCode: http.StatusBadRequest,
-					Code:       "CAPABILITY_UNSUPPORTED",
-					Message:    fmt.Sprintf("document %d requires color printing which is not supported by this kiosk", doc.DocumentIndex),
+					Message:    fmt.Sprintf("document %d: %v", doc.DocumentIndex, err),
 				}
 			}
 		}
 	} else {
-		if ord.Command.Duplex != contracts.DuplexSimplex && !policy.AllowDuplex {
+		if err := contracts.ValidatePrintModeAgainstPolicy(ord.Command.Duplex, ord.ColorMode, policy); err != nil {
 			return &printerConditionError{
 				StatusCode: http.StatusBadRequest,
 				Code:       "CAPABILITY_UNSUPPORTED",
-				Message:    "order requires duplex printing which is not supported by this kiosk",
+				Message:    err.Error(),
 			}
 		}
-		if strings.EqualFold(ord.ColorMode, "COLOR") && !policy.AllowColor {
+		if err := contracts.ValidatePrintModeAgainstPolicy(ord.Command.Duplex, ord.Command.ColorMode, policy); err != nil {
 			return &printerConditionError{
 				StatusCode: http.StatusBadRequest,
 				Code:       "CAPABILITY_UNSUPPORTED",
-				Message:    "order requires color printing which is not supported by this kiosk",
+				Message:    err.Error(),
 			}
 		}
 	}
@@ -271,7 +270,12 @@ func (s *appServer) dispatchAuthorizedCommands(ctx context.Context, tag string, 
 	if s == nil || s.hub == nil {
 		return
 	}
+	policy := s.policy()
 	for _, cmd := range cmds {
+		if err := contracts.ValidatePrintModeAgainstPolicy(cmd.Duplex, cmd.ColorMode, policy); err != nil {
+			log.Printf("%s Blocked dispatch of job %s to kiosk %s by product policy: %v", tag, cmd.JobID, cmd.KioskID, err)
+			break
+		}
 		if err := s.hub.SendJob(ctx, cmd); err != nil {
 			log.Printf("%s Warning: failed to send job %s to kiosk %s: %v", tag, cmd.JobID, cmd.KioskID, err)
 			s.hub.MarkDispatchRetryNeeded(cmd.KioskID)
@@ -1047,15 +1051,26 @@ func (s *appServer) handleKioskRefill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	configuredCapacity := 150
-	if _, health, hasHealth, _, _ := s.hub.EvaluateKioskReadiness(kioskID); hasHealth && health.ConfiguredTrayCapacity > 0 {
-		configuredCapacity = health.ConfiguredTrayCapacity
+	_, health, hasHealth, _, _ := s.hub.EvaluateKioskReadiness(kioskID)
+	if !hasHealth || health.ConfiguredTrayCapacity <= 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "kiosk configured tray capacity is unavailable; cannot validate refill",
+			"code":  "CAPACITY_UNAVAILABLE",
+		})
+		return
 	}
-	if sheets < 0 || sheets > configuredCapacity {
+	maxCapacity := contracts.EffectiveTrayCapacity(
+		health.ConfiguredTrayCapacity,
+		health.InputTrayCapacity,
+		health.InputTrayCapacityKnown,
+	)
+	if sheets < 0 || sheets > maxCapacity {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": fmt.Sprintf("sheets must be between 0 and %d inclusive, got %d", configuredCapacity, sheets),
+			"error": fmt.Sprintf("sheets must be between 0 and %d inclusive, got %d", maxCapacity, sheets),
 			"code":  "INVALID_REFILL_COUNT",
 		})
 		return

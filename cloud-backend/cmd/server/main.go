@@ -1104,6 +1104,7 @@ func main() {
 		convWake:   make(chan struct{}, 1),
 		pinLimiter: pinLimiter,
 	}
+	hub.SetProductPolicy(app.policy())
 
 	mux := app.routes()
 

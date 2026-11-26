@@ -503,19 +503,43 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 		t.Fatal("timeout waiting for mock printer to complete")
 	}
 
-	// Wait a moment for completion to settle in store and WS
-	deadline := time.Now().Add(3 * time.Second)
+	// Wait for durable completion, completion-screen transition, and COMPLETED progress event before canceling daemon.
+	deadline := time.Now().Add(5 * time.Second)
 	completed := false
 	for time.Now().Before(deadline) {
 		inc, err := store.GetIncompleteJob(ctx)
-		if err == nil && inc == nil {
-			// If incomplete job is nil, verify local DB is readable
-			if _, sErr := store.GetEstimatedSheets(ctx); sErr == nil {
-				completed = true
+		durableDone := err == nil && inc == nil
+		if durableDone {
+			if _, sErr := store.GetEstimatedSheets(ctx); sErr != nil {
+				durableDone = false
+			}
+		}
+
+		client.renderHistoryMu.Lock()
+		var uiCompleted bool
+		for _, s := range client.renderHistory {
+			if s.Mode == ui_ipc.ModeCompleted {
+				uiCompleted = true
 				break
 			}
 		}
-		time.Sleep(30 * time.Millisecond)
+		client.renderHistoryMu.Unlock()
+
+		progressMu.Lock()
+		var wsCompleted bool
+		for _, p := range receivedProgress {
+			if p.Status == contracts.JobStatusCompleted && p.PagesPrinted == 1 && p.SheetsPrinted == 1 {
+				wsCompleted = true
+				break
+			}
+		}
+		progressMu.Unlock()
+
+		if durableDone && uiCompleted && wsCompleted {
+			completed = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	cancel()
