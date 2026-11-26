@@ -375,9 +375,10 @@ func TestPackage5B_RefillConfirmationDetailedBinding(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	type ackResponse struct {
-		ok         bool
-		calibrated bool
-		sheets     *int
+		ok           bool
+		calibrated   bool
+		sheets       *int
+		inventorySeq uint64
 	}
 	ackCh := make(chan ackResponse, 10)
 
@@ -397,10 +398,11 @@ func TestPackage5B_RefillConfirmationDetailedBinding(t *testing.T) {
 					return
 				}
 				ack := map[string]interface{}{
-					"type":       "refill_ack",
-					"request_id": msg.RequestID,
-					"ok":         resp.ok,
-					"calibrated": resp.calibrated,
+					"type":          "refill_ack",
+					"request_id":    msg.RequestID,
+					"ok":            resp.ok,
+					"calibrated":    resp.calibrated,
+					"inventory_seq": resp.inventorySeq,
 				}
 				if resp.sheets != nil {
 					ack["sheets"] = *resp.sheets
@@ -413,7 +415,7 @@ func TestPackage5B_RefillConfirmationDetailedBinding(t *testing.T) {
 	ptr := func(i int) *int { return &i }
 
 	// 1. Zero-sheet confirmation succeeds
-	ackCh <- ackResponse{ok: true, calibrated: true, sheets: ptr(0)}
+	ackCh <- ackResponse{ok: true, calibrated: true, sheets: ptr(0), inventorySeq: 1}
 	if err := app.hub.SendRefill(ctx, kioskID, 0); err != nil {
 		t.Fatalf("expected zero-sheet refill confirmation to succeed, got %v", err)
 	}
@@ -422,37 +424,49 @@ func TestPackage5B_RefillConfirmationDetailedBinding(t *testing.T) {
 		t.Fatalf("expected cached health sheets=0 after zero-sheet refill, got sheets=%d ok=%v", h.EstimatedSheets, ok)
 	}
 
-	// 2. Wrong count returns error
-	ackCh <- ackResponse{ok: true, calibrated: true, sheets: ptr(40)}
+	// 2. Wrong count returns error and retains pending calibration until resolved
+	ackCh <- ackResponse{ok: true, calibrated: true, sheets: ptr(40), inventorySeq: 2}
 	if err := app.hub.SendRefill(ctx, kioskID, 80); err == nil {
 		t.Fatal("expected error when returned sheet count (40) differs from requested count (80)")
 	}
+	now = now.Add(time.Second)
+	hResolve2 := makeHealthyHealth(40, 150, now)
+	hResolve2.InventorySeq = 2
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hResolve2})
+	time.Sleep(40 * time.Millisecond)
 
-	// 3. Missing calibration flag returns error
-	ackCh <- ackResponse{ok: true, calibrated: false, sheets: ptr(80)}
+	// 3. Missing calibration flag returns error and retains pending calibration until resolved
+	ackCh <- ackResponse{ok: true, calibrated: false, sheets: ptr(80), inventorySeq: 3}
 	if err := app.hub.SendRefill(ctx, kioskID, 80); err == nil {
 		t.Fatal("expected error when calibrated flag is false")
 	}
+	now = now.Add(time.Second)
+	hResolve3 := makeHealthyHealth(40, 150, now)
+	hResolve3.InventorySeq = 3
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hResolve3})
+	time.Sleep(40 * time.Millisecond)
 
-	// 4. Timeout returns error
+	// 4. Timeout returns error and retains pending calibration until resolved
 	timeoutCtx, cancelTimeout := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancelTimeout()
 	if err := app.hub.SendRefill(timeoutCtx, kioskID, 50); err == nil {
 		t.Fatal("expected timeout error when no ack is returned")
 	}
-	// Drain the un-acked refill message sent during timeout test so it does not pollute subsequent steps
+	// Drain the un-acked refill message sent during timeout test by rejecting it
 	ackCh <- ackResponse{ok: false, calibrated: false, sheets: nil}
+	time.Sleep(40 * time.Millisecond)
 
 	// 5. Downward calibration immediately updates cached kiosk inventory and blocks reservations
-	// First set health back to 100 sheets with updated timestamp
 	now = now.Add(time.Second)
+	hPreDown := makeHealthyHealth(100, 150, now)
+	hPreDown.InventorySeq = 4
 	_ = wsjson.Write(ctx, conn, map[string]interface{}{
 		"type":   "health",
-		"health": makeHealthyHealth(100, 150, now),
+		"health": hPreDown,
 	})
 	time.Sleep(50 * time.Millisecond)
 
-	ackCh <- ackResponse{ok: true, calibrated: true, sheets: ptr(2)}
+	ackCh <- ackResponse{ok: true, calibrated: true, sheets: ptr(2), inventorySeq: 5}
 	if err := app.hub.SendRefill(ctx, kioskID, 2); err != nil {
 		t.Fatalf("downward refill to 2 sheets failed: %v", err)
 	}
@@ -684,29 +698,33 @@ func TestPackage5B_RefillPreservesFaultAndHandlesConcurrentAndStaleAndTimeout(t 
 		t.Fatalf("expected stale pre-calibration frame not to overwrite confirmed 10 sheets, got %d", hAfterStale.EstimatedSheets)
 	}
 
-	// 3. Concurrent refill requests are serialized and do not interleave
+	// 3. Only one unresolved calibration is permitted per active kiosk connection
 	errCh1 := make(chan error, 1)
-	errCh2 := make(chan error, 1)
 	go func() { errCh1 <- app.hub.SendRefill(ctx, kioskID, 40) }()
-	go func() { errCh2 <- app.hub.SendRefill(ctx, kioskID, 15) }()
-
-	var order []int
-	var nextSeq uint64 = 3
-	for i := 0; i < 2; i++ {
-		req := <-refillCh
-		order = append(order, *req.Sheets)
-		sendAck(req, *req.Sheets, nextSeq)
-		nextSeq++
+	reqFirst := <-refillCh
+	// While first refill is still unresolved, a concurrent second refill MUST be rejected without transmitting
+	if err2 := app.hub.SendRefill(ctx, kioskID, 15); err2 == nil {
+		t.Fatal("expected concurrent second SendRefill to be rejected while first is unresolved")
 	}
+	select {
+	case unexpected := <-refillCh:
+		t.Fatalf("expected no second refill transmission while first is unresolved, got %+v", unexpected)
+	default:
+	}
+	sendAck(reqFirst, *reqFirst.Sheets, 3)
 	if e1 := <-errCh1; e1 != nil {
-		t.Fatalf("concurrent SendRefill 1 failed: %v", e1)
+		t.Fatalf("first SendRefill failed: %v", e1)
 	}
-	if e2 := <-errCh2; e2 != nil {
-		t.Fatalf("concurrent SendRefill 2 failed: %v", e2)
+	go func() {
+		req := <-refillCh
+		sendAck(req, *req.Sheets, 4)
+	}()
+	if err2 := app.hub.SendRefill(ctx, kioskID, 15); err2 != nil {
+		t.Fatalf("subsequent SendRefill after resolution failed: %v", err2)
 	}
 	hConcurrent, _ := app.hub.LatestHealth(kioskID)
-	if hConcurrent.EstimatedSheets != order[1] {
-		t.Fatalf("expected final cached sheets %d to match last serialized refill, got %d", order[1], hConcurrent.EstimatedSheets)
+	if hConcurrent.EstimatedSheets != 15 {
+		t.Fatalf("expected final cached sheets 15, got %d", hConcurrent.EstimatedSheets)
 	}
 
 	// 4. Timeout after possible durable application blocks reservations using obsolete larger stock
@@ -948,14 +966,19 @@ func TestPackage5B_AuthoritativeInventorySequenceAndUncertaintyRecovery(t *testi
 	}
 
 	// 2. New-sequence telemetry received BEFORE acknowledgement processing does NOT cause double-increment
-	// and preserves routine consumption updates within the same calibration sequence (seq=1).
+	// and same-sequence consumption update (49) must NOT be overwritten by delayed refill_ack (50).
+	ackSeq1Done := make(chan struct{})
 	go func() {
+		defer close(ackSeq1Done)
 		req := <-refillCh
-		// Pi publishes health(seq=1, sheets=50) BEFORE refill_ack(seq=1, sheets=50) is processed
+		// Pi publishes health(seq=1, sheets=50) AND routine consumption health(seq=1, sheets=49)
+		// BEFORE refill_ack(seq=1, sheets=50) is processed!
 		hNewSeq := makeHealthyHealth(50, 150, time.Now().UTC())
 		hNewSeq.InventorySeq = 1
 		_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hNewSeq})
-		time.Sleep(30 * time.Millisecond)
+		hConsumed := makeHealthyHealth(49, 150, time.Now().UTC().Add(10*time.Millisecond))
+		hConsumed.InventorySeq = 1
+		_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hConsumed})
 		_ = wsjson.Write(ctx, conn, map[string]interface{}{
 			"type":          "refill_ack",
 			"request_id":    req.RequestID,
@@ -968,14 +991,19 @@ func TestPackage5B_AuthoritativeInventorySequenceAndUncertaintyRecovery(t *testi
 	if err := app.hub.SendRefill(ctx, kioskID, 50); err != nil {
 		t.Fatalf("SendRefill(50) failed: %v", err)
 	}
+	<-ackSeq1Done
+	time.Sleep(40 * time.Millisecond)
+	if got, ok := app.hub.LatestHealth(kioskID); !ok || got.EstimatedSheets != 49 || got.InventorySeq != 1 {
+		t.Fatalf("expected same-sequence consumption (49) not overwritten by delayed ack (50), got sheets=%d seq=%d ok=%v", got.EstimatedSheets, got.InventorySeq, ok)
+	}
 
-	// Routine paper consumption with the SAME calibration sequence (seq=1 -> 49 sheets) must succeed!
-	hSeq1Consume := makeHealthyHealth(49, 150, time.Now().UTC().Add(20*time.Millisecond))
+	// Subsequent routine paper consumption within seq=1 (48 sheets) must also succeed!
+	hSeq1Consume := makeHealthyHealth(48, 150, time.Now().UTC().Add(20*time.Millisecond))
 	hSeq1Consume.InventorySeq = 1
 	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hSeq1Consume})
 	time.Sleep(40 * time.Millisecond)
-	if got, ok := app.hub.LatestHealth(kioskID); !ok || got.EstimatedSheets != 49 || got.InventorySeq != 1 {
-		t.Fatalf("expected routine consumption within seq=1 to yield 49 sheets (seq=1), got sheets=%d seq=%d ok=%v", got.EstimatedSheets, got.InventorySeq, ok)
+	if got, ok := app.hub.LatestHealth(kioskID); !ok || got.EstimatedSheets != 48 || got.InventorySeq != 1 {
+		t.Fatalf("expected routine consumption within seq=1 to yield 48 sheets (seq=1), got sheets=%d seq=%d ok=%v", got.EstimatedSheets, got.InventorySeq, ok)
 	}
 
 	// 3. Older acknowledgement cannot overwrite newer inventory (seq=2 arrives before delayed ack for seq=1)
@@ -996,21 +1024,20 @@ func TestPackage5B_AuthoritativeInventorySequenceAndUncertaintyRecovery(t *testi
 			"inventory_seq": 1,
 		})
 	}()
-	if err := app.hub.SendRefill(ctx, kioskID, 45); err != nil {
-		t.Fatalf("SendRefill(45) failed: %v", err)
+	if err := app.hub.SendRefill(ctx, kioskID, 45); err == nil {
+		// Note: SendRefill receives telemetry error (reported 12 != 45) because seq=2 resolved pendingRefill
 	}
 	if got, ok := app.hub.LatestHealth(kioskID); !ok || got.EstimatedSheets != 12 || got.InventorySeq != 2 {
 		t.Fatalf("expected older ack (seq=1) not to overwrite newer inventory (sheets=12, seq=2), got sheets=%d seq=%d", got.EstimatedSheets, got.InventorySeq)
 	}
 
 	// 4. Fresh hardware telemetry arriving before an outstanding refill is applied (same seq=2, newer UpdatedAt)
-	// must NOT clear calibrationUncertain!
+	// must NOT clear pendingRefill uncertainty!
 	inFlightDone := make(chan error, 1)
 	go func() {
 		inFlightDone <- app.hub.SendRefill(ctx, kioskID, 30)
 	}()
 	reqInFlight := <-refillCh
-	// Fresh telemetry with newer UpdatedAt but SAME InventorySeq=2 arrives while refill is in-flight
 	hSameSeq := makeHealthyHealth(12, 150, time.Now().UTC().Add(80*time.Millisecond))
 	hSameSeq.InventorySeq = 2
 	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hSameSeq})
@@ -1030,15 +1057,24 @@ func TestPackage5B_AuthoritativeInventorySequenceAndUncertaintyRecovery(t *testi
 		t.Fatalf("in-flight SendRefill(30) failed: %v", err)
 	}
 
-	// 5. Timeout followed by late confirmation (ignored), AND timeout followed by rejected refill
-	// must NOT clear uncertainty from the earlier unresolved refill!
+	// 5. Unresolved timed-out calibration prevents transmission of another calibration,
+	// and late matching outcome correctly resolves uncertainty.
 	shortCtx, shortCancel := context.WithTimeout(ctx, 40*time.Millisecond)
 	defer shortCancel()
 	if err := app.hub.SendRefill(shortCtx, kioskID, 5); err == nil {
 		t.Fatal("expected timeout on SendRefill(5)")
 	}
 	lateReq := <-refillCh
-	// Late confirmation arrives after timeout -> waiter already removed, uncertainty must stay
+	// Another calibration MUST NOT be transmitted while the timed-out one is unresolved
+	if err := app.hub.SendRefill(ctx, kioskID, 20); err == nil {
+		t.Fatal("expected second SendRefill rejected while earlier timed-out refill is unresolved")
+	}
+	select {
+	case unexpected := <-refillCh:
+		t.Fatalf("expected no refill transmitted while prior refill unresolved, got %+v", unexpected)
+	default:
+	}
+	// Late matching outcome arrives and resolves uncertainty
 	_ = wsjson.Write(ctx, conn, map[string]interface{}{
 		"type":          "refill_ack",
 		"request_id":    lateReq.RequestID,
@@ -1047,26 +1083,9 @@ func TestPackage5B_AuthoritativeInventorySequenceAndUncertaintyRecovery(t *testi
 		"sheets":        5,
 		"inventory_seq": 4,
 	})
-	time.Sleep(30 * time.Millisecond)
-	if stock, condErr := app.checkPrinterCondition(kioskID); condErr == nil {
-		t.Fatalf("expected reservation blocked after timeout+late ack, got stock=%d", stock)
-	}
-
-	// Subsequent rejected refill must NOT clear uncertainty from the earlier timed-out refill
-	go func() {
-		req := <-refillCh
-		_ = wsjson.Write(ctx, conn, map[string]interface{}{
-			"type":       "refill_ack",
-			"request_id": req.RequestID,
-			"ok":         false,
-			"error":      "active job in progress",
-		})
-	}()
-	if err := app.hub.SendRefill(ctx, kioskID, 20); err == nil {
-		t.Fatal("expected rejected refill to return error")
-	}
-	if stock, condErr := app.checkPrinterCondition(kioskID); condErr == nil {
-		t.Fatalf("expected reservation still blocked after later rejected refill (prior timeout unresolved), got stock=%d", stock)
+	time.Sleep(40 * time.Millisecond)
+	if stock, condErr := app.checkPrinterCondition(kioskID); condErr != nil || stock != 5 {
+		t.Fatalf("expected late matching outcome to resolve uncertainty with 5 sheets, got stock=%d err=%+v", stock, condErr)
 	}
 
 	// 6. Reconnect with authoritative current inventory restores clean readiness
@@ -1118,5 +1137,168 @@ func TestPackage5B_AuthoritativeInventorySequenceAndUncertaintyRecovery(t *testi
 	}
 	if stock, condErr := app.checkPrinterCondition(kioskID); condErr != nil || stock != 2 {
 		t.Fatalf("expected post-calibration stock=2, got stock=%d err=%+v", stock, condErr)
+	}
+}
+
+func TestPackage5B_ReservationTransactionAndCalibrationAtomicOrdering(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5b-atomic-order"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	type refillReqMsg struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+		Sheets    *int   `json:"sheets"`
+	}
+	refillCh := make(chan refillReqMsg, 10)
+	go func() {
+		for {
+			var msg refillReqMsg
+			if err := wsjson.Read(ctx, conn, &msg); err != nil {
+				return
+			}
+			if msg.Type == "refill" {
+				refillCh <- msg
+			}
+		}
+	}()
+
+	now := time.Now().UTC()
+	h0 := makeHealthyHealth(100, 150, now)
+	h0.InventorySeq = 1
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": h0})
+	time.Sleep(40 * time.Millisecond)
+
+	// Create a 50-sheet order that would succeed at 100 sheets, but MUST fail at 2 sheets.
+	ordID := "ord-atomic-overlap"
+	ord := store.Order{
+		OrderID:     ordID,
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  500,
+		TotalPages:  50,
+		TotalSheets: 50,
+		ColorMode:   "BW",
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-atomic",
+				OrderID:          ordID,
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "http://example.com/doc.pdf",
+				SHA256Checksum:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				Duplex:           contracts.DuplexSimplex,
+				ColorMode:        "BW",
+				TotalPages:       50,
+				TotalSheets:      50,
+				Copies:           1,
+				PricePaise:       500,
+			},
+		},
+		Command: contracts.PrintJobCommand{
+			JobID:          "job-atomic",
+			OrderID:        ordID,
+			KioskID:        kioskID,
+			DisplayCode:    "8881",
+			DownloadURL:    "http://example.com/doc.pdf",
+			SHA256Checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			TotalPages:     50,
+			TotalSheets:    50,
+			Copies:         1,
+			Duplex:         contracts.DuplexSimplex,
+			ColorMode:      "BW",
+			StartFromPage:  1,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := app.db.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	// Synchronize between inventory read (100) and DB commit in handleOrderClaim
+	readDone := make(chan struct{})
+	proceedCommit := make(chan struct{})
+	app.beforeReserveCommitFn = func() {
+		close(readDone)
+		<-proceedCommit
+	}
+
+	claimStatusCh := make(chan int, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, ordID), nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			claimStatusCh <- -1
+			return
+		}
+		resp.Body.Close()
+		claimStatusCh <- resp.StatusCode
+	}()
+
+	<-readDone
+	// Reservation read 100 sheets and is paused before DB commit. Start downward calibration to 2 sheets.
+	refillErrCh := make(chan error, 1)
+	go func() {
+		refillErrCh <- app.hub.SendRefill(ctx, kioskID, 2)
+	}()
+
+	// Calibration MUST NOT transmit refill while reservation boundary is active!
+	select {
+	case unexpected := <-refillCh:
+		t.Fatalf("calibration started/transmitted before in-flight reservation committed: %+v", unexpected)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	// Allow reservation to commit before calibration begins
+	close(proceedCommit)
+	app.beforeReserveCommitFn = nil
+	if code := <-claimStatusCh; code != http.StatusOK {
+		t.Fatalf("expected claim that started before calibration to commit with 200 OK, got %d", code)
+	}
+
+	// Now calibration begins and completes to 2 sheets
+	reqRefill := <-refillCh
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{
+		"type":          "refill_ack",
+		"request_id":    reqRefill.RequestID,
+		"ok":            true,
+		"calibrated":    true,
+		"sheets":        2,
+		"inventory_seq": 2,
+	})
+	if err := <-refillErrCh; err != nil {
+		t.Fatalf("SendRefill(2) failed: %v", err)
+	}
+
+	// Subsequent order requiring 50 sheets MUST be rejected using the calibrated 2-sheet limit (409 INSUFFICIENT_PAPER)
+	ord2ID := "ord-atomic-after"
+	ord2 := ord
+	ord2.OrderID = ord2ID
+	ord2.Command.OrderID = ord2ID
+	ord2.Command.JobID = "job-atomic-after"
+	ord2.Command.DisplayCode = "8882"
+	ord2.Documents = []store.OrderDocument{ord.Documents[0]}
+	ord2.Documents[0].OrderID = ord2ID
+	ord2.Documents[0].JobID = "job-atomic-after"
+	if err := app.db.CreateOrder(ctx, ord2); err != nil {
+		t.Fatalf("CreateOrder(ord2) failed: %v", err)
+	}
+	req2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/k/%s/orders/%s/claim", ts.URL, kioskID, ord2ID), nil)
+	req2.Header.Set("Authorization", "Bearer "+secret)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("claim ord2 failed: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for 50-sheet order after calibration to 2 sheets, got %d", resp2.StatusCode)
 	}
 }

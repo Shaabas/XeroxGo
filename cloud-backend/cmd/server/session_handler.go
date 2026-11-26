@@ -296,6 +296,13 @@ func (s *appServer) dispatchAuthorizedCommands(ctx context.Context, tag string, 
 	}
 }
 
+func (s *appServer) lockKioskReservation(kioskID string) func() {
+	if s != nil && s.hub != nil {
+		return s.hub.LockKioskReservation(kioskID)
+	}
+	return func() {}
+}
+
 // handleOrderClaim creates or retrieves an active transaction session for a kiosk order.
 // POST /api/k/{kiosk_id}/orders/{order_id}/claim (or /confirm)
 func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +325,9 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
+
+	unlockReserve := s.lockKioskReservation(kioskID)
+	defer unlockReserve()
 
 	// Validate printer condition and get current estimated physical stock
 	stock, condErr := s.checkPrinterCondition(kioskID)
@@ -344,6 +354,10 @@ func (s *appServer) handleOrderClaim(w http.ResponseWriter, r *http.Request) {
 			"code":  polErr.Code,
 		})
 		return
+	}
+
+	if s.beforeReserveCommitFn != nil {
+		s.beforeReserveCommitFn()
 	}
 
 	sess, err := s.db.CreateOrGetKioskSessionWithPaperCheck(r.Context(), kioskID, orderID, stock, kioskCheckoutSessionDuration, now)
@@ -584,6 +598,9 @@ func (s *appServer) handleInitiatePayment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	unlockReserve := s.lockKioskReservation(kioskID)
+	defer unlockReserve()
+
 	// Revalidate printer condition and fresh stock before initiating payment
 	stock, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
@@ -754,9 +771,12 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unlockReserve := s.lockKioskReservation(kioskID)
+
 	// Validate printer condition and stock before releasing paid order
 	_, condErr := s.checkPrinterCondition(kioskID)
 	if condErr != nil {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(condErr.StatusCode)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -768,10 +788,12 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 
 	ord, oErr := s.db.GetOrder(r.Context(), orderID)
 	if oErr != nil || ord == nil {
+		unlockReserve()
 		http.Error(w, "order not found", http.StatusNotFound)
 		return
 	}
 	if polErr := validateOrderAgainstPolicy(ord, s.policy()); polErr != nil {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(polErr.StatusCode)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -790,6 +812,7 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 
 	reqBody.SessionID = strings.TrimSpace(reqBody.SessionID)
 	if reqBody.SessionID == "" {
+		unlockReserve()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -800,6 +823,7 @@ func (s *appServer) handleOrderRelease(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	order, err := s.db.ReleasePaidOrder(r.Context(), kioskID, orderID, reqBody.SessionID, now)
+	unlockReserve()
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		switch {

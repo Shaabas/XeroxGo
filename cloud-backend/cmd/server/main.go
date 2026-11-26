@@ -43,11 +43,12 @@ type serverConfig struct {
 }
 
 type appServer struct {
-	cfg        *serverConfig
-	db         *store.Store
-	hub        *ws.Hub
-	convWake   chan struct{}
-	pinLimiter *PINRateLimiter
+	cfg                   *serverConfig
+	db                    *store.Store
+	hub                   *ws.Hub
+	convWake              chan struct{}
+	pinLimiter            *PINRateLimiter
+	beforeReserveCommitFn func()
 }
 
 func (app *appServer) policy() contracts.ProductCapabilityPolicy {

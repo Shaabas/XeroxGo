@@ -40,20 +40,11 @@ type wireMessage struct {
 	Error        string                      `json:"error,omitempty"`
 }
 
-type refillWaiter struct {
-	ch      chan refillAckResult
-	sess    *kioskSession
-	conn    *websocket.Conn
-	kioskID string
-}
-
-type refillAckResult struct {
-	ok           bool
-	hasSheets    bool
-	sheets       int
-	calibrated   bool
-	inventorySeq uint64
-	errMsg       string
+type pendingRefillOp struct {
+	reqID           string
+	requestedSheets int
+	initialSeq      uint64
+	ch              chan error
 }
 
 type sessionHealthEntry struct {
@@ -67,11 +58,10 @@ type kioskSession struct {
 	sendMu  sync.Mutex
 	closed  chan struct{}
 
-	healthMu             sync.Mutex
-	latestHealth         *sessionHealthEntry
-	refillMu             sync.Mutex
-	calibrationUncertain bool
-	inventorySeq         uint64
+	healthMu      sync.Mutex
+	latestHealth  *sessionHealthEntry
+	pendingRefill *pendingRefillOp
+	inventorySeq  uint64
 
 	dispatchMu           sync.Mutex
 	initialReconnectDone atomic.Bool
@@ -82,26 +72,47 @@ type kioskSession struct {
 // Hub manages active WebSocket connections from kiosks and relays jobs,
 // progress events, and connection-bound canonical printer health telemetry.
 type Hub struct {
-	db            *store.Store
-	mu            sync.RWMutex
-	resetMu       sync.Mutex
-	sessions      map[string]*kioskSession
-	kioskSecret   []byte
-	policyMu      sync.RWMutex
-	policy        contracts.ProductCapabilityPolicy
-	refillMu      sync.Mutex
-	refillWaiters map[string]refillWaiter
-	refillSeq     atomic.Uint64
+	db           *store.Store
+	mu           sync.RWMutex
+	resetMu      sync.Mutex
+	sessions     map[string]*kioskSession
+	kioskSecret  []byte
+	policyMu     sync.RWMutex
+	policy       contracts.ProductCapabilityPolicy
+	reserveMapMu sync.Mutex
+	reserveLocks map[string]*sync.Mutex
+	refillSeq    atomic.Uint64
 }
 
 // NewHub creates and initializes a new cloud WebSocket hub.
 func NewHub(db *store.Store) *Hub {
 	return &Hub{
-		db:            db,
-		sessions:      make(map[string]*kioskSession),
-		policy:        contracts.DefaultDemoProductPolicy(),
-		refillWaiters: make(map[string]refillWaiter),
+		db:           db,
+		sessions:     make(map[string]*kioskSession),
+		policy:       contracts.DefaultDemoProductPolicy(),
+		reserveLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// LockKioskReservation acquires the per-kiosk ordering boundary mutex used to serialize
+// reservation inventory-read+commit against the start of paper calibration.
+func (h *Hub) LockKioskReservation(kioskID string) func() {
+	if h == nil {
+		return func() {}
+	}
+	h.reserveMapMu.Lock()
+	if h.reserveLocks == nil {
+		h.reserveLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := h.reserveLocks[kioskID]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.reserveLocks[kioskID] = mu
+	}
+	h.reserveMapMu.Unlock()
+
+	mu.Lock()
+	return mu.Unlock
 }
 
 // SetProductPolicy sets the canonical product capability policy enforced during dispatch and reconciliation.
@@ -271,37 +282,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "health":
 			h.handleHealthMessage(ctx, kioskID, sess, msg.Health)
 		case "refill_ack":
-			if strings.TrimSpace(msg.RequestID) != "" {
-				sheetsVal := 0
-				hasSheets := false
-				if msg.Sheets != nil {
-					sheetsVal = *msg.Sheets
-					hasSheets = true
-				}
-				h.refillMu.Lock()
-				waiter, exists := h.refillWaiters[msg.RequestID]
-				if exists {
-					if waiter.sess == sess && waiter.conn == sess.conn {
-						delete(h.refillWaiters, msg.RequestID)
-					} else {
-						exists = false
-					}
-				}
-				h.refillMu.Unlock()
-				if exists && waiter.ch != nil {
-					select {
-					case waiter.ch <- refillAckResult{
-						ok:           msg.OK,
-						hasSheets:    hasSheets,
-						sheets:       sheetsVal,
-						calibrated:   msg.Calibrated,
-						inventorySeq: msg.InventorySeq,
-						errMsg:       msg.Error,
-					}:
-					default:
-					}
-				}
-			}
+			h.handleRefillAck(sess, msg)
 		case "error":
 			// Operational error
 		default:
@@ -359,7 +340,19 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 		}
 	} else if snapshot.InventorySeq > sess.inventorySeq {
 		sess.inventorySeq = snapshot.InventorySeq
-		sess.calibrationUncertain = false
+		if op := sess.pendingRefill; op != nil && snapshot.InventorySeq > op.initialSeq {
+			sess.pendingRefill = nil
+			var opErr error
+			if snapshot.EstimatedSheets != op.requestedSheets {
+				opErr = fmt.Errorf("telemetry sequence %d reported %d sheets (expected %d)", snapshot.InventorySeq, snapshot.EstimatedSheets, op.requestedSheets)
+			}
+			if op.ch != nil {
+				select {
+				case op.ch <- opErr:
+				default:
+				}
+			}
+		}
 	}
 	entry := &sessionHealthEntry{
 		health:     snapshot,
@@ -540,7 +533,7 @@ func (h *Hub) EvaluateKioskReadiness(kioskID string) (connected bool, health con
 		sess.healthMu.Lock()
 		inactive := sess.inactive.Load()
 		entry := sess.latestHealth
-		calUncertain := sess.calibrationUncertain
+		calUncertain := sess.pendingRefill != nil
 		var copied contracts.PrinterHealth
 		var receivedAt time.Time
 		hasEntry := entry != nil
@@ -801,6 +794,69 @@ func (h *Hub) BroadcastSyncAds(ctx context.Context, ads []contracts.AdItem) {
 	}
 }
 
+func (h *Hub) handleRefillAck(sess *kioskSession, msg wireMessage) {
+	if sess == nil || strings.TrimSpace(msg.RequestID) == "" {
+		return
+	}
+
+	sess.healthMu.Lock()
+	op := sess.pendingRefill
+	if op == nil || op.reqID != msg.RequestID || sess.inactive.Load() {
+		sess.healthMu.Unlock()
+		return
+	}
+
+	notify := func(err error) {
+		if op.ch != nil {
+			select {
+			case op.ch <- err:
+			default:
+			}
+		}
+	}
+
+	if !msg.OK {
+		sess.pendingRefill = nil
+		sess.healthMu.Unlock()
+		errMsg := firstNonEmpty(msg.Error, "kiosk rejected refill calibration")
+		notify(errors.New(errMsg))
+		return
+	}
+	if !msg.Calibrated {
+		sess.healthMu.Unlock()
+		notify(errors.New("kiosk did not confirm durable calibration flag"))
+		return
+	}
+	if msg.Sheets == nil || *msg.Sheets != op.requestedSheets {
+		got := 0
+		if msg.Sheets != nil {
+			got = *msg.Sheets
+		}
+		sess.healthMu.Unlock()
+		notify(fmt.Errorf("returned sheet count %d does not match requested count %d", got, op.requestedSheets))
+		return
+	}
+	if msg.InventorySeq == 0 || msg.InventorySeq <= op.initialSeq {
+		sess.healthMu.Unlock()
+		notify(fmt.Errorf("refill acknowledgement sequence %d did not advance past initial sequence %d", msg.InventorySeq, op.initialSeq))
+		return
+	}
+
+	// Validated calibration outcome: resolve pending operation and update inventory only if
+	// this sequence has not already been observed via telemetry (never overwrite same-sequence consumption).
+	sess.pendingRefill = nil
+	if msg.InventorySeq > sess.inventorySeq {
+		sess.inventorySeq = msg.InventorySeq
+		if sess.latestHealth != nil {
+			sess.latestHealth.health.EstimatedSheets = *msg.Sheets
+			sess.latestHealth.health.InventoryCalibrated = true
+			sess.latestHealth.health.InventorySeq = msg.InventorySeq
+		}
+	}
+	sess.healthMu.Unlock()
+	notify(nil)
+}
+
 // SendRefill sends an authenticated operator paper refill command to the connected kiosk
 // and waits for confirmed durable application from the Pi.
 func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error {
@@ -823,41 +879,29 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 		return errors.New("kiosk not connected")
 	}
 
-	sess.refillMu.Lock()
-	defer sess.refillMu.Unlock()
+	reqID := fmt.Sprintf("refill-%d-%d", time.Now().UnixNano(), h.refillSeq.Add(1))
+	ackCh := make(chan error, 1)
 
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+	unlockReserve := h.LockKioskReservation(kioskID)
+	sess.healthMu.Lock()
 	if !h.isActiveSession(kioskID, sess) {
+		sess.healthMu.Unlock()
+		unlockReserve()
 		return errors.New("kiosk not connected")
 	}
-
-	reqID := fmt.Sprintf("refill-%d-%d", time.Now().UnixNano(), h.refillSeq.Add(1))
-	ackCh := make(chan refillAckResult, 1)
-
-	h.refillMu.Lock()
-	if h.refillWaiters == nil {
-		h.refillWaiters = make(map[string]refillWaiter)
+	if sess.pendingRefill != nil {
+		sess.healthMu.Unlock()
+		unlockReserve()
+		return errors.New("previous refill calibration is still unresolved; cannot start another calibration")
 	}
-	h.refillWaiters[reqID] = refillWaiter{
-		ch:      ackCh,
-		sess:    sess,
-		conn:    sess.conn,
-		kioskID: kioskID,
+	sess.pendingRefill = &pendingRefillOp{
+		reqID:           reqID,
+		requestedSheets: sheets,
+		initialSeq:      sess.inventorySeq,
+		ch:              ackCh,
 	}
-	h.refillMu.Unlock()
-
-	defer func() {
-		h.refillMu.Lock()
-		delete(h.refillWaiters, reqID)
-		h.refillMu.Unlock()
-	}()
-
-	sess.healthMu.Lock()
-	wasAlreadyUncertain := sess.calibrationUncertain
-	sess.calibrationUncertain = true
 	sess.healthMu.Unlock()
+	unlockReserve()
 
 	s := sheets
 	msg := wireMessage{
@@ -873,44 +917,11 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 	}
 
 	select {
-	case res := <-ackCh:
+	case opErr := <-ackCh:
 		if !h.isActiveSession(kioskID, sess) {
 			return errors.New("kiosk session replaced or disconnected before confirming refill calibration")
 		}
-		if !res.ok {
-			// A rejected refill only clears uncertainty if no earlier unresolved refill was already pending.
-			if !wasAlreadyUncertain {
-				sess.healthMu.Lock()
-				sess.calibrationUncertain = false
-				sess.healthMu.Unlock()
-			}
-			if strings.TrimSpace(res.errMsg) != "" {
-				return errors.New(res.errMsg)
-			}
-			return errors.New("kiosk rejected refill calibration")
-		}
-		if !res.calibrated {
-			return errors.New("kiosk did not confirm durable calibration flag")
-		}
-		if !res.hasSheets || res.sheets != sheets {
-			return fmt.Errorf("returned sheet count %d does not match requested count %d", res.sheets, sheets)
-		}
-
-		// Confirmed calibration consumes the authoritative Pi sequence without incrementing independently.
-		// Delayed acknowledgements with an older sequence (< sess.inventorySeq) must not overwrite newer stock.
-		sess.healthMu.Lock()
-		if res.inventorySeq >= sess.inventorySeq {
-			sess.inventorySeq = res.inventorySeq
-			sess.calibrationUncertain = false
-			if sess.latestHealth != nil {
-				sess.latestHealth.health.EstimatedSheets = sheets
-				sess.latestHealth.health.InventoryCalibrated = true
-				sess.latestHealth.health.InventorySeq = res.inventorySeq
-			}
-		}
-		sess.healthMu.Unlock()
-
-		return nil
+		return opErr
 	case <-sess.closed:
 		return errors.New("kiosk session replaced or disconnected before confirming refill calibration")
 	case <-ctx.Done():

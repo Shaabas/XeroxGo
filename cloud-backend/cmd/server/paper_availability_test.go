@@ -452,11 +452,12 @@ func TestPaperAvailability_Refill_Endpoint(t *testing.T) {
 			}
 			if msg.Type == "refill" {
 				_ = wsjson.Write(context.Background(), conn, map[string]interface{}{
-					"type":       "refill_ack",
-					"request_id": msg.RequestID,
-					"ok":         true,
-					"calibrated": true,
-					"sheets":     msg.Sheets,
+					"type":          "refill_ack",
+					"request_id":    msg.RequestID,
+					"ok":            true,
+					"calibrated":    true,
+					"sheets":        msg.Sheets,
+					"inventory_seq": 1,
 				})
 				receivedRefill <- wireMsg{Type: msg.Type, Sheets: msg.Sheets}
 				return
