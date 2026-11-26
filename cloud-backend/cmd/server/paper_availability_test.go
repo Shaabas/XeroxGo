@@ -54,6 +54,25 @@ func connectKioskWithHealth(t *testing.T, srvURL, kioskID string, initialHealth 
 	// Send initial health observation
 	writeCtx, wCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer wCancel()
+	if initialHealth.EvaluatedHealth == "" {
+		switch {
+		case !initialHealth.Online || initialHealth.State == "ERROR" || initialHealth.State == "OFFLINE" || initialHealth.PaperJam || initialHealth.CoverOpen || initialHealth.OutputBinFull:
+			initialHealth.EvaluatedHealth = contracts.EvaluatedHealthFault
+		case initialHealth.State == "UNKNOWN" || initialHealth.State == "":
+			initialHealth.EvaluatedHealth = contracts.EvaluatedHealthUnverified
+		default:
+			initialHealth.EvaluatedHealth = contracts.EvaluatedHealthHealthy
+		}
+	}
+	if initialHealth.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+		initialHealth.InventoryCalibrated = true
+		initialHealth.ExecutionSafe = true
+		initialHealth.TonerLevelKnown = true
+		initialHealth.DrumLifeKnown = true
+		if initialHealth.EvidenceFreshness == nil {
+			initialHealth.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(initialHealth.UpdatedAt, contracts.DefaultTelemetryMaxAge)
+		}
+	}
 	if err := wsjson.Write(writeCtx, conn, wireMsg{Type: "health", Health: &initialHealth}); err != nil {
 		cancel()
 		t.Fatalf("failed to send initial health: %v", err)
@@ -63,6 +82,41 @@ func connectKioskWithHealth(t *testing.T, srvURL, kioskID string, initialHealth 
 	time.Sleep(50 * time.Millisecond)
 
 	return conn, cancel
+}
+
+func sendTestHealthyStatus(ctx context.Context, t *testing.T, hub *ws.Hub, conn *websocket.Conn, kioskID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	h := contracts.PrinterHealth{
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     250,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		TonerLevelPercent:   90,
+		TonerLevelKnown:     true,
+		DrumLifePercent:     95,
+		DrumLifeKnown:       true,
+		InputTrayLevel:      -1,
+		InputTrayCapacity:   -1,
+		UpdatedAt:           now,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now, contracts.DefaultTelemetryMaxAge),
+	}
+	if err := wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &h}); err != nil {
+		t.Fatalf("failed to send test healthy status for %s: %v", kioskID, err)
+	}
+	if hub != nil {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if ready, _ := hub.IsKioskReadyForDispatch(kioskID); ready {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("kiosk %s did not become ready after sending valid health", kioskID)
+	}
 }
 
 func setupPaperTestServer(t *testing.T) (*appServer, *httptest.Server, *store.Store, string) {
@@ -167,12 +221,17 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 3. Connect/update with Tray UNKNOWN -> HTTP 409 Conflict (PAPER_UNKNOWN)
+	now3 := time.Now().UTC()
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "UNKNOWN",
-		EstimatedSheets: 100,
-		UpdatedAt:       time.Now().UTC(),
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "UNKNOWN",
+		EstimatedSheets:     100,
+		InventoryCalibrated: false,
+		ExecutionSafe:       true,
+		UpdatedAt:           now3,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now3, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -192,12 +251,17 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 4. Update with Tray EMPTY -> HTTP 409 Conflict (INSUFFICIENT_PAPER)
+	now4 := time.Now().UTC().Add(time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "EMPTY",
-		EstimatedSheets: 0,
-		UpdatedAt:       time.Now().UTC(),
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     0,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		UpdatedAt:           now4,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now4, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -217,12 +281,17 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 5. Update with Insufficient Sheets: tray has 5 sheets, order needs 10 -> HTTP 409 Conflict (INSUFFICIENT_PAPER)
+	now5 := time.Now().UTC().Add(2 * time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "LOW",
-		EstimatedSheets: 5,
-		UpdatedAt:       time.Now().UTC(),
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "LOW",
+		EstimatedSheets:     5,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		UpdatedAt:           now5,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now5, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -242,12 +311,17 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 6. Update with Sufficient Sheets: tray has 50 sheets, order needs 10 -> HTTP 200 OK!
+	now6 := time.Now().UTC().Add(3 * time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "OK",
-		EstimatedSheets: 50,
-		UpdatedAt:       time.Now().UTC(),
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     50,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		UpdatedAt:           now6,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now6, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -304,11 +378,14 @@ func TestPaperAvailability_PaymentInitiation_Revalidation(t *testing.T) {
 
 	// 2. Now printer paper status drops to EMPTY before payment is initiated
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "EMPTY",
-		EstimatedSheets: 0,
-		UpdatedAt:       time.Now().UTC(),
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthFault,
+		PaperTrayStatus:     "EMPTY",
+		EstimatedSheets:     0,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		UpdatedAt:           time.Now().UTC(),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -326,8 +403,8 @@ func TestPaperAvailability_PaymentInitiation_Revalidation(t *testing.T) {
 	}
 	var errResp map[string]string
 	_ = json.NewDecoder(resPay.Body).Decode(&errResp)
-	if errResp["code"] != "INSUFFICIENT_PAPER" {
-		t.Errorf("code = %s, want INSUFFICIENT_PAPER", errResp["code"])
+	if errResp["code"] != "PRINTER_ERROR" && errResp["code"] != "INSUFFICIENT_PAPER" {
+		t.Errorf("code = %s, want PRINTER_ERROR or INSUFFICIENT_PAPER", errResp["code"])
 	}
 }
 

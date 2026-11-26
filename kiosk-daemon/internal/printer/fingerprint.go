@@ -335,13 +335,8 @@ func probeCUPSQueue(ctx context.Context, runner CommandRunner, queue string) *Qu
 	}
 
 	// Discover device URI via lpstat -v
-	if out, err := runner(ctx, "lpstat", "-v", queue); err == nil {
-		line := strings.TrimSpace(string(out))
-		if idx := strings.Index(line, ":"); idx != -1 {
-			res.DeviceURI = stripURLCredentials(strings.TrimSpace(line[idx+1:]))
-		} else {
-			res.DeviceURI = stripURLCredentials(line)
-		}
+	if deviceURI, err := DiscoverQueueDeviceURI(ctx, runner, queue); err == nil {
+		res.DeviceURI = stripURLCredentials(deviceURI)
 	}
 
 	// Discover queue status via lpstat -p
@@ -421,37 +416,11 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 		res.ProbeError = fmt.Sprintf("ipptool query failed for remote IPP URI: %v", err)
 	}
 
-	// Parse raw attributes
-	singleAttrs := make(map[string]string)
-	var rawReasons []string
+	singleAttrs, rawAttrs, statusCode := parseIPPAttributes(out, true)
+	res.RawAttributes = rawAttrs
+	res.StatusCode = statusCode
 
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		m := ippAttributeRegex.FindStringSubmatch(line)
-		if len(m) < 3 {
-			continue
-		}
-		attrName := strings.ToLower(strings.TrimSpace(m[1]))
-		val := strings.TrimSpace(m[2])
-
-		if _, exists := singleAttrs[attrName]; !exists {
-			singleAttrs[attrName] = val
-		}
-		parts := splitCleanValues(val)
-		if len(parts) > 0 {
-			res.RawAttributes[attrName] = append(res.RawAttributes[attrName], parts...)
-		}
-		if attrName == "printer-state-reasons" {
-			for _, p := range parts {
-				if !strings.EqualFold(p, "none") && p != "" {
-					rawReasons = append(rawReasons, p)
-				}
-			}
-		}
-	}
-
-	// Capture identity and status metadata if available in output
-	res.StatusCode = strings.Trim(strings.TrimSpace(singleAttrs["status-code"]), `"`)
+	// Capture identity metadata if available in output
 	if v, ok := singleAttrs["printer-name"]; ok {
 		res.PrinterName = strings.Trim(strings.TrimSpace(v), `"`)
 	}
@@ -468,8 +437,7 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 		return res
 	}
 
-	scLower := strings.ToLower(res.StatusCode)
-	if strings.HasPrefix(scLower, "client-error") || strings.HasPrefix(scLower, "server-error") {
+	if isIPPFailureStatus(res.StatusCode) {
 		if res.ProbeError == "" {
 			res.ProbeError = fmt.Sprintf("IPP server returned error status: %s", res.StatusCode)
 		}
@@ -480,18 +448,11 @@ func probeRemoteIPP(ctx context.Context, runner CommandRunner, remoteURI string)
 		return res
 	}
 
-	// State & reasons
-	if v, ok := singleAttrs["printer-state"]; ok {
-		res.PrinterState, _ = NormalizeIPPPrinterState(v)
-	}
-	if v, ok := singleAttrs["printer-is-accepting-jobs"]; ok {
-		res.AcceptingJobs = NormalizeAcceptingJobs(v)
-	}
-	for _, r := range rawReasons {
-		if parsed, ok := parseIPPReason(r); ok {
-			res.StateReasons = append(res.StateReasons, parsed)
-		}
-	}
+	// Reuse canonical IPP state and reason parser
+	stateRes := ParseNativeIPPPrinterState(out, remoteURI)
+	res.PrinterState = stateRes.State
+	res.AcceptingJobs = stateRes.AcceptingJobs
+	res.StateReasons = stateRes.ParsedReasons
 
 	// Formats & Media
 	res.DocumentFormats = res.RawAttributes["document-format-supported"]

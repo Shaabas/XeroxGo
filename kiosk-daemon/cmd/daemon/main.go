@@ -276,8 +276,7 @@ func main() {
 	enableSound := flag.Bool("enable-sound", true, "Enable sound playback on job completion (degrades gracefully if hardware unavailable)")
 	simulatedFailure := flag.String("simulated-failure", "", "Simulated failure condition: none, paper-empty, jam, offline")
 	simulatedFailureSheet := flag.Int("simulated-failure-sheet", 0, "Sheet number after which to inject simulated failure (0 = fail at start/health)")
-	enableShadowHealth := flag.Bool("enable-shadow-health", false, "Enable read-only background printer health shadow reconciliation mode (default false)")
-	shadowHealthInterval := flag.Duration("shadow-health-interval", 30*time.Second, "Interval between background shadow health reconciliation checks (default 30s)")
+	nativeIPPURI := flag.String("native-ipp-uri", "", "Optional explicit native printer IPP URI override when DNS-SD path cannot be verified automatically")
 	flag.Parse()
 
 	if *cupsPrinter == "" && *cupsQueue != "" {
@@ -404,27 +403,42 @@ func main() {
 			failureType:  *simulatedFailure,
 			failureSheet: *simulatedFailureSheet,
 		}
-		addr, cleanup, err := startMockPrinter(ctx, *downloadDir, &rootWg, mockState)
-		if err != nil {
-			log.Fatalf("Fatal: failed to start mock printer: %v", err)
+		if *printerAddr != "" && *printerAddr != "192.168.99.2:9100" {
+			actualPrinterAddr = *printerAddr
+			log.Printf("XeroxGo kiosk daemon: mock health mode active targeting %s", actualPrinterAddr)
+		} else {
+			addr, cleanup, err := startMockPrinter(ctx, *downloadDir, &rootWg, mockState)
+			if err != nil {
+				log.Fatalf("Fatal: failed to start mock printer: %v", err)
+			}
+			cleanupMock = cleanup
+			actualPrinterAddr = addr
+			log.Printf("XeroxGo kiosk daemon: mock printer active on %s (simulated failure: %q, sheet: %d)", actualPrinterAddr, *simulatedFailure, *simulatedFailureSheet)
 		}
-		cleanupMock = cleanup
-		actualPrinterAddr = addr
-		log.Printf("XeroxGo kiosk daemon: mock printer active on %s (simulated failure: %q, sheet: %d)", actualPrinterAddr, *simulatedFailure, *simulatedFailureSheet)
 
 		mockHealthPoller = func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
 			h := contracts.PrinterHealth{
-				Online:            true,
-				State:             "IDLE",
-				PaperTrayStatus:   "OK",
-				EstimatedSheets:   estimatedSheets,
-				TonerLevelPercent: 95,
-				DrumLifePercent:   98,
-				UpdatedAt:         time.Now().UTC(),
+				Online:              true,
+				State:               "IDLE",
+				EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+				PaperTrayStatus:     "OK",
+				EstimatedSheets:     estimatedSheets,
+				InventoryCalibrated: true,
+				ExecutionSafe:       true,
+				TonerLevelPercent:   95,
+				TonerLevelKnown:     true,
+				DrumLifePercent:     98,
+				DrumLifeKnown:       true,
+				InputTrayLevel:      -1,
+				InputTrayCapacity:   -1,
+				UpdatedAt:           time.Now().UTC(),
 			}
 
 			if estimatedSheets <= 0 {
 				h.PaperTrayStatus = "EMPTY"
+				h.EvaluatedHealth = contracts.EvaluatedHealthFault
+				h.Online = false
+				h.BlockingReasons = []contracts.HealthReason{{Code: "paper_empty", Source: "mock", Message: "estimated sheets depleted"}}
 			} else if estimatedSheets <= 10 {
 				h.PaperTrayStatus = "LOW"
 			}
@@ -432,20 +446,30 @@ func main() {
 			if mockState != nil && mockState.failureTriggered.Load() {
 				switch strings.ToLower(strings.TrimSpace(mockState.failureType)) {
 				case "paper-empty":
+					h.Online = false
+					h.State = "ERROR"
+					h.EvaluatedHealth = contracts.EvaluatedHealthFault
 					h.PaperTrayStatus = "EMPTY"
 					h.EstimatedSheets = 0
 					h.ErrorMessage = "printer paper tray empty"
+					h.BlockingReasons = []contracts.HealthReason{{Code: "paper_empty", Source: "mock", Message: h.ErrorMessage}}
 				case "jam":
+					h.Online = false
 					h.State = "ERROR"
+					h.EvaluatedHealth = contracts.EvaluatedHealthFault
 					h.PaperJam = true
 					h.ErrorMessage = "printer has a paper jam"
+					h.BlockingReasons = []contracts.HealthReason{{Code: "paper_jam", Source: "mock", Message: h.ErrorMessage}}
 				case "offline":
 					h.Online = false
 					h.State = "OFFLINE"
+					h.EvaluatedHealth = contracts.EvaluatedHealthFault
 					h.ErrorMessage = "printer is offline or disconnected"
+					h.BlockingReasons = []contracts.HealthReason{{Code: "offline", Source: "mock", Message: h.ErrorMessage}}
 				}
 			}
 
+			h.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(h.UpdatedAt, contracts.DefaultTelemetryMaxAge)
 			return h
 		}
 	}
@@ -514,6 +538,7 @@ func main() {
 		SNMPCommunity:            *snmpCommunity,
 		SNMPPort:                 *snmpPort,
 		CUPSQueue:                *cupsPrinter,
+		NativeIPPURI:             strings.TrimSpace(*nativeIPPURI),
 		PrinterModel:             effectivePrinterModel,
 		DownloadDir:              *downloadDir,
 		IdleQRContent:            *idleQRContent,
@@ -528,8 +553,6 @@ func main() {
 		PaymentTimeout:           *paymentPendingTimeout,
 		PaymentURLBase:           *paymentURLBase,
 		SoundPlayer:              soundPlayer,
-		EnableShadowHealth:       *enableShadowHealth,
-		ShadowHealthInterval:     *shadowHealthInterval,
 		OnJobCompleted: func(jobID string) {
 			if viewerServer != nil {
 				viewerServer.NotifyJobCompleted(jobID)
@@ -550,9 +573,6 @@ func main() {
 		targetDesc = "cups:" + *cupsPrinter
 	}
 	log.Printf("XeroxGo kiosk daemon started for kiosk %s (cloud=%s, target=%s, model=%s)", *kioskID, *cloudURL, targetDesc, effectivePrinterModel)
-	if *enableShadowHealth {
-		log.Printf("XeroxGo kiosk daemon: shadow health reconciliation mode enabled (interval: %v, queue: %q)", *shadowHealthInterval, *cupsPrinter)
-	}
 
 	if err := client.Run(ctx); err != nil {
 		log.Printf("spooler client exited with error: %v", err)

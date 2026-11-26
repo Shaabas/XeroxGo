@@ -24,9 +24,11 @@ const (
 )
 
 const (
-	// CapabilitySourceCUPSQueue identifies the capability origin as the CUPS queue configuration.
+	// CapabilitySourceCUPSQueue identifies the capability origin as the local CUPS queue configuration.
 	// This reflects the CUPS queue / PPD configuration, NOT verified physical hardware capabilities.
 	CapabilitySourceCUPSQueue = "CUPS_QUEUE"
+	// CapabilitySourceNativeIPP identifies telemetry queried directly from the physical printer's native IPP endpoint.
+	CapabilitySourceNativeIPP = "NATIVE_IPP"
 )
 
 // PrinterCapabilities holds normalized and raw capability details discovered from a CUPS queue via IPP.
@@ -93,6 +95,53 @@ var (
 	statusCodeTokenRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-]+`)
 )
 
+// parseIPPAttributes extracts normalized single-value attributes, multi-value attribute slices,
+// and the lowercased IPP status code token from raw `ipptool -tv` output.
+func parseIPPAttributes(out []byte, stripQuotes bool) (map[string]string, map[string][]string, string) {
+	singleAttrs := make(map[string]string)
+	rawAttrs := make(map[string][]string)
+
+	if len(out) == 0 {
+		return singleAttrs, rawAttrs, ""
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		m := ippAttributeRegex.FindStringSubmatch(line)
+		if len(m) < 3 {
+			continue
+		}
+
+		attrName := strings.ToLower(strings.TrimSpace(m[1]))
+		val := strings.TrimSpace(m[2])
+
+		if _, exists := singleAttrs[attrName]; !exists {
+			singleAttrs[attrName] = val
+		}
+
+		parts := splitIPPValuesWithQuotes(val, stripQuotes)
+		if len(parts) > 0 {
+			rawAttrs[attrName] = append(rawAttrs[attrName], parts...)
+		}
+	}
+
+	var statusCode string
+	if v, ok := singleAttrs["status-code"]; ok {
+		trimmed := strings.TrimSpace(v)
+		if stripQuotes {
+			trimmed = strings.Trim(trimmed, `"`)
+		}
+		if token := statusCodeTokenRegex.FindString(trimmed); token != "" {
+			statusCode = strings.ToLower(token)
+		} else {
+			statusCode = strings.ToLower(trimmed)
+		}
+	}
+
+	return singleAttrs, rawAttrs, statusCode
+}
+
 // ParsePrinterCapabilities parses the output of `ipptool -tv ... get-printer-attributes.test`
 // and returns normalized printer capabilities.
 // Unknown or missing attributes are kept distinct from unsupported attributes (never assumed false).
@@ -116,37 +165,9 @@ func ParsePrinterCapabilities(out []byte, queue string) PrinterCapabilities {
 		return caps
 	}
 
-	singleAttrs := make(map[string]string)
-
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		line := scanner.Text()
-		m := ippAttributeRegex.FindStringSubmatch(line)
-		if len(m) < 3 {
-			continue
-		}
-
-		attrName := strings.ToLower(strings.TrimSpace(m[1]))
-		val := strings.TrimSpace(m[2])
-
-		if _, exists := singleAttrs[attrName]; !exists {
-			singleAttrs[attrName] = val
-		}
-
-		parts := splitIPPValues(val)
-		if len(parts) > 0 {
-			caps.RawAttributes[attrName] = append(caps.RawAttributes[attrName], parts...)
-		}
-	}
-
-	// 0. Status code
-	if v, ok := singleAttrs["status-code"]; ok {
-		if token := statusCodeTokenRegex.FindString(strings.TrimSpace(v)); token != "" {
-			caps.StatusCode = strings.ToLower(token)
-		} else {
-			caps.StatusCode = strings.ToLower(strings.TrimSpace(v))
-		}
-	}
+	singleAttrs, rawAttrs, statusCode := parseIPPAttributes(out, false)
+	caps.RawAttributes = rawAttrs
+	caps.StatusCode = statusCode
 
 	// 1. Identity attributes
 	if v, ok := singleAttrs["printer-name"]; ok {
@@ -327,10 +348,18 @@ func isIPPFailureStatus(statusCode string) bool {
 }
 
 func splitIPPValues(val string) []string {
+	return splitIPPValuesWithQuotes(val, false)
+}
+
+func splitIPPValuesWithQuotes(val string, stripQuotes bool) []string {
 	parts := strings.Split(val, ",")
 	var result []string
 	for _, p := range parts {
 		trimmed := strings.TrimSpace(p)
+		if stripQuotes {
+			trimmed = strings.Trim(trimmed, `"`)
+			trimmed = strings.Trim(trimmed, `'`)
+		}
 		if trimmed != "" {
 			result = append(result, trimmed)
 		}

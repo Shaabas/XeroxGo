@@ -230,6 +230,7 @@ func TestClientCloudRecovery_StartupInterruptionMarkedPausedError(t *testing.T) 
 		KioskID:             "kiosk-test",
 		StateStore:          store,
 		CUPSQueue:           "test-cups",
+		MockHealth:          testHealthyMockHealth,
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,

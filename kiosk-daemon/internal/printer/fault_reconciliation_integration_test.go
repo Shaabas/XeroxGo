@@ -113,9 +113,10 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 	t.Run("Scenario_HealthyAgreement", func(t *testing.T) {
 		setSNMP(t, "-status", "idle", "-clear-all-errors", "-offline", "false")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
-		if !snmpHealth.Online || snmpHealth.State != "IDLE" {
-			t.Fatalf("SNMP expected healthy IDLE, got Online=%v State=%s", snmpHealth.Online, snmpHealth.State)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
+		if !snmpObs.Available || !snmpHealth.Online || snmpHealth.State != "IDLE" {
+			t.Fatalf("SNMP expected healthy IDLE, got Avail=%v Online=%v State=%s", snmpObs.Available, snmpHealth.Online, snmpHealth.State)
 		}
 
 		cupsHealth := contracts.PrinterHealth{
@@ -157,7 +158,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 	t.Run("Scenario_PaperJamAgreement", func(t *testing.T) {
 		setSNMP(t, "-status", "other", "-clear-all-errors", "-set-error", "paper_jam", "-offline", "false")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.PaperJam {
 			t.Fatalf("SNMP expected PaperJam=true, got false")
 		}
@@ -208,7 +210,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 	t.Run("Scenario_CoverOpenAgreement", func(t *testing.T) {
 		setSNMP(t, "-status", "other", "-clear-all-errors", "-set-error", "cover_open", "-offline", "false")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.CoverOpen {
 			t.Fatalf("SNMP expected CoverOpen=true, got false")
 		}
@@ -253,7 +256,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 	t.Run("Scenario_PaperEmptyAgreement", func(t *testing.T) {
 		setSNMP(t, "-status", "other", "-clear-all-errors", "-set-error", "no_paper", "-offline", "false")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if snmpHealth.PaperTrayStatus != "EMPTY" {
 			t.Fatalf("SNMP expected PaperTrayStatus='EMPTY', got %q", snmpHealth.PaperTrayStatus)
 		}
@@ -299,7 +303,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 		// SNMP healthy
 		setSNMP(t, "-status", "idle", "-clear-all-errors", "-offline", "false")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if snmpHealth.PaperJam {
 			t.Fatalf("SNMP expected PaperJam=false")
 		}
@@ -347,7 +352,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 		// SNMP reports Jam
 		setSNMP(t, "-status", "other", "-clear-all-errors", "-set-error", "paper_jam", "-offline", "false")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.PaperJam {
 			t.Fatalf("SNMP expected PaperJam=true")
 		}
@@ -391,7 +397,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 		// Drop SNMP UDP packets
 		setSNMP(t, "-offline", "true")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if snmpHealth.Online {
 			t.Errorf("expected SNMP Online=false during packet drop")
 		}
@@ -424,7 +431,8 @@ func TestFaultReconciliation_Integration(t *testing.T) {
 		// Restore SNMP communication and healthy state
 		setSNMP(t, "-offline", "false", "-status", "idle", "-clear-all-errors")
 
-		snmpHealth := PollHealthConfig(ctx, cfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, cfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.Online || snmpHealth.State != "IDLE" {
 			t.Fatalf("expected SNMP recovered Online=true State=IDLE, got Online=%v State=%s", snmpHealth.Online, snmpHealth.State)
 		}
@@ -644,7 +652,9 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if ippHealth.State != IPPPrinterStateIdle {
 			t.Errorf("IPP State = %q, want idle", ippHealth.State)
 		}
@@ -656,7 +666,8 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 		}
 
 		// Real SNMP query
-		snmpHealth := PollHealthConfig(ctx, snmpCfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, snmpCfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.Online || snmpHealth.State != "IDLE" {
 			t.Fatalf("SNMP expected Online=true State=IDLE, got Online=%v State=%s", snmpHealth.Online, snmpHealth.State)
 		}
@@ -700,13 +711,16 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if !ippHealth.PaperJam {
 			t.Errorf("expected IPP PaperJam = true, got %v (reasons: %v)", ippHealth.PaperJam, ippHealth.RawReasons)
 		}
 
 		// Real SNMP query
-		snmpHealth := PollHealthConfig(ctx, snmpCfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, snmpCfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.Online || !snmpHealth.PaperJam {
 			t.Fatalf("SNMP expected Online=true PaperJam=true, got Online=%v PaperJam=%v State=%s",
 				snmpHealth.Online, snmpHealth.PaperJam, snmpHealth.State)
@@ -751,13 +765,16 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if !ippHealth.MediaEmpty {
 			t.Errorf("expected IPP MediaEmpty = true, got %v (reasons: %v)", ippHealth.MediaEmpty, ippHealth.RawReasons)
 		}
 
 		// Real SNMP query
-		snmpHealth := PollHealthConfig(ctx, snmpCfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, snmpCfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.Online || snmpHealth.PaperTrayStatus != "EMPTY" {
 			t.Fatalf("SNMP expected Online=true PaperTrayStatus=EMPTY, got Online=%v Tray=%v State=%s",
 				snmpHealth.Online, snmpHealth.PaperTrayStatus, snmpHealth.State)
@@ -820,7 +837,8 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 		}
 
 		// Real SNMP query (packets dropped)
-		snmpHealth := PollHealthConfig(ctx, snmpCfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, snmpCfg, 250)
+		snmpHealth := snmpObs.Health
 		if snmpHealth.Online {
 			t.Errorf("expected SNMP Online = false during offline packet drop")
 		}
@@ -859,7 +877,9 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 			t.Fatalf("ipptool query failed after recovery: %v (%s)", err, string(out))
 		}
 
-		ippHealth := ParseIPPPrinterState(out, "XeroxGoEmuTest")
+		ippHealth := ParseNativeIPPPrinterState(out, ippURI)
+		ippHealth.EndpointReachable = true
+		ippHealth.QueueAccessible = true
 		if ippHealth.State != IPPPrinterStateIdle {
 			t.Errorf("IPP State = %q, want idle after recovery", ippHealth.State)
 		}
@@ -868,7 +888,8 @@ func TestFaultReconciliation_LiveIPPAndSNMP(t *testing.T) {
 		}
 
 		// Real SNMP query
-		snmpHealth := PollHealthConfig(ctx, snmpCfg, 250)
+		snmpObs := PollSNMPDynamic(ctx, snmpCfg, 250)
+		snmpHealth := snmpObs.Health
 		if !snmpHealth.Online || snmpHealth.State != "IDLE" {
 			t.Fatalf("expected SNMP recovered Online=true State=IDLE, got Online=%v State=%s",
 				snmpHealth.Online, snmpHealth.State)

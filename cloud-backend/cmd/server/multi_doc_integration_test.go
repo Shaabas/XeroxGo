@@ -113,12 +113,15 @@ func testDirectStoreCapturePayment(ctx context.Context, app *appServer, orderID,
 	if captureRes.DispatchEligible && app.hub != nil {
 		if len(captureRes.Commands) > 0 {
 			for _, cmd := range captureRes.Commands {
-				_ = app.hub.SendJob(ctx, cmd)
+				if err := app.hub.SendJob(ctx, cmd); err != nil {
+					break
+				}
 				_ = app.db.MarkDispatchIntentSent(ctx, cmd.JobID)
 			}
 		} else if captureRes.Command != nil {
-			_ = app.hub.SendJob(ctx, *captureRes.Command)
-			_ = app.db.MarkDispatchIntentSent(ctx, captureRes.Command.JobID)
+			if err := app.hub.SendJob(ctx, *captureRes.Command); err == nil {
+				_ = app.db.MarkDispatchIntentSent(ctx, captureRes.Command.JobID)
+			}
 		}
 	}
 	return captureRes, nil
@@ -281,6 +284,7 @@ func TestMultiDoc_Cloud_FullFlowAndPricing(t *testing.T) {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
 	defer wsConn.CloseNow()
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// 5. Payment captured via direct store-level capture (isolated test fixture)
 	captureRes, err := testDirectStoreCapturePayment(ctx, app, orderID, kioskID, sessionID)
@@ -634,6 +638,7 @@ func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("websocket 1 dial failed: %v", err)
 	}
+	sendTestHealthyStatus(ctx1, t, app.hub, ws1, kioskID)
 
 	// Trigger payment via direct store-level capture (isolated test fixture)
 	if _, err := testDirectStoreCapturePayment(ctx1, app, orderID, kioskID, sessionID); err != nil {
@@ -674,6 +679,7 @@ func TestMultiDoc_Cloud_WebSocketReconnectReplay(t *testing.T) {
 		t.Fatalf("websocket 2 dial failed: %v", err)
 	}
 	defer ws2.CloseNow()
+	sendTestHealthyStatus(ctx2, t, app.hub, ws2, kioskID)
 
 	// On reconnect, Cloud replays uncompleted jobs (Doc 1)
 	replayedCmd, err := readNextJobCommand(ctx2, ws2)
@@ -745,6 +751,8 @@ func TestMultiDoc_Cloud_PublicPaymentFlowSupported(t *testing.T) {
 		t.Fatalf("websocket.Dial failed: %v", err)
 	}
 	defer wsConn.CloseNow()
+	sendTestHealthyStatus(wsCtx, t, nil, wsConn, kioskID)
+	time.Sleep(50 * time.Millisecond)
 
 	// 3. Confirm payment through the real demo checkout endpoint.
 	token, _ := initData["demo_token"].(string)

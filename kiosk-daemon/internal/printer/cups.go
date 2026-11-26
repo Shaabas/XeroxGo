@@ -817,10 +817,11 @@ func ExtractHostFromCUPSDeviceURI(rawURI string) string {
 	}
 }
 
-// DiscoverQueueHost queries CUPS via lpstat -v to find the device URI host for queue.
-func DiscoverQueueHost(ctx context.Context, runner CommandRunner, queue string) string {
-	if strings.TrimSpace(queue) == "" {
-		return ""
+// DiscoverQueueDeviceURI queries CUPS via lpstat -v to find the configured device URI for queue.
+func DiscoverQueueDeviceURI(ctx context.Context, runner CommandRunner, queue string) (string, error) {
+	queue = strings.TrimSpace(queue)
+	if queue == "" {
+		return "", errors.New("CUPS queue name is empty")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -828,11 +829,34 @@ func DiscoverQueueHost(ctx context.Context, runner CommandRunner, queue string) 
 	if runner == nil {
 		runner = defaultCommandRunner
 	}
-	out, err := runner(ctx, "lpstat", "-v", queue)
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	out, err := runner(queryCtx, "lpstat", "-v", queue)
+	if err != nil {
+		return "", fmt.Errorf("lpstat -v %s failed: %w", queue, err)
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return "", fmt.Errorf("lpstat -v %s returned empty output", queue)
+	}
+	if idx := strings.Index(line, ":"); idx != -1 && strings.HasPrefix(strings.ToLower(line), "device for") {
+		uri := strings.TrimSpace(line[idx+1:])
+		if uri == "" {
+			return "", fmt.Errorf("lpstat -v %s returned empty device URI", queue)
+		}
+		return uri, nil
+	}
+	return line, nil
+}
+
+// DiscoverQueueHost queries CUPS via lpstat -v to find the device URI host for queue.
+func DiscoverQueueHost(ctx context.Context, runner CommandRunner, queue string) string {
+	uri, err := DiscoverQueueDeviceURI(ctx, runner, queue)
 	if err != nil {
 		return ""
 	}
-	return ExtractHostFromCUPSDeviceURI(string(out))
+	return ExtractHostFromCUPSDeviceURI(uri)
 }
 
 // IsLoopbackHost returns true if host is localhost, ::1, or within 127.0.0.0/8.
@@ -890,11 +914,6 @@ func ResolveSNMPTarget(
 		return candidate
 	}
 	return ""
-}
-
-// PollCUPSHealth checks the operational status of a CUPS queue using lpstat.
-func PollCUPSHealth(ctx context.Context, queue string, estimatedSheets int) contracts.PrinterHealth {
-	return PollCUPSHealthCustom(ctx, defaultCommandRunner, queue, estimatedSheets)
 }
 
 // QueryCUPSHealth queries CUPS for printer health using defaultCommandRunner, returning health and query error.
@@ -1064,51 +1083,6 @@ func isRecognizableCUPSStateText(s string) bool {
 		strings.Contains(s, "intervention-needed")
 }
 
-// PollCUPSHealthCustom allows injection of a custom command runner for testing CUPS health checks.
-// It queries CUPS using 'lpstat -l -p' to inspect extended printer status and state reasons (e.g. media-jam-error),
-// falling back to 'lpstat -p' if extended status is unavailable.
-// Preserves legacy production poller behavior.
-func PollCUPSHealthCustom(
-	ctx context.Context,
-	runner CommandRunner,
-	queue string,
-	estimatedSheets int,
-) contracts.PrinterHealth {
-	now := time.Now().UTC()
-	if strings.TrimSpace(queue) == "" {
-		return contracts.PrinterHealth{
-			Online:          false,
-			State:           "ERROR",
-			PaperTrayStatus: "UNKNOWN",
-			EstimatedSheets: estimatedSheets,
-			UpdatedAt:       now,
-		}
-	}
-
-	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	if runner == nil {
-		runner = defaultCommandRunner
-	}
-
-	out, err := runner(pollCtx, "lpstat", "-l", "-p", queue)
-	if err != nil {
-		out, err = runner(pollCtx, "lpstat", "-p", queue)
-	}
-	if err != nil {
-		return contracts.PrinterHealth{
-			Online:          false,
-			State:           "OFFLINE",
-			PaperTrayStatus: "UNKNOWN",
-			EstimatedSheets: estimatedSheets,
-			UpdatedAt:       now,
-		}
-	}
-
-	return parseCUPSHealthOutput(out, estimatedSheets, now)
-}
-
 // parseCUPSHealthOutput parses the raw stdout of lpstat into normalized contracts.PrinterHealth.
 func parseCUPSHealthOutput(out []byte, estimatedSheets int, now time.Time) contracts.PrinterHealth {
 	raw := strings.ToLower(string(out))
@@ -1214,11 +1188,10 @@ func parseCUPSHealthOutput(out []byte, estimatedSheets int, now time.Time) contr
 		}
 	}
 
-	// Default fallback for recognized queue
 	return contracts.PrinterHealth{
-		Online:          true,
-		State:           "READY",
-		PaperTrayStatus: "OK",
+		Online:          false,
+		State:           "UNKNOWN",
+		PaperTrayStatus: "UNKNOWN",
 		EstimatedSheets: estimatedSheets,
 		UpdatedAt:       now,
 	}

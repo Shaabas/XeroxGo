@@ -1,11 +1,10 @@
 package printer
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -46,14 +45,17 @@ type IPPPrinterReason struct {
 	Severity ReasonSeverity `json:"severity"`
 }
 
-// IPPPrinterStateResult holds normalized and raw state details retrieved from a CUPS queue via IPP.
-// Note: This reflects the state reported by the CUPS queue and its driver,
-// not verified physical hardware status.
+// IPPPrinterStateResult holds normalized and raw state details retrieved from either
+// a local CUPS queue (CapabilitySourceCUPSQueue) or a physical printer's native IPP endpoint
+// (CapabilitySourceNativeIPP). Callers must check Source to avoid treating CUPS driver state
+// as independent physical printer telemetry.
 type IPPPrinterStateResult struct {
-	// Source identifies where this state was queried from (always CapabilitySourceCUPSQueue).
+	// Source identifies where this state was queried from (CapabilitySourceCUPSQueue or CapabilitySourceNativeIPP).
 	Source string `json:"source"`
-	// Queue is the name of the CUPS queue queried.
+	// Queue is the name of the CUPS queue queried (for CUPS IPP queries).
 	Queue string `json:"queue"`
+	// TargetURI is the resolved endpoint URI queried (with any credentials stripped).
+	TargetURI string `json:"target_uri,omitempty"`
 
 	// State is the normalized IPP operational state ("idle", "processing", "stopped", "unknown").
 	State IPPPrinterState `json:"state"`
@@ -174,12 +176,28 @@ func parseIPPReason(raw string) (IPPPrinterReason, bool) {
 }
 
 // ParseIPPPrinterState parses the output of `ipptool -tv ... get-printer-attributes.test`
-// for printer-state, printer-state-reasons, and printer-is-accepting-jobs.
+// for a local CUPS queue (explicitly tagged with CapabilitySourceCUPSQueue).
 func ParseIPPPrinterState(out []byte, queue string) IPPPrinterStateResult {
+	return ParseIPPPrinterStateWithSource(out, CapabilitySourceCUPSQueue, queue, "")
+}
+
+// ParseNativeIPPPrinterState parses the output of `ipptool -tv ... get-printer-attributes.test`
+// for a physical printer's native IPP endpoint (explicitly tagged with CapabilitySourceNativeIPP).
+func ParseNativeIPPPrinterState(out []byte, targetURI string) IPPPrinterStateResult {
+	return ParseIPPPrinterStateWithSource(out, CapabilitySourceNativeIPP, "", targetURI)
+}
+
+// ParseIPPPrinterStateWithSource parses `ipptool -tv` state output using canonical IPP semantics
+// and tags the origin source explicitly.
+func ParseIPPPrinterStateWithSource(out []byte, source, queue, targetURI string) IPPPrinterStateResult {
 	now := time.Now().UTC()
+	if source == "" {
+		source = CapabilitySourceCUPSQueue
+	}
 	res := IPPPrinterStateResult{
-		Source:        CapabilitySourceCUPSQueue,
+		Source:        source,
 		Queue:         queue,
+		TargetURI:     stripURLCredentials(targetURI),
 		State:         IPPPrinterStateUnknown,
 		AcceptingJobs: AcceptingJobsUnknown,
 		ObservedAt:    now,
@@ -189,55 +207,33 @@ func ParseIPPPrinterState(out []byte, queue string) IPPPrinterStateResult {
 		return res
 	}
 
-	singleAttrs := make(map[string]string)
-	var rawReasons []string
+	singleAttrs, rawAttrs, statusCode := parseIPPAttributes(out, false)
+	res.StatusCode = statusCode
 
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		line := scanner.Text()
-		m := ippAttributeRegex.FindStringSubmatch(line)
-		if len(m) < 3 {
-			continue
-		}
-
-		attrName := strings.ToLower(strings.TrimSpace(m[1]))
-		val := strings.TrimSpace(m[2])
-
-		if _, exists := singleAttrs[attrName]; !exists {
-			singleAttrs[attrName] = val
-		}
-
-		if attrName == "printer-state-reasons" {
-			parts := splitIPPValues(val)
-			for _, p := range parts {
-				if !strings.EqualFold(p, "none") && p != "" {
-					rawReasons = append(rawReasons, p)
-				}
-			}
-		}
-	}
-
-	// 1. Status Code
-	if v, ok := singleAttrs["status-code"]; ok {
-		if token := statusCodeTokenRegex.FindString(strings.TrimSpace(v)); token != "" {
-			res.StatusCode = strings.ToLower(token)
-		} else {
-			res.StatusCode = strings.ToLower(strings.TrimSpace(v))
-		}
-	}
-
-	// 2. printer-state
 	if v, ok := singleAttrs["printer-state"]; ok {
 		res.State, res.RawState = NormalizeIPPPrinterState(v)
 	}
-
-	// 3. printer-is-accepting-jobs
 	if v, ok := singleAttrs["printer-is-accepting-jobs"]; ok {
 		res.AcceptingJobs = NormalizeAcceptingJobs(v)
 	}
 
-	// 4. printer-state-reasons
+	var rawReasons []string
+	for _, p := range rawAttrs["printer-state-reasons"] {
+		if !strings.EqualFold(p, "none") && p != "" {
+			rawReasons = append(rawReasons, p)
+		}
+	}
 	res.RawReasons = rawReasons
+	applyIPPStateReasons(&res, rawReasons)
+
+	return res
+}
+
+// applyIPPStateReasons classifies RFC 8011 printer-state-reasons by keyword semantics rather
+// than severity suffix alone. Confirmed physical blocking faults (jam, media-empty, cover-open,
+// output-bin-full, empty marker supplies, waste full) block even when reported with "-report"
+// or "-warning" suffixes. Non-blocking supply/media low conditions remain warnings.
+func applyIPPStateReasons(res *IPPPrinterStateResult, rawReasons []string) {
 	for _, rawReason := range rawReasons {
 		parsed, ok := parseIPPReason(rawReason)
 		if !ok {
@@ -249,38 +245,28 @@ func ParseIPPPrinterState(out []byte, queue string) IPPPrinterStateResult {
 		switch parsed.Keyword {
 		case "media-jam", "paper-jam":
 			res.PaperJam = true
-			if parsed.Severity == SeverityError || parsed.Severity == SeverityNone {
-				res.HasHardwareFault = true
-			}
+			res.HasHardwareFault = true
 		case "media-empty", "media-needed", "input-tray-missing":
 			res.MediaEmpty = true
-			if parsed.Severity == SeverityError || parsed.Severity == SeverityNone {
-				res.HasHardwareFault = true
-			}
+			res.HasHardwareFault = true
 		case "media-low":
 			res.MediaLow = true
 		case "door-open", "cover-open", "interlock-open":
 			res.CoverOpen = true
-			if parsed.Severity == SeverityError || parsed.Severity == SeverityNone {
-				res.HasHardwareFault = true
-			}
+			res.HasHardwareFault = true
 		case "output-area-full", "output-bin-full":
 			res.OutputBinFull = true
-			if parsed.Severity == SeverityError || parsed.Severity == SeverityNone {
-				res.HasHardwareFault = true
-			}
+			res.HasHardwareFault = true
 		case "marker-supply-empty", "toner-empty", "ink-empty":
 			res.MarkerEmpty = true
-			if parsed.Severity == SeverityError || parsed.Severity == SeverityNone {
-				res.HasHardwareFault = true
-			}
+			res.HasHardwareFault = true
 		case "marker-supply-low", "toner-low", "ink-low":
 			res.MarkerLow = true
-		case "marker-waste-full", "marker-waste-almost-full":
+		case "marker-waste-almost-full":
 			res.OtherError = true
-			if parsed.Severity == SeverityError || (parsed.Severity == SeverityNone && parsed.Keyword == "marker-waste-full") {
-				res.HasHardwareFault = true
-			}
+		case "marker-waste-full":
+			res.OtherError = true
+			res.HasHardwareFault = true
 		default:
 			if parsed.Severity == SeverityError {
 				res.OtherError = true
@@ -288,29 +274,85 @@ func ParseIPPPrinterState(out []byte, queue string) IPPPrinterStateResult {
 			}
 		}
 	}
-
-	return res
 }
 
-// QueryIPPPrinterState queries Get-Printer-Attributes via ipptool for printer-state,
-// printer-state-reasons, and printer-is-accepting-jobs.
-// It returns a normalized result distinguishing transport reachability, queue accessibility,
-// job acceptance, operational state, and recognized hardware fault indicators.
+// QueryIPPPrinterState queries Get-Printer-Attributes via ipptool against local CUPS IPP
+// (`ipp://localhost:631/printers/<queue>`). This observes CUPS queue state and driver-reported
+// state, NOT independent physical printer telemetry.
 func QueryIPPPrinterState(ctx context.Context, runner CommandRunner, queue string) (IPPPrinterStateResult, error) {
-	now := time.Now().UTC()
 	queue = strings.TrimSpace(queue)
 	if queue == "" {
 		return IPPPrinterStateResult{
-			Source:            CapabilitySourceCUPSQueue,
-			State:             IPPPrinterStateUnknown,
-			AcceptingJobs:     AcceptingJobsUnknown,
-			EndpointReachable: false,
-			QueueAccessible:   false,
-			ObservedAt:        now,
-			Error:             "cups queue name cannot be empty",
+			Source:        CapabilitySourceCUPSQueue,
+			State:         IPPPrinterStateUnknown,
+			AcceptingJobs: AcceptingJobsUnknown,
+			ObservedAt:    time.Now().UTC(),
+			Error:         "cups queue name cannot be empty",
 		}, errors.New("cups queue name cannot be empty")
 	}
 
+	ippURI := fmt.Sprintf("ipp://localhost:631/printers/%s", queue)
+	return queryIPPEndpointState(ctx, runner, CapabilitySourceCUPSQueue, queue, ippURI)
+}
+
+// QueryNativeIPPPrinterState queries Get-Printer-Attributes directly from a physical printer's
+// resolved native IPP endpoint (`targetURI`). It rejects empty URIs and local CUPS queue URIs
+// so CUPS state cannot be misrepresented as independent physical IPP telemetry.
+func QueryNativeIPPPrinterState(ctx context.Context, runner CommandRunner, targetURI string) (IPPPrinterStateResult, error) {
+	trimmedURI := strings.TrimSpace(targetURI)
+	if err := validateNativeIPPEndpointURI(trimmedURI); err != nil {
+		return IPPPrinterStateResult{
+			Source:        CapabilitySourceNativeIPP,
+			TargetURI:     stripURLCredentials(trimmedURI),
+			State:         IPPPrinterStateUnknown,
+			AcceptingJobs: AcceptingJobsUnknown,
+			ObservedAt:    time.Now().UTC(),
+			Error:         err.Error(),
+		}, err
+	}
+	return queryIPPEndpointState(ctx, runner, CapabilitySourceNativeIPP, "", trimmedURI)
+}
+
+func validateNativeIPPEndpointURI(rawURI string) error {
+	if rawURI == "" {
+		return errors.New("native IPP target URI cannot be empty")
+	}
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return fmt.Errorf("invalid native IPP URI %q: %w", stripURLCredentials(rawURI), err)
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	switch scheme {
+	case "ipp", "ipps", "http", "https":
+	default:
+		return fmt.Errorf("unsupported native IPP URI scheme %q", u.Scheme)
+	}
+	if strings.TrimSpace(u.Hostname()) == "" {
+		return fmt.Errorf("native IPP URI %q lacks hostname", stripURLCredentials(rawURI))
+	}
+	// Guard against mistaking local CUPS /printers/<queue> on port 631 for native printer telemetry.
+	if IsLoopbackHost(u.Hostname()) && (u.Port() == "631" || (u.Port() == "" && (scheme == "ipp" || scheme == "ipps"))) &&
+		strings.HasPrefix(strings.ToLower(u.Path), "/printers/") {
+		return fmt.Errorf("refusing local CUPS queue URI %q as native physical IPP endpoint", stripURLCredentials(rawURI))
+	}
+	return nil
+}
+
+// ResolveNativeIPPEndpoint resolves the physical printer's native IPP URI from an explicit
+// override or the CUPS queue's configured device URI (`lpstat -v` + verified DNS-SD resolution).
+// It never hardcodes a printer IP or guesses an unverified IPP resource path such as /ipp/print.
+func ResolveNativeIPPEndpoint(ctx context.Context, runner CommandRunner, queue, explicitOverrideURI string) (string, error) {
+	if override := strings.TrimSpace(explicitOverrideURI); override != "" {
+		if err := validateNativeIPPEndpointURI(override); err != nil {
+			return "", err
+		}
+		return override, nil
+	}
+
+	queue = strings.TrimSpace(queue)
+	if queue == "" {
+		return "", errors.New("cannot resolve native IPP endpoint: CUPS queue name is empty")
+	}
 	if runner == nil {
 		runner = defaultCommandRunner
 	}
@@ -318,42 +360,87 @@ func QueryIPPPrinterState(ctx context.Context, runner CommandRunner, queue strin
 		ctx = context.Background()
 	}
 
-	ippURI := fmt.Sprintf("ipp://localhost:631/printers/%s", queue)
-	out, runnerErr := runner(ctx, "ipptool", "-tv", ippURI, "get-printer-attributes.test")
+	deviceURI, err := DiscoverQueueDeviceURI(ctx, runner, queue)
+	if err != nil {
+		return "", err
+	}
+	lowerURI := strings.ToLower(deviceURI)
+	switch {
+	case strings.HasPrefix(lowerURI, "ipp://") ||
+		strings.HasPrefix(lowerURI, "ipps://") ||
+		strings.HasPrefix(lowerURI, "http://") ||
+		strings.HasPrefix(lowerURI, "https://"):
+		if err := validateNativeIPPEndpointURI(deviceURI); err != nil {
+			return "", err
+		}
+		return deviceURI, nil
 
-	// Parse whatever attributes were received in output to preserve partial data
-	res := ParseIPPPrinterState(out, queue)
+	case strings.HasPrefix(lowerURI, "dnssd://"):
+		endpoint, rErr := ResolveDNSSDTarget(ctx, runner, deviceURI)
+		if rErr != nil {
+			return "", fmt.Errorf("DNS-SD native IPP resolution failed for %q: %w", stripURLCredentials(deviceURI), rErr)
+		}
+		if !endpoint.PathVerified || strings.TrimSpace(endpoint.Path) == "" {
+			return "", fmt.Errorf("DNS-SD resolved host %s:%d without a verified IPP resource path", endpoint.Host, endpoint.Port)
+		}
+		if endpoint.ExactURI != "" {
+			return endpoint.ExactURI, nil
+		}
+		scheme := endpoint.Scheme
+		if scheme == "" {
+			scheme = "ipp"
+		}
+		return fmt.Sprintf("%s://%s:%d%s", scheme, endpoint.Host, endpoint.Port, endpoint.Path), nil
 
-	// If a valid IPP response was returned (indicated by parsed status-code or recognized attributes),
-	// the transport endpoint was reached and responded.
+	default:
+		return "", fmt.Errorf("CUPS device URI %q is not an IPP or DNS-SD endpoint", stripURLCredentials(deviceURI))
+	}
+}
+
+func queryIPPEndpointState(ctx context.Context, runner CommandRunner, source, queue, ippURI string) (IPPPrinterStateResult, error) {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	out, runnerErr := runner(queryCtx, "ipptool", "-tv", ippURI, "get-printer-attributes.test")
+	res := ParseIPPPrinterStateWithSource(out, source, queue, ippURI)
+
 	hasIPPResponse := res.StatusCode != "" || res.HasRecognizedStateAttributes()
 	if hasIPPResponse {
 		res.EndpointReachable = true
 	}
 
-	// 1. Check for explicit IPP failure status (e.g. client-error-not-found, server-error-internal-error)
-	if isIPPFailureStatus(res.StatusCode) {
-		res.QueueAccessible = false
-		res.Error = fmt.Sprintf("IPP state query returned failure status %q for CUPS queue %q", res.StatusCode, queue)
-		return res, fmt.Errorf("IPP state query returned failure status %q for CUPS queue %q", res.StatusCode, queue)
+	targetDesc := fmt.Sprintf("CUPS queue %q", queue)
+	if source == CapabilitySourceNativeIPP {
+		targetDesc = fmt.Sprintf("native IPP endpoint %q", stripURLCredentials(ippURI))
 	}
 
-	// 2. Check for runner execution error (transport failure, absent binary, timeout, etc.)
+	if isIPPFailureStatus(res.StatusCode) {
+		res.QueueAccessible = false
+		res.Error = fmt.Sprintf("IPP state query returned failure status %q for %s", res.StatusCode, targetDesc)
+		return res, errors.New(res.Error)
+	}
+
 	if runnerErr != nil {
 		if !hasIPPResponse {
 			res.EndpointReachable = false
 		}
 		res.QueueAccessible = false
 		res.Error = runnerErr.Error()
-		return res, fmt.Errorf("ipptool state query failed for CUPS queue %q: %w", queue, runnerErr)
+		return res, fmt.Errorf("ipptool state query failed for %s: %w", targetDesc, runnerErr)
 	}
 
-	// 3. Lack of recognizable printer state attributes
 	if !res.HasRecognizedStateAttributes() {
 		res.EndpointReachable = false
 		res.QueueAccessible = false
 		res.Error = "no recognizable printer state attributes found in IPP response"
-		return res, fmt.Errorf("no recognizable printer state attributes found in IPP response for CUPS queue %q", queue)
+		return res, fmt.Errorf("no recognizable printer state attributes found in IPP response for %s", targetDesc)
 	}
 
 	res.EndpointReachable = true

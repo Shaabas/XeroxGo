@@ -838,7 +838,7 @@ func TestPollCUPSHealth(t *testing.T) {
 				return []byte(tc.output), tc.cmdErr
 			}
 
-			h := PollCUPSHealthCustom(context.Background(), runner, tc.queue, 150)
+			h, _ := QueryCUPSHealthDiagnostic(context.Background(), runner, tc.queue, 150)
 			if h.Online != tc.wantOnline {
 				t.Errorf("Online: got %v, want %v", h.Online, tc.wantOnline)
 			}
@@ -862,7 +862,10 @@ func TestPollCUPSHealth_ExtendedPrinterStateReasons(t *testing.T) {
 			return []byte(output), nil
 		}
 
-		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		h, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "HPTank", 100)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if h.State != "ERROR" {
 			t.Errorf("State: got %q, want ERROR", h.State)
 		}
@@ -880,7 +883,10 @@ func TestPollCUPSHealth_ExtendedPrinterStateReasons(t *testing.T) {
 			return []byte(output), nil
 		}
 
-		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		h, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "HPTank", 100)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if h.State != "ERROR" {
 			t.Errorf("State: got %q, want ERROR", h.State)
 		}
@@ -895,7 +901,10 @@ func TestPollCUPSHealth_ExtendedPrinterStateReasons(t *testing.T) {
 			return []byte(output), nil
 		}
 
-		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		h, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "HPTank", 100)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if h.State != "ERROR" {
 			t.Errorf("State: got %q, want ERROR", h.State)
 		}
@@ -910,7 +919,10 @@ func TestPollCUPSHealth_ExtendedPrinterStateReasons(t *testing.T) {
 			return []byte(output), nil
 		}
 
-		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		h, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "HPTank", 100)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if h.State != "ERROR" {
 			t.Errorf("State: got %q, want ERROR", h.State)
 		}
@@ -929,7 +941,10 @@ func TestPollCUPSHealth_ExtendedPrinterStateReasons(t *testing.T) {
 			return []byte("printer HPTank is idle. enabled since Thu Nov 13"), nil
 		}
 
-		h := PollCUPSHealthCustom(context.Background(), runner, "HPTank", 100)
+		h, err := QueryCUPSHealthDiagnostic(context.Background(), runner, "HPTank", 100)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if h.State != "IDLE" {
 			t.Errorf("State: got %q, want IDLE via fallback", h.State)
 		}
@@ -958,12 +973,6 @@ func TestQueryCUPSHealthDiagnostic(t *testing.T) {
 		}
 		if health.Online {
 			t.Error("expected health.Online false")
-		}
-
-		// Verify existing PollCUPSHealthCustom signature and behavior is completely unchanged
-		legacyHealth := PollCUPSHealthCustom(context.Background(), runner, "BrotherDCP", 50)
-		if legacyHealth.State != "OFFLINE" {
-			t.Errorf("expected legacyHealth.State OFFLINE, got %s", legacyHealth.State)
 		}
 	})
 
@@ -1081,12 +1090,6 @@ func TestQueryCUPSHealthDiagnostic(t *testing.T) {
 		if health.Online || health.State != "UNKNOWN" {
 			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
 		}
-
-		// Contrast with legacy PollCUPSHealthCustom which preserves backward-compatible fallback to READY
-		legacy := PollCUPSHealthCustom(context.Background(), runner, "BrotherDCP", 50)
-		if !legacy.Online || legacy.State != "READY" {
-			t.Errorf("expected legacy PollCUPSHealthCustom to return Online=true State=READY on empty output, got Online=%t State=%s", legacy.Online, legacy.State)
-		}
 	})
 
 	t.Run("whitespace_only_output_returns_error", func(t *testing.T) {
@@ -1120,12 +1123,6 @@ func TestQueryCUPSHealthDiagnostic(t *testing.T) {
 		}
 		if health.Online || health.State != "UNKNOWN" {
 			t.Errorf("expected Online=false State=UNKNOWN, got Online=%t State=%s", health.Online, health.State)
-		}
-
-		// Legacy poller fallback
-		legacy := PollCUPSHealthCustom(context.Background(), runner, "BrotherDCP", 50)
-		if !legacy.Online || legacy.State != "READY" {
-			t.Errorf("expected legacy poller to return READY for unparsed text, got State=%s", legacy.State)
 		}
 	})
 
