@@ -325,4 +325,18 @@ test('Frontend Availability — CHECKING barrier, transitions, fail-closed error
   mode = 'ok';
   assert.equal(await ctrl.checkOnce(), 'AVAILABLE');
   assert.deepEqual(states, ['AVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'AVAILABLE']);
+
+  // Overlapping / delayed poll: second checkOnce() while first is in-flight must not overlap
+  let resolveSlow;
+  const slowCtrl = createAvailabilityController({
+    kioskId: 'kiosk-fe-overlap',
+    timeoutMs: 500,
+    fetchImpl: () => new Promise((res) => { resolveSlow = res; })
+  });
+  const p1 = slowCtrl.checkOnce();
+  assert.equal(slowCtrl.isInFlight(), true);
+  const p2 = await slowCtrl.checkOnce();
+  assert.equal(p2, 'CHECKING', 'overlapping poll must not bypass CHECKING state');
+  resolveSlow({ ok: true, json: async () => ({ available: true }) });
+  assert.equal(await p1, 'AVAILABLE');
 });

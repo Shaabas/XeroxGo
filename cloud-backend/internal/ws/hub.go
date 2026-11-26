@@ -58,11 +58,12 @@ type kioskSession struct {
 	sendMu  sync.Mutex
 	closed  chan struct{}
 
-	healthMu      sync.Mutex
-	latestHealth  *sessionHealthEntry
-	pendingRefill *pendingRefillOp
-	inventorySeq  uint64
-	expiryTimer   *time.Timer
+	healthMu       sync.Mutex
+	latestHealth   *sessionHealthEntry
+	pendingRefill  *pendingRefillOp
+	inventorySeq   uint64
+	expiryTimer    *time.Timer
+	expiryTimerGen uint64
 
 	dispatchMu           sync.Mutex
 	initialReconnectDone atomic.Bool
@@ -217,6 +218,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.resetMu.Unlock()
 	if replacedOld != nil {
 		replacedOld.healthMu.Lock()
+		replacedOld.expiryTimerGen++
 		if replacedOld.expiryTimer != nil {
 			replacedOld.expiryTimer.Stop()
 			replacedOld.expiryTimer = nil
@@ -227,12 +229,15 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				_ = c.Close(websocket.StatusPolicyViolation, "replaced by new connection")
 			}(replacedOld.conn)
 		}
-		h.triggerUnpaidInvalidation(kioskID)
 	}
+	// On every new kiosk connection (including after backend restart), invalidate any obsolete
+	// persisted unpaid checkout sessions before restoring customer admission.
+	h.triggerUnpaidInvalidation(kioskID)
 	log.Printf("[HUB] Kiosk connected (unverified readiness): %q (client IP: %s)", kioskID, r.RemoteAddr)
 
 	defer func() {
 		sess.healthMu.Lock()
+		sess.expiryTimerGen++
 		if sess.expiryTimer != nil {
 			sess.expiryTimer.Stop()
 			sess.expiryTimer = nil
@@ -384,16 +389,33 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 	sess.latestHealth = entry
 	ready, _ := isHealthEntryReady(entry, now)
 	availOK, _ := contracts.IsHealthAvailable(snapshot, now, DefaultTelemetryFreshnessWindow)
-	if availOK && sess.pendingRefill == nil {
-		if sess.expiryTimer != nil {
-			sess.expiryTimer.Stop()
-		}
-		sess.expiryTimer = time.AfterFunc(DefaultTelemetryFreshnessWindow+50*time.Millisecond, func() {
-			h.onSessionTelemetryExpired(kioskID, sess)
-		})
-	} else if sess.expiryTimer != nil {
+	sess.expiryTimerGen++
+	if sess.expiryTimer != nil {
 		sess.expiryTimer.Stop()
 		sess.expiryTimer = nil
+	}
+	if availOK && sess.pendingRefill == nil {
+		// Schedule invalidation at the earliest authoritative expiry across hardware observations,
+		// UpdatedAt, and server receipt freshness without restarting the full window.
+		earliestExpiry := recvAt.Add(DefaultTelemetryFreshnessWindow)
+		if _, oldestObs, _ := contracts.ValidateHealthEvidenceFreshness(snapshot, now, DefaultTelemetryFreshnessWindow); !oldestObs.IsZero() {
+			if obsExp := oldestObs.Add(DefaultTelemetryFreshnessWindow); obsExp.Before(earliestExpiry) {
+				earliestExpiry = obsExp
+			}
+		}
+		if !snapshot.UpdatedAt.IsZero() {
+			if updExp := snapshot.UpdatedAt.Add(DefaultTelemetryFreshnessWindow); updExp.Before(earliestExpiry) {
+				earliestExpiry = updExp
+			}
+		}
+		delay := earliestExpiry.Sub(now) + 10*time.Millisecond
+		if delay < time.Millisecond {
+			delay = time.Millisecond
+		}
+		timerGen := sess.expiryTimerGen
+		sess.expiryTimer = time.AfterFunc(delay, func() {
+			h.onSessionTelemetryExpired(kioskID, sess, timerGen)
+		})
 	}
 	sess.healthMu.Unlock()
 
@@ -942,8 +964,16 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 		initialSeq:      sess.inventorySeq,
 		ch:              ackCh,
 	}
+	sess.expiryTimerGen++
+	if sess.expiryTimer != nil {
+		sess.expiryTimer.Stop()
+		sess.expiryTimer = nil
+	}
 	sess.healthMu.Unlock()
 	unlockReserve()
+
+	// Unresolved calibration makes kiosk unavailable; invalidate any active unpaid checkouts.
+	h.triggerUnpaidInvalidation(kioskID)
 
 	s := sheets
 	msg := wireMessage{
@@ -1007,6 +1037,13 @@ func (h *Hub) runUnpaidInvalidation(kioskID string, gen uint64) {
 	if h == nil || h.db == nil {
 		return
 	}
+	h.invalidationMu.Lock()
+	if h.pendingInvalidation[kioskID] != gen {
+		h.invalidationMu.Unlock()
+		return
+	}
+	h.invalidationMu.Unlock()
+
 	unlock := h.LockKioskReservation(kioskID)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	err := h.db.CancelActiveUnpaidSessionsForKiosk(ctx, kioskID, time.Now().UTC())
@@ -1029,8 +1066,14 @@ func (h *Hub) runUnpaidInvalidation(kioskID string, gen uint64) {
 	}
 }
 
-func (h *Hub) onSessionTelemetryExpired(kioskID string, sess *kioskSession) {
+func (h *Hub) onSessionTelemetryExpired(kioskID string, sess *kioskSession, timerGen uint64) {
 	if !h.isActiveSession(kioskID, sess) {
+		return
+	}
+	sess.healthMu.Lock()
+	staleTimer := sess.inactive.Load() || sess.expiryTimerGen != timerGen
+	sess.healthMu.Unlock()
+	if staleTimer {
 		return
 	}
 	if _, _, _, ready, _ := h.EvaluateKioskReadiness(kioskID); !ready {

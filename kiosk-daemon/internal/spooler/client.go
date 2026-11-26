@@ -125,9 +125,10 @@ type Client struct {
 	normalizedURL string
 	safeURL       string
 
-	connMu sync.Mutex
-	conn   *websocket.Conn
-	sendMu sync.Mutex
+	connMu    sync.Mutex
+	conn      *websocket.Conn
+	runActive bool
+	sendMu    sync.Mutex
 
 	jobQueue   chan contracts.PrintJobCommand
 	activeMu      sync.Mutex
@@ -623,6 +624,15 @@ func (c *Client) DiscoverStartupPrinterState(ctx context.Context) printer.IPPPri
 
 // Run executes the spooler client loops until the context is canceled.
 func (c *Client) Run(ctx context.Context) error {
+	c.connMu.Lock()
+	c.runActive = true
+	c.connMu.Unlock()
+	defer func() {
+		c.connMu.Lock()
+		c.runActive = false
+		c.connMu.Unlock()
+	}()
+
 	runCtx, runCancel := context.WithCancel(ctx)
 	c.queueMu.Lock()
 	c.runCtx = runCtx
@@ -1103,7 +1113,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 	c.connMu.Lock()
 	c.conn = conn
 	c.connMu.Unlock()
-	c.syncPinAvailability(ctx)
+	c.syncCustomerServiceState(ctx)
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1114,7 +1124,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 			c.conn = nil
 		}
 		c.connMu.Unlock()
-		c.syncPinAvailability(ctx)
+		c.syncCustomerServiceState(ctx)
 	}()
 
 	var connWg sync.WaitGroup
@@ -2037,6 +2047,7 @@ func (c *Client) jobWorker(ctx context.Context) {
 			c.activeMu.Lock()
 			delete(c.activeJobs, cmd.JobID)
 			c.activeMu.Unlock()
+			c.syncCustomerServiceState(ctx)
 			c.drainDeferredJobsIfSafe(ctx)
 		}
 	}
@@ -2149,9 +2160,9 @@ func (c *Client) validateDownloadURL(rawURL string) error {
 
 func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 	c.deferredMu.Lock()
-	defer c.deferredMu.Unlock()
-
-	if len(c.deferredJobs) == 0 {
+	hasDeferred := len(c.deferredJobs) > 0
+	c.deferredMu.Unlock()
+	if !hasDeferred {
 		return
 	}
 
@@ -2167,12 +2178,29 @@ func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 		return
 	}
 
-	// Gate deferred admission on canonical printer readiness, absence of active fault, and durable SQLite execution safety.
+	// Gate deferred admission on canonical printer readiness, absence of active fault, and durable SQLite execution safety
+	// BEFORE locking deferredMu so CheckPrinterHealth -> syncCustomerServiceState cannot self-deadlock.
 	snap := c.ensureOrCurrentHealthSnapshot(ctx)
 	if c.isHardwareFaultActive() || snap.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !snap.ExecutionSafe {
 		return
 	}
 	if safe, _ := c.computeExecutionSafety(ctx, ""); !safe {
+		return
+	}
+
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+
+	if len(c.deferredJobs) == 0 {
+		return
+	}
+	if c.pinController != nil && c.pinController.HasActiveTransaction() {
+		return
+	}
+	c.activeMu.Lock()
+	isBusyNow := len(c.activeJobs) > 0
+	c.activeMu.Unlock()
+	if isBusyNow {
 		return
 	}
 
@@ -2278,6 +2306,7 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	} else if c.pinController != nil {
 		c.pinController.ResetToIdle()
 	}
+	c.syncCustomerServiceState(ctx)
 
 	c.idleMu.Lock()
 	if c.idleTimer != nil {
@@ -3303,7 +3332,6 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	}
 	isNowFault := c.hardwareFault
 	effReason := c.faultReason
-	effCustMsg := c.faultCustomerMsg
 	streak := c.consecutiveHealthy
 	reqCount := c.requiredRecoveryCount
 	c.faultMu.Unlock()
@@ -3357,8 +3385,6 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	}
 
 	c.snapshotMu.Lock()
-	prevHasSample := c.latestSnap.HasSample
-	prevHealthEval := c.latestSnap.Health.EvaluatedHealth
 	c.latestSnap = telemetrySnapshot{
 		HasSample:     true,
 		Seq:           seq,
@@ -3373,22 +3399,6 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	c.calibrationMu.Unlock()
 	c.acqMu.Unlock()
 
-	c.activeMu.Lock()
-	hasActiveJobs := len(c.activeJobs) > 0
-	c.activeMu.Unlock()
-
-	if hasActiveJobs {
-		return effectiveH
-	}
-
-	c.syncPinAvailability(ctx)
-
-	c.currentModeMu.Lock()
-	currentMode := c.currentMode
-	c.currentModeMu.Unlock()
-
-	pinActive := c.pinController != nil && c.pinController.HasActiveTransaction()
-
 	if wasFault && !isNowFault {
 		log.Printf("[SPOOLER] Printer hardware reliably recovered from fault (consecutive healthy cycles: %d). Refreshing screen cleanly.", c.requiredRecoveryCount)
 		c.idleMu.Lock()
@@ -3400,40 +3410,9 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 
 		// Reconcile any interrupted CUPS job that was paused during the fault without auto-reprinting.
 		c.reconcileInterruptedCUPSJob(ctx)
-
-		if !pinActive {
-			if ready := c.syncIdleOrBlockedScreen(ctx); ready {
-				c.drainDeferredJobsIfSafe(ctx)
-			} else {
-				log.Printf("[SPOOLER] Hardware recovered, but effective readiness or durable execution-safety barrier remains blocked")
-			}
-		}
-	} else if isNowFault && (currentMode == ui_ipc.ModeIdle || !pinActive) {
-		log.Printf("[SPOOLER] Hardware fault detected while idle: %s", firstNonEmptyString(reason, effReason))
-		_ = c.renderScreen(ui_ipc.ScreenState{
-			Mode:    ui_ipc.ModeError,
-			Message: firstNonEmptyString(custMsg, effCustMsg, "A printer hardware fault requires attention."),
-			Detail:  firstNonEmptyString(effReason, "A printer hardware fault requires attention."),
-		})
-	} else if !isNowFault && !pinActive {
-		ready, blockReason, effSnap := c.isServiceReadyForIdle(ctx)
-		if !ready && currentMode == ui_ipc.ModeIdle {
-			log.Printf("[SPOOLER] Effective readiness lost while idle (%s); leaving ready screen", blockReason)
-			_ = c.renderScreen(ui_ipc.ScreenState{
-				Mode:    ui_ipc.ModeError,
-				Message: "Printer verification required",
-				Detail:  firstNonEmptyString(effSnap.ExecutionSafetyReason, effSnap.ErrorMessage, blockReason),
-			})
-		} else if ready && currentMode == ui_ipc.ModeError && prevHasSample && prevHealthEval != contracts.EvaluatedHealthHealthy && !c.isIdleTimerActive() {
-			// Clear transient unverified/startup block once full readiness + ExecutionSafe is established.
-			_ = c.renderScreen(ui_ipc.ScreenState{
-				Mode:      ui_ipc.ModeIdle,
-				QRContent: c.cfg.IdleQRContent,
-				Message:   "Ready to print",
-			})
-			c.drainDeferredJobsIfSafe(ctx)
-		}
 	}
+
+	c.syncCustomerServiceState(ctx)
 
 	return effectiveH
 }
@@ -3800,6 +3779,7 @@ func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, 
 	if conn != nil {
 		_ = c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h})
 	}
+	go c.syncCustomerServiceState(context.Background())
 }
 
 // CurrentHealthSnapshot reads the shared canonical health snapshot without triggering
@@ -3954,11 +3934,20 @@ func (c *Client) isIdleTimerActive() bool {
 	return active
 }
 
-func (c *Client) isServiceReadyForIdle(ctx context.Context) (bool, string, contracts.PrinterHealth) {
+func (c *Client) effectiveCustomerServiceReadiness(ctx context.Context) (bool, string, contracts.PrinterHealth) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	snap := c.CurrentHealthSnapshot(ctx)
+
+	c.connMu.Lock()
+	mustBeConnected := c.runActive
+	connected := c.conn != nil
+	c.connMu.Unlock()
+	if mustBeConnected && !connected {
+		return false, "cloud connection unavailable", snap
+	}
+
 	if c.isHardwareFaultActive() {
 		return false, firstNonEmptyString(c.getFaultReason(), "active hardware fault"), snap
 	}
@@ -3968,31 +3957,67 @@ func (c *Client) isServiceReadyForIdle(ctx context.Context) (bool, string, contr
 	return true, "", snap
 }
 
-func (c *Client) syncPinAvailability(ctx context.Context) {
-	if c.pinController == nil {
+func (c *Client) isServiceReadyForIdle(ctx context.Context) (bool, string, contracts.PrinterHealth) {
+	return c.effectiveCustomerServiceReadiness(ctx)
+}
+
+func (c *Client) syncCustomerServiceState(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.activeMu.Lock()
+	hasActiveJobs := len(c.activeJobs) > 0
+	c.activeMu.Unlock()
+
+	ready, reason, snap := c.effectiveCustomerServiceReadiness(ctx)
+	if c.pinController != nil {
+		pinReady := ready && !hasActiveJobs
+		pinReason := reason
+		if hasActiveJobs {
+			pinReason = "kiosk is currently printing"
+		}
+		c.pinController.SetAvailability(pinReady, pinReason)
+	}
+
+	if hasActiveJobs {
 		return
 	}
-	ready, reason, _ := c.isServiceReadyForIdle(ctx)
-	c.connMu.Lock()
-	connected := c.conn != nil
-	c.connMu.Unlock()
-	if !connected {
-		ready = false
-		reason = "cloud connection unavailable"
+
+	pinActive := c.pinController != nil && c.pinController.HasActiveTransaction()
+	if pinActive {
+		return
 	}
-	c.pinController.SetAvailability(ready, reason)
-	if !ready {
-		c.activeMu.Lock()
-		hasActiveJobs := len(c.activeJobs) > 0
-		c.activeMu.Unlock()
-		if !hasActiveJobs {
+
+	c.currentModeMu.Lock()
+	currentMode := c.currentMode
+	c.currentModeMu.Unlock()
+
+	if ready {
+		if currentMode != ui_ipc.ModeIdle && !c.isIdleTimerActive() {
 			_ = c.renderScreen(ui_ipc.ScreenState{
-				Mode:    ui_ipc.ModeError,
-				Message: "Temporarily unavailable",
-				Detail:  firstNonEmptyString(reason, "Please try again shortly."),
+				Mode:      ui_ipc.ModeIdle,
+				QRContent: c.cfg.IdleQRContent,
+				Message:   "Ready to print",
 			})
+			c.drainDeferredJobsIfSafe(ctx)
 		}
+		return
 	}
+
+	msg := "Temporarily unavailable"
+	if c.isHardwareFaultActive() || snap.EvaluatedHealth == contracts.EvaluatedHealthFault {
+		c.faultMu.Lock()
+		cust := c.faultCustomerMsg
+		c.faultMu.Unlock()
+		msg = firstNonEmptyString(cust, "A printer hardware fault requires attention.")
+	} else if !snap.ExecutionSafe {
+		msg = "Manual check required before printing"
+	}
+	_ = c.renderScreen(ui_ipc.ScreenState{
+		Mode:    ui_ipc.ModeError,
+		Message: msg,
+		Detail:  firstNonEmptyString(snap.ExecutionSafetyReason, snap.ErrorMessage, reason, "Please try again shortly."),
+	})
 }
 
 func (c *Client) syncIdleOrBlockedScreen(ctx context.Context) bool {

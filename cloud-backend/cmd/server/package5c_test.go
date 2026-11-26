@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"xeroxgo/cloud-backend/internal/store"
+	"xeroxgo/cloud-backend/internal/ws"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -350,4 +352,299 @@ func TestPackage5C_AutomaticUnpaidInvalidationAndCaptureSafety(t *testing.T) {
 		t.Fatalf("expected 200 OK on order status while unavailable, got err=%v resp=%v", err, respStatus)
 	}
 	respStatus.Body.Close()
+}
+
+func TestPackage5C_FreshHubRestartInvalidatesPersistedUnpaidCheckout(t *testing.T) {
+	app1, _, secret1 := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5c-restart"
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Seed an unpaid checkout session in DB as if active before backend restart
+	ordID := "ord-5c-restart"
+	if err := app1.db.CreateOrder(ctx, store.Order{
+		OrderID:      ordID,
+		Status:       contracts.JobStatusPendingPayment,
+		PricePaise:   300,
+		TotalPages:   1,
+		TotalSheets:  1,
+		ColorMode:    "BW",
+		PINExpiresAt: now.Add(10 * time.Minute),
+		Documents: []store.OrderDocument{{
+			JobID: "job-5c-restart", OrderID: ordID, DocumentIndex: 0,
+			OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
+			TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300,
+		}},
+		Command: contracts.PrintJobCommand{
+			JobID: "job-5c-restart", OrderID: ordID, KioskID: kioskID, DisplayCode: "7741",
+			TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1,
+		},
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	sess, err := app1.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+
+	// Simulate backend restart: fresh Hub on the same DB
+	hub2 := ws.NewHub(app1.db)
+	hub2.SetKioskSecret([]byte(secret1))
+	ts2 := httptest.NewServer(hub2)
+	t.Cleanup(ts2.Close)
+	wsURL := strings.Replace(ts2.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret1
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial after restart failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// Even before or right as healthy telemetry arrives, the persisted unpaid session must be invalidated
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, time.Now().UTC())})
+	time.Sleep(50 * time.Millisecond)
+
+	gotSess, err := app1.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+	if err != nil || gotSess == nil || gotSess.Status != store.KioskSessionCanceled {
+		t.Fatalf("expected persisted unpaid session canceled on new connection after restart, got %+v err=%v", gotSess, err)
+	}
+}
+
+func TestPackage5C_DelayedTelemetryAuthoritativeExpiry_AndUnresolvedCalibrationInvalidation(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5c-expiry"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// Send delayed telemetry whose observation is already 5.8s old (only ~200ms of freshness left!)
+	delayedObs := time.Now().UTC().Add(-5800 * time.Millisecond)
+	hDelayed := makeHealthyHealth(50, 150, delayedObs)
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": hDelayed})
+	time.Sleep(30 * time.Millisecond)
+
+	now := time.Now().UTC()
+	ordID := "ord-5c-expiry"
+	if err := app.db.CreateOrder(ctx, store.Order{
+		OrderID:      ordID,
+		Status:       contracts.JobStatusPendingPayment,
+		PricePaise:   300,
+		TotalPages:   1,
+		TotalSheets:  1,
+		ColorMode:    "BW",
+		PINExpiresAt: now.Add(10 * time.Minute),
+		Documents: []store.OrderDocument{{
+			JobID: "job-5c-expiry", OrderID: ordID, DocumentIndex: 0,
+			OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
+			TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300,
+		}},
+		Command: contracts.PrintJobCommand{
+			JobID: "job-5c-expiry", OrderID: ordID, KioskID: kioskID, DisplayCode: "7742",
+			TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1,
+		},
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+
+	// Wait ~350ms with NO further frames -> silent expiry must invalidate the unpaid session
+	// using the earliest authoritative expiry (NOT restarting a full 6s window)!
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		gs, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+		if gs != nil && gs.Status == store.KioskSessionCanceled {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	gotSess, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+	if gotSess == nil || gotSess.Status != store.KioskSessionCanceled {
+		t.Fatalf("expected silent telemetry expiry at earliest authoritative deadline to cancel unpaid session, got %+v", gotSess)
+	}
+
+	// Now recover and create a new session, then start an unresolved refill -> must invalidate unpaid checkout!
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, time.Now().UTC())})
+	time.Sleep(40 * time.Millisecond)
+	sess2, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck(2) failed: %v", err)
+	}
+	shortCtx, shortCancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer shortCancel()
+	_ = app.hub.SendRefill(shortCtx, kioskID, 10)
+	time.Sleep(40 * time.Millisecond)
+	gotSess2, _ := app.db.GetKioskSession(ctx, sess2.SessionID, time.Now().UTC())
+	if gotSess2 == nil || gotSess2.Status != store.KioskSessionCanceled {
+		t.Fatalf("expected unresolved calibration to invalidate active unpaid checkout, got %+v", gotSess2)
+	}
+}
+
+func TestPackage5C_StaleTimerAndConnectionReplacementPreservesNewSession(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5c-stale-timer"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn1, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial 1 failed: %v", err)
+	}
+	defer conn1.CloseNow()
+
+	// Send near-expiring telemetry on conn1 (~180ms remaining)
+	delayedObs := time.Now().UTC().Add(-5820 * time.Millisecond)
+	_ = wsjson.Write(ctx, conn1, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, delayedObs)})
+	time.Sleep(30 * time.Millisecond)
+
+	// Immediately replace with conn2 and send fresh healthy telemetry
+	conn2, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial 2 failed: %v", err)
+	}
+	defer conn2.CloseNow()
+	_ = wsjson.Write(ctx, conn2, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, time.Now().UTC())})
+	time.Sleep(40 * time.Millisecond)
+
+	now := time.Now().UTC()
+	ordID := "ord-5c-stale-timer"
+	if err := app.db.CreateOrder(ctx, store.Order{
+		OrderID:      ordID,
+		Status:       contracts.JobStatusPendingPayment,
+		PricePaise:   300,
+		TotalPages:   1,
+		TotalSheets:  1,
+		ColorMode:    "BW",
+		PINExpiresAt: now.Add(10 * time.Minute),
+		Documents: []store.OrderDocument{{
+			JobID: "job-5c-stale-timer", OrderID: ordID, DocumentIndex: 0,
+			OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
+			TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300,
+		}},
+		Command: contracts.PrintJobCommand{
+			JobID: "job-5c-stale-timer", OrderID: ordID, KioskID: kioskID, DisplayCode: "7743",
+			TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1,
+		},
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	sessNew, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+
+	// Wait past conn1's old expiry deadline (~250ms): conn1's stale timer MUST NOT cancel sessNew!
+	time.Sleep(250 * time.Millisecond)
+	gotSess, err := app.db.GetKioskSession(ctx, sessNew.SessionID, time.Now().UTC())
+	if err != nil || gotSess == nil || gotSess.Status != store.KioskSessionPaymentPending {
+		t.Fatalf("expected new session on conn2 to remain PAYMENT_PENDING after conn1 timer deadline, got %+v err=%v", gotSess, err)
+	}
+}
+
+func TestPackage5C_ConcurrentCaptureVsCancellationOrderings(t *testing.T) {
+	app, ts, secret := setupPackage5BTestServer(t)
+	kioskID := "kiosk-5c-race"
+	ctx := context.Background()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+	_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, time.Now().UTC())})
+	time.Sleep(40 * time.Millisecond)
+
+	for i := 0; i < 6; i++ {
+		now := time.Now().UTC()
+		ordID := fmt.Sprintf("ord-5c-race-%d", i)
+		tok := fmt.Sprintf("tok-5c-race-%d", i)
+		if err := app.db.CreateOrder(ctx, store.Order{
+			OrderID:      ordID,
+			Status:       contracts.JobStatusPendingPayment,
+			PricePaise:   300,
+			TotalPages:   1,
+			TotalSheets:  1,
+			ColorMode:    "BW",
+			PINExpiresAt: now.Add(10 * time.Minute),
+			Documents: []store.OrderDocument{{
+				JobID: fmt.Sprintf("job-5c-race-%d", i), OrderID: ordID, DocumentIndex: 0,
+				OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
+				TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300,
+			}},
+			Command: contracts.PrintJobCommand{
+				JobID: fmt.Sprintf("job-5c-race-%d", i), OrderID: ordID, KioskID: kioskID, DisplayCode: fmt.Sprintf("88%02d", i),
+				TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreateOrder(%d) failed: %v", i, err)
+		}
+		sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+		if err != nil {
+			t.Fatalf("CreateOrGetKioskSessionWithPaperCheck(%d) failed: %v", i, err)
+		}
+		att := store.PaymentAttempt{
+			AttemptID:      fmt.Sprintf("att-5c-race-%d", i),
+			DemoToken:      tok,
+			OrderID:        ordID,
+			SessionID:      sess.SessionID,
+			KioskID:        kioskID,
+			Provider:       "mock",
+			AmountPaise:    300,
+			Currency:       "INR",
+			Status:         "CREATED",
+			IdempotencyKey: fmt.Sprintf("idem-5c-race-%d", i),
+			ExpiresAt:      now.Add(2 * time.Minute),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		if err := app.db.CreatePaymentAttempt(ctx, att); err != nil {
+			t.Fatalf("CreatePaymentAttempt(%d) failed: %v", i, err)
+		}
+
+		startCh := make(chan struct{})
+		payStatusCh := make(chan int, 1)
+		go func() {
+			<-startCh
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/pay/"+tok, nil)
+			req.Header.Set("Accept", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				payStatusCh <- -1
+				return
+			}
+			resp.Body.Close()
+			payStatusCh <- resp.StatusCode
+		}()
+		go func() {
+			<-startCh
+			_ = app.db.CancelActiveUnpaidSessionsForKiosk(ctx, kioskID, time.Now().UTC())
+		}()
+		close(startCh)
+
+		payStatus := <-payStatusCh
+		gotSess, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+		gotOrd, _ := app.db.GetOrder(ctx, ordID)
+		if payStatus == http.StatusOK {
+			if gotSess == nil || gotSess.Status != store.KioskSessionCompleted || gotOrd == nil || gotOrd.Status == contracts.JobStatusPendingPayment {
+				t.Fatalf("iteration %d: HTTP 200 capture must commit paid order & COMPLETED session, got sess=%+v ord=%+v", i, gotSess, gotOrd)
+			}
+		} else if payStatus == http.StatusGone || payStatus == http.StatusServiceUnavailable {
+			if gotSess == nil || gotSess.Status != store.KioskSessionCanceled || gotOrd == nil || gotOrd.Status != contracts.JobStatusPendingPayment {
+				t.Fatalf("iteration %d: rejected capture (%d) must leave session CANCELED and order PENDING_PAYMENT, got sess=%+v ord=%+v", i, payStatus, gotSess, gotOrd)
+			}
+		} else {
+			t.Fatalf("iteration %d: unexpected POST /pay status %d", i, payStatus)
+		}
+	}
 }

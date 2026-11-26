@@ -2521,7 +2521,7 @@
     const availabilitySpinner = document.getElementById('availability-spinner');
     const availabilityTitle = document.getElementById('availability-title');
     const availabilityDesc = document.getElementById('availability-desc');
-    const portalSections = [viewCart, viewSettings, viewPreview, viewCheckout, pwaInstallBanner, pwaMiniPill];
+    const portalSections = [viewCart, viewSettings, viewPreview, viewCheckout, pwaInstallBanner, pwaMiniPill, pwaGuideModal];
 
     function applyAvailabilityState(availState) {
       const accessible = (availState === 'AVAILABLE');
@@ -2553,18 +2553,22 @@
             ? 'Please wait a moment.'
             : 'Service will resume automatically once the kiosk is ready.';
         }
-        if (availState === 'UNAVAILABLE' && viewCheckout && viewCheckout.classList.contains('active-view')) {
-          switchView('cart');
-        }
       }
     }
 
+    let availabilityCtrl = null;
     if (availabilityBarrier && !window.__PORTAL_TEST__) {
       applyAvailabilityState('CHECKING');
-      const availabilityCtrl = createAvailabilityController({
+      availabilityCtrl = createAvailabilityController({
         kioskId: kioskID,
         onStateChange: applyAvailabilityState
       });
+      document.addEventListener('keydown', (e) => {
+        if (availabilityCtrl && availabilityCtrl.getState() !== 'AVAILABLE') {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }, true);
       availabilityCtrl.checkOnce();
       setInterval(() => {
         availabilityCtrl.checkOnce();

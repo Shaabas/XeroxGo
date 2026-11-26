@@ -1233,6 +1233,26 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	hub.SetKioskSecret([]byte(kSec))
 	app.hub = hub
 
+	// 0. Kiosk Connects via WebSocket and reports healthy status before customer session
+	u, _ := url.Parse(ts.URL)
+	u.Scheme = "ws"
+	u.Path = "/ws"
+	q := u.Query()
+	q.Set("kiosk_id", kioskID)
+	u.RawQuery = q.Encode()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wsConn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + kSec}},
+	})
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
+
 	// 1. PIN Lookup from Kiosk
 	lookupURL := fmt.Sprintf("%s/api/k/%s/orders/lookup", ts.URL, kioskID)
 	lookupBody := fmt.Sprintf(`{"pin":%q}`, pin)
@@ -1268,26 +1288,6 @@ func TestPaymentSafety_CompleteEndToEndSimulatedFlow(t *testing.T) {
 	if sessID == "" {
 		t.Fatalf("expected non-empty session_id")
 	}
-
-	// 3. Kiosk Connects via WebSocket
-	u, _ := url.Parse(ts.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-	q := u.Query()
-	q.Set("kiosk_id", kioskID)
-	u.RawQuery = q.Encode()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	wsConn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + kSec}},
-	})
-	if err != nil {
-		t.Fatalf("websocket.Dial failed: %v", err)
-	}
-	defer wsConn.CloseNow()
-	sendTestHealthyStatus(ctx, t, app.hub, wsConn, kioskID)
 
 	// 4. Payment Captured via Signed Razorpay Webhook
 	paymentID := "pay_e2e_evt_999"

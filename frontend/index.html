@@ -60,7 +60,7 @@
     </div>
 
     <!-- Top Floating PWA Install Banner -->
-    <div id="pwa-install-banner" class="pwa-install-banner animate-slide-down hidden">
+    <div id="pwa-install-banner" class="pwa-install-banner animate-slide-down hidden" inert aria-hidden="true">
       <div class="pwa-banner-left">
         <div class="pwa-icon-wrapper">
           <img src="/assets/xeroxgo-logo-transparent.png" alt="XeroxGO" class="pwa-banner-icon" />
@@ -82,7 +82,7 @@
     </div>
 
     <!-- Mini Install Pill (shown if dismissed) -->
-    <div id="pwa-mini-pill" class="hidden" style="display:flex; justify-content:center; margin:0.5rem 0;">
+    <div id="pwa-mini-pill" class="hidden" style="display:flex; justify-content:center; margin:0.5rem 0;" inert aria-hidden="true">
       <button id="pwa-pill-btn" type="button" class="pwa-header-pill-btn" style="box-shadow:0 2px 6px rgba(37,99,235,0.08);">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
         Install XeroxGO App
@@ -92,7 +92,7 @@
     <!-- ================================================================= -->
     <!-- VIEW 1: FILES CART SCREEN                                         -->
     <!-- ================================================================= -->
-    <main id="view-cart" class="portal-view active-view">
+    <main id="view-cart" class="portal-view active-view" inert aria-hidden="true">
       <!-- Header -->
       <header class="portal-header">
         <div class="logo-box">
@@ -175,7 +175,7 @@
     <!-- ================================================================= -->
     <!-- VIEW 2: DOCUMENT SETTINGS & PREVIEW SCREEN                        -->
     <!-- ================================================================= -->
-    <section id="view-settings" class="portal-view hidden">
+    <section id="view-settings" class="portal-view hidden" inert aria-hidden="true">
       <!-- Navigation Bar -->
       <div class="view-nav-bar">
         <button type="button" id="btn-settings-back" class="btn-nav-back" aria-label="Back to Cart">
@@ -415,12 +415,12 @@
     </section>
 
     <!-- Placeholder for legacy view-preview (unified into view-settings) -->
-    <section id="view-preview" class="portal-view hidden"></section>
+    <section id="view-preview" class="portal-view hidden" inert aria-hidden="true"></section>
 
     <!-- ================================================================= -->
     <!-- VIEW 4: CHECKOUT / PIN SCREEN                                     -->
     <!-- ================================================================= -->
-    <section id="view-checkout" class="portal-view hidden">
+    <section id="view-checkout" class="portal-view hidden" inert aria-hidden="true">
       <!-- Header -->
       <header class="portal-header">
         <div class="logo-box">
@@ -498,7 +498,7 @@
     </section>
 
     <!-- PWA Install Guide Modal (iOS/Android manual) -->
-    <div id="pwa-guide-modal" class="modal-overlay hidden">
+    <div id="pwa-guide-modal" class="modal-overlay hidden" inert aria-hidden="true">
       <div class="pwa-ios-modal animate-scale-up" onclick="event.stopPropagation();">
         <div class="pwa-ios-modal-header">
           <div style="display:flex; align-items:center; gap:8px;">
