@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"xeroxgo/kiosk-daemon/internal/input"
 	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 	"xeroxgo/pkg/contracts"
@@ -135,6 +136,18 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 			return
 		}
 
+		if r.URL.Path == "/ws" {
+			if c, err := websocket.Accept(w, r, nil); err == nil {
+				defer c.CloseNow()
+				for {
+					if _, _, rErr := c.Read(r.Context()); rErr != nil {
+						return
+					}
+				}
+			}
+			return
+		}
+
 		http.NotFound(w, r)
 	}))
 	defer ts.Close()
@@ -154,6 +167,7 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 		KioskSecret:              "e2e-secret",
 		StateStore:               store,
 		PrinterAddr:              "127.0.0.1:9100",
+		MockHealth:               testHealthyMockHealth,
 		DownloadDir:              filepath.Join(tempDir, "downloads"),
 		IdleQRContent:            "https://xeroxgo.demo/k/kiosk-e2e",
 		AdsCachePath:             filepath.Join(tempDir, "ads.json"),
@@ -181,7 +195,9 @@ func TestPINFlow_EndToEndSimulation(t *testing.T) {
 		_ = client.Run(ctx)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	if !waitCondition(5*time.Second, func() bool { return !pinCtrl.IsBlocked() }) {
+		t.Fatal("timed out waiting for kiosk availability barrier to clear")
+	}
 
 	// Step 1: Input valid 4-digit PIN "8899"
 	simInput.EmitDigits("8899")
@@ -257,6 +273,17 @@ func TestPINFlow_KioskIsolationAndUnauthorized(t *testing.T) {
 	defer store.Close()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ws" {
+			if c, err := websocket.Accept(w, r, nil); err == nil {
+				defer c.CloseNow()
+				for {
+					if _, _, rErr := c.Read(r.Context()); rErr != nil {
+						return
+					}
+				}
+			}
+			return
+		}
 		auth := r.Header.Get("Authorization")
 		if auth != "Bearer kiosk-secret-A" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -292,6 +319,7 @@ func TestPINFlow_KioskIsolationAndUnauthorized(t *testing.T) {
 		KioskSecret:       "kiosk-secret-B", // wrong secret for server
 		StateStore:        store,
 		PrinterAddr:       "127.0.0.1:9100",
+		MockHealth:        testHealthyMockHealth,
 		DownloadDir:       filepath.Join(tempDir, "dl"),
 		IdleQRContent:     "https://kiosk-b",
 		ScreenSink:        func(img *image.RGBA) error { return nil },
@@ -310,7 +338,9 @@ func TestPINFlow_KioskIsolationAndUnauthorized(t *testing.T) {
 	defer cancel()
 	go func() { _ = clientB.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	if !waitCondition(5*time.Second, func() bool { return !ctrlB.IsBlocked() }) {
+		t.Fatal("timed out waiting for kiosk availability barrier to clear")
+	}
 
 	simInput.EmitDigits("1234")
 	if !waitCondition(5*time.Second, func() bool { return ctrlB.GetPINBuffer() == "1234" }) {
@@ -347,6 +377,17 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ws" {
+			if c, err := websocket.Accept(w, r, nil); err == nil {
+				defer c.CloseNow()
+				for {
+					if _, _, rErr := c.Read(r.Context()); rErr != nil {
+						return
+					}
+				}
+			}
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"order_id":          "ord_readonly",
@@ -371,6 +412,7 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 		StateStore:        store,
 		PrinterAddr:       "127.0.0.1:9100",
 		CUPSQueue:         "test-queue",
+		MockHealth:        testHealthyMockHealth,
 		MockCUPSPrint:     mockCUPS,
 		DownloadDir:       filepath.Join(tempDir, "dl_ro"),
 		IdleQRContent:     "https://kiosk-ro",
@@ -389,7 +431,9 @@ func TestPINFlow_ReadOnlyInvariant_NoPrintingOrPaidMutation(t *testing.T) {
 	defer cancel()
 	go func() { _ = client.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	if !waitCondition(5*time.Second, func() bool { return !client.PINController().IsBlocked() }) {
+		t.Fatal("timed out waiting for kiosk availability barrier to clear")
+	}
 
 	simInput.EmitDigits("1231")
 	if !waitCondition(5*time.Second, func() bool { return client.PINController().GetPINBuffer() == "1231" }) {
@@ -455,6 +499,15 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 			})
 		case strings.HasPrefix(r.URL.Path, "/api/k/kiosk-prot/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel"):
 			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/ws":
+			if c, err := websocket.Accept(w, r, nil); err == nil {
+				defer c.CloseNow()
+				for {
+					if _, _, rErr := c.Read(r.Context()); rErr != nil {
+						return
+					}
+				}
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -470,6 +523,7 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 		KioskSecret:       "prot-secret",
 		StateStore:        st,
 		PrinterAddr:       "127.0.0.1:9100",
+		MockHealth:        testHealthyMockHealth,
 		DownloadDir:       filepath.Join(tempDir, "dl_prot"),
 		IdleQRContent:     "https://kiosk-prot",
 		ScreenSink:        func(img *image.RGBA) error { return nil },
@@ -488,7 +542,9 @@ func TestPINFlow_OrderConfirmAndUnrelatedJobProtection(t *testing.T) {
 	defer cancel()
 	go func() { _ = client.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	if !waitCondition(5*time.Second, func() bool { return !client.PINController().IsBlocked() }) {
+		t.Fatal("timed out waiting for kiosk availability barrier to clear")
+	}
 
 	// 1. Enter PIN & lookup -> automatically claims order and enters PAYMENT_PENDING
 	simInput.EmitDigits("9876")
@@ -605,6 +661,15 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 			})
 		case strings.HasPrefix(r.URL.Path, "/api/k/kiosk-qr/sessions/") && strings.HasSuffix(r.URL.Path, "/cancel"):
 			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/ws":
+			if c, err := websocket.Accept(w, r, nil); err == nil {
+				defer c.CloseNow()
+				for {
+					if _, _, rErr := c.Read(r.Context()); rErr != nil {
+						return
+					}
+				}
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -620,6 +685,7 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 		KioskSecret:       "qr-secret",
 		StateStore:        st,
 		PrinterAddr:       "127.0.0.1:9100",
+		MockHealth:        testHealthyMockHealth,
 		DownloadDir:       filepath.Join(tempDir, "dl_qr"),
 		IdleQRContent:     "https://kiosk-qr",
 		ScreenSink:        func(img *image.RGBA) error { return nil },
@@ -638,7 +704,9 @@ func TestPINFlow_ConfirmInitiatesPaymentAndRendersDynamicQR(t *testing.T) {
 	defer cancel()
 	go func() { _ = client.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	if !waitCondition(5*time.Second, func() bool { return !client.PINController().IsBlocked() }) {
+		t.Fatal("timed out waiting for kiosk availability barrier to clear")
+	}
 
 	// 1. Enter PIN & lookup -> automatically claims and initiates payment in PAYMENT_PENDING
 	simInput.EmitDigits("1122")
@@ -832,6 +900,15 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/pdf"):
 			w.Header().Set("Content-Type", "application/pdf")
 			_, _ = w.Write(pdfBytes)
+		case r.URL.Path == "/ws":
+			if c, err := websocket.Accept(w, r, nil); err == nil {
+				defer c.CloseNow()
+				for {
+					if _, _, rErr := c.Read(r.Context()); rErr != nil {
+						return
+					}
+				}
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -893,7 +970,9 @@ func TestSpooler_UnrelatedJobBeforeActive_NoDeadlock(t *testing.T) {
 	defer cancel()
 	go func() { _ = client.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	if !waitCondition(5*time.Second, func() bool { return !client.PINController().IsBlocked() }) {
+		t.Fatal("timed out waiting for kiosk availability barrier to clear")
+	}
 
 	// 4. Customer enters PIN "5555" -> claims order -> PAYMENT_PENDING
 	simInput.EmitDigits("5555")

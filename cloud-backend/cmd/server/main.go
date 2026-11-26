@@ -762,6 +762,25 @@ func (s *appServer) handleDocumentPreview(w http.ResponseWriter, r *http.Request
 	}
 	defer file.Close()
 
+	kioskID := strings.TrimSpace(r.URL.Query().Get("kiosk_id"))
+	if kioskID == "" {
+		kioskID = strings.TrimSpace(r.FormValue("kiosk_id"))
+	}
+	if kioskID == "" {
+		kioskID = strings.TrimSpace(r.Header.Get("X-Kiosk-ID"))
+	}
+	if kioskID != "" || !s.cfg.devMode {
+		if _, condErr := s.checkPrinterCondition(kioskID); condErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "service is temporarily unavailable",
+				"code":  "SERVICE_UNAVAILABLE",
+			})
+			return
+		}
+	}
+
 	pricing, err := s.db.GetPricing(r.Context())
 	if err != nil {
 		http.Error(w, "pricing unavailable: "+err.Error(), http.StatusInternalServerError)
@@ -1182,6 +1201,8 @@ func (app *appServer) routes() *http.ServeMux {
 			app.handleGetSession(w, r)
 		case strings.HasSuffix(path, "/refill"):
 			app.handleKioskRefill(w, r)
+		case strings.HasSuffix(path, "/availability"):
+			app.handleKioskAvailability(w, r)
 		default:
 			http.NotFound(w, r)
 		}

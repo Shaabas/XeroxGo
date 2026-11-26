@@ -62,6 +62,7 @@ type kioskSession struct {
 	latestHealth  *sessionHealthEntry
 	pendingRefill *pendingRefillOp
 	inventorySeq  uint64
+	expiryTimer   *time.Timer
 
 	dispatchMu           sync.Mutex
 	initialReconnectDone atomic.Bool
@@ -72,25 +73,28 @@ type kioskSession struct {
 // Hub manages active WebSocket connections from kiosks and relays jobs,
 // progress events, and connection-bound canonical printer health telemetry.
 type Hub struct {
-	db           *store.Store
-	mu           sync.RWMutex
-	resetMu      sync.Mutex
-	sessions     map[string]*kioskSession
-	kioskSecret  []byte
-	policyMu     sync.RWMutex
-	policy       contracts.ProductCapabilityPolicy
-	reserveMapMu sync.Mutex
-	reserveLocks map[string]*sync.Mutex
-	refillSeq    atomic.Uint64
+	db                  *store.Store
+	mu                  sync.RWMutex
+	resetMu             sync.Mutex
+	sessions            map[string]*kioskSession
+	kioskSecret         []byte
+	policyMu            sync.RWMutex
+	policy              contracts.ProductCapabilityPolicy
+	reserveMapMu        sync.Mutex
+	reserveLocks        map[string]*sync.Mutex
+	invalidationMu      sync.Mutex
+	pendingInvalidation map[string]uint64
+	refillSeq           atomic.Uint64
 }
 
 // NewHub creates and initializes a new cloud WebSocket hub.
 func NewHub(db *store.Store) *Hub {
 	return &Hub{
-		db:           db,
-		sessions:     make(map[string]*kioskSession),
-		policy:       contracts.DefaultDemoProductPolicy(),
-		reserveLocks: make(map[string]*sync.Mutex),
+		db:                  db,
+		sessions:            make(map[string]*kioskSession),
+		policy:              contracts.DefaultDemoProductPolicy(),
+		reserveLocks:        make(map[string]*sync.Mutex),
+		pendingInvalidation: make(map[string]uint64),
 	}
 }
 
@@ -211,14 +215,30 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.sessions[kioskID] = sess
 	h.mu.Unlock()
 	h.resetMu.Unlock()
-	if replacedOld != nil && replacedOld.conn != nil {
-		go func(c *websocket.Conn) {
-			_ = c.Close(websocket.StatusPolicyViolation, "replaced by new connection")
-		}(replacedOld.conn)
+	if replacedOld != nil {
+		replacedOld.healthMu.Lock()
+		if replacedOld.expiryTimer != nil {
+			replacedOld.expiryTimer.Stop()
+			replacedOld.expiryTimer = nil
+		}
+		replacedOld.healthMu.Unlock()
+		if replacedOld.conn != nil {
+			go func(c *websocket.Conn) {
+				_ = c.Close(websocket.StatusPolicyViolation, "replaced by new connection")
+			}(replacedOld.conn)
+		}
+		h.triggerUnpaidInvalidation(kioskID)
 	}
 	log.Printf("[HUB] Kiosk connected (unverified readiness): %q (client IP: %s)", kioskID, r.RemoteAddr)
 
 	defer func() {
+		sess.healthMu.Lock()
+		if sess.expiryTimer != nil {
+			sess.expiryTimer.Stop()
+			sess.expiryTimer = nil
+		}
+		sess.healthMu.Unlock()
+
 		var wasActive bool
 		h.mu.Lock()
 		sess.inactive.Store(true)
@@ -228,6 +248,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.mu.Unlock()
 		close(sess.closed)
+		if wasActive {
+			h.triggerUnpaidInvalidation(kioskID)
+		}
 		log.Printf("[HUB] Kiosk disconnected: %q (active=%v)", kioskID, wasActive)
 		_ = conn.Close(websocket.StatusNormalClosure, "session ended")
 	}()
@@ -360,7 +383,23 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 	}
 	sess.latestHealth = entry
 	ready, _ := isHealthEntryReady(entry, now)
+	availOK, _ := contracts.IsHealthAvailable(snapshot, now, DefaultTelemetryFreshnessWindow)
+	if availOK && sess.pendingRefill == nil {
+		if sess.expiryTimer != nil {
+			sess.expiryTimer.Stop()
+		}
+		sess.expiryTimer = time.AfterFunc(DefaultTelemetryFreshnessWindow+50*time.Millisecond, func() {
+			h.onSessionTelemetryExpired(kioskID, sess)
+		})
+	} else if sess.expiryTimer != nil {
+		sess.expiryTimer.Stop()
+		sess.expiryTimer = nil
+	}
 	sess.healthMu.Unlock()
+
+	if !availOK {
+		h.triggerUnpaidInvalidation(kioskID)
+	}
 
 	if !ready || !h.isActiveSession(kioskID, sess) {
 		return
@@ -552,6 +591,9 @@ func (h *Hub) EvaluateKioskReadiness(kioskID string) (connected bool, health con
 
 		if !hasEntry {
 			return true, contracts.PrinterHealth{}, false, false, "no telemetry received on active connection"
+		}
+		if h.hasPendingInvalidation(kioskID) {
+			return true, copied, true, false, "pending unpaid checkout invalidation"
 		}
 
 		now := time.Now().UTC()
@@ -934,4 +976,64 @@ func (h *Hub) ConnectedKiosksCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.sessions)
+}
+
+func (h *Hub) hasPendingInvalidation(kioskID string) bool {
+	if h == nil {
+		return false
+	}
+	h.invalidationMu.Lock()
+	pending := h.pendingInvalidation[kioskID] > 0
+	h.invalidationMu.Unlock()
+	return pending
+}
+
+func (h *Hub) triggerUnpaidInvalidation(kioskID string) {
+	if h == nil || strings.TrimSpace(kioskID) == "" || h.db == nil {
+		return
+	}
+	h.invalidationMu.Lock()
+	if h.pendingInvalidation == nil {
+		h.pendingInvalidation = make(map[string]uint64)
+	}
+	h.pendingInvalidation[kioskID]++
+	gen := h.pendingInvalidation[kioskID]
+	h.invalidationMu.Unlock()
+
+	h.runUnpaidInvalidation(kioskID, gen)
+}
+
+func (h *Hub) runUnpaidInvalidation(kioskID string, gen uint64) {
+	if h == nil || h.db == nil {
+		return
+	}
+	unlock := h.LockKioskReservation(kioskID)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := h.db.CancelActiveUnpaidSessionsForKiosk(ctx, kioskID, time.Now().UTC())
+	cancel()
+	unlock()
+
+	h.invalidationMu.Lock()
+	defer h.invalidationMu.Unlock()
+	if err == nil || strings.Contains(err.Error(), "database is closed") {
+		if h.pendingInvalidation[kioskID] == gen {
+			delete(h.pendingInvalidation, kioskID)
+		}
+		return
+	}
+	log.Printf("[HUB] Failed canceling unpaid sessions for unavailable kiosk %q (retrying): %v", kioskID, err)
+	if h.pendingInvalidation[kioskID] == gen {
+		time.AfterFunc(250*time.Millisecond, func() {
+			h.runUnpaidInvalidation(kioskID, gen)
+		})
+	}
+}
+
+func (h *Hub) onSessionTelemetryExpired(kioskID string, sess *kioskSession) {
+	if !h.isActiveSession(kioskID, sess) {
+		return
+	}
+	if _, _, _, ready, _ := h.EvaluateKioskReadiness(kioskID); !ready {
+		h.triggerUnpaidInvalidation(kioskID)
+	}
 }

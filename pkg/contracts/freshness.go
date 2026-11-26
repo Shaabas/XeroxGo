@@ -96,6 +96,31 @@ func ValidateReadyHealth(h PrinterHealth, now time.Time, maxAge time.Duration) (
 	return true, ""
 }
 
+// IsHealthAvailable evaluates the canonical service availability decision across hardware readiness,
+// execution safety, configured capacity bounds, and calibrated effective paper inventory.
+func IsHealthAvailable(h PrinterHealth, now time.Time, maxAge time.Duration) (bool, string) {
+	if ok, reason := ValidateReadyHealth(h, now, maxAge); !ok {
+		return false, reason
+	}
+	if h.ConfiguredTrayCapacity <= 0 {
+		return false, "kiosk reported invalid or non-positive tray capacity"
+	}
+	if h.EstimatedSheets < 0 || h.EstimatedSheets > h.ConfiguredTrayCapacity {
+		return false, fmt.Sprintf("kiosk estimated sheets %d out of bounds [0, %d]", h.EstimatedSheets, h.ConfiguredTrayCapacity)
+	}
+	tray := strings.ToUpper(strings.TrimSpace(h.PaperTrayStatus))
+	if tray == "UNKNOWN" || !h.InventoryCalibrated {
+		return false, "printer paper supply is unknown; tray calibration required"
+	}
+	if tray == "EMPTY" || tray == "CHECK_PRINTER" || h.EstimatedSheets <= 0 {
+		return false, "printer paper tray is empty or low; attendant refill required"
+	}
+	if EffectiveInventorySheets(h.EstimatedSheets, h.ConfiguredTrayCapacity, h.InputTrayCapacity, h.InputTrayCapacityKnown) <= 0 {
+		return false, "effective verified tray inventory is zero"
+	}
+	return true, ""
+}
+
 // BuildUniformEvidenceFreshness constructs a consistent HealthEvidenceFreshness block when all three
 // required sources share a verified observation timestamp (e.g. test/emulator simulations).
 func BuildUniformEvidenceFreshness(ts time.Time, maxAge time.Duration) *HealthEvidenceFreshness {

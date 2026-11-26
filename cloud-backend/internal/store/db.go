@@ -3164,7 +3164,7 @@ WHERE order_id = ?;
 	_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE payment_attempts
 SET status = 'CANCELED', updated_at_ns = ?
-WHERE session_id = ? AND status = 'CREATED';
+WHERE session_id = ? AND status IN ('CREATED', 'ACTIVE');
 `), nowNS, sessionID)
 
 	// Cancel any pending or unacknowledged dispatch intents for this session
@@ -4115,6 +4115,47 @@ WHERE order_id = ?;
 	}
 
 	return tx.Commit()
+}
+
+// CancelActiveUnpaidSessionsForKiosk cancels all active unpaid (PAYMENT_PENDING) checkout sessions
+// for a kiosk when service becomes unavailable, preserving unexpired original PIN reservations.
+func (s *Store) CancelActiveUnpaidSessionsForKiosk(ctx context.Context, kioskID string, now time.Time) error {
+	if s == nil || s.db == nil {
+		return errors.New("store not initialized")
+	}
+	kioskID = strings.TrimSpace(kioskID)
+	if kioskID == "" {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, s.rebind(`
+SELECT session_id
+FROM kiosk_sessions
+WHERE kiosk_id = ? AND status = 'PAYMENT_PENDING';
+`), kioskID)
+	if err != nil {
+		return fmt.Errorf("query active unpaid sessions for kiosk %q: %w", kioskID, err)
+	}
+	var sessionIDs []string
+	for rows.Next() {
+		var sid string
+		if scanErr := rows.Scan(&sid); scanErr != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan unpaid session for kiosk %q: %w", kioskID, scanErr)
+		}
+		sessionIDs = append(sessionIDs, sid)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate unpaid sessions for kiosk %q: %w", kioskID, err)
+	}
+	_ = rows.Close()
+
+	for _, sid := range sessionIDs {
+		if err := s.CancelKioskSession(ctx, sid, kioskID, now); err != nil && !errors.Is(err, ErrSessionNotFound) {
+			return fmt.Errorf("cancel unpaid session %s for kiosk %q: %w", sid, kioskID, err)
+		}
+	}
+	return nil
 }
 
 // MarkDispatchIntentSent marks the dispatch intent for a specific job as SENT.

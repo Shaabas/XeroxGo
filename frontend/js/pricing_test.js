@@ -270,3 +270,59 @@ test('Frontend Capability Policy — Hides and disables Color and Double-sided b
   assert.equal(cardModeColor.disabled, true, 'Color card must be disabled when color_enabled is false');
   assert.equal(cardSideDouble.disabled, true, 'Double-sided card must be disabled when duplex_enabled is false');
 });
+
+test('Frontend Availability — CHECKING barrier, transitions, fail-closed errors, and recovery', async () => {
+  const { createAvailabilityController } = global.window.__portal;
+  const states = [];
+  let mode = 'ok';
+  const ctrl = createAvailabilityController({
+    kioskId: 'kiosk-fe-test',
+    timeoutMs: 30,
+    onStateChange: (s) => states.push(s),
+    fetchImpl: async (_url, init) => {
+      if (mode === 'timeout') {
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('Aborted')));
+        });
+      }
+      if (mode === 'network_err') {
+        throw new Error('ECONNREFUSED');
+      }
+      if (mode === 'malformed') {
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      if (mode === 'unavailable') {
+        return { ok: false, status: 503, json: async () => ({ available: false }) };
+      }
+      return { ok: true, json: async () => ({ available: true }) };
+    }
+  });
+
+  // Initial state is CHECKING before first poll completes
+  assert.equal(ctrl.getState(), 'CHECKING');
+
+  // Available transition
+  mode = 'ok';
+  assert.equal(await ctrl.checkOnce(), 'AVAILABLE');
+
+  // Unavailable HTTP 503
+  mode = 'unavailable';
+  assert.equal(await ctrl.checkOnce(), 'UNAVAILABLE');
+
+  // Timeout fails closed
+  mode = 'timeout';
+  assert.equal(await ctrl.checkOnce(), 'UNAVAILABLE');
+
+  // Malformed response fails closed
+  mode = 'malformed';
+  assert.equal(await ctrl.checkOnce(), 'UNAVAILABLE');
+
+  // Network failure fails closed
+  mode = 'network_err';
+  assert.equal(await ctrl.checkOnce(), 'UNAVAILABLE');
+
+  // Automatic recovery
+  mode = 'ok';
+  assert.equal(await ctrl.checkOnce(), 'AVAILABLE');
+  assert.deepEqual(states, ['AVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'AVAILABLE']);
+});

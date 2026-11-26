@@ -34,6 +34,25 @@ func (s *appServer) handleCreateConversion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	kioskID := strings.TrimSpace(r.URL.Query().Get("kiosk_id"))
+	if kioskID == "" {
+		kioskID = strings.TrimSpace(r.FormValue("kiosk_id"))
+	}
+	if kioskID == "" {
+		kioskID = strings.TrimSpace(r.Header.Get("X-Kiosk-ID"))
+	}
+	if kioskID != "" || !s.cfg.devMode {
+		if _, condErr := s.checkPrinterCondition(kioskID); condErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "service is temporarily unavailable",
+				"code":  "SERVICE_UNAVAILABLE",
+			})
+			return
+		}
+	}
+
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "missing file field", http.StatusBadRequest)

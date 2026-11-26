@@ -456,6 +456,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				},
 			}, cfg.InputSource)
 			if err == nil {
+				pinCtrl.SetAvailability(false, "initializing kiosk availability")
 				client.pinController = pinCtrl
 			} else {
 				log.Printf("[SPOOLER] Warning: failed to initialize PIN controller: %v", err)
@@ -1102,6 +1103,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 	c.connMu.Lock()
 	c.conn = conn
 	c.connMu.Unlock()
+	c.syncPinAvailability(ctx)
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1112,6 +1114,7 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 			c.conn = nil
 		}
 		c.connMu.Unlock()
+		c.syncPinAvailability(ctx)
 	}()
 
 	var connWg sync.WaitGroup
@@ -3378,6 +3381,8 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 		return effectiveH
 	}
 
+	c.syncPinAvailability(ctx)
+
 	c.currentModeMu.Lock()
 	currentMode := c.currentMode
 	c.currentModeMu.Unlock()
@@ -3403,7 +3408,7 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 				log.Printf("[SPOOLER] Hardware recovered, but effective readiness or durable execution-safety barrier remains blocked")
 			}
 		}
-	} else if isNowFault && currentMode == ui_ipc.ModeIdle {
+	} else if isNowFault && (currentMode == ui_ipc.ModeIdle || !pinActive) {
 		log.Printf("[SPOOLER] Hardware fault detected while idle: %s", firstNonEmptyString(reason, effReason))
 		_ = c.renderScreen(ui_ipc.ScreenState{
 			Mode:    ui_ipc.ModeError,
@@ -3957,10 +3962,37 @@ func (c *Client) isServiceReadyForIdle(ctx context.Context) (bool, string, contr
 	if c.isHardwareFaultActive() {
 		return false, firstNonEmptyString(c.getFaultReason(), "active hardware fault"), snap
 	}
-	if ok, reason := contracts.ValidateReadyHealth(snap, time.Now().UTC(), DefaultTelemetryMaxAge); !ok {
+	if ok, reason := contracts.IsHealthAvailable(snap, time.Now().UTC(), DefaultTelemetryMaxAge); !ok {
 		return false, reason, snap
 	}
 	return true, "", snap
+}
+
+func (c *Client) syncPinAvailability(ctx context.Context) {
+	if c.pinController == nil {
+		return
+	}
+	ready, reason, _ := c.isServiceReadyForIdle(ctx)
+	c.connMu.Lock()
+	connected := c.conn != nil
+	c.connMu.Unlock()
+	if !connected {
+		ready = false
+		reason = "cloud connection unavailable"
+	}
+	c.pinController.SetAvailability(ready, reason)
+	if !ready {
+		c.activeMu.Lock()
+		hasActiveJobs := len(c.activeJobs) > 0
+		c.activeMu.Unlock()
+		if !hasActiveJobs {
+			_ = c.renderScreen(ui_ipc.ScreenState{
+				Mode:    ui_ipc.ModeError,
+				Message: "Temporarily unavailable",
+				Detail:  firstNonEmptyString(reason, "Please try again shortly."),
+			})
+		}
+	}
 }
 
 func (c *Client) syncIdleOrBlockedScreen(ctx context.Context) bool {

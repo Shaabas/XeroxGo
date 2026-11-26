@@ -19,7 +19,81 @@
   let kioskDuplexEnabled = false;
   let pricingLoaded = false;
 
+  function createAvailabilityController(options) {
+    const opts = options || {};
+    const targetKioskId = String(opts.kioskId || 'kiosk-demo').trim() || 'kiosk-demo';
+    const fetchFn = opts.fetchImpl || (typeof fetch === 'function' ? fetch : null);
+    const timeoutMs = (typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0) ? opts.timeoutMs : 2500;
+    const onStateChange = typeof opts.onStateChange === 'function' ? opts.onStateChange : null;
+
+    let state = 'CHECKING';
+    let inFlight = false;
+    let seq = 0;
+
+    function setState(next) {
+      state = next;
+      if (onStateChange) {
+        onStateChange(next);
+      }
+    }
+
+    async function checkOnce() {
+      if (inFlight) {
+        return state;
+      }
+      if (!fetchFn) {
+        setState('UNAVAILABLE');
+        return state;
+      }
+
+      inFlight = true;
+      const mySeq = ++seq;
+      const controller = (typeof AbortController === 'function') ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+      try {
+        const url = `/api/k/${encodeURIComponent(targetKioskId)}/availability`;
+        const resp = await fetchFn(url, {
+          method: 'GET',
+          cache: 'no-store',
+          signal: controller ? controller.signal : undefined
+        });
+        if (mySeq !== seq) {
+          return state;
+        }
+        if (!resp || !resp.ok) {
+          setState('UNAVAILABLE');
+          return state;
+        }
+        const data = await resp.json();
+        if (mySeq !== seq) {
+          return state;
+        }
+        if (data && data.available === true) {
+          setState('AVAILABLE');
+        } else {
+          setState('UNAVAILABLE');
+        }
+      } catch (_) {
+        if (mySeq === seq) {
+          setState('UNAVAILABLE');
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+        inFlight = false;
+      }
+      return state;
+    }
+
+    return {
+      getState: () => state,
+      isInFlight: () => inFlight,
+      checkOnce
+    };
+  }
+
   // --- Configuration from DOM ---
+  let kioskID = 'kiosk-demo';
   const container = (typeof document !== 'undefined') ? (document.getElementById('app-container') || document.querySelector('.app-container')) : null;
   if (!container) {
     if (typeof module !== 'undefined' && module.exports) {
@@ -29,13 +103,14 @@
         fetchPricing,
         setPricingConfig,
         formatRupees,
-        getDocSelectedPages
+        getDocSelectedPages,
+        createAvailabilityController
       };
     }
     return;
   }
 
-  let kioskID = container.dataset.kioskId || 'kiosk-demo';
+  kioskID = container.dataset.kioskId || 'kiosk-demo';
   const pathMatch = window.location.pathname.match(/\/k\/([^/]+)/);
   const searchParams = new URLSearchParams(window.location.search);
   const urlKiosk = (pathMatch && pathMatch[1]) || searchParams.get('kiosk_id');
@@ -790,6 +865,9 @@
 
     // 1. Initial Job Submission (POST /api/conversions)
     reportStatus('Uploading for conversion...');
+    if (typeof kioskID === 'string' && kioskID && formData && typeof formData.has === 'function' && !formData.has('kiosk_id')) {
+      formData.append('kiosk_id', kioskID);
+    }
 
     let resp;
     try {
@@ -2426,7 +2504,8 @@
         setPricingConfig,
         formatRupees,
         switchView,
-        openSettings
+        openSettings,
+        createAvailabilityController
       };
     }
     setupBanner();
@@ -2437,6 +2516,60 @@
     setupCheckoutEventListeners();
     renderCart();
     fetchPricing();
+
+    const availabilityBarrier = document.getElementById('availability-barrier');
+    const availabilitySpinner = document.getElementById('availability-spinner');
+    const availabilityTitle = document.getElementById('availability-title');
+    const availabilityDesc = document.getElementById('availability-desc');
+    const portalSections = [viewCart, viewSettings, viewPreview, viewCheckout, pwaInstallBanner, pwaMiniPill];
+
+    function applyAvailabilityState(availState) {
+      const accessible = (availState === 'AVAILABLE');
+      for (const el of portalSections) {
+        if (!el) continue;
+        el.inert = !accessible;
+        if (typeof el.setAttribute === 'function' && typeof el.removeAttribute === 'function') {
+          if (!accessible) {
+            el.setAttribute('aria-hidden', 'true');
+          } else {
+            el.removeAttribute('aria-hidden');
+          }
+        }
+      }
+      if (availabilityBarrier && !window.__PORTAL_TEST__) {
+        availabilityBarrier.classList.toggle('hidden', accessible);
+      }
+      if (!accessible) {
+        if (availabilitySpinner) {
+          availabilitySpinner.classList.toggle('hidden', availState !== 'CHECKING');
+        }
+        if (availabilityTitle) {
+          availabilityTitle.textContent = availState === 'CHECKING'
+            ? 'Checking kiosk availability...'
+            : 'Temporarily unavailable. Please try again shortly.';
+        }
+        if (availabilityDesc) {
+          availabilityDesc.textContent = availState === 'CHECKING'
+            ? 'Please wait a moment.'
+            : 'Service will resume automatically once the kiosk is ready.';
+        }
+        if (availState === 'UNAVAILABLE' && viewCheckout && viewCheckout.classList.contains('active-view')) {
+          switchView('cart');
+        }
+      }
+    }
+
+    if (availabilityBarrier && !window.__PORTAL_TEST__) {
+      applyAvailabilityState('CHECKING');
+      const availabilityCtrl = createAvailabilityController({
+        kioskId: kioskID,
+        onStateChange: applyAvailabilityState
+      });
+      availabilityCtrl.checkOnce();
+      setInterval(() => {
+        availabilityCtrl.checkOnce();
+      }, 3000);
+    }
   }
 
   if (document.readyState === 'loading') {
