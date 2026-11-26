@@ -394,6 +394,7 @@ func buildMockHealthPoller(mockState *mockPrinterState) func(ctx context.Context
 			}
 		}
 
+		h.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(h.UpdatedAt, contracts.DefaultTelemetryMaxAge)
 		return h
 	}
 }

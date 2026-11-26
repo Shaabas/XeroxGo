@@ -16,7 +16,9 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"xeroxgo/kiosk-daemon/internal/printer"
 	"xeroxgo/kiosk-daemon/internal/state"
+	"xeroxgo/kiosk-daemon/internal/ui_ipc"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -349,7 +351,7 @@ func TestSpoolerCanonical_MissingProductionConfig_NeverFabricatesReady(t *testin
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
-	h, _, _ := client.acquireTelemetryCycle(context.Background())
+	h := client.CheckPrinterHealth(context.Background())
 	if h.Online || h.EvaluatedHealth != contracts.EvaluatedHealthUnverified || h.State != "UNKNOWN" {
 		t.Fatalf("expected missing config to produce UNVERIFIED offline state, got %+v", h)
 	}
@@ -522,7 +524,7 @@ func TestSpoolerCanonical_DurableExecutionBarrier_BlocksDrainAndSubmissionAfterH
 
 	// Acquire 3 healthy cycles cleanly: hardware is HEALTHY, yet durable barrier remains blocking!
 	for i := 0; i < 3; i++ {
-		h, _, _ := client.acquireTelemetryCycle(ctx)
+		h := client.CheckPrinterHealth(ctx)
 		if h.EvaluatedHealth != contracts.EvaluatedHealthHealthy || h.ExecutionSafe {
 			t.Fatalf("expected healthy hardware with ExecutionSafe=false due to durable barrier, got %+v", h)
 		}
@@ -555,4 +557,330 @@ func TestSpoolerCanonical_DurableExecutionBarrier_BlocksDrainAndSubmissionAfterH
 	if lpInvoked.Load() {
 		t.Fatal("lp must NEVER be called while unresolved paused job barrier exists after hardware recovery")
 	}
+}
+
+func TestSpoolerCanonical_Correction1_UnifiedRecoverySnapshotAndWSPublication(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := state.Open(filepath.Join(tmpDir, "canon_c1.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer st.Close()
+	_ = st.ResetPaperTray(ctx, 100)
+
+	var wsMu sync.Mutex
+	var published []contracts.PrinterHealth
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		for {
+			var msg wireMessage
+			if err := wsjson.Read(r.Context(), c, &msg); err != nil {
+				return
+			}
+			if msg.Type == "health" && msg.Health != nil {
+				wsMu.Lock()
+				published = append(published, *msg.Health)
+				wsMu.Unlock()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	var phase atomic.Int32 // 0=SNMP fault, 1=all healthy, 2=SNMP missing/unavailable
+	poller := func(ctx context.Context, sheets int) contracts.PrinterHealth {
+		now := time.Now().UTC()
+		switch phase.Load() {
+		case 0:
+			return contracts.PrinterHealth{
+				Online:          false,
+				State:           "ERROR",
+				EvaluatedHealth: contracts.EvaluatedHealthFault,
+				PaperTrayStatus: "OK",
+				PaperJam:        true,
+				BlockingReasons: []contracts.HealthReason{{Code: "paper_jam", Source: "snmp", Message: "SNMP detected paper jam"}},
+				ErrorMessage:    "SNMP detected paper jam",
+				UpdatedAt:       now,
+			}
+		case 2:
+			ef := contracts.BuildUniformEvidenceFreshness(now, DefaultTelemetryMaxAge)
+			ef.SNMP = contracts.SourceFreshness{Available: false, Fresh: false, Error: "SNMP unavailable"}
+			return contracts.PrinterHealth{
+				Online:            false,
+				State:             "UNKNOWN",
+				EvaluatedHealth:   contracts.EvaluatedHealthUnverified,
+				PaperTrayStatus:   "UNKNOWN",
+				EvidenceFreshness: ef,
+				ErrorMessage:      "SNMP evidence unavailable",
+				UpdatedAt:         now,
+			}
+		default:
+			return testHealthyMockHealth(ctx, sheets)
+		}
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:                     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		KioskID:                      "kiosk-c1-unified",
+		StateStore:                   st,
+		PrinterAddr:                  "127.0.0.1:9100",
+		DownloadDir:                  tmpDir,
+		IdleQRContent:                "https://kiosk.test/c1",
+		ScreenSink:                   func(*image.RGBA) error { return nil },
+		MockHealth:                   poller,
+		HealthPollInterval:           5 * time.Second,
+		RequiredRecoveryHealthyCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	wsCtx, wsCancel := context.WithCancel(ctx)
+	defer wsCancel()
+	go func() {
+		_ = client.Run(wsCtx)
+	}()
+
+	// Wait for WS connection and initial fault snapshot to be published.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		wsMu.Lock()
+		n := len(published)
+		wsMu.Unlock()
+		if n >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Healthy cycle 1 -> healthy cycle 2 -> SNMP unavailable (resets!) -> 3 healthy cycles.
+	phase.Store(1)
+	h1 := client.CheckPrinterHealth(ctx)
+	snap1 := client.CurrentHealthSnapshot(ctx)
+	if h1.EvaluatedHealth != contracts.EvaluatedHealthFault || snap1.EvaluatedHealth != contracts.EvaluatedHealthFault || snap1.Online {
+		t.Fatalf("cycle 1/3 must keep returned & shared snapshot FAULT, got ret=%s snap=%s online=%v", h1.EvaluatedHealth, snap1.EvaluatedHealth, snap1.Online)
+	}
+	h2 := client.CheckPrinterHealth(ctx)
+	snap2 := client.CurrentHealthSnapshot(ctx)
+	if h2.EvaluatedHealth != contracts.EvaluatedHealthFault || snap2.EvaluatedHealth != contracts.EvaluatedHealthFault {
+		t.Fatalf("cycle 2/3 must keep returned & shared snapshot FAULT, got ret=%s snap=%s", h2.EvaluatedHealth, snap2.EvaluatedHealth)
+	}
+
+	// Missing evidence from fault source ("snmp") must reset streak and NEVER clear fault.
+	phase.Store(2)
+	hReset := client.CheckPrinterHealth(ctx)
+	if hReset.EvaluatedHealth != contracts.EvaluatedHealthFault || !client.isHardwareFaultActive() {
+		t.Fatalf("missing evidence must keep fault active, got %+v", hReset)
+	}
+
+	// Cycle 1 & 2 after reset must still publish FAULT; cycle 3 clears to HEALTHY.
+	phase.Store(1)
+	for i := 1; i <= 2; i++ {
+		hi := client.CheckPrinterHealth(ctx)
+		if hi.EvaluatedHealth != contracts.EvaluatedHealthFault {
+			t.Fatalf("post-reset cycle %d/3 must stay FAULT, got %s", i, hi.EvaluatedHealth)
+		}
+	}
+	h3 := client.CheckPrinterHealth(ctx)
+	snap3 := client.CurrentHealthSnapshot(ctx)
+	if h3.EvaluatedHealth != contracts.EvaluatedHealthHealthy || snap3.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !snap3.Online {
+		t.Fatalf("cycle 3/3 must publish and commit HEALTHY, got ret=%s snap=%s online=%v", h3.EvaluatedHealth, snap3.EvaluatedHealth, snap3.Online)
+	}
+
+	// Verify WS frames match sequence: first 6 frames FAULT, last frame HEALTHY.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		wsMu.Lock()
+		n := len(published)
+		wsMu.Unlock()
+		if n >= 7 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	wsMu.Lock()
+	defer wsMu.Unlock()
+	if len(published) < 7 {
+		t.Fatalf("expected >=7 published WS health snapshots, got %d", len(published))
+	}
+	for i := 0; i < 6; i++ {
+		if published[i].EvaluatedHealth == contracts.EvaluatedHealthHealthy || published[i].Online {
+			t.Fatalf("published WS frame %d leaked HEALTHY before 3-cycle confirmation: %+v", i, published[i])
+		}
+	}
+	last := published[len(published)-1]
+	if last.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !last.Online {
+		t.Fatalf("final published WS frame should be HEALTHY, got %+v", last)
+	}
+}
+
+func TestSpoolerCanonical_Correction2_ScreenSafetyAndActiveHealthyPrint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := state.Open(filepath.Join(tmpDir, "canon_c2.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer st.Close()
+	_ = st.ResetPaperTray(ctx, 100)
+
+	// Configure client with UNVERIFIED telemetry -> startup screen MUST NOT advertise ModeIdle "Ready to print".
+	client, err := NewClient(ClientConfig{
+		CloudURL:      "ws://127.0.0.1:1/ws",
+		KioskID:       "kiosk-c2-screen",
+		StateStore:    st,
+		PrinterAddr:   "127.0.0.1:9100",
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://kiosk.test/c2",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		MockHealth: func(ctx context.Context, sheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{
+				Online:          false,
+				State:           "UNKNOWN",
+				EvaluatedHealth: contracts.EvaluatedHealthUnverified,
+				PaperTrayStatus: "UNKNOWN",
+				EstimatedSheets: sheets,
+				UpdatedAt:       time.Now().UTC(),
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = client.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(client.RenderHistory()) > 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	runCancel()
+	<-runDone
+
+	for _, rs := range client.RenderHistory() {
+		if rs.Mode == ui_ipc.ModeIdle {
+			t.Fatalf("startup with UNVERIFIED telemetry rendered ModeIdle: %+v", rs)
+		}
+	}
+
+	// Attempt to bypass via renderScreen(ModeIdle) or scheduleResetToIdle -> must remain suppressed.
+	_ = client.renderScreen(ui_ipc.ScreenState{Mode: ui_ipc.ModeIdle, QRContent: "x", Message: "Ready to print"})
+	client.scheduleResetToIdle(15 * time.Millisecond)
+	time.Sleep(40 * time.Millisecond)
+	client.currentModeMu.Lock()
+	modeAfter := client.currentMode
+	client.currentModeMu.Unlock()
+	if modeAfter == ui_ipc.ModeIdle {
+		t.Fatal("scheduleResetToIdle/renderScreen must not advertise ModeIdle while UNVERIFIED")
+	}
+
+	// Normal actively-monitored healthy print in activeJobs keeps ExecutionSafe=true (excludeJobID==""),
+	// while still serializing physical submission for another job (excludeJobID=="job-other") AND
+	// blocking once PAUSED_ERROR!
+	activeCmd := contracts.PrintJobCommand{
+		JobID:          "job-active-healthy",
+		KioskID:        "kiosk-c2-screen",
+		DownloadURL:    "http://127.0.0.1:1/a.pdf",
+		SHA256Checksum: strings.Repeat("b", 64),
+		TotalPages:     2,
+		TotalSheets:    2,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}
+	_ = st.SaveJob(ctx, activeCmd, contracts.JobStatusPrinting)
+	_ = st.MarkJobSubmitting(ctx, activeCmd.JobID)
+	_ = st.RecordJobSubmission(ctx, activeCmd.JobID, "HPTank-101")
+
+	client.activeMu.Lock()
+	client.activeJobs[activeCmd.JobID] = true
+	client.activeMu.Unlock()
+
+	if safe, reason := client.computeExecutionSafety(ctx, ""); !safe {
+		t.Fatalf("healthy actively-monitored print must keep ExecutionSafe=true for order prep, got false (%s)", reason)
+	}
+	if safeOther, _ := client.computeExecutionSafety(ctx, "job-second"); safeOther {
+		t.Fatal("concurrent physical submission check (excludeJobID != \"\") must stay serialized/blocked")
+	}
+}
+
+func TestSpoolerCanonical_Correction3And5_StaggeredExpiryAndCachedIPPURI(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := state.Open(filepath.Join(tmpDir, "canon_c35.db"))
+	if err != nil {
+		t.Fatalf("state.Open failed: %v", err)
+	}
+	defer st.Close()
+	_ = st.ResetPaperTray(ctx, 100)
+
+	var lpstatVCalls atomic.Int32
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" && len(args) > 0 && args[0] == "-v" {
+			lpstatVCalls.Add(1)
+			return []byte("device for HPTank: ipp://10.42.0.210:631/ipp/print\n"), nil
+		}
+		if name == "ipptool" {
+			return []byte("printer-state (enum) = idle\nprinter-is-accepting-jobs (boolean) = true\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	staleSNMP := time.Now().UTC().Add(-5750 * time.Millisecond)
+	client, err := NewClient(ClientConfig{
+		CloudURL:      "ws://127.0.0.1:1/ws",
+		KioskID:       "kiosk-c35",
+		StateStore:    st,
+		CUPSQueue:     "HPTank",
+		CUPSRunner:    runner,
+		DownloadDir:   tmpDir,
+		IdleQRContent: "https://kiosk.test/c35",
+		ScreenSink:    func(*image.RGBA) error { return nil },
+		MockCUPSHealth: func(ctx context.Context, sheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+		},
+		MockSNMPHealth: func(ctx context.Context, sheets int) contracts.PrinterHealth {
+			return contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: staleSNMP}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	h1 := client.CheckPrinterHealth(ctx)
+	if h1.EvaluatedHealth != contracts.EvaluatedHealthHealthy {
+		t.Fatalf("expected initial near-expiry staggered evaluation to be HEALTHY (oldest age ~5.75s), got %s (%s)", h1.EvaluatedHealth, h1.ErrorMessage)
+	}
+	// Run two more polls: native IPP URI must remain cached (lpstat -v called only once across 3 cycles).
+	_ = client.CheckPrinterHealth(ctx)
+	_ = client.CheckPrinterHealth(ctx)
+	if got := lpstatVCalls.Load(); got != 1 {
+		t.Fatalf("expected lpstat -v native IPP discovery to be cached after 1st poll (1 call), got %d calls", got)
+	}
+
+	// Wait ~350ms so oldest staggered source (5.75s) crosses 6.0s lifetime even though CUPS/IPP were fresh!
+	time.Sleep(350 * time.Millisecond)
+	snapExpired := client.CurrentHealthSnapshot(ctx)
+	if snapExpired.EvaluatedHealth != contracts.EvaluatedHealthUnverified || snapExpired.Online {
+		t.Fatalf("expected staggered oldest source >6s to expire CurrentHealthSnapshot to UNVERIFIED, got %s online=%v", snapExpired.EvaluatedHealth, snapExpired.Online)
+	}
+	_ = printer.CapabilitySourceNativeIPP
 }

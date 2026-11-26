@@ -87,16 +87,18 @@ func TestCloudHub_ConnectionBoundHealth_StartsUnverified_ReconcilesOnlyOnVerifie
 	}
 
 	// 2. Sending ExecutionSafe=false healthy hardware must still NOT reconcile dispatch.
+	unsafeNow := time.Now().UTC()
 	unsafeHealth := contracts.PrinterHealth{
-		Online:              true,
-		State:               "IDLE",
-		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
-		PaperTrayStatus:     "OK",
-		EstimatedSheets:     100,
-		InventoryCalibrated: true,
-		ExecutionSafe:       false,
+		Online:                true,
+		State:                 "IDLE",
+		EvaluatedHealth:       contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:       "OK",
+		EstimatedSheets:       100,
+		InventoryCalibrated:   true,
+		ExecutionSafe:         false,
 		ExecutionSafetyReason: "unresolved paused job barrier",
-		UpdatedAt:           time.Now().UTC(),
+		UpdatedAt:             unsafeNow,
+		EvidenceFreshness:     contracts.BuildUniformEvidenceFreshness(unsafeNow, DefaultTelemetryFreshnessWindow),
 	}
 	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &unsafeHealth}); err != nil {
 		t.Fatalf("write unsafe health failed: %v", err)
@@ -248,5 +250,175 @@ func TestCloudHub_RejectsMalformedContradictoryAndStaleReplayTelemetry(t *testin
 	err := hub.SendJob(ctx, contracts.PrintJobCommand{JobID: "job-expired", KioskID: "kiosk-validate"})
 	if err == nil {
 		t.Fatal("expected SendJob to reject kiosk with >6s expired observation timestamp")
+	}
+}
+
+func TestCloudHub_Correction3And4_FreshnessResetCadenceAndSendTimeCheck(t *testing.T) {
+	db := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Seed paid order whose dispatch intent starts PENDING.
+	now := time.Now().UTC()
+	ord := store.Order{
+		OrderID: "ord-c4-01",
+		Command: contracts.PrintJobCommand{
+			JobID:       "job-c4-01",
+			KioskID:     "kiosk-c4",
+			DisplayCode: "9090",
+		},
+		Status:      contracts.JobStatusPendingPayment,
+		PricePaise:  500,
+		TotalPages:  1,
+		TotalSheets: 1,
+		Documents: []store.OrderDocument{
+			{
+				JobID:            "job-c4-01",
+				OrderID:          "ord-c4-01",
+				DocumentIndex:    0,
+				OriginalFilename: "doc.pdf",
+				DownloadURL:      "https://cloud.test/doc.pdf",
+				SHA256Checksum:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				TotalPages:       1,
+				TotalSheets:      1,
+				Copies:           1,
+				Duplex:           contracts.DuplexSimplex,
+				ColorMode:        "BW",
+				PricePaise:       500,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := db.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+	kSess, err := db.CreateOrGetKioskSessionWithPaperCheck(ctx, "kiosk-c4", ord.OrderID, 10, 10*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+	}
+	if _, err := db.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID:   "pay-c4",
+		OrderID:     ord.OrderID,
+		KioskID:     "kiosk-c4",
+		SessionID:   kSess.SessionID,
+		AmountPaise: 500,
+		Status:      "captured",
+		Provider:    "DEMO",
+	}, now); err != nil {
+		t.Fatalf("CapturePaymentAndCheckDispatch failed: %v", err)
+	}
+
+	hub := NewHub(db)
+	srv := httptest.NewServer(http.HandlerFunc(hub.ServeHTTP))
+	defer srv.Close()
+
+	conn, _ := connectTestKiosk(t, hub, srv.URL, "kiosk-c4")
+
+	// Malformed HEALTHY missing EvidenceFreshness must be rejected cleanly.
+	malformed := contracts.PrinterHealth{
+		Online:              true,
+		State:               "IDLE",
+		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:     "OK",
+		EstimatedSheets:     100,
+		InventoryCalibrated: true,
+		ExecutionSafe:       true,
+		UpdatedAt:           time.Now().UTC(),
+	}
+	_ = wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &malformed})
+	time.Sleep(50 * time.Millisecond)
+	if ready, _ := hub.IsKioskReadyForDispatch("kiosk-c4"); ready {
+		t.Fatal("HEALTHY payload missing evidence_freshness must be rejected")
+	}
+
+	// Send first valid HEALTHY frame -> reconciles & sends job-c4-01 ONCE (intent becomes SENT).
+	sendTestReadyHealth(ctx, t, hub, conn, "kiosk-c4")
+	msg := readJobMessage(ctx, t, conn)
+	if msg.Job == nil || msg.Job.JobID != "job-c4-01" {
+		t.Fatalf("expected job-c4-01 on first ready frame, got %+v", msg)
+	}
+	intentStatus, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-c4-01")
+	if intentStatus != "SENT" {
+		t.Fatalf("expected dispatch intent SENT after reconciliation, got %s", intentStatus)
+	}
+
+	// Subsequent routine HEALTHY telemetry frames while session stays healthy MUST NOT call
+	// ResetUnacknowledgedDispatchIntents and revert unacknowledged SENT intents back to PENDING!
+	for i := 1; i <= 5; i++ {
+		ts := time.Now().UTC().Add(time.Duration(i) * time.Millisecond)
+		hNext := contracts.PrinterHealth{
+			Online:              true,
+			State:               "IDLE",
+			EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+			PaperTrayStatus:     "OK",
+			EstimatedSheets:     100,
+			InventoryCalibrated: true,
+			ExecutionSafe:       true,
+			TonerLevelPercent:   90,
+			TonerLevelKnown:     true,
+			DrumLifePercent:     90,
+			DrumLifeKnown:       true,
+			UpdatedAt:           ts,
+			EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(ts, DefaultTelemetryFreshnessWindow),
+		}
+		_ = wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &hNext})
+	}
+	time.Sleep(80 * time.Millisecond)
+	intentAfter, _, _ := db.GetJobDispatchIntentStatus(ctx, "job-c4-01")
+	if intentAfter != "SENT" {
+		t.Fatalf("routine healthy frames must NOT reset unacknowledged SENT intent to %s", intentAfter)
+	}
+
+	// SendJob holding expired session readiness must fail inside sendJobToSession under sendMu.
+	hub.mu.RLock()
+	sess := hub.sessions["kiosk-c4"]
+	hub.mu.RUnlock()
+	sess.healthMu.Lock()
+	expiredH := cloneHealth(sess.latestHealth.health)
+	expiredH.UpdatedAt = time.Now().UTC().Add(-7 * time.Second)
+	sess.latestHealth = &sessionHealthEntry{health: expiredH, receivedAt: sess.latestHealth.receivedAt}
+	sess.healthMu.Unlock()
+
+	err = hub.SendJob(ctx, contracts.PrintJobCommand{
+		JobID:          "job-c4-fail-expired",
+		KioskID:        "kiosk-c4",
+		DownloadURL:    "https://cloud.test/doc.pdf",
+		SHA256Checksum: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	})
+	if err == nil {
+		t.Fatal("SendJob must reject expired session inside sendJobToSession")
+	}
+
+	// Restore fresh health on sess, close socket, and verify sendJobToSession fails cleanly.
+	nowFresh := time.Now().UTC()
+	freshH := cloneHealth(expiredH)
+	freshH.UpdatedAt = nowFresh
+	freshH.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(nowFresh, DefaultTelemetryFreshnessWindow)
+	sess.healthMu.Lock()
+	sess.latestHealth = &sessionHealthEntry{health: freshH, receivedAt: nowFresh}
+	sess.healthMu.Unlock()
+
+	_ = conn.CloseNow()
+	if sess.conn != nil {
+		_ = sess.conn.CloseNow()
+	}
+	if err := hub.sendJobToSession(ctx, sess, contracts.PrintJobCommand{
+		JobID:          "job-c4-closed",
+		KioskID:        "kiosk-c4",
+		DownloadURL:    "https://cloud.test/doc.pdf",
+		SHA256Checksum: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		TotalPages:     1,
+		TotalSheets:    1,
+		Copies:         1,
+		Duplex:         contracts.DuplexSimplex,
+		StartFromPage:  1,
+	}); err == nil {
+		t.Fatal("sendJobToSession must return error when write fails on closed connection")
 	}
 }

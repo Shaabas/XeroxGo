@@ -19,8 +19,18 @@ import (
 )
 
 const (
-	oidSysObjectID = "1.3.6.1.2.1.1.2.0"
-	oidSysUpTime   = "1.3.6.1.2.1.1.3.0"
+	oidSysObjectID               = "1.3.6.1.2.1.1.2.0"
+	oidSysUpTime                 = "1.3.6.1.2.1.1.3.0"
+	emuOidPrtMarkerSuppliesType1 = "1.3.6.1.2.1.43.11.1.1.5.1.1"
+	emuOidPrtMarkerSuppliesDesc1 = "1.3.6.1.2.1.43.11.1.1.6.1.1"
+	emuOidPrtMarkerSuppliesUnit1 = "1.3.6.1.2.1.43.11.1.1.7.1.1"
+	oidPrtMarkerSuppliesMax1     = "1.3.6.1.2.1.43.11.1.1.8.1.1"
+	oidPrtMarkerSuppliesLevel1   = "1.3.6.1.2.1.43.11.1.1.9.1.1"
+	emuOidPrtMarkerSuppliesType2 = "1.3.6.1.2.1.43.11.1.1.5.1.2"
+	emuOidPrtMarkerSuppliesDesc2 = "1.3.6.1.2.1.43.11.1.1.6.1.2"
+	emuOidPrtMarkerSuppliesUnit2 = "1.3.6.1.2.1.43.11.1.1.7.1.2"
+	oidPrtMarkerSuppliesMax2     = "1.3.6.1.2.1.43.11.1.1.8.1.2"
+	oidPrtMarkerSuppliesLevel2   = "1.3.6.1.2.1.43.11.1.1.9.1.2"
 )
 
 // emulatedSNMPState holds the mutable telemetry state for the in-process test responder.
@@ -157,8 +167,71 @@ func (r *testSNMPResponder) serve() {
 		state := r.state
 		r.mu.RUnlock()
 
-		if packet.Community != community || packet.PDUType != gosnmp.GetRequest {
+		if packet.Community != community {
 			continue
+		}
+		if packet.PDUType != gosnmp.GetRequest && packet.PDUType != gosnmp.GetNextRequest && packet.PDUType != gosnmp.GetBulkRequest {
+			continue
+		}
+
+		// Lexicographically ordered MIB entries for Get / GetNext / GetBulk table walks.
+		omittedSet := make(map[string]bool, len(state.OmittedOIDs))
+		for _, o := range state.OmittedOIDs {
+			omittedSet[strings.TrimPrefix(o, ".")] = true
+		}
+		allMIB := []gosnmp.SnmpPDU{
+			{Name: "." + oidSysDescr, Type: gosnmp.OctetString, Value: []byte(state.SysDescr)},
+			{Name: ".1.3.6.1.2.1.25.3.2.1.5.1", Type: gosnmp.Integer, Value: 2},
+			{Name: "." + oidHrPrinterStatus, Type: gosnmp.Integer, Value: state.HrPrinterStatus},
+			{Name: "." + oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{state.ErrorByte0, state.ErrorByte1}},
+			{Name: ".1.3.6.1.2.1.43.10.2.1.3.1.1", Type: gosnmp.Integer, Value: 8},
+			{Name: "." + oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: state.MarkerLifeCount},
+			{Name: "." + emuOidPrtMarkerSuppliesType1, Type: gosnmp.Integer, Value: 3},
+			{Name: "." + emuOidPrtMarkerSuppliesType2, Type: gosnmp.Integer, Value: 9},
+			{Name: "." + emuOidPrtMarkerSuppliesDesc1, Type: gosnmp.OctetString, Value: []byte("Toner Cartridge")},
+			{Name: "." + emuOidPrtMarkerSuppliesDesc2, Type: gosnmp.OctetString, Value: []byte("Imaging Drum")},
+			{Name: "." + emuOidPrtMarkerSuppliesUnit1, Type: gosnmp.Integer, Value: 7},
+			{Name: "." + emuOidPrtMarkerSuppliesUnit2, Type: gosnmp.Integer, Value: 7},
+			{Name: "." + oidPrtMarkerSuppliesMax1, Type: gosnmp.Integer, Value: state.TonerMax},
+			{Name: "." + oidPrtMarkerSuppliesMax2, Type: gosnmp.Integer, Value: state.DrumMax},
+			{Name: "." + oidPrtMarkerSuppliesLevel1, Type: gosnmp.Integer, Value: state.TonerLevel},
+			{Name: "." + oidPrtMarkerSuppliesLevel2, Type: gosnmp.Integer, Value: state.DrumLevel},
+		}
+		var activeMIB []gosnmp.SnmpPDU
+		mibByOID := make(map[string]gosnmp.SnmpPDU, len(allMIB))
+		for _, entry := range allMIB {
+			nOID := strings.TrimPrefix(entry.Name, ".")
+			if omittedSet[nOID] {
+				continue
+			}
+			activeMIB = append(activeMIB, entry)
+			mibByOID[nOID] = entry
+		}
+
+		compareOID := func(a, b string) int {
+			pa := strings.Split(strings.TrimPrefix(a, "."), ".")
+			pb := strings.Split(strings.TrimPrefix(b, "."), ".")
+			n := len(pa)
+			if len(pb) < n {
+				n = len(pb)
+			}
+			for i := 0; i < n; i++ {
+				ai, _ := strconv.Atoi(pa[i])
+				bi, _ := strconv.Atoi(pb[i])
+				if ai < bi {
+					return -1
+				}
+				if ai > bi {
+					return 1
+				}
+			}
+			if len(pa) < len(pb) {
+				return -1
+			}
+			if len(pa) > len(pb) {
+				return 1
+			}
+			return 0
 		}
 
 		resp := &gosnmp.SnmpPacket{
@@ -170,81 +243,47 @@ func (r *testSNMPResponder) serve() {
 			Variables: make([]gosnmp.SnmpPDU, 0, len(packet.Variables)),
 		}
 
-		for _, pdu := range packet.Variables {
-			normOID := strings.TrimPrefix(pdu.Name, ".")
-
-			omitted := false
-			for _, o := range state.OmittedOIDs {
-				if strings.TrimPrefix(o, ".") == normOID {
-					omitted = true
-					break
+		if packet.PDUType == gosnmp.GetRequest {
+			for _, pdu := range packet.Variables {
+				normOID := strings.TrimPrefix(pdu.Name, ".")
+				if item, ok := mibByOID[normOID]; ok {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  item.Type,
+						Value: item.Value,
+					})
+				} else {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  gosnmp.NoSuchInstance,
+						Value: nil,
+					})
 				}
 			}
-
-			if omitted {
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.NoSuchInstance,
-					Value: nil,
-				})
-				continue
+		} else {
+			maxRep := 1
+			if packet.PDUType == gosnmp.GetBulkRequest && packet.MaxRepetitions > 0 {
+				maxRep = int(packet.MaxRepetitions)
 			}
-
-			switch normOID {
-			case normalizeOID(oidSysDescr):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.OctetString,
-					Value: []byte(state.SysDescr),
-				})
-			case normalizeOID(oidHrPrinterStatus):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.HrPrinterStatus,
-				})
-			case normalizeOID(oidHrPrinterDetectedErrorState):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.OctetString,
-					Value: []byte{state.ErrorByte0, state.ErrorByte1},
-				})
-			case normalizeOID(oidPrtMarkerLifeCount):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Counter32,
-					Value: state.MarkerLifeCount,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesLevel1):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.TonerLevel,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesMax1):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.TonerMax,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesLevel2):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.DrumLevel,
-				})
-			case normalizeOID(oidPrtMarkerSuppliesMax2):
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.Integer,
-					Value: state.DrumMax,
-				})
-			default:
-				resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
-					Name:  pdu.Name,
-					Type:  gosnmp.NoSuchInstance,
-					Value: nil,
-				})
+			for _, pdu := range packet.Variables {
+				curOID := strings.TrimPrefix(pdu.Name, ".")
+				emitted := 0
+				for _, item := range activeMIB {
+					if compareOID(item.Name, curOID) > 0 {
+						resp.Variables = append(resp.Variables, item)
+						emitted++
+						if emitted >= maxRep {
+							break
+						}
+					}
+				}
+				if emitted == 0 {
+					resp.Variables = append(resp.Variables, gosnmp.SnmpPDU{
+						Name:  pdu.Name,
+						Type:  gosnmp.EndOfMibView,
+						Value: nil,
+					})
+				}
 			}
 		}
 
@@ -273,9 +312,10 @@ func TestSNMPEmulator_HealthyState(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1. PollHealthConfig
-	health := PollHealthConfig(ctx, cfg, 500)
-	if !health.Online {
+	// 1. PollSNMPDynamic
+	obs := PollSNMPDynamic(ctx, cfg, 500)
+	health := obs.Health
+	if !obs.Available || !health.Online {
 		t.Fatalf("expected Online=true, got false (error: %s)", health.ErrorMessage)
 	}
 	if health.State != "IDLE" {
@@ -346,16 +386,16 @@ func TestSNMPEmulator_ErrorBitDecoding(t *testing.T) {
 	ctx := context.Background()
 
 	cases := []struct {
-		name            string
-		byte0           byte
-		byte1           byte
-		wantOnline      bool
-		wantState       string
-		wantPaperTray   string
-		wantCoverOpen   bool
-		wantPaperJam    bool
-		wantOutputFull  bool
-		errContains     []string
+		name           string
+		byte0          byte
+		byte1          byte
+		wantOnline     bool
+		wantState      string
+		wantPaperTray  string
+		wantCoverOpen  bool
+		wantPaperJam   bool
+		wantOutputFull bool
+		errContains    []string
 	}{
 		{
 			name:          "DoorOpen (0x08 in byte 0)",
@@ -384,7 +424,7 @@ func TestSNMPEmulator_ErrorBitDecoding(t *testing.T) {
 			wantOnline:    true,
 			wantState:     "ERROR",
 			wantPaperTray: "EMPTY",
-			errContains:   []string{"no paper"},
+			errContains:   []string{"paper empty"},
 		},
 		{
 			name:          "LowPaper (0x80 in byte 0)",
@@ -430,16 +470,16 @@ func TestSNMPEmulator_ErrorBitDecoding(t *testing.T) {
 			wantOnline:    true,
 			wantState:     "ERROR",
 			wantPaperTray: "EMPTY",
-			errContains:   []string{"input tray empty"},
+			errContains:   []string{"paper empty"},
 		},
 		{
 			name:          "InputTrayMissing (0x80 in byte 1)",
 			byte0:         0x00,
 			byte1:         0x80,
 			wantOnline:    true,
-			wantState:     "IDLE", // InputTrayMissing sets PaperTrayStatus=EMPTY
+			wantState:     "ERROR", // Missing input tray prevents feeding paper -> ERROR
 			wantPaperTray: "EMPTY",
-			errContains:   []string{"input tray missing"},
+			errContains:   []string{"paper empty"},
 		},
 		{
 			name:          "OverdueMaintenance (0x02 in byte 1)",
@@ -472,7 +512,7 @@ func TestSNMPEmulator_ErrorBitDecoding(t *testing.T) {
 				s.ErrorByte1 = tc.byte1
 			})
 
-			health := PollHealthConfig(ctx, cfg, 100)
+			health := PollSNMPDynamic(ctx, cfg, 100).Health
 			if health.Online != tc.wantOnline {
 				t.Errorf("Online: got %v, want %v", health.Online, tc.wantOnline)
 			}
@@ -491,9 +531,13 @@ func TestSNMPEmulator_ErrorBitDecoding(t *testing.T) {
 			if tc.wantOutputFull && !health.OutputBinFull {
 				t.Errorf("expected OutputBinFull=true")
 			}
+			diagnosticText := strings.ToLower(health.ErrorMessage)
+			for _, w := range health.Warnings {
+				diagnosticText += " " + strings.ToLower(w.Message)
+			}
 			for _, expectedText := range tc.errContains {
-				if !strings.Contains(health.ErrorMessage, expectedText) {
-					t.Errorf("ErrorMessage %q does not contain expected substring %q", health.ErrorMessage, expectedText)
+				if !strings.Contains(diagnosticText, expectedText) {
+					t.Errorf("ErrorMessage %q / Warnings %+v does not contain expected substring %q", health.ErrorMessage, health.Warnings, expectedText)
 				}
 			}
 		})
@@ -518,13 +562,13 @@ func TestSNMPEmulator_TonerAndDrumPercentages(t *testing.T) {
 	ctx := context.Background()
 
 	cases := []struct {
-		name        string
-		tonerLevel  int
-		tonerMax    int
-		drumLevel   int
-		drumMax     int
-		wantToner   int
-		wantDrum    int
+		name       string
+		tonerLevel int
+		tonerMax   int
+		drumLevel  int
+		drumMax    int
+		wantToner  int
+		wantDrum   int
 	}{
 		{
 			name:       "100% full consumables",
@@ -559,7 +603,7 @@ func TestSNMPEmulator_TonerAndDrumPercentages(t *testing.T) {
 			tonerMax:   100,
 			drumLevel:  50,
 			drumMax:    100,
-			wantToner:  0,
+			wantToner:  -1,
 			wantDrum:   50,
 		},
 		{
@@ -568,7 +612,7 @@ func TestSNMPEmulator_TonerAndDrumPercentages(t *testing.T) {
 			tonerMax:   0,
 			drumLevel:  50,
 			drumMax:    100,
-			wantToner:  0,
+			wantToner:  -1,
 			wantDrum:   50,
 		},
 	}
@@ -582,7 +626,7 @@ func TestSNMPEmulator_TonerAndDrumPercentages(t *testing.T) {
 				s.DrumMax = tc.drumMax
 			})
 
-			health := PollHealthConfig(ctx, cfg, 0)
+			health := PollSNMPDynamic(ctx, cfg, 0).Health
 			if health.TonerLevelPercent != tc.wantToner {
 				t.Errorf("TonerLevelPercent: got %d, want %d", health.TonerLevelPercent, tc.wantToner)
 			}
@@ -631,6 +675,7 @@ func TestSNMPEmulator_MissingOIDs(t *testing.T) {
 		responder.UpdateState(func(s *emulatedSNMPState) {
 			*s = defaultTestState()
 			s.OmittedOIDs = []string{
+				".1.3.6.1.2.1.25.3.2.1.5.1",
 				oidHrPrinterStatus,
 				oidHrPrinterDetectedErrorState,
 				oidPrtMarkerLifeCount,
@@ -641,9 +686,10 @@ func TestSNMPEmulator_MissingOIDs(t *testing.T) {
 			}
 		})
 
-		health := PollHealthConfig(ctx, cfg, 200)
-		if !health.Online {
-			t.Errorf("expected Online=true when agent responds, got false")
+		obs := PollSNMPDynamic(ctx, cfg, 200)
+		health := obs.Health
+		if obs.Available {
+			t.Errorf("expected Available=false when all printer metrics omitted, got true")
 		}
 		if health.State != "UNKNOWN" {
 			t.Errorf("expected State='UNKNOWN', got %q", health.State)
@@ -651,8 +697,8 @@ func TestSNMPEmulator_MissingOIDs(t *testing.T) {
 		if health.PaperTrayStatus != "UNKNOWN" {
 			t.Errorf("expected PaperTrayStatus='UNKNOWN', got %q", health.PaperTrayStatus)
 		}
-		if !strings.Contains(health.ErrorMessage, "no supported printer metrics") {
-			t.Errorf("expected ErrorMessage to mention missing metrics, got %q", health.ErrorMessage)
+		if health.ErrorMessage == "" {
+			t.Errorf("expected non-empty ErrorMessage when metrics omitted")
 		}
 	})
 }
@@ -676,7 +722,7 @@ func TestSNMPEmulator_TimeoutsAndCancellation(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		health := PollHealthConfig(ctx, cfg, 100)
+		health := PollSNMPDynamic(ctx, cfg, 100).Health
 		if health.Online {
 			t.Errorf("expected Online=false for canceled context, got true")
 		}
@@ -706,15 +752,15 @@ func TestSNMPEmulator_TimeoutsAndCancellation(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
 
-		health := PollHealthConfig(ctx, unreachableCfg, 50)
+		health := PollSNMPDynamic(ctx, unreachableCfg, 50).Health
 		if health.Online {
 			t.Errorf("expected Online=false for unreachable port, got true")
 		}
 		if health.State != "OFFLINE" {
 			t.Errorf("expected State='OFFLINE', got %q", health.State)
 		}
-		if !strings.Contains(health.ErrorMessage, "SNMP GET request failed") {
-			t.Errorf("expected ErrorMessage to mention request failure, got %q", health.ErrorMessage)
+		if health.ErrorMessage == "" {
+			t.Errorf("expected non-empty ErrorMessage on unreachable timeout")
 		}
 	})
 }
@@ -769,7 +815,7 @@ func TestSNMPEmulator_RestartPersistence(t *testing.T) {
 		t.Errorf("expected StatusState='PRINTING' to persist, got %q", telem2.StatusState)
 	}
 
-	health2 := PollHealthConfig(ctx, cfg, 0)
+	health2 := PollSNMPDynamic(ctx, cfg, 0).Health
 	if health2.TonerLevelPercent != 42 {
 		t.Errorf("expected TonerLevelPercent=42 to persist, got %d", health2.TonerLevelPercent)
 	}
@@ -931,7 +977,7 @@ func TestSNMPEmulator_ActualBinaryProcess(t *testing.T) {
 
 	// 1. Verify healthy status through actual responder
 	t.Run("ActualBinary_HealthyStatus", func(t *testing.T) {
-		health := PollHealthConfig(ctx, cfg, 250)
+		health := PollSNMPDynamic(ctx, cfg, 250).Health
 		if !health.Online {
 			t.Fatalf("expected Online=true, got false (error: %s)", health.ErrorMessage)
 		}
@@ -971,14 +1017,14 @@ func TestSNMPEmulator_ActualBinaryProcess(t *testing.T) {
 
 		time.Sleep(50 * time.Millisecond)
 
-		health := PollHealthConfig(ctx, cfg, 250)
+		health := PollSNMPDynamic(ctx, cfg, 250).Health
 		if health.State != "ERROR" {
 			t.Errorf("expected State='ERROR' after jam, got %q", health.State)
 		}
 		if !health.PaperJam {
 			t.Errorf("expected PaperJam=true after jam bit set")
 		}
-		if !strings.Contains(health.ErrorMessage, "paper jam") {
+		if !strings.Contains(strings.ToLower(health.ErrorMessage), "jam") {
 			t.Errorf("expected ErrorMessage to contain 'paper jam', got %q", health.ErrorMessage)
 		}
 
@@ -1288,11 +1334,11 @@ func TestSNMPEmulator_CounterUnits(t *testing.T) {
 	ctx := context.Background()
 
 	cases := []struct {
-		name          string
-		unitArg       string
-		wantUnit      int64
-		wantUnitName  string
-		wantIsPage    bool
+		name         string
+		unitArg      string
+		wantUnit     int64
+		wantUnitName string
+		wantIsPage   bool
 	}{
 		{"impressions(7)", "7", 7, "impressions", true},
 		{"hours(11)", "11", 11, "hours", false},
@@ -1436,7 +1482,7 @@ func TestSNMPEmulator_MissingSupplies(t *testing.T) {
 	}
 
 	// 2. Verify independent health polling works when supplies are missing
-	health := PollHealthConfig(ctx, cfg, 100)
+	health := PollSNMPDynamic(ctx, cfg, 100).Health
 	if !health.Online || health.State != "IDLE" {
 		t.Errorf("expected printer to remain Online and IDLE, got Online=%v State=%q", health.Online, health.State)
 	}

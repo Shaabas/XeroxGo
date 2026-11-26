@@ -369,6 +369,77 @@ func TestCanonicalEvaluator_HPTank1020wRecordedFixture(t *testing.T) {
 	}
 }
 
+func TestCanonicalHealth_StaggeredSourcesAndValidityOverrides(t *testing.T) {
+	now := time.Now().UTC()
+	cupsTrue := true
+	snmpTrue := true
+
+	t.Run("staggered oldest observation expires at 6s regardless of newer sources", func(t *testing.T) {
+		oldestSNMP := now.Add(-5900 * time.Millisecond)
+		cupsObs := contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: now}
+		ippObs := IPPPrinterStateResult{
+			Source: CapabilitySourceNativeIPP, Queue: "HPTank", TargetURI: "ipp://10.42.0.210:631/ipp/print",
+			State: IPPPrinterStateIdle, AcceptingJobs: AcceptingJobsAccepting,
+			EndpointReachable: true, QueueAccessible: true, ObservedAt: now.Add(-1 * time.Second),
+		}
+		snmpObs := SNMPObservation{
+			Available: true, ObservedAt: oldestSNMP, DeviceStatus: 2, PrinterStatus: 3, HasErrorFlags: true,
+			Health: contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", TonerLevelPercent: 80, TonerLevelKnown: true, DrumLifePercent: -1},
+		}
+
+		resNearExpiry := EvaluateCanonicalPrinterHealth(CanonicalHealthInput{
+			CUPS:             cupsObs,
+			CUPSValid:        &cupsTrue,
+			CUPSQueried:      true,
+			IPP:              ippObs,
+			RequireNativeIPP: true,
+			SNMP:             snmpObs,
+			SNMPQueried:      true,
+			RequireSNMP:      true,
+			RequireIPP:       true,
+			RequireCUPS:      true,
+			EvalTime:         now,
+			MaxSourceAge:     DefaultMaxSourceAge,
+		})
+		if resNearExpiry.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !resNearExpiry.IsReady() {
+			t.Fatalf("expected healthy at 5.9s oldest source age, got %s unknown=%v", resNearExpiry.EvaluatedHealth, resNearExpiry.UnknownConditions)
+		}
+		contractH := resNearExpiry.ToContract(100, true, true, "")
+		if !contractH.UpdatedAt.Equal(oldestSNMP) {
+			t.Fatalf("expected UpdatedAt anchored to oldest required source (%v), got %v", oldestSNMP, contractH.UpdatedAt)
+		}
+		if ok, reason := contracts.ValidateReadyHealth(contractH, now.Add(200*time.Millisecond), contracts.DefaultTelemetryMaxAge); ok {
+			t.Fatalf("expected contract health to expire once oldest staggered source passes 6s (reason=%q)", reason)
+		}
+	})
+
+	t.Run("CUPSValid and SNMPValid overrides never bypass zero or stale timestamps", func(t *testing.T) {
+		ippObs := IPPPrinterStateResult{
+			Source: CapabilitySourceNativeIPP, Queue: "HPTank", TargetURI: "ipp://10.42.0.210:631/ipp/print",
+			State: IPPPrinterStateIdle, AcceptingJobs: AcceptingJobsAccepting,
+			EndpointReachable: true, QueueAccessible: true, ObservedAt: now,
+		}
+		resZero := EvaluateCanonicalPrinterHealth(CanonicalHealthInput{
+			CUPS:             contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK"}, // zero UpdatedAt
+			CUPSValid:        &cupsTrue,
+			CUPSQueried:      true,
+			IPP:              ippObs,
+			RequireNativeIPP: true,
+			SNMP:             SNMPObservation{Available: true, DeviceStatus: 2, PrinterStatus: 3, HasErrorFlags: true}, // zero ObservedAt
+			SNMPValid:        &snmpTrue,
+			SNMPQueried:      true,
+			RequireSNMP:      true,
+			RequireIPP:       true,
+			RequireCUPS:      true,
+			EvalTime:         now,
+			MaxSourceAge:     DefaultMaxSourceAge,
+		})
+		if resZero.EvaluatedHealth != contracts.EvaluatedHealthUnverified || resZero.IsReady() {
+			t.Fatalf("expected zero timestamps with validity overrides to be UNVERIFIED, got %s", resZero.EvaluatedHealth)
+		}
+	})
+}
+
 func TestCanonicalFingerprint_ReusesCanonicalReaders(t *testing.T) {
 	ctx := context.Background()
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {

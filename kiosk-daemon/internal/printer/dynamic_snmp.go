@@ -31,6 +31,7 @@ type DynamicSNMPSession interface {
 // RealDynamicSNMPSession implements DynamicSNMPSession using *gosnmp.GoSNMP.
 type RealDynamicSNMPSession struct {
 	client *gosnmp.GoSNMP
+	stop   context.CancelFunc
 }
 
 func (s *RealDynamicSNMPSession) Get(oids []string) (*gosnmp.SnmpPacket, error) {
@@ -42,6 +43,9 @@ func (s *RealDynamicSNMPSession) Walk(rootOid string, walkFn gosnmp.WalkFunc) er
 }
 
 func (s *RealDynamicSNMPSession) Close() error {
+	if s.stop != nil {
+		s.stop()
+	}
 	if s.client != nil && s.client.Conn != nil {
 		return s.client.Conn.Close()
 	}
@@ -50,6 +54,12 @@ func (s *RealDynamicSNMPSession) Close() error {
 
 // NewRealDynamicSNMPSession creates a real GoSNMP session using SNMPv2c.
 func NewRealDynamicSNMPSession(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	target := cfg.Target
 	if target == "" {
 		target = defaultTarget
@@ -85,7 +95,17 @@ func NewRealDynamicSNMPSession(ctx context.Context, cfg SNMPConfig) (DynamicSNMP
 		return nil, fmt.Errorf("failed to connect to printer at %s:%d: %w", target, port, err)
 	}
 
-	return &RealDynamicSNMPSession{client: client}, nil
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	conn := client.Conn
+	if conn != nil {
+		go func() {
+			<-watchCtx.Done()
+			// Unblock pending UDP read/write immediately on context cancellation without racing on client.Conn.
+			_ = conn.SetDeadline(time.Now())
+		}()
+	}
+
+	return &RealDynamicSNMPSession{client: client, stop: stopWatch}, nil
 }
 
 // SNMPPrinterDevice represents an entry from RFC 2790 hrPrinterTable and hrDeviceTable.
@@ -197,6 +217,11 @@ func DiscoverSNMPDynamic(ctx context.Context, session DynamicSNMPSession, host s
 	}
 
 	// 1. Query System Group scalar OIDs (sysDescr, sysObjectID, sysUpTime)
+	if err := ctx.Err(); err != nil {
+		res.DiscoveryMode = "SNMP_OFFLINE"
+		res.ProbeError = err.Error()
+		return res, err
+	}
 	sysOIDs := []string{
 		"1.3.6.1.2.1.1.1.0", // sysDescr
 		"1.3.6.1.2.1.1.2.0", // sysObjectID
@@ -221,6 +246,12 @@ func DiscoverSNMPDynamic(ctx context.Context, session DynamicSNMPSession, host s
 				}
 			}
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		res.DiscoveryMode = "SNMP_OFFLINE"
+		res.ProbeError = err.Error()
+		return res, err
 	}
 
 	// 2. Dynamic Table Walks
@@ -853,10 +884,10 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 		oidHrPrinterStatus,             // 1.3.6.1.2.1.25.3.5.1.1.1
 		oidHrPrinterDetectedErrorState, // 1.3.6.1.2.1.25.3.5.1.2.1
 		oidPrtMarkerLifeCount,          // 1.3.6.1.2.1.43.10.2.1.4.1.1
-		oidPrtMarkerSuppliesLevel1,     // 1.3.6.1.2.1.43.11.1.1.9.1.1
-		oidPrtMarkerSuppliesMax1,       // 1.3.6.1.2.1.43.11.1.1.8.1.1
-		oidPrtMarkerSuppliesLevel2,     // 1.3.6.1.2.1.43.11.1.1.9.1.2
-		oidPrtMarkerSuppliesMax2,       // 1.3.6.1.2.1.43.11.1.1.8.1.2
+		"1.3.6.1.2.1.43.11.1.1.9.1.1",  // fallback prtMarkerSuppliesLevel.1.1
+		"1.3.6.1.2.1.43.11.1.1.8.1.1",  // fallback prtMarkerSuppliesMaxCapacity.1.1
+		"1.3.6.1.2.1.43.11.1.1.9.1.2",  // fallback prtMarkerSuppliesLevel.1.2
+		"1.3.6.1.2.1.43.11.1.1.8.1.2",  // fallback prtMarkerSuppliesMaxCapacity.1.2
 	}
 
 	packet, err := session.Get(oids)
@@ -992,12 +1023,12 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 	}
 
 	var tonerLevel, tonerMax int64 = -2, -2
-	if pdu, ok := findPDU(packet, oidPrtMarkerSuppliesLevel1, -1); ok && isValidPDU(pdu) {
+	if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.9.1.1", -1); ok && isValidPDU(pdu) {
 		if v, ok := pduToInt64(pdu); ok {
 			tonerLevel = v
 		}
 	}
-	if pdu, ok := findPDU(packet, oidPrtMarkerSuppliesMax1, -1); ok && isValidPDU(pdu) {
+	if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.8.1.1", -1); ok && isValidPDU(pdu) {
 		if v, ok := pduToInt64(pdu); ok {
 			tonerMax = v
 		}
@@ -1021,12 +1052,12 @@ func querySNMPStandardFallback(session DynamicSNMPSession) (*SNMPProbeResult, er
 	}
 
 	var drumLevel, drumMax int64 = -2, -2
-	if pdu, ok := findPDU(packet, oidPrtMarkerSuppliesLevel2, -1); ok && isValidPDU(pdu) {
+	if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.9.1.2", -1); ok && isValidPDU(pdu) {
 		if v, ok := pduToInt64(pdu); ok {
 			drumLevel = v
 		}
 	}
-	if pdu, ok := findPDU(packet, oidPrtMarkerSuppliesMax2, -1); ok && isValidPDU(pdu) {
+	if pdu, ok := findPDU(packet, "1.3.6.1.2.1.43.11.1.1.8.1.2", -1); ok && isValidPDU(pdu) {
 		if v, ok := pduToInt64(pdu); ok {
 			drumMax = v
 		}

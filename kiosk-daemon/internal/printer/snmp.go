@@ -22,28 +22,11 @@ const (
 	// RFC 1213 / RFC 3418 MIB-II
 	oidSysDescr = "1.3.6.1.2.1.1.1.0"
 
-	// RFC 2790 Host Resources MIB
+	// RFC 2790 / RFC 3805 OIDs used for job-level odometer and fallback hardware telemetry queries
 	oidHrPrinterStatus             = "1.3.6.1.2.1.25.3.5.1.1.1"
 	oidHrPrinterDetectedErrorState = "1.3.6.1.2.1.25.3.5.1.2.1"
-
-	// RFC 3805 / RFC 1759 Printer MIB
-	oidPrtMarkerLifeCount      = "1.3.6.1.2.1.43.10.2.1.4.1.1"
-	oidPrtMarkerSuppliesLevel1 = "1.3.6.1.2.1.43.11.1.1.9.1.1" // Supply 1 (toner) level
-	oidPrtMarkerSuppliesMax1   = "1.3.6.1.2.1.43.11.1.1.8.1.1" // Supply 1 (toner) max capacity
-	oidPrtMarkerSuppliesLevel2 = "1.3.6.1.2.1.43.11.1.1.9.1.2" // Supply 2 (drum/waste) level
-	oidPrtMarkerSuppliesMax2   = "1.3.6.1.2.1.43.11.1.1.8.1.2" // Supply 2 (drum/waste) max capacity
+	oidPrtMarkerLifeCount          = "1.3.6.1.2.1.43.10.2.1.4.1.1"
 )
-
-// queriedOIDs contains the standard Host-Resources-MIB and Printer-MIB OIDs queried for health.
-var queriedOIDs = []string{
-	oidHrPrinterStatus,
-	oidHrPrinterDetectedErrorState,
-	oidPrtMarkerLifeCount,
-	oidPrtMarkerSuppliesLevel1,
-	oidPrtMarkerSuppliesMax1,
-	oidPrtMarkerSuppliesLevel2,
-	oidPrtMarkerSuppliesMax2,
-}
 
 // SNMPConfig encapsulates SNMP connection parameters.
 type SNMPConfig struct {
@@ -114,90 +97,6 @@ func DecodeErrorBitmask(raw []byte) PrinterErrorFlags {
 	return flags
 }
 
-type snmpSession interface {
-	Get(oids []string) (*gosnmp.SnmpPacket, error)
-	Close() error
-}
-
-type realSnmpSession struct {
-	client *gosnmp.GoSNMP
-}
-
-func (s *realSnmpSession) Get(oids []string) (*gosnmp.SnmpPacket, error) {
-	return s.client.Get(oids)
-}
-
-func (s *realSnmpSession) Close() error {
-	if s.client != nil && s.client.Conn != nil {
-		return s.client.Conn.Close()
-	}
-	return nil
-}
-
-type sessionFactory func(ctx context.Context) (snmpSession, error)
-
-func realSessionFactoryWithConfig(cfg SNMPConfig) sessionFactory {
-	return func(ctx context.Context) (snmpSession, error) {
-		target := cfg.Target
-		if target == "" {
-			target = defaultTarget
-		}
-		port := uint16(cfg.Port)
-		if port == 0 {
-			port = defaultPort
-		}
-		community := cfg.Community
-		if community == "" {
-			community = defaultCommunity
-		}
-		timeout := cfg.Timeout
-		if timeout <= 0 {
-			timeout = defaultTimeout
-		}
-		retries := cfg.Retries
-		if retries < 0 {
-			retries = 0
-		}
-
-		client := &gosnmp.GoSNMP{
-			Target:    target,
-			Port:      port,
-			Community: community,
-			Version:   gosnmp.Version2c,
-			Timeout:   timeout,
-			Retries:   retries,
-			Context:   ctx,
-		}
-
-		if err := client.Connect(); err != nil {
-			return nil, fmt.Errorf("failed to connect to printer at %s:%d: %w", target, port, err)
-		}
-
-		return &realSnmpSession{client: client}, nil
-	}
-}
-
-func realSessionFactoryWithTarget(target string) sessionFactory {
-	cfg := DefaultSNMPConfig()
-	cfg.Target = target
-	return realSessionFactoryWithConfig(cfg)
-}
-
-func realSessionFactory(ctx context.Context) (snmpSession, error) {
-	return realSessionFactoryWithTarget(defaultTarget)(ctx)
-}
-
-func offlineHealth(estimatedSheets int, errMsg string) contracts.PrinterHealth {
-	return contracts.PrinterHealth{
-		Online:          false,
-		State:           "OFFLINE",
-		PaperTrayStatus: "UNKNOWN",
-		EstimatedSheets: estimatedSheets,
-		ErrorMessage:    errMsg,
-		UpdatedAt:       time.Now().UTC(),
-	}
-}
-
 func normalizeOID(oid string) string {
 	return strings.TrimPrefix(oid, ".")
 }
@@ -252,301 +151,13 @@ func pduToInt64(pdu gosnmp.SnmpPDU) (int64, bool) {
 	}
 }
 
-// calcSupplyPercentage calculates remaining percentage following RFC 3805 semantics:
-// Level: >= 0 (valid units), -1 (other), -2 (unknown), -3 (some remaining).
-// MaxCapacity: > 0 (valid units), -1 (other), -2 (unknown).
-// Only returns valid when maxCap > 0 and level >= 0.
-func calcSupplyPercentage(pduLevel, pduMax gosnmp.SnmpPDU) (int, bool) {
-	if !isValidPDU(pduLevel) || !isValidPDU(pduMax) {
-		return 0, false
-	}
-	level, okL := pduToInt64(pduLevel)
-	maxCap, okM := pduToInt64(pduMax)
-	if !okL || !okM {
-		return 0, false
-	}
-	if maxCap <= 0 || level < 0 {
-		return 0, false
-	}
-	pct := int((level * 100) / maxCap)
-	if pct > 100 {
-		pct = 100
-	}
-	if pct < 0 {
-		pct = 0
-	}
-	return pct, true
-}
-
-func pollHealthWithFactory(
-	ctx context.Context,
-	estimatedSheets int,
-	factory sessionFactory,
-) contracts.PrinterHealth {
-	if ctx == nil {
-		return offlineHealth(estimatedSheets, "context cannot be nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return offlineHealth(estimatedSheets, fmt.Sprintf("context canceled: %v", err))
-	}
-
-	session, err := factory(ctx)
-	if err != nil {
-		return offlineHealth(estimatedSheets, fmt.Sprintf("SNMP connection failed: %v", err))
-	}
-	defer session.Close()
-
-	packet, err := session.Get(queriedOIDs)
-	if err != nil {
-		return offlineHealth(estimatedSheets, fmt.Sprintf("SNMP GET request failed: %v", err))
-	}
-	if packet == nil {
-		return offlineHealth(estimatedSheets, "SNMP response was nil")
-	}
-
-	// In SNMPv1 or strict agents, querying unsupported OIDs can return NoSuchName at packet level.
-	// Fall back to essential Host-Resources-MIB OIDs if that occurs.
-	if packet.Error == gosnmp.NoSuchName {
-		essentialOIDs := []string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState}
-		fallbackPacket, fallbackErr := session.Get(essentialOIDs)
-		if fallbackErr == nil && fallbackPacket != nil && fallbackPacket.Error == gosnmp.NoError {
-			packet = fallbackPacket
-		} else {
-			return offlineHealth(estimatedSheets, fmt.Sprintf("SNMP error status in response: %v (index %d)", packet.Error, packet.ErrorIndex))
-		}
-	} else if packet.Error != gosnmp.NoError {
-		return offlineHealth(estimatedSheets, fmt.Sprintf("SNMP error status in response: %v (index %d)", packet.Error, packet.ErrorIndex))
-	}
-
-	// 1. hrPrinterStatus (1.3.6.1.2.1.25.3.5.1.1.1)
-	// RFC 2790: 1=other, 2=unknown, 3=idle, 4=printing, 5=warmup
-	statusState := "UNKNOWN"
-	statusFound := false
-	var statusVal int
-
-	pduStatus, okStatus := findPDU(packet, oidHrPrinterStatus, 0)
-	if okStatus && isValidPDU(pduStatus) {
-		if v, okVal := pduToInt64(pduStatus); okVal {
-			statusVal = int(v)
-			statusFound = true
-			switch statusVal {
-			case 1, 2:
-				statusState = "UNKNOWN"
-			case 3:
-				statusState = "IDLE"
-			case 4:
-				statusState = "PRINTING"
-			case 5:
-				statusState = "WARMING_UP"
-			case 6:
-				statusState = "ERROR"
-			case 7:
-				statusState = "OFFLINE"
-			default:
-				statusState = "UNKNOWN"
-			}
-		}
-	}
-
-	// 2. hrPrinterDetectedErrorState (1.3.6.1.2.1.25.3.5.1.2.1)
-	var flags PrinterErrorFlags
-	errorFlagsFound := false
-	pduErrorState, okErr := findPDU(packet, oidHrPrinterDetectedErrorState, 1)
-	if okErr && isValidPDU(pduErrorState) {
-		var rawBytes []byte
-		switch v := pduErrorState.Value.(type) {
-		case []byte:
-			rawBytes = v
-		case string:
-			rawBytes = []byte(v)
-		}
-		if len(rawBytes) > 0 {
-			flags = DecodeErrorBitmask(rawBytes)
-			errorFlagsFound = true
-		}
-	}
-
-	// 3. prtMarkerLifeCount (1.3.6.1.2.1.43.10.2.1.4.1.1)
-	markerFound := false
-	pduMarkerLife, okMarker := findPDU(packet, oidPrtMarkerLifeCount, 2)
-	if okMarker && isValidPDU(pduMarkerLife) {
-		if _, okVal := pduToInt64(pduMarkerLife); okVal {
-			markerFound = true
-		}
-	}
-
-	// 4. prtMarkerSuppliesLevel & MaxCapacity (Supply 1 - Toner)
-	tonerPercent := 0
-	tonerKnown := false
-	pduTonerLevel, okTL := findPDU(packet, oidPrtMarkerSuppliesLevel1, 3)
-	pduTonerMax, okTM := findPDU(packet, oidPrtMarkerSuppliesMax1, 4)
-	if okTL && okTM {
-		if pct, valid := calcSupplyPercentage(pduTonerLevel, pduTonerMax); valid {
-			tonerPercent = pct
-			tonerKnown = true
-		}
-	}
-
-	// 5. prtMarkerSuppliesLevel & MaxCapacity (Supply 2 - Drum Unit)
-	drumPercent := 0
-	drumKnown := false
-	pduDrumLevel, okDL := findPDU(packet, oidPrtMarkerSuppliesLevel2, 5)
-	pduDrumMax, okDM := findPDU(packet, oidPrtMarkerSuppliesMax2, 6)
-	if okDL && okDM {
-		if pct, valid := calcSupplyPercentage(pduDrumLevel, pduDrumMax); valid {
-			drumPercent = pct
-			drumKnown = true
-		}
-	}
-
-	// Distinguish actual communication failure from missing individual metrics.
-	// If the SNMP agent responded but returned zero recognizable metrics, report UNKNOWN.
-	if !statusFound && !errorFlagsFound && !markerFound && !tonerKnown && !drumKnown {
-		return contracts.PrinterHealth{
-			Online:             true,
-			State:              "UNKNOWN",
-			PaperTrayStatus:    "UNKNOWN",
-			EstimatedSheets:    estimatedSheets,
-			TonerLevelPercent:  0,
-			TonerLevelKnown:    false,
-			DrumLifePercent:    0,
-			DrumLifeKnown:      false,
-			InputTrayLevel:     -1,
-			InputTrayCapacity:  -1,
-			CoverOpen:          false,
-			PaperJam:           false,
-			OutputBinFull:      false,
-			ErrorMessage:       "SNMP responded but returned no supported printer metrics",
-			UpdatedAt:          time.Now().UTC(),
-		}
-	}
-
-	// PaperTrayStatus resolution
-	paperTrayStatus := "OK"
-	if flags.NoPaper || flags.InputTrayEmpty || flags.InputTrayMissing {
-		paperTrayStatus = "EMPTY"
-	} else if flags.LowPaper {
-		paperTrayStatus = "LOW"
-	}
-
-	// Online and State mapping
-	isOffline := (statusState == "OFFLINE") || flags.Offline
-	var online bool
-	var finalState string
-
-	if isOffline {
-		online = false
-		finalState = "OFFLINE"
-	} else {
-		online = true
-		if flags.DoorOpen || flags.Jammed || flags.OutputFull || flags.NoPaper || flags.NoToner || flags.InputTrayEmpty || flags.ServiceRequested {
-			finalState = "ERROR"
-		} else {
-			finalState = statusState
-		}
-	}
-
-	// Formulation of descriptive ErrorMessage
-	var issues []string
-	if isOffline {
-		issues = append(issues, "printer offline")
-	}
-	if flags.DoorOpen {
-		issues = append(issues, "door open")
-	}
-	if flags.Jammed {
-		issues = append(issues, "paper jam")
-	}
-	if flags.OutputFull {
-		issues = append(issues, "output bin full")
-	} else if flags.OutputNearFull {
-		issues = append(issues, "output bin near full")
-	}
-	if flags.NoPaper {
-		issues = append(issues, "no paper")
-	} else if flags.InputTrayEmpty {
-		issues = append(issues, "input tray empty")
-	} else if flags.InputTrayMissing {
-		issues = append(issues, "input tray missing")
-	} else if flags.LowPaper {
-		issues = append(issues, "low paper")
-	}
-	if flags.NoToner {
-		issues = append(issues, "no toner")
-	} else if flags.LowToner {
-		issues = append(issues, "low toner")
-	}
-	if flags.MarkerSupplyMissing {
-		issues = append(issues, "marker supply missing")
-	}
-	if flags.ServiceRequested {
-		issues = append(issues, "service requested")
-	}
-	if flags.OverduePreventMaint {
-		issues = append(issues, "maintenance overdue")
-	}
-
-	if finalState == "ERROR" && len(issues) == 0 {
-		if statusVal == 6 {
-			issues = append(issues, "printer error")
-		} else {
-			issues = append(issues, "unrecognized printer error")
-		}
-	} else if finalState == "UNKNOWN" && len(issues) == 0 && statusFound {
-		issues = append(issues, fmt.Sprintf("unrecognized printer status: %d", statusVal))
-	}
-
-	errorMsg := strings.Join(issues, ", ")
-
-	return contracts.PrinterHealth{
-		Online:            online,
-		State:             finalState,
-		PaperTrayStatus:   paperTrayStatus,
-		EstimatedSheets:   estimatedSheets,
-		TonerLevelPercent: tonerPercent,
-		TonerLevelKnown:   tonerKnown,
-		DrumLifePercent:   drumPercent,
-		DrumLifeKnown:     drumKnown,
-		InputTrayLevel:    -1,
-		InputTrayCapacity: -1,
-		CoverOpen:         flags.DoorOpen,
-		PaperJam:          flags.Jammed,
-		OutputBinFull:     flags.OutputFull,
-		ErrorMessage:      errorMsg,
-		UpdatedAt:         time.Now().UTC(),
-	}
-}
-
-// PollHealthConfig polls printer hardware health over SNMP with the provided configuration.
-func PollHealthConfig(
-	ctx context.Context,
-	cfg SNMPConfig,
-	estimatedSheets int,
-) contracts.PrinterHealth {
-	return pollHealthWithFactory(ctx, estimatedSheets, realSessionFactoryWithConfig(cfg))
-}
-
-// PollHealthTarget polls printer hardware health over SNMP targeting a specific host/IP.
-func PollHealthTarget(
-	ctx context.Context,
-	target string,
-	estimatedSheets int,
-) contracts.PrinterHealth {
-	cfg := DefaultSNMPConfig()
-	cfg.Target = target
-	return PollHealthConfig(ctx, cfg, estimatedSheets)
-}
-
-// PollHealth polls printer hardware health over SNMP using the default address.
-func PollHealth(
-	ctx context.Context,
-	estimatedSheets int,
-) contracts.PrinterHealth {
-	return PollHealthTarget(ctx, defaultTarget, estimatedSheets)
-}
-
 // DynamicSessionFactory constructs a DynamicSNMPSession for target inspection and polling.
 type DynamicSessionFactory func(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error)
+
+// PollSNMPDynamic performs a single bounded dynamic SNMP probe against cfg and returns a canonical SNMPObservation.
+func PollSNMPDynamic(ctx context.Context, cfg SNMPConfig, estimatedSheets int) SNMPObservation {
+	return NewSNMPMonitor(cfg, nil).Poll(ctx, estimatedSheets)
+}
 
 // SNMPObservation captures normalized RFC 2790/3805 physical printer telemetry from one SNMP cycle.
 type SNMPObservation struct {
@@ -860,12 +471,19 @@ func (m *SNMPHealthMonitor) pollTargetedWithPlan(
 }
 
 func unavailableSNMPObservation(target string, estimatedSheets int, now time.Time, errMsg string) SNMPObservation {
-	h := offlineHealth(estimatedSheets, errMsg)
-	h.UpdatedAt = now
-	h.TonerLevelPercent = -1
-	h.DrumLifePercent = -1
-	h.InputTrayLevel = -1
-	h.InputTrayCapacity = -1
+	h := contracts.PrinterHealth{
+		Online:            false,
+		State:             "OFFLINE",
+		EvaluatedHealth:   contracts.EvaluatedHealthUnverified,
+		PaperTrayStatus:   "UNKNOWN",
+		EstimatedSheets:   estimatedSheets,
+		TonerLevelPercent: -1,
+		DrumLifePercent:   -1,
+		InputTrayLevel:    -1,
+		InputTrayCapacity: -1,
+		ErrorMessage:      errMsg,
+		UpdatedAt:         now,
+	}
 	return SNMPObservation{
 		Available:         false,
 		ObservedAt:        now,
@@ -888,12 +506,16 @@ func EvaluateSNMPProbe(probe *SNMPProbeResult, estimatedSheets int, now time.Tim
 	if probe == nil {
 		return unavailableSNMPObservation("", estimatedSheets, now, "nil SNMP probe result")
 	}
-	if len(probe.Printers) == 0 && len(probe.Alerts) == 0 && len(probe.Supplies) == 0 && len(probe.Inputs) == 0 {
+	if len(probe.Printers) == 0 && len(probe.Alerts) == 0 {
 		msg := probe.ProbeError
 		if msg == "" {
-			msg = "SNMP probe returned no printer metrics"
+			msg = "SNMP probe returned no printer status or alert metrics"
 		}
-		return unavailableSNMPObservation(probe.TargetHost, estimatedSheets, now, msg)
+		obs := unavailableSNMPObservation(probe.TargetHost, estimatedSheets, now, msg)
+		if probe.ProbeError == "" {
+			obs.Health.State = "UNKNOWN"
+		}
+		return obs
 	}
 
 	obs := SNMPObservation{
@@ -1084,6 +706,9 @@ func EvaluateSNMPProbe(probe *SNMPProbeResult, estimatedSheets int, now time.Tim
 	if flags.OutputNearFull {
 		addWarning("output_bin_near_full", "SNMP detected output bin near full")
 	}
+	if flags.OverduePreventMaint {
+		addWarning("overdue_maintenance", "SNMP detected maintenance overdue")
+	}
 
 	// Deduplicate reasons while preserving order
 	obs.BlockingFaults = dedupeHealthReasons(obs.BlockingFaults)
@@ -1192,12 +817,16 @@ type HardwareTelemetry struct {
 
 func pollHardwareTelemetryWithFactory(
 	ctx context.Context,
-	factory sessionFactory,
+	cfg SNMPConfig,
+	factory DynamicSessionFactory,
 ) HardwareTelemetry {
 	if ctx == nil || ctx.Err() != nil {
 		return HardwareTelemetry{Online: false, ErrorMsg: "context canceled"}
 	}
-	session, err := factory(ctx)
+	if factory == nil {
+		factory = NewRealDynamicSNMPSession
+	}
+	session, err := factory(ctx, cfg)
 	if err != nil {
 		return HardwareTelemetry{Online: false, ErrorMsg: err.Error()}
 	}
@@ -1259,7 +888,7 @@ func pollHardwareTelemetryWithFactory(
 
 // PollHardwareTelemetry queries physical hardware telemetry from SNMP.
 func PollHardwareTelemetry(ctx context.Context, cfg SNMPConfig) HardwareTelemetry {
-	return pollHardwareTelemetryWithFactory(ctx, realSessionFactoryWithConfig(cfg))
+	return pollHardwareTelemetryWithFactory(ctx, cfg, NewRealDynamicSNMPSession)
 }
 
 // PollMarkerLifeCount returns the current physical odometer count from SNMP, or -1 if unavailable.

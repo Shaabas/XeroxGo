@@ -9,13 +9,13 @@ import (
 )
 
 // DefaultMaxSourceAge defines the canonical maximum age (6s) for required printer telemetry sources.
-const DefaultMaxSourceAge = 6 * time.Second
+const DefaultMaxSourceAge = contracts.DefaultTelemetryMaxAge
 
 // MaxIPPObservationAge aliases DefaultMaxSourceAge for existing callers and tests.
 const MaxIPPObservationAge = DefaultMaxSourceAge
 
 // FutureTimestampTolerance defines maximum allowable future clock skew on observations.
-const FutureTimestampTolerance = 5 * time.Second
+const FutureTimestampTolerance = contracts.FutureHealthTimestampTolerance
 
 // HealthSource identifies the reporting subsystem for a health observation.
 type HealthSource string
@@ -127,10 +127,11 @@ type ReconciledHealthResult struct {
 
 	BlockingReasons   []contracts.HealthReason         `json:"blocking_reasons,omitempty"`
 	Warnings          []contracts.HealthReason         `json:"warnings,omitempty"`
-	EvidenceFreshness *contracts.HealthEvidenceFreshness `json:"evidence_freshness,omitempty"`
+	EvidenceFreshness  *contracts.HealthEvidenceFreshness `json:"evidence_freshness,omitempty"`
 
-	EvaluatedAt       time.Time        `json:"evaluated_at"`
-	DiagnosticDetails []DiagnosticItem `json:"diagnostic_details,omitempty"`
+	EvaluatedAt        time.Time        `json:"evaluated_at"`
+	EffectiveUpdatedAt time.Time        `json:"effective_updated_at,omitempty"`
+	DiagnosticDetails  []DiagnosticItem `json:"diagnostic_details,omitempty"`
 }
 
 // HasBlockingFaults returns true if there are one or more confirmed blocking faults.
@@ -193,6 +194,11 @@ func (r ReconciledHealthResult) ToContract(
 		trayStatus = "UNKNOWN"
 	}
 
+	updatedAt := r.EffectiveUpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = r.EvaluatedAt
+	}
+
 	return contracts.PrinterHealth{
 		Online:                 r.EvaluatedHealth == contracts.EvaluatedHealthHealthy,
 		State:                  state,
@@ -217,7 +223,7 @@ func (r ReconciledHealthResult) ToContract(
 		Warnings:               append([]contracts.HealthReason(nil), r.Warnings...),
 		EvidenceFreshness:      r.EvidenceFreshness,
 		ErrorMessage:           strings.Join(errMsgs, "; "),
-		UpdatedAt:              r.EvaluatedAt,
+		UpdatedAt:              updatedAt,
 	}
 }
 
@@ -384,7 +390,7 @@ func checkFreshTimestamp(ts, evalTime time.Time, maxAge time.Duration, label str
 }
 
 func (e *evaluatorState) validateSources() {
-	// CUPS validity & freshness
+	// CUPS validity & freshness: validity overrides must NEVER bypass timestamp validation.
 	cupsTS := e.in.CUPS.UpdatedAt
 	cupsFreshOK, cupsAgeSec, cupsTimeErr := checkFreshTimestamp(cupsTS, e.evalTime, e.maxAge, "CUPS")
 	if !cupsTS.IsZero() {
@@ -393,20 +399,19 @@ func (e *evaluatorState) validateSources() {
 	}
 	e.cupsFresh.AgeSeconds = cupsAgeSec
 
-	if e.in.CUPSValid != nil {
-		e.cupsValid = *e.in.CUPSValid && !e.evalTime.IsZero()
-		if !*e.in.CUPSValid {
+	if !cupsFreshOK {
+		e.cupsValid = false
+		e.cupsFresh.Error = cupsTimeErr
+		e.unknownConditions = appendUnique(e.unknownConditions, cupsTimeErr)
+		e.addDiagnostic(CategoryUnknown, UnknownQueueState, cupsTimeErr, SourceCUPS, "", "INFO")
+	} else if e.in.CUPSValid != nil {
+		e.cupsValid = *e.in.CUPSValid
+		if !e.cupsValid {
 			e.cupsFresh.Error = firstNonEmpty(e.in.CUPSError, "CUPS source invalid or unavailable")
 		}
 	} else {
 		cupsStateUpper := strings.ToUpper(strings.TrimSpace(e.in.CUPS.State))
-		if e.evalTime.IsZero() {
-			e.cupsValid = false
-			e.cupsFresh.Error = "evaluation time is zero"
-		} else if !cupsTS.IsZero() && !cupsFreshOK {
-			e.cupsValid = false
-			e.cupsFresh.Error = cupsTimeErr
-		} else if cupsStateUpper == "" || cupsStateUpper == "UNKNOWN" {
+		if cupsStateUpper == "" || cupsStateUpper == "UNKNOWN" {
 			e.cupsValid = false
 			e.cupsFresh.Error = firstNonEmpty(e.in.CUPSError, "CUPS queue state unknown")
 		} else {
@@ -414,7 +419,7 @@ func (e *evaluatorState) validateSources() {
 		}
 	}
 	e.cupsFresh.Available = e.cupsValid
-	e.cupsFresh.Fresh = e.cupsValid && (cupsTS.IsZero() || cupsFreshOK)
+	e.cupsFresh.Fresh = e.cupsValid && cupsFreshOK
 
 	// IPP validity & freshness
 	ippTS := e.in.IPP.ObservedAt
@@ -479,7 +484,7 @@ func (e *evaluatorState) validateSources() {
 	e.ippFresh.Fresh = e.ippValid && ippFreshOK
 	e.ippFresh.Error = ippReject
 
-	// SNMP validity & freshness
+	// SNMP validity & freshness: validity overrides must NEVER bypass timestamp validation.
 	snmpTS := e.snmpHealth.UpdatedAt
 	if !e.in.SNMP.ObservedAt.IsZero() {
 		snmpTS = e.in.SNMP.ObservedAt
@@ -491,23 +496,22 @@ func (e *evaluatorState) validateSources() {
 	snmpFreshOK, snmpAgeSec, snmpTimeErr := checkFreshTimestamp(snmpTS, e.evalTime, e.maxAge, "SNMP")
 	e.snmpFresh.AgeSeconds = snmpAgeSec
 
-	if e.in.SNMPValid != nil {
-		e.snmpValid = *e.in.SNMPValid && !e.evalTime.IsZero()
-		if !*e.in.SNMPValid {
-			e.snmpFresh.Error = firstNonEmpty(e.snmpHealth.ErrorMessage, "SNMP source invalid or unavailable")
+	if !snmpFreshOK {
+		e.snmpValid = false
+		e.snmpFresh.Error = snmpTimeErr
+		e.unknownConditions = appendUnique(e.unknownConditions, snmpTimeErr)
+		e.addDiagnostic(CategoryUnknown, UnknownSNMP, snmpTimeErr, SourceSNMP, "", "INFO")
+	} else if e.in.SNMPValid != nil {
+		e.snmpValid = *e.in.SNMPValid
+		if !e.snmpValid {
+			e.snmpFresh.Error = firstNonEmpty(e.in.SNMP.Error, e.snmpHealth.ErrorMessage, "SNMP source invalid or unavailable")
 		}
 	} else {
 		snmpAvail := e.snmpHealth.Online
 		if e.in.LegacySNMP == nil {
 			snmpAvail = e.in.SNMP.Available
 		}
-		if e.evalTime.IsZero() {
-			e.snmpValid = false
-			e.snmpFresh.Error = "evaluation time is zero"
-		} else if !snmpTS.IsZero() && !snmpFreshOK {
-			e.snmpValid = false
-			e.snmpFresh.Error = snmpTimeErr
-		} else if e.in.LegacySNMP == nil && !snmpAvail {
+		if e.in.LegacySNMP == nil && !snmpAvail {
 			e.snmpValid = false
 			e.snmpFresh.Error = firstNonEmpty(e.in.SNMP.Error, e.snmpHealth.ErrorMessage, "SNMP telemetry unavailable")
 		} else {
@@ -518,7 +522,7 @@ func (e *evaluatorState) validateSources() {
 		}
 	}
 	e.snmpFresh.Available = e.snmpValid
-	e.snmpFresh.Fresh = e.snmpValid && (snmpTS.IsZero() || snmpFreshOK)
+	e.snmpFresh.Fresh = e.snmpValid && snmpFreshOK
 }
 
 func (e *evaluatorState) analyzeCUPS() {
@@ -991,6 +995,17 @@ func (e *evaluatorState) run() ReconciledHealthResult {
 		MaxAgeSec: e.maxAge.Seconds(),
 	}
 
+	// Anchor effective readiness timestamp to the oldest required fresh source observation so
+	// evaluation/reconciliation never extends source lifetime beyond 6s from oldest observation.
+	effectiveUpdatedAt := e.evalTime
+	for _, src := range []contracts.SourceFreshness{e.cupsFresh, e.ippFresh, e.snmpFresh} {
+		if src.Available && src.ObservedAt != nil && !src.ObservedAt.IsZero() {
+			if effectiveUpdatedAt.IsZero() || src.ObservedAt.Before(effectiveUpdatedAt) {
+				effectiveUpdatedAt = *src.ObservedAt
+			}
+		}
+	}
+
 	return ReconciledHealthResult{
 		EffectiveState:         effectiveState,
 		EvaluatedHealth:        evaluatedHealth,
@@ -1018,6 +1033,7 @@ func (e *evaluatorState) run() ReconciledHealthResult {
 		Warnings:               dedupeHealthReasons(e.warningsReasons),
 		EvidenceFreshness:      freshness,
 		EvaluatedAt:            e.evalTime,
+		EffectiveUpdatedAt:     effectiveUpdatedAt,
 		DiagnosticDetails:      e.diagnosticDetails,
 	}
 }

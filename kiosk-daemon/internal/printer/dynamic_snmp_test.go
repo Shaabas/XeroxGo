@@ -250,8 +250,8 @@ func TestDynamicSNMP_WalkFails_FallsBackToGet(t *testing.T) {
 					{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: int32(3)}, // idle
 					{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00, 0x00}},
 					{Name: oidPrtMarkerLifeCount, Type: gosnmp.Counter32, Value: uint32(300)},
-					{Name: oidPrtMarkerSuppliesLevel1, Type: gosnmp.Integer, Value: int32(80)},
-					{Name: oidPrtMarkerSuppliesMax1, Type: gosnmp.Integer, Value: int32(100)},
+					{Name: "1.3.6.1.2.1.43.11.1.1.9.1.1", Type: gosnmp.Integer, Value: int32(80)},
+					{Name: "1.3.6.1.2.1.43.11.1.1.8.1.1", Type: gosnmp.Integer, Value: int32(100)},
 				},
 			}, nil
 		},

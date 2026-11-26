@@ -469,6 +469,7 @@ func main() {
 				}
 			}
 
+			h.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(h.UpdatedAt, contracts.DefaultTelemetryMaxAge)
 			return h
 		}
 	}

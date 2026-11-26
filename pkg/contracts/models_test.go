@@ -112,3 +112,61 @@ func TestJSONRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateHealthEvidenceFreshness_AndStaggeredExpiry(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-1 * time.Second)
+	nearlyExpiredCUPS := now.Add(-5500 * time.Millisecond)
+
+	base := contracts.PrinterHealth{
+		Online:            true,
+		State:             "IDLE",
+		EvaluatedHealth:   contracts.EvaluatedHealthHealthy,
+		PaperTrayStatus:   "OK",
+		ExecutionSafe:     true,
+		EvidenceFreshness: contracts.BuildUniformEvidenceFreshness(fresh, contracts.DefaultTelemetryMaxAge),
+		UpdatedAt:         fresh,
+	}
+
+	if ok, oldest, reason := contracts.ValidateHealthEvidenceFreshness(base, now, contracts.DefaultTelemetryMaxAge); !ok || !oldest.Equal(fresh) {
+		t.Fatalf("expected uniform fresh health valid, got ok=%v oldest=%v reason=%s", ok, oldest, reason)
+	}
+	if ok, reason := contracts.ValidateReadyHealth(base, now, contracts.DefaultTelemetryMaxAge); !ok {
+		t.Fatalf("expected ValidateReadyHealth true, got false (%s)", reason)
+	}
+
+	// Staggered sources: CUPS is 5.5s old while IPP/SNMP are 1s old.
+	staggered := base
+	staggered.EvidenceFreshness = &contracts.HealthEvidenceFreshness{
+		CUPS:      contracts.SourceFreshness{Available: true, ObservedAt: &nearlyExpiredCUPS, Fresh: true},
+		NativeIPP: contracts.SourceFreshness{Available: true, ObservedAt: &fresh, Fresh: true},
+		SNMP:      contracts.SourceFreshness{Available: true, ObservedAt: &fresh, Fresh: true},
+		MaxAgeSec: 6,
+	}
+	staggered.UpdatedAt = nearlyExpiredCUPS
+	if ok, oldest, reason := contracts.ValidateHealthEvidenceFreshness(staggered, now, contracts.DefaultTelemetryMaxAge); !ok || !oldest.Equal(nearlyExpiredCUPS) {
+		t.Fatalf("expected staggered 5.5s sample valid at now, got ok=%v reason=%s", ok, reason)
+	}
+	if ok, _, _ := contracts.ValidateHealthEvidenceFreshness(staggered, now.Add(600*time.Millisecond), contracts.DefaultTelemetryMaxAge); ok {
+		t.Fatal("expected staggered 5.5s CUPS source to expire at now+600ms")
+	}
+
+	// UpdatedAt renewed to `fresh` while CUPS is 5.5s old must be rejected.
+	inflated := staggered
+	inflated.UpdatedAt = fresh
+	if ok, _, _ := contracts.ValidateHealthEvidenceFreshness(inflated, now, contracts.DefaultTelemetryMaxAge); ok {
+		t.Fatal("expected UpdatedAt newer than oldest required source to be rejected")
+	}
+
+	// Missing NativeIPP evidence_freshness cannot establish HEALTHY readiness.
+	missingIPP := base
+	missingIPP.EvidenceFreshness = &contracts.HealthEvidenceFreshness{
+		CUPS:      contracts.SourceFreshness{Available: true, ObservedAt: &fresh, Fresh: true},
+		NativeIPP: contracts.SourceFreshness{Available: false, ObservedAt: &fresh, Fresh: false, Error: "unreachable"},
+		SNMP:      contracts.SourceFreshness{Available: true, ObservedAt: &fresh, Fresh: true},
+		MaxAgeSec: 6,
+	}
+	if ok, _ := contracts.ValidateReadyHealth(missingIPP, now, contracts.DefaultTelemetryMaxAge); ok {
+		t.Fatal("expected ValidateReadyHealth to reject HEALTHY missing NativeIPP evidence")
+	}
+}

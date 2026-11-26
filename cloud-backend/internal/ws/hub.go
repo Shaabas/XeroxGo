@@ -49,7 +49,9 @@ type kioskSession struct {
 	healthMu     sync.Mutex
 	latestHealth *sessionHealthEntry
 
-	dispatchMu sync.Mutex
+	dispatchMu           sync.Mutex
+	initialReconnectDone bool
+	reconcileRetryNeeded bool
 }
 
 // Hub manages active WebSocket connections from kiosks and relays jobs,
@@ -242,27 +244,41 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 		sess.healthMu.Unlock()
 		return
 	}
+	wasReady := false
+	recvAt := now
 	if sess.latestHealth != nil {
 		prev := sess.latestHealth
+		wasReady, _ = isHealthEntryReady(prev, now)
 		if snapshot.UpdatedAt.Before(prev.health.UpdatedAt) {
 			sess.healthMu.Unlock()
 			return
 		}
-		// Repeated/replayed identical UpdatedAt must NOT extend server-side freshness.
+		// Repeated/replayed identical UpdatedAt must NOT extend server-side freshness, though
+		// explicit invalidation to FAULT/UNVERIFIED or ExecutionSafe=false takes effect promptly.
 		if snapshot.UpdatedAt.Equal(prev.health.UpdatedAt) {
-			sess.healthMu.Unlock()
-			return
+			if snapshot.EvaluatedHealth == contracts.EvaluatedHealthHealthy && snapshot.ExecutionSafe == prev.health.ExecutionSafe {
+				sess.healthMu.Unlock()
+				return
+			}
+			recvAt = prev.receivedAt
 		}
 	}
 	entry := &sessionHealthEntry{
 		health:     snapshot,
-		receivedAt: now,
+		receivedAt: recvAt,
 	}
 	sess.latestHealth = entry
 	ready, _ := isHealthEntryReady(entry, now)
 	sess.healthMu.Unlock()
 
-	if ready {
+	if !ready {
+		return
+	}
+
+	sess.dispatchMu.Lock()
+	shouldReconcile := !wasReady || !sess.initialReconnectDone || sess.reconcileRetryNeeded
+	sess.dispatchMu.Unlock()
+	if shouldReconcile {
 		h.reconcilePendingDispatchOrders(ctx, kioskID, sess)
 	}
 }
@@ -275,23 +291,40 @@ func (h *Hub) reconcilePendingDispatchOrders(ctx context.Context, kioskID string
 	sess.dispatchMu.Lock()
 	defer sess.dispatchMu.Unlock()
 
-	if ready, _ := h.IsKioskReadyForDispatch(kioskID); !ready || !h.isActiveSession(kioskID, sess) {
+	if ready, _ := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready || !h.isActiveSession(kioskID, sess) {
 		return
 	}
 
-	_ = h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID)
+	if !sess.initialReconnectDone {
+		if err := h.db.ResetUnacknowledgedDispatchIntents(ctx, kioskID); err != nil {
+			sess.reconcileRetryNeeded = true
+			log.Printf("[HUB] Failed resetting unacknowledged dispatch intents for kiosk %s: %v", kioskID, err)
+			return
+		}
+		sess.initialReconnectDone = true
+	}
+
 	pendingJobs, err := h.db.GetPendingDispatchOrders(ctx, kioskID)
-	if err != nil || len(pendingJobs) == 0 {
+	if err != nil {
+		sess.reconcileRetryNeeded = true
+		log.Printf("[HUB] Failed loading pending dispatch orders for kiosk %s: %v", kioskID, err)
+		return
+	}
+	if len(pendingJobs) == 0 {
+		sess.reconcileRetryNeeded = false
 		return
 	}
 
 	log.Printf("[HUB] Reconciling %d pending dispatch orders for verified ready kiosk %s", len(pendingJobs), kioskID)
+	sess.reconcileRetryNeeded = false
 	for _, jobCmd := range pendingJobs {
-		if ready, reason := h.IsKioskReadyForDispatch(kioskID); !ready || !h.isActiveSession(kioskID, sess) {
+		if ready, reason := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready || !h.isActiveSession(kioskID, sess) {
+			sess.reconcileRetryNeeded = true
 			log.Printf("[HUB] Halting pending dispatch reconciliation for kiosk %s (%s)", kioskID, reason)
 			break
 		}
-		if err := h.SendJob(ctx, jobCmd); err != nil {
+		if err := h.sendJobToSession(ctx, sess, jobCmd); err != nil {
+			sess.reconcileRetryNeeded = true
 			log.Printf("[HUB] Failed to dispatch pending job %s to kiosk %s: %v", jobCmd.JobID, kioskID, err)
 			break
 		}
@@ -334,6 +367,9 @@ func validateHealthPayload(h *contracts.PrinterHealth, now time.Time) error {
 		return fmt.Errorf("unknown drum_life_percent %d invalid", h.DrumLifePercent)
 	}
 	if h.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+		if ok, _, reason := contracts.ValidateHealthEvidenceFreshness(*h, now, DefaultTelemetryFreshnessWindow); !ok {
+			return fmt.Errorf("HEALTHY payload lacks fresh required source evidence: %s", reason)
+		}
 		if !h.Online || h.State == "ERROR" || h.State == "OFFLINE" || h.State == "UNKNOWN" ||
 			h.CoverOpen || h.PaperJam || h.OutputBinFull || h.PaperTrayStatus == "EMPTY" || len(h.BlockingReasons) > 0 {
 			return errors.New("contradictory HEALTHY claim with active fault or non-ready state")
@@ -346,42 +382,16 @@ func isHealthEntryReady(entry *sessionHealthEntry, now time.Time) (bool, string)
 	if entry == nil {
 		return false, "no telemetry received on active connection"
 	}
-	h := entry.health
-	if h.UpdatedAt.IsZero() || h.UpdatedAt.After(now.Add(FutureHealthTimestampTolerance)) {
-		return false, "invalid telemetry timestamp"
-	}
 	if now.Sub(entry.receivedAt) > DefaultTelemetryFreshnessWindow {
 		return false, "server receipt freshness expired (>6s)"
 	}
-	if now.Sub(h.UpdatedAt) > DefaultTelemetryFreshnessWindow {
-		return false, "observation timestamp expired (>6s)"
-	}
-	if h.EvaluatedHealth != contracts.EvaluatedHealthHealthy {
-		return false, fmt.Sprintf("evaluated health is %s", h.EvaluatedHealth)
-	}
-	if !h.ExecutionSafe {
-		return false, firstNonEmpty(h.ExecutionSafetyReason, "local execution safety barrier active")
-	}
-	if !h.Online || h.State == "ERROR" || h.State == "OFFLINE" || h.State == "UNKNOWN" ||
-		h.PaperJam || h.CoverOpen || h.OutputBinFull || h.PaperTrayStatus == "EMPTY" || len(h.BlockingReasons) > 0 {
-		return false, firstNonEmpty(h.ErrorMessage, "printer reported blocking condition")
-	}
-	return true, ""
+	return contracts.ValidateReadyHealth(entry.health, now, DefaultTelemetryFreshnessWindow)
 }
 
-// IsKioskReadyForDispatch returns true iff the kiosk has an active session whose latest valid
-// telemetry is fresh within 6s (both observation and server receipt), HEALTHY, and ExecutionSafe.
-func (h *Hub) IsKioskReadyForDispatch(kioskID string) (bool, string) {
-	if h == nil {
-		return false, "hub is nil"
-	}
-	h.mu.RLock()
-	sess, ok := h.sessions[kioskID]
-	h.mu.RUnlock()
-	if !ok || sess == nil {
+func (h *Hub) isSessionReadyForDispatch(sess *kioskSession, now time.Time) (bool, string) {
+	if sess == nil {
 		return false, "kiosk not connected"
 	}
-
 	sess.healthMu.Lock()
 	entry := sess.latestHealth
 	var copied *sessionHealthEntry
@@ -390,8 +400,65 @@ func (h *Hub) IsKioskReadyForDispatch(kioskID string) (bool, string) {
 		copied = &sessionHealthEntry{health: c, receivedAt: entry.receivedAt}
 	}
 	sess.healthMu.Unlock()
+	return isHealthEntryReady(copied, now)
+}
 
-	return isHealthEntryReady(copied, time.Now().UTC())
+// EvaluateKioskReadiness returns the canonical connection-bound readiness snapshot and decision
+// for a kiosk so WS dispatch admission and HTTP reservation/release share one source of truth.
+func (h *Hub) EvaluateKioskReadiness(kioskID string) (connected bool, health contracts.PrinterHealth, hasHealth bool, ready bool, reason string) {
+	if h == nil {
+		return false, contracts.PrinterHealth{}, false, false, "hub is nil"
+	}
+	h.mu.RLock()
+	sess, ok := h.sessions[kioskID]
+	h.mu.RUnlock()
+	if !ok || sess == nil {
+		return false, contracts.PrinterHealth{}, false, false, "kiosk not connected"
+	}
+
+	sess.healthMu.Lock()
+	entry := sess.latestHealth
+	var copied contracts.PrinterHealth
+	var receivedAt time.Time
+	hasEntry := entry != nil
+	if hasEntry {
+		copied = cloneHealth(entry.health)
+		receivedAt = entry.receivedAt
+	}
+	sess.healthMu.Unlock()
+
+	if !hasEntry {
+		return true, contracts.PrinterHealth{}, false, false, "no telemetry received on active connection"
+	}
+
+	now := time.Now().UTC()
+	entryCopy := &sessionHealthEntry{health: copied, receivedAt: receivedAt}
+	ready, reason = isHealthEntryReady(entryCopy, now)
+
+	if okFresh, _, freshErr := contracts.ValidateHealthEvidenceFreshness(copied, now, DefaultTelemetryFreshnessWindow); now.Sub(receivedAt) > DefaultTelemetryFreshnessWindow || !okFresh {
+		copied.Online = false
+		if copied.EvaluatedHealth != contracts.EvaluatedHealthFault {
+			copied.EvaluatedHealth = contracts.EvaluatedHealthUnverified
+		}
+		if copied.EvidenceFreshness != nil {
+			ef := *copied.EvidenceFreshness
+			ef.CUPS.Fresh = false
+			ef.NativeIPP.Fresh = false
+			ef.SNMP.Fresh = false
+			copied.EvidenceFreshness = &ef
+		}
+		if copied.ErrorMessage == "" {
+			copied.ErrorMessage = firstNonEmpty(freshErr, "printer health telemetry expired")
+		}
+	}
+	return true, copied, true, ready, reason
+}
+
+// IsKioskReadyForDispatch returns true iff the kiosk has an active session whose latest valid
+// telemetry is fresh within 6s (both observation and server receipt), HEALTHY, and ExecutionSafe.
+func (h *Hub) IsKioskReadyForDispatch(kioskID string) (bool, string) {
+	_, _, _, ready, reason := h.EvaluateKioskReadiness(kioskID)
+	return ready, reason
 }
 
 // SendJob dispatches a PrintJobCommand envelope ONLY when the kiosk is connected and currently
@@ -407,6 +474,19 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 		return fmt.Errorf("send job: %w", err)
 	}
 
+	h.mu.RLock()
+	sess, ok := h.sessions[cmd.KioskID]
+	h.mu.RUnlock()
+	if !ok || sess == nil {
+		return fmt.Errorf("send job: kiosk %q not connected", cmd.KioskID)
+	}
+	return h.sendJobToSession(ctx, sess, cmd)
+}
+
+func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd contracts.PrintJobCommand) error {
+	if sess == nil {
+		return fmt.Errorf("send job: kiosk %q not connected", cmd.KioskID)
+	}
 	if strings.TrimSpace(cmd.JobID) == "" {
 		return fmt.Errorf("send job: empty job ID")
 	}
@@ -432,17 +512,6 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 		return fmt.Errorf("send job: invalid start from page %d", cmd.StartFromPage)
 	}
 
-	h.mu.RLock()
-	sess, ok := h.sessions[cmd.KioskID]
-	h.mu.RUnlock()
-	if !ok || sess == nil {
-		return fmt.Errorf("send job: kiosk %q not connected", cmd.KioskID)
-	}
-
-	if ready, reason := h.IsKioskReadyForDispatch(cmd.KioskID); !ready {
-		return fmt.Errorf("send job: kiosk %q not ready (%s)", cmd.KioskID, reason)
-	}
-
 	msg := wireMessage{
 		Type: "job",
 		Job:  &cmd,
@@ -453,6 +522,9 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 
 	if !h.isActiveSession(cmd.KioskID, sess) {
 		return fmt.Errorf("send job: kiosk %q connection replaced", cmd.KioskID)
+	}
+	if ready, reason := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready {
+		return fmt.Errorf("send job: kiosk %q not ready (%s)", cmd.KioskID, reason)
 	}
 
 	if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
@@ -477,49 +549,9 @@ func (h *Hub) IsConnected(kioskID string) bool {
 // If the kiosk is disconnected or no telemetry has arrived on this session, ok is false.
 // If stored telemetry is older than 6s (observation or server receipt), EvaluatedHealth is expired to UNVERIFIED.
 func (h *Hub) LatestHealth(kioskID string) (contracts.PrinterHealth, bool) {
-	if h == nil {
+	connected, copied, hasHealth, _, _ := h.EvaluateKioskReadiness(kioskID)
+	if !connected || !hasHealth {
 		return contracts.PrinterHealth{}, false
-	}
-	h.mu.RLock()
-	sess, ok := h.sessions[kioskID]
-	h.mu.RUnlock()
-	if !ok || sess == nil {
-		return contracts.PrinterHealth{}, false
-	}
-
-	sess.healthMu.Lock()
-	entry := sess.latestHealth
-	var copied contracts.PrinterHealth
-	var receivedAt time.Time
-	hasEntry := entry != nil
-	if hasEntry {
-		copied = cloneHealth(entry.health)
-		receivedAt = entry.receivedAt
-	}
-	sess.healthMu.Unlock()
-
-	if !hasEntry {
-		return contracts.PrinterHealth{}, false
-	}
-
-	now := time.Now().UTC()
-	if now.Sub(receivedAt) > DefaultTelemetryFreshnessWindow ||
-		now.Sub(copied.UpdatedAt) > DefaultTelemetryFreshnessWindow ||
-		copied.UpdatedAt.After(now.Add(FutureHealthTimestampTolerance)) {
-		copied.Online = false
-		if copied.EvaluatedHealth != contracts.EvaluatedHealthFault {
-			copied.EvaluatedHealth = contracts.EvaluatedHealthUnverified
-		}
-		if copied.EvidenceFreshness != nil {
-			ef := *copied.EvidenceFreshness
-			ef.CUPS.Fresh = false
-			ef.NativeIPP.Fresh = false
-			ef.SNMP.Fresh = false
-			copied.EvidenceFreshness = &ef
-		}
-		if copied.ErrorMessage == "" {
-			copied.ErrorMessage = "printer health telemetry expired"
-		}
 	}
 	return copied, true
 }

@@ -90,6 +90,7 @@ func connectTestKiosk(t *testing.T, hub *Hub, serverURL, kioskID string) (*webso
 
 func sendTestReadyHealth(ctx context.Context, t *testing.T, hub *Hub, conn *websocket.Conn, kioskID string) {
 	t.Helper()
+	now := time.Now().UTC()
 	h := contracts.PrinterHealth{
 		Online:              true,
 		State:               "IDLE",
@@ -104,7 +105,8 @@ func sendTestReadyHealth(ctx context.Context, t *testing.T, hub *Hub, conn *webs
 		DrumLifeKnown:       true,
 		InputTrayLevel:      -1,
 		InputTrayCapacity:   -1,
-		UpdatedAt:           time.Now().UTC(),
+		UpdatedAt:           now,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now, DefaultTelemetryFreshnessWindow),
 	}
 	if err := wsjson.Write(ctx, conn, wireMessage{Type: "health", Health: &h}); err != nil {
 		t.Fatalf("failed to write test ready health: %v", err)
@@ -301,8 +303,10 @@ func TestHubTracksLatestHealth(t *testing.T) {
 		DrumLifePercent:     90,
 		DrumLifeKnown:       true,
 		UpdatedAt:           t1,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(t1, DefaultTelemetryFreshnessWindow),
 	}
 
+	t2 := t1.Add(time.Millisecond)
 	health2 := contracts.PrinterHealth{
 		Online:              true,
 		State:               "PRINTING",
@@ -315,7 +319,8 @@ func TestHubTracksLatestHealth(t *testing.T) {
 		TonerLevelKnown:     true,
 		DrumLifePercent:     89,
 		DrumLifeKnown:       true,
-		UpdatedAt:           t1.Add(time.Millisecond),
+		UpdatedAt:           t2,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(t2, DefaultTelemetryFreshnessWindow),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

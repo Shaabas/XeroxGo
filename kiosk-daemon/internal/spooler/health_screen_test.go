@@ -363,17 +363,26 @@ func TestHealthScreen_SNMPTimeout_CUPSReasonsPreserved(t *testing.T) {
 	if cupsErr != nil {
 		t.Fatalf("unexpected CUPS error: %v", cupsErr)
 	}
-	// SNMP target unreachable
-	snmpHealth := printer.PollHealthConfig(context.Background(), printer.SNMPConfig{
+	// SNMP target unreachable (canonical dynamic monitor)
+	snmpObs := printer.PollSNMPDynamic(context.Background(), printer.SNMPConfig{
 		Target:  "127.0.0.1",
 		Port:    54321,
 		Timeout: 50 * time.Millisecond,
 		Retries: 0,
 	}, 100)
 
-	reconciled := printer.ReconcilePrinterHealth(cupsHealth, printer.IPPPrinterStateResult{}, snmpHealth, time.Now().UTC(), printer.SourceValidity{
-		CUPSValid: true,
-		SNMPValid: false,
+	now := time.Now().UTC()
+	cupsValid := true
+	reconciled := printer.EvaluateCanonicalPrinterHealth(printer.CanonicalHealthInput{
+		CUPS:        cupsHealth,
+		CUPSValid:   &cupsValid,
+		CUPSQueried: true,
+		SNMP:        snmpObs,
+		SNMPQueried: true,
+		RequireCUPS: true,
+		RequireIPP:  true,
+		RequireSNMP: true,
+		EvalTime:    now,
 	})
 	health := reconciled.ToContract(100, true, true, "")
 	if health.State != "ERROR" || health.EvaluatedHealth != contracts.EvaluatedHealthFault {
@@ -475,10 +484,11 @@ func TestHealthScreen_Recovery_RefreshesScreenWithoutReprintingOrCompleting(t *t
 	// 2. Printer hardware recovers
 	isRecovered.Store(true)
 
-	// Step 2A: Verify a single transient healthy reading does NOT clear the fault (Point 6)
+	// Step 2A: Verify a single transient healthy reading does NOT clear the fault AND
+	// effective published/snapshot state stays blocked (Correction 1).
 	h1 := client.CheckPrinterHealth(ctx)
-	if h1.State != "IDLE" {
-		t.Fatalf("expected healthy IDLE state on recovery, got %s", h1.State)
+	if h1.State != "ERROR" || h1.EvaluatedHealth != contracts.EvaluatedHealthFault || h1.Online {
+		t.Fatalf("expected fault barrier to remain blocked in snapshot after 1st healthy cycle, got State=%s EvaluatedHealth=%s Online=%v", h1.State, h1.EvaluatedHealth, h1.Online)
 	}
 	if !client.isHardwareFaultActive() {
 		t.Fatal("expected hardware fault to remain active after single transient healthy reading")
@@ -486,25 +496,32 @@ func TestHealthScreen_Recovery_RefreshesScreenWithoutReprintingOrCompleting(t *t
 
 	// Step 2B: Supply remaining consecutive healthy readings to satisfy reliable recovery evidence (Point 7)
 	client.CheckPrinterHealth(ctx)
-	client.CheckPrinterHealth(ctx)
+	h3 := client.CheckPrinterHealth(ctx)
+	if h3.State != "IDLE" || h3.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !h3.Online {
+		t.Fatalf("expected healthy IDLE state after 3 consecutive healthy cycles, got State=%s EvaluatedHealth=%s Online=%v", h3.State, h3.EvaluatedHealth, h3.Online)
+	}
 
 	if client.isHardwareFaultActive() {
 		t.Fatal("expected hardware fault to be cleared after reliable recovery evidence (3 consecutive healthy readings)")
 	}
 
-	// 3. Verify screen refreshed to ModeIdle ("Ready to print")
+	// 3. With unresolved PAUSED_ERROR job still in store, durable execution-safety barrier
+	// MUST keep the screen in ModeError and prevent advertising "Ready to print" (Correction 2).
+	if h3.ExecutionSafe {
+		t.Fatal("expected ExecutionSafe=false while paused job barrier remains unresolved")
+	}
 	client.currentModeMu.Lock()
 	currentMode := client.currentMode
 	client.currentModeMu.Unlock()
 
-	if currentMode != ui_ipc.ModeIdle {
-		t.Fatalf("expected currentMode to be ModeIdle after recovery, got %s", currentMode)
+	if currentMode != ui_ipc.ModeError {
+		t.Fatalf("expected currentMode to remain ModeError while paused barrier active, got %s", currentMode)
 	}
 
 	history := client.RenderHistory()
 	lastState := history[len(history)-1]
-	if lastState.Mode != ui_ipc.ModeIdle || lastState.Message != "Ready to print" {
-		t.Fatalf("last rendered state = %v, want ModeIdle with 'Ready to print'", lastState)
+	if lastState.Mode == ui_ipc.ModeIdle {
+		t.Fatalf("must not render ModeIdle while durable execution-safety barrier is unresolved: %v", lastState)
 	}
 
 	// 4. Verify interrupted job was NOT marked COMPLETED and NOT reprinted
@@ -947,7 +964,8 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 		select {
 		case <-printStarted:
 			time.Sleep(15 * time.Millisecond)
-		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return
 		}
 		jamReported.Store(true)
 	}()

@@ -69,6 +69,9 @@ func connectKioskWithHealth(t *testing.T, srvURL, kioskID string, initialHealth 
 		initialHealth.ExecutionSafe = true
 		initialHealth.TonerLevelKnown = true
 		initialHealth.DrumLifeKnown = true
+		if initialHealth.EvidenceFreshness == nil {
+			initialHealth.EvidenceFreshness = contracts.BuildUniformEvidenceFreshness(initialHealth.UpdatedAt, contracts.DefaultTelemetryMaxAge)
+		}
 	}
 	if err := wsjson.Write(writeCtx, conn, wireMsg{Type: "health", Health: &initialHealth}); err != nil {
 		cancel()
@@ -83,6 +86,7 @@ func connectKioskWithHealth(t *testing.T, srvURL, kioskID string, initialHealth 
 
 func sendTestHealthyStatus(ctx context.Context, t *testing.T, hub *ws.Hub, conn *websocket.Conn, kioskID string) {
 	t.Helper()
+	now := time.Now().UTC()
 	h := contracts.PrinterHealth{
 		Online:              true,
 		State:               "IDLE",
@@ -97,7 +101,8 @@ func sendTestHealthyStatus(ctx context.Context, t *testing.T, hub *ws.Hub, conn 
 		DrumLifeKnown:       true,
 		InputTrayLevel:      -1,
 		InputTrayCapacity:   -1,
-		UpdatedAt:           time.Now().UTC(),
+		UpdatedAt:           now,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now, contracts.DefaultTelemetryMaxAge),
 	}
 	if err := wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &h}); err != nil {
 		t.Fatalf("failed to send test healthy status for %s: %v", kioskID, err)
@@ -216,6 +221,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 3. Connect/update with Tray UNKNOWN -> HTTP 409 Conflict (PAPER_UNKNOWN)
+	now3 := time.Now().UTC()
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
 		Online:              true,
 		State:               "IDLE",
@@ -224,7 +230,8 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		EstimatedSheets:     100,
 		InventoryCalibrated: false,
 		ExecutionSafe:       true,
-		UpdatedAt:           time.Now().UTC(),
+		UpdatedAt:           now3,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now3, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -244,6 +251,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 4. Update with Tray EMPTY -> HTTP 409 Conflict (INSUFFICIENT_PAPER)
+	now4 := time.Now().UTC().Add(time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
 		Online:              true,
 		State:               "IDLE",
@@ -252,7 +260,8 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		EstimatedSheets:     0,
 		InventoryCalibrated: true,
 		ExecutionSafe:       true,
-		UpdatedAt:           time.Now().UTC().Add(time.Millisecond),
+		UpdatedAt:           now4,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now4, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -272,6 +281,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 5. Update with Insufficient Sheets: tray has 5 sheets, order needs 10 -> HTTP 409 Conflict (INSUFFICIENT_PAPER)
+	now5 := time.Now().UTC().Add(2 * time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
 		Online:              true,
 		State:               "IDLE",
@@ -280,7 +290,8 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		EstimatedSheets:     5,
 		InventoryCalibrated: true,
 		ExecutionSafe:       true,
-		UpdatedAt:           time.Now().UTC().Add(2 * time.Millisecond),
+		UpdatedAt:           now5,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now5, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
@@ -300,6 +311,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 	}
 
 	// 6. Update with Sufficient Sheets: tray has 50 sheets, order needs 10 -> HTTP 200 OK!
+	now6 := time.Now().UTC().Add(3 * time.Millisecond)
 	_ = wsjson.Write(ctx, conn, wireMsg{Type: "health", Health: &contracts.PrinterHealth{
 		Online:              true,
 		State:               "IDLE",
@@ -308,7 +320,8 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		EstimatedSheets:     50,
 		InventoryCalibrated: true,
 		ExecutionSafe:       true,
-		UpdatedAt:           time.Now().UTC().Add(3 * time.Millisecond),
+		UpdatedAt:           now6,
+		EvidenceFreshness:   contracts.BuildUniformEvidenceFreshness(now6, contracts.DefaultTelemetryMaxAge),
 	}})
 	time.Sleep(50 * time.Millisecond)
 
