@@ -648,3 +648,250 @@ func TestPackage5C_ConcurrentCaptureVsCancellationOrderings(t *testing.T) {
 		}
 	}
 }
+
+func TestPackage5C_RefillResolutionRestoresExpiryTimerAndRejectsStaleEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		acceptOK       bool
+		alreadyStaleAt time.Duration
+	}{
+		{name: "accepted_refill", acceptOK: true, alreadyStaleAt: -5200 * time.Millisecond},
+		{name: "rejected_refill", acceptOK: false, alreadyStaleAt: -5200 * time.Millisecond},
+		{name: "accepted_refill_already_stale", acceptOK: true, alreadyStaleAt: -5920 * time.Millisecond},
+		{name: "rejected_refill_already_stale", acceptOK: false, alreadyStaleAt: -5920 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, ts, secret := setupPackage5BTestServer(t)
+			kioskID := "kiosk-5c-" + tc.name
+			ctx := context.Background()
+
+			wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+			conn, _, err := websocket.Dial(ctx, wsURL, nil)
+			if err != nil {
+				t.Fatalf("ws dial failed: %v", err)
+			}
+			defer conn.CloseNow()
+
+			obsAt := time.Now().UTC().Add(tc.alreadyStaleAt)
+			_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, obsAt)})
+			time.Sleep(40 * time.Millisecond)
+
+			// Start SendRefill in background and respond from kiosk mock.
+			refillErrCh := make(chan error, 1)
+			go func() {
+				rCtx, rCancel := context.WithTimeout(ctx, 2*time.Second)
+				defer rCancel()
+				refillErrCh <- app.hub.SendRefill(rCtx, kioskID, 80)
+			}()
+
+			var reqMsg struct {
+				Type      string `json:"type"`
+				RequestID string `json:"request_id"`
+			}
+			for reqMsg.Type != "refill" {
+				if err := wsjson.Read(ctx, conn, &reqMsg); err != nil {
+					t.Fatalf("failed reading refill request: %v", err)
+				}
+			}
+			if tc.alreadyStaleAt < -5900*time.Millisecond {
+				// Let cached evidence cross the 6s window before ack arrives.
+				time.Sleep(100 * time.Millisecond)
+			}
+			ack := map[string]interface{}{
+				"type":       "refill_ack",
+				"request_id": reqMsg.RequestID,
+				"ok":         tc.acceptOK,
+			}
+			if tc.acceptOK {
+				ack["calibrated"] = true
+				ack["sheets"] = 80
+				ack["inventory_seq"] = uint64(2)
+			} else {
+				ack["error"] = "operator rejected"
+			}
+			if err := wsjson.Write(ctx, conn, ack); err != nil {
+				t.Fatalf("failed writing refill_ack: %v", err)
+			}
+			refillErr := <-refillErrCh
+			if tc.acceptOK && refillErr != nil {
+				t.Fatalf("expected nil SendRefill err on accept, got %v", refillErr)
+			}
+			if !tc.acceptOK && refillErr == nil {
+				t.Fatalf("expected non-nil SendRefill err on reject")
+			}
+
+			if tc.alreadyStaleAt < -5900*time.Millisecond {
+				_, _, _, ready, reason := app.hub.EvaluateKioskReadiness(kioskID)
+				if ready {
+					t.Fatalf("expected kiosk to remain unavailable when cached evidence is already stale at %s, got ready=true (%s)", tc.name, reason)
+				}
+				return
+			}
+
+			// Evidence still has ~700ms remaining: create an unpaid checkout now.
+			now := time.Now().UTC()
+			ordID := "ord-" + tc.name
+			if err := app.db.CreateOrder(ctx, store.Order{
+				OrderID:      ordID,
+				Status:       contracts.JobStatusPendingPayment,
+				PricePaise:   300,
+				TotalPages:   1,
+				TotalSheets:  1,
+				ColorMode:    "BW",
+				PINExpiresAt: now.Add(10 * time.Minute),
+				Documents: []store.OrderDocument{{
+					JobID: "job-" + ordID, OrderID: ordID, DocumentIndex: 0,
+					OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
+					TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300,
+				}},
+				Command: contracts.PrintJobCommand{
+					JobID: "job-" + ordID, OrderID: ordID, KioskID: kioskID, DisplayCode: "7755",
+					TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1,
+				},
+				CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("CreateOrder failed: %v", err)
+			}
+			sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+			if err != nil {
+				t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+			}
+
+			// Wait silently (no more health frames) -> restored expiry timer MUST cancel sess!
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				gs, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+				if gs != nil && gs.Status == store.KioskSessionCanceled {
+					break
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			gotSess, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+			if gotSess == nil || gotSess.Status != store.KioskSessionCanceled {
+				t.Fatalf("expected silent telemetry expiry after %s to cancel unpaid checkout, got %+v", tc.name, gotSess)
+			}
+		})
+	}
+}
+
+func TestPackage5C_ControlledCaptureVsAvailabilityCancellationBothOrderings(t *testing.T) {
+	ctx := context.Background()
+
+	// Ordering A: Availability-driven cancellation wins against payment capture.
+	t.Run("availability_cancellation_wins", func(t *testing.T) {
+		app, ts, secret := setupPackage5BTestServer(t)
+		kioskID := "kiosk-5c-order-a"
+		wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+		conn, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("ws dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+		_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, time.Now().UTC())})
+		time.Sleep(40 * time.Millisecond)
+
+		now := time.Now().UTC()
+		ordID := "ord-5c-order-a"
+		if err := app.db.CreateOrder(ctx, store.Order{
+			OrderID: ordID, Status: contracts.JobStatusPendingPayment, PricePaise: 300, TotalPages: 1, TotalSheets: 1, ColorMode: "BW", PINExpiresAt: now.Add(10 * time.Minute),
+			Documents: []store.OrderDocument{{JobID: "job-5c-order-a", OrderID: ordID, DocumentIndex: 0, OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW", TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300}},
+			Command:   contracts.PrintJobCommand{JobID: "job-5c-order-a", OrderID: ordID, KioskID: kioskID, DisplayCode: "8811", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1},
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreateOrder failed: %v", err)
+		}
+		sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+		if err != nil {
+			t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+		}
+		if err := app.db.CreatePaymentAttempt(ctx, store.PaymentAttempt{
+			AttemptID: "att-5c-order-a", DemoToken: "tok-5c-order-a", OrderID: ordID, SessionID: sess.SessionID,
+			KioskID: kioskID, Provider: "mock", AmountPaise: 300, Currency: "INR", Status: "CREATED",
+			IdempotencyKey: "idem-5c-order-a", ExpiresAt: now.Add(2 * time.Minute), CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreatePaymentAttempt failed: %v", err)
+		}
+
+		// Disconnect WS to trigger availability-driven cancellation first, then attempt capture.
+		_ = conn.Close(websocket.StatusNormalClosure, "fault disconnect")
+		time.Sleep(60 * time.Millisecond)
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/pay/tok-5c-order-a", nil)
+		req.Header.Set("Accept", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /pay failed: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusGone {
+			t.Fatalf("expected 503 or 410 when availability cancellation won, got %d", resp.StatusCode)
+		}
+		gotSess, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+		gotOrd, _ := app.db.GetOrder(ctx, ordID)
+		if gotSess == nil || gotSess.Status != store.KioskSessionCanceled || gotOrd == nil || gotOrd.Status != contracts.JobStatusPendingPayment {
+			t.Fatalf("expected CANCELED session & PENDING_PAYMENT order, got sess=%+v ord=%+v", gotSess, gotOrd)
+		}
+	})
+
+	// Ordering B: Payment capture wins before availability-driven cancellation, preserving paid entitlement & dispatch intent.
+	t.Run("payment_capture_wins", func(t *testing.T) {
+		app, ts, secret := setupPackage5BTestServer(t)
+		kioskID := "kiosk-5c-order-b"
+		wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws?kiosk_id=" + kioskID + "&token=" + secret
+		conn, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("ws dial failed: %v", err)
+		}
+		defer conn.CloseNow()
+		_ = wsjson.Write(ctx, conn, map[string]interface{}{"type": "health", "health": makeHealthyHealth(50, 150, time.Now().UTC())})
+		time.Sleep(40 * time.Millisecond)
+
+		now := time.Now().UTC()
+		ordID := "ord-5c-order-b"
+		if err := app.db.CreateOrder(ctx, store.Order{
+			OrderID: ordID, Status: contracts.JobStatusPendingPayment, PricePaise: 300, TotalPages: 1, TotalSheets: 1, ColorMode: "BW", PINExpiresAt: now.Add(10 * time.Minute),
+			Documents: []store.OrderDocument{{JobID: "job-5c-order-b", OrderID: ordID, DocumentIndex: 0, OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW", TotalPages: 1, TotalSheets: 1, Copies: 1, PricePaise: 300}},
+			Command:   contracts.PrintJobCommand{JobID: "job-5c-order-b", OrderID: ordID, KioskID: kioskID, DisplayCode: "8822", TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1},
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreateOrder failed: %v", err)
+		}
+		sess, err := app.db.CreateOrGetKioskSessionWithPaperCheck(ctx, kioskID, ordID, 50, 2*time.Minute, now)
+		if err != nil {
+			t.Fatalf("CreateOrGetKioskSessionWithPaperCheck failed: %v", err)
+		}
+		if err := app.db.CreatePaymentAttempt(ctx, store.PaymentAttempt{
+			AttemptID: "att-5c-order-b", DemoToken: "tok-5c-order-b", OrderID: ordID, SessionID: sess.SessionID,
+			KioskID: kioskID, Provider: "mock", AmountPaise: 300, Currency: "INR", Status: "CREATED",
+			IdempotencyKey: "idem-5c-order-b", ExpiresAt: now.Add(2 * time.Minute), CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreatePaymentAttempt failed: %v", err)
+		}
+
+		// Hold LockKioskReservation? No, complete capture first while healthy, then immediately disconnect (availability-driven cancellation).
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/pay/tok-5c-order-b", nil)
+		req.Header.Set("Accept", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on capture before fault, got err=%v resp=%v", err, resp)
+		}
+		resp.Body.Close()
+
+		// Now trigger availability-driven invalidation via WS disconnect: paid entitlement & dispatch intent MUST survive!
+		_ = conn.Close(websocket.StatusNormalClosure, "post-capture fault")
+		time.Sleep(60 * time.Millisecond)
+
+		gotSess, _ := app.db.GetKioskSession(ctx, sess.SessionID, time.Now().UTC())
+		gotOrd, _ := app.db.GetOrder(ctx, ordID)
+		intentStatus, _, _ := app.db.GetJobDispatchIntentStatus(ctx, "job-5c-order-b")
+		if gotSess == nil || gotSess.Status != store.KioskSessionCompleted {
+			t.Fatalf("expected COMPLETED session preserved after capture+disconnect, got %+v", gotSess)
+		}
+		if gotOrd == nil || gotOrd.Status == contracts.JobStatusPendingPayment {
+			t.Fatalf("expected paid order status preserved after capture+disconnect, got %+v", gotOrd)
+		}
+		if intentStatus == "" {
+			t.Fatalf("expected dispatch intent preserved after capture+disconnect, got empty")
+		}
+	})
+}
