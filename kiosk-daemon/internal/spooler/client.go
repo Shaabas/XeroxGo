@@ -35,16 +35,17 @@ import (
 )
 
 type wireMessage struct {
-	Type       string                      `json:"type"`
-	Job        *contracts.PrintJobCommand  `json:"job,omitempty"`
-	Progress   *contracts.JobProgressEvent `json:"progress,omitempty"`
-	Health     *contracts.PrinterHealth    `json:"health,omitempty"`
-	Sheets     *int                        `json:"sheets,omitempty"`
-	RequestID  string                      `json:"request_id,omitempty"`
-	OK         bool                        `json:"ok,omitempty"`
-	Calibrated bool                        `json:"calibrated,omitempty"`
-	Error      string                      `json:"error,omitempty"`
-	Ads        []contracts.AdItem          `json:"ads,omitempty"`
+	Type         string                      `json:"type"`
+	Job          *contracts.PrintJobCommand  `json:"job,omitempty"`
+	Progress     *contracts.JobProgressEvent `json:"progress,omitempty"`
+	Health       *contracts.PrinterHealth    `json:"health,omitempty"`
+	Sheets       *int                        `json:"sheets,omitempty"`
+	RequestID    string                      `json:"request_id,omitempty"`
+	OK           bool                        `json:"ok,omitempty"`
+	Calibrated   bool                        `json:"calibrated,omitempty"`
+	InventorySeq uint64                      `json:"inventory_seq,omitempty"`
+	Error        string                      `json:"error,omitempty"`
+	Ads          []contracts.AdItem          `json:"ads,omitempty"`
 }
 
 // StateStore defines the persistence interface required by the spooler client.
@@ -3724,7 +3725,7 @@ func (c *Client) configuredTrayCapacity() int {
 }
 
 func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, msg wireMessage) {
-	sendAck := func(ok bool, sheetsVal int, errMsg string) {
+	sendAck := func(ok bool, sheetsVal int, invSeq uint64, errMsg string) {
 		if conn == nil || strings.TrimSpace(msg.RequestID) == "" {
 			return
 		}
@@ -3734,19 +3735,20 @@ func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, 
 			sheetsPtr = &s
 		}
 		_ = c.sendWire(ctx, conn, wireMessage{
-			Type:       "refill_ack",
-			RequestID:  msg.RequestID,
-			OK:         ok,
-			Calibrated: ok,
-			Sheets:     sheetsPtr,
-			Error:      errMsg,
+			Type:         "refill_ack",
+			RequestID:    msg.RequestID,
+			OK:           ok,
+			Calibrated:   ok,
+			Sheets:       sheetsPtr,
+			InventorySeq: invSeq,
+			Error:        errMsg,
 		})
 	}
 
 	if msg.Sheets == nil {
 		errMsg := "missing sheets value in refill command"
 		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
-		sendAck(false, 0, errMsg)
+		sendAck(false, 0, 0, errMsg)
 		return
 	}
 	sheets := *msg.Sheets
@@ -3763,7 +3765,7 @@ func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, 
 	if sheets < 0 || sheets > cap {
 		errMsg := fmt.Sprintf("refill sheets %d outside configured tray capacity [0, %d]", sheets, cap)
 		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
-		sendAck(false, 0, errMsg)
+		sendAck(false, 0, 0, errMsg)
 		return
 	}
 
@@ -3777,19 +3779,19 @@ func (c *Client) handleRefillMessage(ctx context.Context, conn *websocket.Conn, 
 	if activeCount > 0 || monitoredCount > 0 {
 		errMsg := "cannot calibrate paper tray while active print job is in progress"
 		log.Printf("[SPOOLER] Rejecting refill message: %s", errMsg)
-		sendAck(false, 0, errMsg)
+		sendAck(false, 0, 0, errMsg)
 		return
 	}
 
 	if err := c.cfg.StateStore.CalibratePaperTray(ctx, sheets); err != nil {
 		log.Printf("[SPOOLER] Failed to calibrate paper tray on refill message: %v", err)
-		sendAck(false, 0, err.Error())
+		sendAck(false, 0, 0, err.Error())
 		return
 	}
 
 	log.Printf("[SPOOLER] Successfully refilled paper tray inventory to %d sheets (capacity %d)", sheets, cap)
 	h := c.updateSnapshotInventory(ctx, sheets, true)
-	sendAck(true, sheets, "")
+	sendAck(true, sheets, c.calibrationSeq, "")
 	if conn != nil {
 		_ = c.sendWire(ctx, conn, wireMessage{Type: "health", Health: &h})
 	}

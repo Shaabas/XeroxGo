@@ -27,16 +27,17 @@ const (
 )
 
 type wireMessage struct {
-	Type       string                      `json:"type"`
-	Job        *contracts.PrintJobCommand  `json:"job,omitempty"`
-	Progress   *contracts.JobProgressEvent `json:"progress,omitempty"`
-	Health     *contracts.PrinterHealth    `json:"health,omitempty"`
-	Ads        []contracts.AdItem          `json:"ads,omitempty"`
-	Sheets     *int                        `json:"sheets,omitempty"`
-	RequestID  string                      `json:"request_id,omitempty"`
-	OK         bool                        `json:"ok,omitempty"`
-	Calibrated bool                        `json:"calibrated,omitempty"`
-	Error      string                      `json:"error,omitempty"`
+	Type         string                      `json:"type"`
+	Job          *contracts.PrintJobCommand  `json:"job,omitempty"`
+	Progress     *contracts.JobProgressEvent `json:"progress,omitempty"`
+	Health       *contracts.PrinterHealth    `json:"health,omitempty"`
+	Ads          []contracts.AdItem          `json:"ads,omitempty"`
+	Sheets       *int                        `json:"sheets,omitempty"`
+	RequestID    string                      `json:"request_id,omitempty"`
+	OK           bool                        `json:"ok,omitempty"`
+	Calibrated   bool                        `json:"calibrated,omitempty"`
+	InventorySeq uint64                      `json:"inventory_seq,omitempty"`
+	Error        string                      `json:"error,omitempty"`
 }
 
 type refillWaiter struct {
@@ -47,11 +48,12 @@ type refillWaiter struct {
 }
 
 type refillAckResult struct {
-	ok         bool
-	hasSheets  bool
-	sheets     int
-	calibrated bool
-	errMsg     string
+	ok           bool
+	hasSheets    bool
+	sheets       int
+	calibrated   bool
+	inventorySeq uint64
+	errMsg       string
 }
 
 type sessionHealthEntry struct {
@@ -65,13 +67,11 @@ type kioskSession struct {
 	sendMu  sync.Mutex
 	closed  chan struct{}
 
-	healthMu              sync.Mutex
-	latestHealth          *sessionHealthEntry
-	refillMu              sync.Mutex
-	calibrationUncertain  bool
-	inventorySeq          uint64
-	lastRefillSentAt      time.Time
-	lastRefillConfirmedAt time.Time
+	healthMu             sync.Mutex
+	latestHealth         *sessionHealthEntry
+	refillMu             sync.Mutex
+	calibrationUncertain bool
+	inventorySeq         uint64
 
 	dispatchMu           sync.Mutex
 	initialReconnectDone atomic.Bool
@@ -291,11 +291,12 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if exists && waiter.ch != nil {
 					select {
 					case waiter.ch <- refillAckResult{
-						ok:         msg.OK,
-						hasSheets:  hasSheets,
-						sheets:     sheetsVal,
-						calibrated: msg.Calibrated,
-						errMsg:     msg.Error,
+						ok:           msg.OK,
+						hasSheets:    hasSheets,
+						sheets:       sheetsVal,
+						calibrated:   msg.Calibrated,
+						inventorySeq: msg.InventorySeq,
+						errMsg:       msg.Error,
 					}:
 					default:
 					}
@@ -347,21 +348,18 @@ func (h *Hub) handleHealthMessage(ctx context.Context, kioskID string, sess *kio
 			recvAt = prev.receivedAt
 		}
 	}
-	if sess.calibrationUncertain {
-		if (!sess.lastRefillSentAt.IsZero() && !snapshot.UpdatedAt.Before(sess.lastRefillSentAt)) ||
-			(snapshot.InventorySeq > 0 && snapshot.InventorySeq > sess.inventorySeq) {
-			sess.calibrationUncertain = false
+	// Pi alone owns and advances InventorySeq. Sequence 0 is treated consistently as the initial sequence.
+	// Only an authoritative Pi sequence advancement (> sess.inventorySeq) proves post-refill state;
+	// a frame with an older sequence (< sess.inventorySeq) cannot overwrite newer inventory.
+	if snapshot.InventorySeq < sess.inventorySeq {
+		if sess.latestHealth != nil {
+			snapshot.EstimatedSheets = sess.latestHealth.health.EstimatedSheets
+			snapshot.InventoryCalibrated = sess.latestHealth.health.InventoryCalibrated
+			snapshot.InventorySeq = sess.latestHealth.health.InventorySeq
 		}
-	}
-	// Prevent an older telemetry acquisition started before calibration from overwriting confirmed newer inventory.
-	staleInventory := (snapshot.InventorySeq > 0 && sess.inventorySeq > 0 && snapshot.InventorySeq < sess.inventorySeq) ||
-		(snapshot.InventorySeq == 0 && !sess.lastRefillConfirmedAt.IsZero() && snapshot.UpdatedAt.Before(sess.lastRefillConfirmedAt))
-	if staleInventory && sess.latestHealth != nil {
-		snapshot.EstimatedSheets = sess.latestHealth.health.EstimatedSheets
-		snapshot.InventoryCalibrated = sess.latestHealth.health.InventoryCalibrated
-		snapshot.InventorySeq = sess.latestHealth.health.InventorySeq
 	} else if snapshot.InventorySeq > sess.inventorySeq {
 		sess.inventorySeq = snapshot.InventorySeq
+		sess.calibrationUncertain = false
 	}
 	entry := &sessionHealthEntry{
 		health:     snapshot,
@@ -857,8 +855,8 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 	}()
 
 	sess.healthMu.Lock()
+	wasAlreadyUncertain := sess.calibrationUncertain
 	sess.calibrationUncertain = true
-	sess.lastRefillSentAt = time.Now().UTC()
 	sess.healthMu.Unlock()
 
 	s := sheets
@@ -880,9 +878,12 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 			return errors.New("kiosk session replaced or disconnected before confirming refill calibration")
 		}
 		if !res.ok {
-			sess.healthMu.Lock()
-			sess.calibrationUncertain = false
-			sess.healthMu.Unlock()
+			// A rejected refill only clears uncertainty if no earlier unresolved refill was already pending.
+			if !wasAlreadyUncertain {
+				sess.healthMu.Lock()
+				sess.calibrationUncertain = false
+				sess.healthMu.Unlock()
+			}
 			if strings.TrimSpace(res.errMsg) != "" {
 				return errors.New(res.errMsg)
 			}
@@ -895,16 +896,17 @@ func (h *Hub) SendRefill(ctx context.Context, kioskID string, sheets int) error 
 			return fmt.Errorf("returned sheet count %d does not match requested count %d", res.sheets, sheets)
 		}
 
-		// Confirmed calibration updates cached kiosk inventory only; physical fault state,
-		// PaperTrayStatus, and observation timestamps are never overwritten or cleared.
+		// Confirmed calibration consumes the authoritative Pi sequence without incrementing independently.
+		// Delayed acknowledgements with an older sequence (< sess.inventorySeq) must not overwrite newer stock.
 		sess.healthMu.Lock()
-		sess.calibrationUncertain = false
-		sess.lastRefillConfirmedAt = time.Now().UTC()
-		sess.inventorySeq++
-		if sess.latestHealth != nil {
-			sess.latestHealth.health.EstimatedSheets = sheets
-			sess.latestHealth.health.InventoryCalibrated = true
-			sess.latestHealth.health.InventorySeq = sess.inventorySeq
+		if res.inventorySeq >= sess.inventorySeq {
+			sess.inventorySeq = res.inventorySeq
+			sess.calibrationUncertain = false
+			if sess.latestHealth != nil {
+				sess.latestHealth.health.EstimatedSheets = sheets
+				sess.latestHealth.health.InventoryCalibrated = true
+				sess.latestHealth.health.InventorySeq = res.inventorySeq
+			}
 		}
 		sess.healthMu.Unlock()
 
