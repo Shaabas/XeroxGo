@@ -822,6 +822,37 @@ type HardwareTelemetry struct {
 	ErrorMsg        string
 }
 
+func decodeStatusAndFlags(packet *gosnmp.SnmpPacket, telem *HardwareTelemetry) {
+	if pdu, ok := findPDU(packet, oidHrPrinterStatus, 0); ok && isValidPDU(pdu) {
+		if v, okVal := pduToInt64(pdu); okVal {
+			switch int(v) {
+			case 3:
+				telem.StatusState = "IDLE"
+			case 4:
+				telem.StatusState = "PRINTING"
+			case 5:
+				telem.StatusState = "WARMING_UP"
+			default:
+				telem.StatusState = "UNKNOWN"
+			}
+		}
+	}
+
+	if pdu, ok := findPDU(packet, oidHrPrinterDetectedErrorState, 1); ok && isValidPDU(pdu) {
+		var rawBytes []byte
+		switch v := pdu.Value.(type) {
+		case []byte:
+			rawBytes = v
+		case string:
+			rawBytes = []byte(v)
+		}
+		if len(rawBytes) > 0 {
+			telem.Flags = DecodeErrorBitmask(rawBytes)
+			telem.HasFlags = true
+		}
+	}
+}
+
 func pollHardwareTelemetryWithFactory(
 	ctx context.Context,
 	cfg SNMPConfig,
@@ -839,51 +870,18 @@ func pollHardwareTelemetryWithFactory(
 	}
 	defer session.Close()
 
-	packet, err := session.Get([]string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState, oidPrtMarkerLifeCount})
+	packet, err := session.Get([]string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState})
 	if err != nil || packet == nil {
-		// Fallback to essential OIDs if prtMarkerLifeCount is unsupported on strict agents
-		packet, err = session.Get([]string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState})
-		if err != nil || packet == nil {
-			return HardwareTelemetry{Online: false, ErrorMsg: "SNMP GET failed"}
-		}
+		return HardwareTelemetry{Online: false, ErrorMsg: "SNMP GET failed"}
 	}
 
-	var telem HardwareTelemetry
-	telem.Online = true
-	telem.ObservedAt = time.Now().UTC()
-
-	// 1. Status
-	if pdu, ok := findPDU(packet, oidHrPrinterStatus, 0); ok && isValidPDU(pdu) {
-		if v, okVal := pduToInt64(pdu); okVal {
-			switch int(v) {
-			case 3:
-				telem.StatusState = "IDLE"
-			case 4:
-				telem.StatusState = "PRINTING"
-			case 5:
-				telem.StatusState = "WARMING_UP"
-			default:
-				telem.StatusState = "UNKNOWN"
-			}
-		}
+	telem := HardwareTelemetry{
+		Online:     true,
+		ObservedAt: time.Now().UTC(),
 	}
+	decodeStatusAndFlags(packet, &telem)
 
-	// 2. Error flags
-	if pdu, ok := findPDU(packet, oidHrPrinterDetectedErrorState, 1); ok && isValidPDU(pdu) {
-		var rawBytes []byte
-		switch v := pdu.Value.(type) {
-		case []byte:
-			rawBytes = v
-		case string:
-			rawBytes = []byte(v)
-		}
-		if len(rawBytes) > 0 {
-			telem.Flags = DecodeErrorBitmask(rawBytes)
-			telem.HasFlags = true
-		}
-	}
-
-	// 3. Dynamic marker discovery via prtMarkerTable (with direct OID fallback for unit mocks)
+	// Dynamic marker discovery via prtMarkerTable (fail closed if unavailable; no fixed 1.1 fallback).
 	if markers, mErr := walkPrtMarkerTable(session); mErr == nil && len(markers) > 0 {
 		if m := SelectPrimaryMarker(markers); m != nil && m.HasLifeCount {
 			telem.LifeCount = m.LifeCount
@@ -895,30 +893,69 @@ func pollHardwareTelemetryWithFactory(
 			telem.HasCounterMeta = m.CounterUnit >= 0
 		}
 	}
-	if !telem.HasLife {
-		if pdu, ok := findPDU(packet, oidPrtMarkerLifeCount, 2); ok && isValidPDU(pdu) {
-			if v, okVal := pduToInt64(pdu); okVal {
-				telem.LifeCount = v
-				telem.HasLife = true
-				telem.CounterIndex = "1.1"
-			}
+
+	return telem
+}
+
+func pollSelectedCounterTelemetryWithFactory(
+	ctx context.Context,
+	cfg SNMPConfig,
+	counterIndex string,
+	factory DynamicSessionFactory,
+) HardwareTelemetry {
+	if ctx == nil || ctx.Err() != nil {
+		return HardwareTelemetry{Online: false, ErrorMsg: "context canceled"}
+	}
+	counterIndex = strings.TrimSpace(counterIndex)
+	if counterIndex == "" {
+		return HardwareTelemetry{Online: false, ErrorMsg: "selected counter index is required"}
+	}
+	if factory == nil {
+		factory = NewRealDynamicSNMPSession
+	}
+	session, err := factory(ctx, cfg)
+	if err != nil {
+		return HardwareTelemetry{Online: false, ErrorMsg: err.Error()}
+	}
+	defer session.Close()
+
+	oidLife := "1.3.6.1.2.1.43.10.2.1.4." + counterIndex
+	oidUnit := "1.3.6.1.2.1.43.10.2.1.3." + counterIndex
+	packet, err := session.Get([]string{oidHrPrinterStatus, oidHrPrinterDetectedErrorState, oidLife, oidUnit})
+	if err != nil || packet == nil {
+		return HardwareTelemetry{Online: false, ErrorMsg: "SNMP GET failed"}
+	}
+
+	telem := HardwareTelemetry{
+		Online:       true,
+		CounterIndex: counterIndex,
+		ObservedAt:   time.Now().UTC(),
+	}
+	decodeStatusAndFlags(packet, &telem)
+
+	if pdu, ok := findPDU(packet, oidLife, 2); ok && isValidPDU(pdu) {
+		if v, okVal := pduToInt64(pdu); okVal {
+			telem.LifeCount = v
+			telem.HasLife = true
 		}
-		if telem.HasLife {
-			if unitPkt, uErr := session.Get([]string{oidPrtMarkerCounterUnit}); uErr == nil && unitPkt != nil {
-				if pdu, ok := findPDU(unitPkt, oidPrtMarkerCounterUnit, 0); ok && isValidPDU(pdu) {
-					if v, okVal := pduToInt64(pdu); okVal {
-						unitName, isPage := FormatMarkerCounterUnit(v)
-						telem.CounterUnit = v
-						telem.CounterUnitName = unitName
-						telem.IsPageCounter = isPage
-						telem.HasCounterMeta = true
-					}
-				}
-			}
+	}
+	if pdu, ok := findPDU(packet, oidUnit, 3); ok && isValidPDU(pdu) {
+		if v, okVal := pduToInt64(pdu); okVal {
+			unitName, isPage := FormatMarkerCounterUnit(v)
+			telem.CounterUnit = v
+			telem.CounterUnitName = unitName
+			telem.IsPageCounter = isPage
+			telem.HasCounterMeta = true
 		}
 	}
 
 	return telem
+}
+
+// PollSelectedCounterTelemetry queries a previously selected marker counter index directly
+// without walking the entire prtMarkerTable on every poll.
+func PollSelectedCounterTelemetry(ctx context.Context, cfg SNMPConfig, counterIndex string) HardwareTelemetry {
+	return pollSelectedCounterTelemetryWithFactory(ctx, cfg, counterIndex, NewRealDynamicSNMPSession)
 }
 
 // PollHardwareTelemetry queries physical hardware telemetry from SNMP.

@@ -3588,6 +3588,7 @@ job-media-sheets-completed (integer) = 1
 				return []byte(`
 job-id (integer) = 202
 job-state (enum) = completed
+job-state-reasons (keyword) = job-completed-successfully
 job-media-sheets-completed (integer) = 1
 `), nil
 			}
@@ -3595,7 +3596,12 @@ job-media-sheets-completed (integer) = 1
 				if !lpInvoked.Load() {
 					return []byte(""), nil
 				}
-				return []byte("DCPT310-202 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+				for i, arg := range args {
+					if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+						return []byte("DCPT310-202 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
+					}
+				}
+				return []byte("DCPT310-202 user 1024 Tue Nov 3 14:00:00 2026"), nil
 			}
 			return []byte(""), nil
 		}
@@ -4057,7 +4063,7 @@ job-media-sheets-completed (integer) = 1
 				if !lpSubmitted.Load() {
 					return []byte(""), nil
 				}
-				return []byte("DCPT310-701 user 1024 Tue Nov 3 14:00:00 2026\n\tprocessing"), nil
+				return []byte("DCPT310-701 user 1024 Tue Nov 3 14:00:00 2026"), nil
 			}
 			return []byte(""), nil
 		}
@@ -4067,6 +4073,7 @@ job-media-sheets-completed (integer) = 1
 		time.AfterFunc(30*time.Millisecond, cancel)
 
 		hooks := &printer.CUPSPrintHooks{
+			OnSubmittingWithBaseline: func(printer.CounterBaseline) error { return nil },
 			TelemetryPoller: func(ctx context.Context) printer.HardwareTelemetry {
 				return printer.HardwareTelemetry{
 					Online:         true,

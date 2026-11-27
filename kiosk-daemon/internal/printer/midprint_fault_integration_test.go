@@ -319,9 +319,9 @@ func runMidPrintFaultScenario(t *testing.T, scenario string, expectedErrMsg stri
 	onPageCalls := 0
 
 	hooks := &CUPSPrintHooks{
-		OnSubmitting: func() error {
+		OnSubmittingWithBaseline: func(b CounterBaseline) error {
 			submittingCalls++
-			return store.MarkJobSubmitting(ctx, cmd.JobID)
+			return store.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, b.HasBaseline, b.Value, b.Index, b.Unit, b.ObservedAt)
 		},
 		OnSubmitted: func(cupsID string) error {
 			submittedCalls++
@@ -686,6 +686,7 @@ func TestMidPrintHardwareFault_DistinguishCompletedFromHeld(t *testing.T) {
 	var cupsJobID string
 	var postSubCount atomic.Int32
 	hooks := &CUPSPrintHooks{
+		OnSubmittingWithBaseline: func(CounterBaseline) error { return nil },
 		OnSubmitted: func(id string) error {
 			cupsJobID = id
 			return nil

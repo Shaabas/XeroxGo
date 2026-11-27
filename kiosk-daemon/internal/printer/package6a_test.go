@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosnmp/gosnmp"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -339,7 +340,7 @@ func TestPackage6A_OwnershipVerification_DefaultRunnerAndFailClosed(t *testing.T
 			}
 			return []byte(""), nil
 		}
-		err := PrintPDFWithCUPSHooksCustom(context.Background(), runner, "HPTank", cmd, "/tmp/a.pdf", nil, 10*time.Millisecond, &CUPSPrintHooks{TelemetryPoller: validPoller})
+		err := PrintPDFWithCUPSHooksCustom(context.Background(), runner, "HPTank", cmd, "/tmp/a.pdf", nil, 10*time.Millisecond, &CUPSPrintHooks{TelemetryPoller: validPoller, OnSubmittingWithBaseline: func(CounterBaseline) error { return nil }})
 		if err == nil || !strings.Contains(err.Error(), "ownership check failed") {
 			t.Fatalf("expected ownership check error, got %v", err)
 		}
@@ -359,7 +360,7 @@ func TestPackage6A_OwnershipVerification_DefaultRunnerAndFailClosed(t *testing.T
 			}
 			return []byte(""), nil
 		}
-		err := PrintPDFWithCUPSHooksCustom(context.Background(), runner, "HPTank", cmd, "/tmp/a.pdf", nil, 10*time.Millisecond, &CUPSPrintHooks{TelemetryPoller: validPoller})
+		err := PrintPDFWithCUPSHooksCustom(context.Background(), runner, "HPTank", cmd, "/tmp/a.pdf", nil, 10*time.Millisecond, &CUPSPrintHooks{TelemetryPoller: validPoller, OnSubmittingWithBaseline: func(CounterBaseline) error { return nil }})
 		if err == nil || !strings.Contains(err.Error(), "unrelated active CUPS job") {
 			t.Fatalf("expected unrelated active CUPS job error, got %v", err)
 		}
@@ -433,7 +434,8 @@ func TestPackage6A_MissingPollerOrInvalidCounterMetadataPreventsSubmission(t *te
 				return []byte(""), nil
 			}
 			hooks := &CUPSPrintHooks{
-				TelemetryPoller: func(ctx context.Context) HardwareTelemetry { return tc.telem },
+				OnSubmittingWithBaseline: func(CounterBaseline) error { return nil },
+				TelemetryPoller:          func(ctx context.Context) HardwareTelemetry { return tc.telem },
 			}
 			err := PrintPDFWithCUPSHooksCustom(context.Background(), runner, "HPTank", cmd, "/tmp/a.pdf", nil, 10*time.Millisecond, hooks)
 			if err == nil || !strings.Contains(err.Error(), "baseline acquisition failed") {
@@ -592,6 +594,183 @@ func TestPackage6A_CompletionEvidence_StrictPolicy(t *testing.T) {
 		err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-701", nil, 10*time.Millisecond, poller, baseline)
 		if err == nil || !strings.Contains(err.Error(), "counter anomaly") {
 			t.Fatalf("expected sticky counter anomaly error, got %v", err)
+		}
+	})
+}
+
+func TestPackage6A_SelectedMarkerPolling_DirectWithoutTableWalk(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("polls_selected_index_directly_without_walking_table", func(t *testing.T) {
+		var walkCalled atomic.Bool
+		var requestedOIDs []string
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				requestedOIDs = append([]string(nil), oids...)
+				return &gosnmp.SnmpPacket{
+					Error: gosnmp.NoError,
+					Variables: []gosnmp.SnmpPDU{
+						{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
+						{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
+						{Name: "1.3.6.1.2.1.43.10.2.1.4.2.3", Type: gosnmp.Counter32, Value: uint32(4205)},
+						{Name: "1.3.6.1.2.1.43.10.2.1.3.2.3", Type: gosnmp.Integer, Value: 8},
+					},
+				}, nil
+			},
+			walkFunc: func(rootOid string, walkFn gosnmp.WalkFunc) error {
+				walkCalled.Store(true)
+				return errors.New("walk must not be called during selected counter polling")
+			},
+		}
+		factory := func(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error) {
+			return session, nil
+		}
+		telem := pollSelectedCounterTelemetryWithFactory(ctx, SNMPConfig{}, "2.3", factory)
+		if walkCalled.Load() {
+			t.Fatal("walkFunc must NOT be called during selected-marker polling")
+		}
+		if !telem.Online || !telem.HasLife || telem.LifeCount != 4205 || telem.CounterIndex != "2.3" || telem.CounterUnit != 8 || !telem.HasCounterMeta {
+			t.Fatalf("unexpected selected telemetry: %+v", telem)
+		}
+		if len(requestedOIDs) != 4 || requestedOIDs[2] != "1.3.6.1.2.1.43.10.2.1.4.2.3" || requestedOIDs[3] != "1.3.6.1.2.1.43.10.2.1.3.2.3" {
+			t.Fatalf("expected direct selected OIDs, got %v", requestedOIDs)
+		}
+	})
+
+	t.Run("selected_counter_disappearing_or_changing_identity_fails_closed", func(t *testing.T) {
+		session := &fakeSnmpSession{
+			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
+				// Return status & flags only, missing life/unit PDUs for 2.3
+				return &gosnmp.SnmpPacket{
+					Error: gosnmp.NoError,
+					Variables: []gosnmp.SnmpPDU{
+						{Name: oidHrPrinterStatus, Type: gosnmp.Integer, Value: 3},
+						{Name: oidHrPrinterDetectedErrorState, Type: gosnmp.OctetString, Value: []byte{0x00}},
+					},
+				}, nil
+			},
+		}
+		telem := pollSelectedCounterTelemetryWithFactory(ctx, SNMPConfig{}, "2.3", func(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error) {
+			return session, nil
+		})
+		if err := isValidPageCounterReading(telem); err == nil {
+			t.Fatal("expected error when selected counter disappears")
+		}
+
+		// Identity change during monitoring fails closed
+		cmd := contracts.PrintJobCommand{JobID: "job-6a-idchg", TotalPages: 2, TotalSheets: 2, Copies: 1, Duplex: contracts.DuplexSimplex}
+		baseline := CounterBaseline{HasBaseline: true, Value: 4200, Index: "2.3", Unit: 8, ObservedAt: time.Now().UTC()}
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" {
+				for i, a := range args {
+					if a == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+						return []byte("HPTank-701 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully\n"), nil
+					}
+				}
+			}
+			return []byte(""), nil
+		}
+		poller := func(ctx context.Context) HardwareTelemetry {
+			return HardwareTelemetry{Online: true, HasLife: true, LifeCount: 4202, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()}
+		}
+		mCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		err := MonitorCUPSJobWithTelemetryBaselineCustom(mCtx, runner, "HPTank", cmd, "HPTank-701", nil, 10*time.Millisecond, poller, baseline)
+		if err == nil || !strings.Contains(err.Error(), "marker identity changed") {
+			t.Fatalf("expected marker identity changed error, got %v", err)
+		}
+	})
+}
+
+func TestPackage6A_TerminalPositiveEvidence_Quiescence_Ownership_And_PersistedWatermark(t *testing.T) {
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-6a-rem", OrderID: "ord-6a-rem", KioskID: "kiosk-6a",
+		TotalPages: 3, TotalSheets: 3, Copies: 1, Duplex: contracts.DuplexSimplex,
+	}
+
+	t.Run("missing_positive_ipp_completion_evidence_rejected", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		baseline := CounterBaseline{HasBaseline: true, Value: 100, Index: "1.1", Unit: 8, ObservedAt: time.Now().UTC()}
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "ipptool" {
+				// completed state with "none" reason (no job-completed-successfully)
+				return []byte("job-id (integer) = 701\njob-state (enum) = completed\njob-state-reasons (keyword) = none\n"), nil
+			}
+			return []byte(""), nil
+		}
+		poller := func(ctx context.Context) HardwareTelemetry {
+			return HardwareTelemetry{Online: true, HasLife: true, LifeCount: 103, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()}
+		}
+		err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-701", nil, 10*time.Millisecond, poller, baseline)
+		if err == nil {
+			t.Fatal("expected error when IPP completed state lacks job-completed-successfully")
+		}
+	})
+
+	t.Run("non_quiescent_pre_submission_baseline_prevents_lp", func(t *testing.T) {
+		var lpCalled atomic.Bool
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lp" {
+				lpCalled.Store(true)
+			}
+			return []byte(""), nil
+		}
+		hooks := &CUPSPrintHooks{
+			OnSubmittingWithBaseline: func(CounterBaseline) error { return nil },
+			TelemetryPoller: func(ctx context.Context) HardwareTelemetry {
+				return HardwareTelemetry{Online: true, HasLife: true, LifeCount: 100, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "PRINTING", ObservedAt: time.Now().UTC()}
+			},
+		}
+		err := PrintPDFWithCUPSHooksCustom(context.Background(), runner, "HPTank", cmd, "/tmp/a.pdf", nil, 10*time.Millisecond, hooks)
+		if err == nil || !strings.Contains(err.Error(), "not quiescent") {
+			t.Fatalf("expected non-quiescent pre-submission error, got %v", err)
+		}
+		if lpCalled.Load() {
+			t.Fatal("lp must NOT be called when hardware is not quiescent")
+		}
+	})
+
+	t.Run("unrelated_active_job_during_resumed_monitoring_fails_closed", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		baseline := CounterBaseline{HasBaseline: true, Value: 100, Index: "1.1", Unit: 8, ObservedAt: time.Now().UTC()}
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" {
+				return []byte("HPTank-999 otheruser 1024 Tue Nov 3 14:00:00 2026\n"), nil
+			}
+			return []byte(""), nil
+		}
+		poller := func(ctx context.Context) HardwareTelemetry {
+			return HardwareTelemetry{Online: true, HasLife: true, LifeCount: 103, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()}
+		}
+		err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-701", nil, 10*time.Millisecond, poller, baseline)
+		if err == nil || !strings.Contains(err.Error(), "unrelated active CUPS job") {
+			t.Fatalf("expected unrelated active CUPS job error during resumed monitoring, got %v", err)
+		}
+	})
+
+	t.Run("counter_regression_below_persisted_progress_rejected", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		// Baseline is 100, persisted progress is 2 sheets, but counter only reports 101 (delta 1 < 2).
+		baseline := CounterBaseline{HasBaseline: true, Value: 100, Index: "1.1", Unit: 8, ObservedAt: time.Now().UTC(), PersistedSheets: 2}
+		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "lpstat" {
+				for i, a := range args {
+					if a == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+						return []byte("HPTank-701 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully\n"), nil
+					}
+				}
+			}
+			return []byte(""), nil
+		}
+		poller := func(ctx context.Context) HardwareTelemetry {
+			return HardwareTelemetry{Online: true, HasLife: true, LifeCount: 101, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()}
+		}
+		err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-701", nil, 10*time.Millisecond, poller, baseline)
+		if err == nil || !strings.Contains(err.Error(), "inconsistent with persisted progress") {
+			t.Fatalf("expected counter regression below persisted progress error, got %v", err)
 		}
 	})
 }

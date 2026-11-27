@@ -1845,19 +1845,23 @@ func (c *Client) resumeCUPSMonitoring(ctx context.Context, job *state.StoredJob)
 		}
 	}
 
+	// Package 6B requirement: uncertain consumption must be reconciled before clearing the
+	// corresponding execution-safety barrier and restoring available inventory.
 	baseline := printer.CounterBaseline{
-		HasBaseline: job.BaselineCounterSet,
-		Value:       job.BaselineCounterValue,
-		Index:       job.BaselineCounterIndex,
-		Unit:        job.BaselineCounterUnit,
-		ObservedAt:  job.BaselineObservedAt,
+		HasBaseline:     job.BaselineCounterSet,
+		Value:           job.BaselineCounterValue,
+		Index:           job.BaselineCounterIndex,
+		Unit:            job.BaselineCounterUnit,
+		ObservedAt:      job.BaselineObservedAt,
+		PersistedSheets: job.SheetsPrinted,
 	}
 	poller := c.snmpPoller
 	if poller == nil {
 		if snmpCfg := c.getSNMPConfig(); snmpCfg != nil {
 			cfgCopy := *snmpCfg
+			counterIdx := baseline.Index
 			poller = func(pCtx context.Context) printer.HardwareTelemetry {
-				return printer.PollHardwareTelemetry(pCtx, cfgCopy)
+				return printer.PollSelectedCounterTelemetry(pCtx, cfgCopy, counterIdx)
 			}
 		}
 	}

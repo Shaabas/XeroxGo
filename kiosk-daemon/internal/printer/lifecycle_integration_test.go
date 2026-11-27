@@ -261,9 +261,9 @@ func TestCUPSPrintLifecycle_RealEmulatorSubmissionAndTracking(t *testing.T) {
 	var onPageCalls []int
 
 	hooks := &CUPSPrintHooks{
-		OnSubmitting: func() error {
+		OnSubmittingWithBaseline: func(b CounterBaseline) error {
 			submittingCalls++
-			return store.MarkJobSubmitting(ctx, cmd.JobID)
+			return store.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, b.HasBaseline, b.Value, b.Index, b.Unit, b.ObservedAt)
 		},
 		OnSubmitted: func(cupsJobID string) error {
 			submittedCalls++
