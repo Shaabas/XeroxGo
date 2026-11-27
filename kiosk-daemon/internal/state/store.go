@@ -279,24 +279,6 @@ CREATE TABLE IF NOT EXISTS printer_state (
 			return nil, fmt.Errorf("migrate jobs add color_mode: %w", err)
 		}
 	}
-	if !jobCols["outcome_version"] {
-		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN outcome_version INTEGER NOT NULL DEFAULT 0;"); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("migrate jobs add outcome_version: %w", err)
-		}
-	}
-	if !jobCols["outcome_synced_version"] {
-		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN outcome_synced_version INTEGER NOT NULL DEFAULT 0;"); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("migrate jobs add outcome_synced_version: %w", err)
-		}
-	}
-	if !jobCols["outcome_timestamp_ns"] {
-		if _, err := tx.ExecContext(ctx, "ALTER TABLE jobs ADD COLUMN outcome_timestamp_ns INTEGER NOT NULL DEFAULT 0;"); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("migrate jobs add outcome_timestamp_ns: %w", err)
-		}
-	}
 	if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_jobs_order_doc ON jobs (order_id, document_index);"); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("create index idx_jobs_order_doc: %w", err)
@@ -481,7 +463,9 @@ SET status = ?,
     outcome_version = outcome_version + 1,
     outcome_timestamp_ns = ?,
     updated_at_ns = ?
-WHERE job_id = ?;`
+WHERE job_id = ?
+  AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED')
+  AND NOT (status = 'FAILED_REFUNDABLE' AND ? <> 'FAILED_REFUNDABLE');`
 		args = []any{
 			string(event.Status),
 			event.PagesPrinted,
@@ -490,6 +474,8 @@ WHERE job_id = ?;`
 			updatedAtNS,
 			updatedAtNS,
 			event.JobID,
+			string(event.Status),
+			string(event.Status),
 		}
 	} else {
 		query = `
@@ -499,7 +485,8 @@ SET status = ?,
     sheets_printed = ?,
     error_reason = ?,
     updated_at_ns = ?
-WHERE job_id = ?;`
+WHERE job_id = ?
+  AND status NOT IN ('COMPLETED', 'FAILED_REFUNDABLE');`
 		args = []any{
 			string(event.Status),
 			event.PagesPrinted,
@@ -565,51 +552,85 @@ func (s *Store) RecordSheetProgress(
 		_ = tx.Rollback()
 	}()
 
+	if _, err := recordSheetProgressTx(ctx, tx, event, false); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit sheet progress transaction: %w", err)
+	}
+
+	return nil
+}
+
+// recordSheetProgressTx applies validated, monotonic job progress and atomic paper stock
+// decrement inside an existing transaction. When skipIfIdenticalOutcome is true and the
+// persisted job already matches status, monotonic pages/sheets, and error_reason, it is a
+// no-op and returns changed=false without bumping outcome_version.
+func recordSheetProgressTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	event contracts.JobProgressEvent,
+	skipIfIdenticalOutcome bool,
+) (bool, error) {
 	var currentPages, currentSheets, totalPages, totalSheets int
-	var currentStatus string
+	var currentStatus, currentReason string
 	queryJob := `
-SELECT status, pages_printed, sheets_printed, total_pages, total_sheets
+SELECT status, pages_printed, sheets_printed, total_pages, total_sheets, error_reason
 FROM jobs
 WHERE job_id = ?;`
-	err = tx.QueryRowContext(ctx, queryJob, event.JobID).Scan(
+	err := tx.QueryRowContext(ctx, queryJob, event.JobID).Scan(
 		&currentStatus,
 		&currentPages,
 		&currentSheets,
 		&totalPages,
 		&totalSheets,
+		&currentReason,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("job not found: %s", event.JobID)
+			return false, fmt.Errorf("job not found: %s", event.JobID)
 		}
-		return fmt.Errorf("failed to query job %s: %w", event.JobID, err)
+		return false, fmt.Errorf("failed to query job %s: %w", event.JobID, err)
 	}
 
 	if event.Status == contracts.JobStatusCompleted {
 		if event.SheetsPrinted != totalSheets {
-			return fmt.Errorf("inconsistent completion sheets_printed: got %d, want %d", event.SheetsPrinted, totalSheets)
+			return false, fmt.Errorf("inconsistent completion sheets_printed: got %d, want %d", event.SheetsPrinted, totalSheets)
 		}
 		if event.PagesPrinted != totalPages {
-			return fmt.Errorf("inconsistent completion pages_printed: got %d, want %d", event.PagesPrinted, totalPages)
+			return false, fmt.Errorf("inconsistent completion pages_printed: got %d, want %d", event.PagesPrinted, totalPages)
 		}
 	}
 	if currentStatus == string(contracts.JobStatusCompleted) && event.Status != contracts.JobStatusCompleted {
-		return fmt.Errorf("cannot regress completed job %s to status %s", event.JobID, event.Status)
+		return false, fmt.Errorf("cannot regress completed job %s to status %s", event.JobID, event.Status)
 	}
 	if currentStatus == string(contracts.JobStatusFailedRefundable) && event.Status != contracts.JobStatusFailedRefundable {
-		return fmt.Errorf("cannot transition terminal FAILED_REFUNDABLE job %s to status %s", event.JobID, event.Status)
+		return false, fmt.Errorf("cannot transition terminal FAILED_REFUNDABLE job %s to status %s", event.JobID, event.Status)
 	}
 
 	if event.SheetsPrinted > totalSheets {
-		return fmt.Errorf("sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
+		return false, fmt.Errorf("sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
 	}
 	if event.PagesPrinted > totalPages {
-		return fmt.Errorf("pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
+		return false, fmt.Errorf("pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
 	}
 	targetSheets := event.SheetsPrinted
 	// Monotonicity clamp: delayed observations must not regress sheets_printed
 	if targetSheets < currentSheets {
 		targetSheets = currentSheets
+	}
+	targetPages := event.PagesPrinted
+	if targetPages < currentPages {
+		targetPages = currentPages
+	}
+
+	if skipIfIdenticalOutcome &&
+		currentStatus == string(event.Status) &&
+		targetPages == currentPages &&
+		targetSheets == currentSheets &&
+		currentReason == event.ErrorReason {
+		return false, nil
 	}
 
 	deltaSheets := targetSheets - currentSheets
@@ -621,20 +642,15 @@ WHERE id = 1
   AND estimated_sheets >= ?;`
 		res, err := tx.ExecContext(ctx, decQuery, deltaSheets, deltaSheets)
 		if err != nil {
-			return fmt.Errorf("failed to decrement sheets: %w", err)
+			return false, fmt.Errorf("failed to decrement sheets: %w", err)
 		}
 		rows, err := res.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("failed to check affected rows during decrement: %w", err)
+			return false, fmt.Errorf("failed to check affected rows during decrement: %w", err)
 		}
 		if rows == 0 {
-			return errors.New("insufficient sheets in paper tray")
+			return false, errors.New("insufficient sheets in paper tray")
 		}
-	}
-
-	targetPages := event.PagesPrinted
-	if targetPages < currentPages {
-		targetPages = currentPages
 	}
 
 	nowNS := event.Timestamp.UTC().UnixNano()
@@ -685,14 +701,9 @@ WHERE job_id = ?;`
 		)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to update job %s: %w", event.JobID, err)
+		return false, fmt.Errorf("failed to update job %s: %w", event.JobID, err)
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit sheet progress transaction: %w", err)
-	}
-
-	return nil
+	return true, nil
 }
 
 func (s *Store) MarkJobSubmitting(
@@ -704,6 +715,7 @@ func (s *Store) MarkJobSubmitting(
 
 // MarkJobSubmittingWithBaseline atomically marks a job as submitted_to_printer = 1
 // and persists the original pre-submission hardware counter baseline before lp runs.
+// It atomically rejects terminal/paused jobs and orders with a durable failure barrier.
 func (s *Store) MarkJobSubmittingWithBaseline(
 	ctx context.Context,
 	jobID string,
@@ -736,6 +748,54 @@ func (s *Store) MarkJobSubmittingWithBaseline(
 		obsNS = baselineObservedAt.UTC().UnixNano()
 	}
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin mark submitting tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var orderID, status string
+	var submitted int
+	err = tx.QueryRowContext(ctx, `
+SELECT order_id, status, submitted_to_printer
+FROM jobs
+WHERE job_id = ?;`, jobID).Scan(&orderID, &status, &submitted)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("job not found: %s", jobID)
+		}
+		return fmt.Errorf("query job %s before submission: %w", jobID, err)
+	}
+	if submitted != 0 {
+		return fmt.Errorf("job %s was already marked submitted to printer", jobID)
+	}
+	if status == string(contracts.JobStatusCompleted) ||
+		status == string(contracts.JobStatusPausedError) ||
+		status == string(contracts.JobStatusFailedRefundable) {
+		return fmt.Errorf("cannot submit job %s in terminal/paused status %s", jobID, status)
+	}
+
+	resolvedOrderID := strings.TrimSpace(orderID)
+	if resolvedOrderID == "" {
+		resolvedOrderID = jobID
+	}
+	var blockingSiblings int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(1)
+FROM jobs
+WHERE (order_id = ? OR (order_id = '' AND job_id = ?))
+  AND job_id != ?
+  AND status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE');`,
+		resolvedOrderID, resolvedOrderID, jobID,
+	).Scan(&blockingSiblings); err != nil {
+		return fmt.Errorf("check order failure barrier for %s: %w", jobID, err)
+	}
+	if blockingSiblings > 0 {
+		return fmt.Errorf("cannot submit job %s: order %s has %d paused/failed sibling(s)", jobID, resolvedOrderID, blockingSiblings)
+	}
+
 	query := `
 UPDATE jobs
 SET submitted_to_printer = 1,
@@ -746,9 +806,11 @@ SET submitted_to_printer = 1,
     baseline_counter_unit = CASE WHEN baseline_counter_set = 1 THEN baseline_counter_unit ELSE ? END,
     baseline_observed_at_ns = CASE WHEN baseline_counter_set = 1 THEN baseline_observed_at_ns ELSE ? END,
     updated_at_ns = ?
-WHERE job_id = ? AND submitted_to_printer = 0;`
+WHERE job_id = ?
+  AND submitted_to_printer = 0
+  AND status NOT IN ('COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE');`
 
-	res, err := s.db.ExecContext(ctx, query, setInt, baselineValue, baselineIndex, baselineUnit, obsNS, nowNS, jobID)
+	res, err := tx.ExecContext(ctx, query, setInt, baselineValue, baselineIndex, baselineUnit, obsNS, nowNS, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to mark job %s submitting: %w", jobID, err)
 	}
@@ -757,13 +819,9 @@ WHERE job_id = ? AND submitted_to_printer = 0;`
 		return fmt.Errorf("failed to check affected rows for %s: %w", jobID, err)
 	}
 	if rows == 0 {
-		var existingSubmitted int
-		if qErr := s.db.QueryRowContext(ctx, "SELECT submitted_to_printer FROM jobs WHERE job_id = ?;", jobID).Scan(&existingSubmitted); qErr == nil && existingSubmitted != 0 {
-			return fmt.Errorf("job %s was already marked submitted to printer", jobID)
-		}
-		return fmt.Errorf("job not found: %s", jobID)
+		return fmt.Errorf("job %s is not eligible for submission", jobID)
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) RecordJobSubmission(
@@ -790,7 +848,9 @@ UPDATE jobs
 SET cups_job_id = ?,
     submitted_to_printer = 1,
     updated_at_ns = ?
-WHERE job_id = ?;`
+WHERE job_id = ?
+  AND status NOT IN ('COMPLETED', 'FAILED_REFUNDABLE')
+  AND NOT (status = 'PAUSED_ERROR' AND cups_job_id != '');`
 
 	res, err := s.db.ExecContext(ctx, query, cupsJobID, nowNS, jobID)
 	if err != nil {
@@ -1339,11 +1399,10 @@ func (s *Store) FinalizeOrderFailure(
 	}()
 
 	var targetOrderID, currentStatus string
-	var currentPages, currentSheets int
 	err = tx.QueryRowContext(ctx, `
-SELECT order_id, status, pages_printed, sheets_printed
+SELECT order_id, status
 FROM jobs
-WHERE job_id = ?;`, jobID).Scan(&targetOrderID, &currentStatus, &currentPages, &currentSheets)
+WHERE job_id = ?;`, jobID).Scan(&targetOrderID, &currentStatus)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("job not found: %s", jobID)
@@ -1351,51 +1410,36 @@ WHERE job_id = ?;`, jobID).Scan(&targetOrderID, &currentStatus, &currentPages, &
 		return nil, fmt.Errorf("query target job %s: %w", jobID, err)
 	}
 
-	resolvedOrderID := strings.TrimSpace(orderID)
+	trimmedOrderID := strings.TrimSpace(orderID)
+	trimmedTargetOrderID := strings.TrimSpace(targetOrderID)
+	if trimmedOrderID != "" && trimmedTargetOrderID != "" && trimmedOrderID != trimmedTargetOrderID {
+		return nil, fmt.Errorf("order_id mismatch for job %s: got %q, want %q", jobID, trimmedOrderID, trimmedTargetOrderID)
+	}
+
+	resolvedOrderID := trimmedOrderID
 	if resolvedOrderID == "" {
-		resolvedOrderID = strings.TrimSpace(targetOrderID)
+		resolvedOrderID = trimmedTargetOrderID
 	}
 	if resolvedOrderID == "" {
 		resolvedOrderID = jobID
 	}
 
-	// Preserve COMPLETED and terminal FAILED_REFUNDABLE states without regression.
+	// Preserve COMPLETED and terminal FAILED_REFUNDABLE states without regression,
+	// while enforcing RecordSheetProgress bounds, monotonicity, and paper accounting.
 	if currentStatus != string(contracts.JobStatusCompleted) &&
 		!(currentStatus == string(contracts.JobStatusFailedRefundable) && event.Status == contracts.JobStatusPausedError) {
-		targetPages := event.PagesPrinted
-		if targetPages < currentPages {
-			targetPages = currentPages
-		}
-		targetSheets := event.SheetsPrinted
-		if targetSheets < currentSheets {
-			targetSheets = currentSheets
-		}
-		if _, err := tx.ExecContext(ctx, `
-UPDATE jobs
-SET status = ?,
-    pages_printed = ?,
-    sheets_printed = ?,
-    error_reason = ?,
-    outcome_version = outcome_version + 1,
-    outcome_timestamp_ns = ?,
-    updated_at_ns = ?
-WHERE job_id = ?;`,
-			string(event.Status),
-			targetPages,
-			targetSheets,
-			event.ErrorReason,
-			tsNS,
-			tsNS,
-			jobID,
-		); err != nil {
-			return nil, fmt.Errorf("update target job %s outcome: %w", jobID, err)
+		evtCopy := event
+		evtCopy.JobID = jobID
+		evtCopy.Timestamp = ts
+		if _, err := recordSheetProgressTx(ctx, tx, evtCopy, true); err != nil {
+			return nil, fmt.Errorf("finalize target job %s outcome: %w", jobID, err)
 		}
 	}
 
 	// Load siblings in the same order and propagate stoppage without disturbing COMPLETED prefix
 	// or unverified submitted jobs.
 	rows, err := tx.QueryContext(ctx, `
-SELECT job_id, status, submitted_to_printer, cups_job_id, sheets_printed
+SELECT job_id, status, submitted_to_printer, cups_job_id, sheets_printed, pages_printed
 FROM jobs
 WHERE (order_id = ? OR (order_id = '' AND job_id = ?))
   AND job_id != ?
@@ -1410,12 +1454,13 @@ ORDER BY document_index ASC;`, resolvedOrderID, resolvedOrderID, jobID)
 		submitted bool
 		cupsID    string
 		sheets    int
+		pages     int
 	}
 	var siblings []siblingRow
 	for rows.Next() {
 		var r siblingRow
 		var subInt int
-		if err := rows.Scan(&r.id, &r.status, &subInt, &r.cupsID, &r.sheets); err != nil {
+		if err := rows.Scan(&r.id, &r.status, &subInt, &r.cupsID, &r.sheets, &r.pages); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan sibling job for order %s: %w", resolvedOrderID, err)
 		}
@@ -1437,7 +1482,7 @@ ORDER BY document_index ASC;`, resolvedOrderID, resolvedOrderID, jobID)
 		if sib.status == string(contracts.JobStatusCompleted) || sib.status == string(contracts.JobStatusFailedRefundable) {
 			continue
 		}
-		definitelyUnsubmitted := !sib.submitted && strings.TrimSpace(sib.cupsID) == "" && sib.sheets == 0
+		definitelyUnsubmitted := !sib.submitted && strings.TrimSpace(sib.cupsID) == "" && sib.sheets == 0 && sib.pages == 0
 		targetSibStatus := contracts.JobStatusPausedError
 		if definitelyUnsubmitted && event.Status == contracts.JobStatusFailedRefundable {
 			targetSibStatus = contracts.JobStatusFailedRefundable

@@ -2257,8 +2257,17 @@ WHERE order_id = ?;
 			if err != nil {
 				return fmt.Errorf("update job progress: update order completed: %w", err)
 			}
-			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
-		} else if pausedDocs > 0 {
+			if _, err = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID); err != nil {
+				return fmt.Errorf("update job progress: release pin reservation: %w", err)
+			}
+			if _, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE kiosk_sessions
+SET status = 'COMPLETED', updated_at_ns = ?
+WHERE order_id = ? AND status IN ('PAYMENT_PENDING', 'PAID', 'ACTIVE');
+`), eventNS, orderID); err != nil {
+				return fmt.Errorf("update job progress: close completed session: %w", err)
+			}
+		} else if pausedDocs > 0 || (failedDocs > 0 && completedDocs+failedDocs < totalDocs) {
 			_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'PAUSED_ERROR', updated_at_ns = ?
@@ -2267,7 +2276,7 @@ WHERE order_id = ? AND status <> 'COMPLETED';
 			if err != nil {
 				return fmt.Errorf("update job progress: update order paused_error: %w", err)
 			}
-		} else if failedDocs > 0 {
+		} else if failedDocs > 0 && totalDocs > 0 && completedDocs+failedDocs == totalDocs {
 			_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'FAILED_REFUNDABLE', updated_at_ns = ?
@@ -2276,8 +2285,22 @@ WHERE order_id = ? AND status <> 'COMPLETED';
 			if err != nil {
 				return fmt.Errorf("update job progress: update order failed_refundable: %w", err)
 			}
-			if totalDocs > 0 && completedDocs+failedDocs == totalDocs {
-				_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
+			if _, err = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID); err != nil {
+				return fmt.Errorf("update job progress: release pin reservation: %w", err)
+			}
+			if _, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE kiosk_sessions
+SET status = 'CANCELED', updated_at_ns = ?
+WHERE order_id = ? AND status IN ('PAYMENT_PENDING', 'PAID', 'ACTIVE');
+`), eventNS, orderID); err != nil {
+				return fmt.Errorf("update job progress: close failed session: %w", err)
+			}
+			if _, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE dispatch_intents
+SET status = 'CANCELED', updated_at_ns = ?
+WHERE order_id = ? AND status IN ('PENDING', 'SENT', 'ACKNOWLEDGED');
+`), eventNS, orderID); err != nil {
+				return fmt.Errorf("update job progress: close failed order dispatch intents: %w", err)
 			}
 		} else if printingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
@@ -2306,29 +2329,55 @@ WHERE job_id = ?
 		}
 
 		if event.Status == contracts.JobStatusCompleted || event.Status == contracts.JobStatusFailedRefundable {
-			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
+			if _, err = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID); err != nil {
+				return fmt.Errorf("update job progress: release pin reservation: %w", err)
+			}
+			sessStatus := "COMPLETED"
+			if event.Status == contracts.JobStatusFailedRefundable {
+				sessStatus = "CANCELED"
+			}
+			if _, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE kiosk_sessions
+SET status = ?, updated_at_ns = ?
+WHERE order_id = ? AND status IN ('PAYMENT_PENDING', 'PAID', 'ACTIVE');
+`), sessStatus, eventNS, orderID); err != nil {
+				return fmt.Errorf("update job progress: close terminal session: %w", err)
+			}
 		}
 	}
 
 	// 7. Synchronize dispatch intent status with authoritative progress
 	if event.Status == contracts.JobStatusCompleted {
-		_, _ = tx.ExecContext(ctx, s.rebind(`
+		if _, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE job_id = ?;
-`), eventNS, event.JobID)
+`), eventNS, event.JobID); err != nil {
+			return fmt.Errorf("update job progress: mark dispatch intent completed: %w", err)
+		}
 	} else if event.Status == contracts.JobStatusPausedError || event.Status == contracts.JobStatusFailedRefundable {
-		_, _ = tx.ExecContext(ctx, s.rebind(`
+		if _, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE dispatch_intents
+SET status = 'CANCELED', updated_at_ns = ?
+WHERE job_id = ? AND status IN ('PENDING', 'SENT', 'ACKNOWLEDGED');
+`), eventNS, event.JobID); err != nil {
+			return fmt.Errorf("update job progress: cancel failed dispatch intent: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'CANCELED', updated_at_ns = ?
 WHERE order_id = ? AND status IN ('PENDING', 'SENT');
-`), eventNS, orderID)
+`), eventNS, orderID); err != nil {
+			return fmt.Errorf("update job progress: cancel order dispatch intents: %w", err)
+		}
 	} else if event.Status == contracts.JobStatusSpooling || event.Status == contracts.JobStatusPrinting {
-		_, _ = tx.ExecContext(ctx, s.rebind(`
+		if _, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'ACKNOWLEDGED', acknowledged_at_ns = ?, updated_at_ns = ?
 WHERE job_id = ? AND status IN ('PENDING', 'SENT');
-`), eventNS, eventNS, event.JobID)
+`), eventNS, eventNS, event.JobID); err != nil {
+			return fmt.Errorf("update job progress: acknowledge dispatch intent: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -2406,7 +2455,8 @@ WHERE job_id = ?;
 }
 
 // GetExpiredOrderIDs returns order IDs whose stored PDF artifacts have exceeded retention.
-// - completedThreshold applies to orders in terminal states (COMPLETED, PAUSED_ERROR, FAILED_REFUNDABLE).
+// - completedThreshold applies to orders in terminal states (COMPLETED, FAILED_REFUNDABLE).
+//   Unresolved PAUSED_ERROR orders are strictly excluded until reconciled.
 // - pendingThreshold applies to unpaid orders still in PENDING_PAYMENT.
 func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pendingThreshold time.Time) ([]string, error) {
 	if s == nil || s.db == nil {
@@ -2421,7 +2471,7 @@ func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pend
 
 	query := `
 SELECT order_id FROM orders
-WHERE (status IN ('COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE') AND updated_at_ns <= ?)
+WHERE (status IN ('COMPLETED', 'FAILED_REFUNDABLE') AND updated_at_ns <= ?)
    OR (status = 'PENDING_PAYMENT' AND created_at_ns <= ?);
 `
 	rows, err := s.db.QueryContext(ctx, s.rebind(query), completedThreshold.UnixNano(), pendingThreshold.UnixNano())
@@ -3960,9 +4010,16 @@ WHERE job_id = ? AND status = 'PENDING'
 
 // MarkDispatchIntentAcknowledged records that the kiosk daemon has durably accepted and persisted a specific job.
 func (s *Store) MarkDispatchIntentAcknowledged(ctx context.Context, jobID string) error {
+	return s.MarkDispatchIntentAcknowledgedForKiosk(ctx, "", jobID)
+}
+
+// MarkDispatchIntentAcknowledgedForKiosk records durable acceptance of a specific job,
+// validating kiosk ownership when kioskID is provided and rejecting stopped/terminal orders.
+func (s *Store) MarkDispatchIntentAcknowledgedForKiosk(ctx context.Context, kioskID, jobID string) error {
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
+	kioskID = strings.TrimSpace(kioskID)
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
 		return errors.New("jobID cannot be empty")
@@ -3971,9 +4028,16 @@ func (s *Store) MarkDispatchIntentAcknowledged(ctx context.Context, jobID string
 	query := s.rebind(`
 UPDATE dispatch_intents
 SET status = 'ACKNOWLEDGED', acknowledged_at_ns = ?, updated_at_ns = ?
-WHERE job_id = ? AND status IN ('PENDING', 'SENT');
+WHERE job_id = ?
+  AND (? = '' OR kiosk_id = ?)
+  AND status IN ('PENDING', 'SENT')
+  AND NOT EXISTS (
+      SELECT 1 FROM orders o
+      WHERE o.order_id = dispatch_intents.order_id
+        AND o.status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED', 'CANCELED')
+  );
 `)
-	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID)
+	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID, kioskID, kioskID)
 	return err
 }
 

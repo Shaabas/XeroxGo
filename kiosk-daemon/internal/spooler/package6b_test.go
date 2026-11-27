@@ -3,6 +3,7 @@ package spooler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"xeroxgo/kiosk-daemon/internal/printer"
+	"xeroxgo/kiosk-daemon/internal/state"
 	"xeroxgo/pkg/contracts"
 )
 
@@ -326,4 +328,374 @@ func TestPackage6B_OutcomeSyncRetransmitsOnReconnectWithOriginalTimestamp(t *tes
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("expected pending outcome sync jobs to be marked synced after progress_ack")
+}
+
+func TestPackage6B_HealthyButPrinting_And_PreCancellationTelemetry_CannotFinalize(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "quiesce.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-quiesce-1", OrderID: "ord-quiesce-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "1212", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("c", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	if err := st.SaveJob(ctx, cmd, contracts.JobStatusDispatched); err != nil {
+		t.Fatalf("SaveJob: %v", err)
+	}
+	if err := st.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 100, "1.1", 8, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkJobSubmittingWithBaseline: %v", err)
+	}
+	if err := st.RecordJobSubmission(ctx, cmd.JobID, "DCPT310-77"); err != nil {
+		t.Fatalf("RecordJobSubmission: %v", err)
+	}
+
+	var canceledNow atomic.Bool
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "cancel":
+			canceledNow.Store(true)
+			return []byte(""), nil
+		case "ipptool":
+			if canceledNow.Load() {
+				return []byte("job-state (enum) = canceled\n"), nil
+			}
+			return []byte("job-state (enum) = processing\n"), nil
+		case "lpstat":
+			if canceledNow.Load() {
+				return []byte(""), nil
+			}
+			return []byte("DCPT310-77 user 1024 Mon\n"), nil
+		default:
+			return []byte(""), nil
+		}
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		CUPSRunner: runner, DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Case 1: EvaluatedHealthHealthy but State == "PRINTING" -> must stay PAUSED_ERROR
+	now := time.Now().UTC()
+	client.snapshotMu.Lock()
+	client.latestSnap = telemetrySnapshot{
+		HasSample: true, Seq: 1, AcquiredAt: now,
+		Health: contracts.PrinterHealth{
+			Online: true, State: "PRINTING", EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+			ExecutionSafe: true, UpdatedAt: now,
+			EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+				CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+			},
+		},
+	}
+	client.snapshotMu.Unlock()
+
+	stored, _ := st.GetJob(ctx, cmd.JobID)
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted")
+	if status != contracts.JobStatusPausedError {
+		t.Fatalf("expected healthy-but-PRINTING telemetry to stay PAUSED_ERROR, got %s", status)
+	}
+
+	// Case 2: Pre-cancellation IDLE telemetry (UpdatedAt strictly before cancel) -> must stay PAUSED_ERROR
+	preCancel := time.Now().UTC().Add(-2 * time.Second)
+	client.snapshotMu.Lock()
+	client.latestSnap = telemetrySnapshot{
+		HasSample: true, Seq: 2, AcquiredAt: preCancel,
+		Health: contracts.PrinterHealth{
+			Online: true, State: "IDLE", EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+			ExecutionSafe: true, UpdatedAt: preCancel,
+			EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+				CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &preCancel},
+				NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &preCancel},
+				SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &preCancel},
+			},
+		},
+	}
+	client.snapshotMu.Unlock()
+
+	stored, _ = st.GetJob(ctx, cmd.JobID)
+	status = client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted")
+	if status != contracts.JobStatusPausedError {
+		t.Fatalf("expected pre-cancellation telemetry to stay PAUSED_ERROR, got %s", status)
+	}
+}
+
+func TestPackage6B_ActiveFaultWithResumedProcessingCUPS_AttemptsSafeTermination(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "resumed_proc.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-resproc-1", OrderID: "ord-resproc-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "1313", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("d", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+	_ = st.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 100, "1.1", 8, time.Now().UTC())
+	_ = st.RecordJobSubmission(ctx, cmd.JobID, "DCPT310-88")
+
+	var cancelCalled atomic.Int32
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "cancel":
+			cancelCalled.Add(1)
+			return []byte(""), nil
+		case "ipptool":
+			if cancelCalled.Load() == 0 {
+				return []byte("job-state (enum) = processing\n"), nil
+			}
+			return []byte("job-state (enum) = canceled\n"), nil
+		default:
+			return []byte(""), nil
+		}
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		CUPSRunner: runner, DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	client.setHardwareFault(true, "paper jam", "Paper jam")
+	stored, _ := st.GetJob(ctx, cmd.JobID)
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "paper jam")
+	if cancelCalled.Load() == 0 {
+		t.Fatalf("expected active resumable processing CUPS job to be canceled even during hardware fault")
+	}
+	if status != contracts.JobStatusPausedError {
+		t.Fatalf("expected job to stay PAUSED_ERROR while fault active, got %s", status)
+	}
+}
+
+func TestPackage6B_CompletedCUPSWithFullVerifiedSheets_CompletesSafely(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "comp6b.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-comp6b-1", OrderID: "ord-comp6b-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "1414", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("e", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+	_ = st.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 100, "1.1", 8, time.Now().UTC())
+	_ = st.RecordJobSubmission(ctx, cmd.JobID, "DCPT310-99")
+	_ = st.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: "kiosk-1", Status: contracts.JobStatusPausedError,
+		PagesPrinted: 2, SheetsPrinted: 2, ErrorReason: "transient error after last sheet", Timestamp: time.Now().UTC(),
+	})
+
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		CUPSRunner: runner, DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	now := time.Now().UTC()
+	client.snapshotMu.Lock()
+	client.latestSnap = telemetrySnapshot{
+		HasSample: true, Seq: 1, AcquiredAt: now,
+		Health: contracts.PrinterHealth{
+			Online: true, State: "IDLE", EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+			ExecutionSafe: true, UpdatedAt: now,
+			EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+				CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+			},
+		},
+	}
+	client.snapshotMu.Unlock()
+
+	stored, _ := st.GetJob(ctx, cmd.JobID)
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "reconcile")
+	if status != contracts.JobStatusCompleted {
+		t.Fatalf("expected verified full-sheet job to reconcile to COMPLETED, got %s", status)
+	}
+}
+
+type failingFinalizeStore struct {
+	StateStore
+	failErr error
+}
+
+func (f *failingFinalizeStore) FinalizeOrderFailure(ctx context.Context, orderID, jobID string, event contracts.JobProgressEvent, invalidateInventory bool) ([]state.StoredJob, error) {
+	return nil, f.failErr
+}
+
+func TestPackage6B_FailedSQLiteTx_RetainsFailClosedBarrier(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	realSt, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "failtx.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer realSt.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-failtx-1", OrderID: "ord-failtx-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "1515", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("f", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = realSt.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+
+	wrapped := &failingFinalizeStore{StateStore: realSt, failErr: errors.New("forced sqlite tx failure")}
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: wrapped, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	client.finalizeAndEmitOrderFailure(ctx, cmd.OrderID, cmd.JobID, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "download failed", Timestamp: time.Now().UTC(),
+	}, false)
+
+	if !client.isHardwareFaultActive() {
+		t.Fatalf("expected fail-closed hardware fault barrier to remain active when FinalizeOrderFailure fails")
+	}
+	stored, _ := realSt.GetJob(ctx, cmd.JobID)
+	if stored.Status == contracts.JobStatusFailedRefundable {
+		t.Fatalf("failed FinalizeOrderFailure must not authorize FAILED_REFUNDABLE")
+	}
+}
+
+func TestPackage6B_LostCompletedOutcome_RetransmitsWithOriginalTimestamp_And_StaleAckIgnored(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "comp_sync.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-compsync-1", OrderID: "ord-compsync-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-compsync", DisplayCode: "1616", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("1", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusPrinting)
+	origTS := time.Now().UTC().Add(-3 * time.Minute).Truncate(time.Millisecond)
+	if err := st.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusCompleted,
+		PagesPrinted: 2, SheetsPrinted: 2, Timestamp: origTS,
+	}); err != nil {
+		t.Fatalf("RecordSheetProgress: %v", err)
+	}
+	// Bump outcome_version to 2 via UpdateProgress idempotent COMPLETED, so v1 is stale
+	_ = st.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusCompleted,
+		PagesPrinted: 2, SheetsPrinted: 2, Timestamp: origTS,
+	})
+
+	// Stale ack for v1 must NOT clear v2
+	_ = st.MarkOutcomeSynced(ctx, cmd.JobID, 1)
+	pending, _ := st.GetPendingOutcomeSyncJobs(ctx)
+	if len(pending) != 1 || pending[0].OutcomeVersion != 2 {
+		t.Fatalf("expected v2 still pending after stale v1 ack, got %+v", pending)
+	}
+
+	var seenAttempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "done")
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), c, &raw); err != nil {
+				return
+			}
+			var m wireMessage
+			if err := json.Unmarshal(raw, &m); err != nil {
+				continue
+			}
+			if m.Type == "progress" && m.Progress != nil && m.Progress.JobID == cmd.JobID {
+				n := seenAttempts.Add(1)
+				if !m.Progress.Timestamp.Equal(origTS) || m.Progress.Status != contracts.JobStatusCompleted {
+					t.Errorf("expected original COMPLETED timestamp %v, got %+v", origTS, m.Progress)
+				}
+				// Drop first attempt's ack to exercise connected retry, ack second attempt
+				if n >= 2 {
+					_ = wsjson.Write(r.Context(), c, wireMessage{
+						Type:           "progress_ack",
+						Progress:       &contracts.JobProgressEvent{JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusCompleted},
+						OutcomeVersion: m.OutcomeVersion,
+						OK:             true,
+					})
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws" + strings.TrimPrefix(srv.URL, "http"), KioskID: cmd.KioskID, StateStore: st,
+		CUPSQueue: "DCPT310", DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	go client.handleConnection(ctx, conn)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p, err := st.GetPendingOutcomeSyncJobs(ctx)
+		if err == nil && len(p) == 0 {
+			cancel()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected lost COMPLETED outcome to retransmit and clear after connected retry ack")
 }

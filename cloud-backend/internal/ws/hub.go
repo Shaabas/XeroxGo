@@ -312,6 +312,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "heartbeat":
 			// Maintain connection liveness only; heartbeats never extend health readiness.
 		case "ack", "job_ack":
+			if !h.isActiveSession(kioskID, sess) {
+				return
+			}
 			jobID := ""
 			if msg.Progress != nil {
 				jobID = msg.Progress.JobID
@@ -320,12 +323,20 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				jobID = msg.Job.JobID
 			}
 			if jobID != "" && h.db != nil {
-				_ = h.db.MarkDispatchIntentAcknowledged(ctx, jobID)
+				if err := h.db.MarkDispatchIntentAcknowledgedForKiosk(ctx, kioskID, jobID); err != nil {
+					log.Printf("[HUB] Failed to acknowledge dispatch intent for kiosk %s job %s: %v", kioskID, jobID, err)
+					continue
+				}
 				if msg.Progress != nil && msg.Progress.KioskID == kioskID && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
-					_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+					if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err != nil {
+						log.Printf("[HUB] Failed to apply job_ack progress for kiosk %s job %s: %v", kioskID, jobID, err)
+					}
 				}
 			}
 		case "progress":
+			if !h.isActiveSession(kioskID, sess) {
+				return
+			}
 			if msg.Progress == nil || msg.Progress.KioskID != kioskID {
 				continue
 			}
@@ -334,27 +345,23 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if h.db != nil {
 				if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err != nil {
+					log.Printf("[HUB] Rejected/failed progress update for kiosk %s job %s: %v", kioskID, msg.Progress.JobID, err)
 					continue
 				}
-				if msg.OutcomeVersion > 0 {
-					h.mu.RLock()
-					active := h.sessions[kioskID] == sess
-					h.mu.RUnlock()
-					if active {
-						ackMsg := wireMessage{
-							Type: "progress_ack",
-							Progress: &contracts.JobProgressEvent{
-								JobID:   msg.Progress.JobID,
-								KioskID: kioskID,
-								Status:  msg.Progress.Status,
-							},
-							OutcomeVersion: msg.OutcomeVersion,
-							OK:             true,
-						}
-						sess.sendMu.Lock()
-						_ = wsjson.Write(ctx, conn, ackMsg)
-						sess.sendMu.Unlock()
+				if msg.OutcomeVersion > 0 && h.isActiveSession(kioskID, sess) {
+					ackMsg := wireMessage{
+						Type: "progress_ack",
+						Progress: &contracts.JobProgressEvent{
+							JobID:   msg.Progress.JobID,
+							KioskID: kioskID,
+							Status:  msg.Progress.Status,
+						},
+						OutcomeVersion: msg.OutcomeVersion,
+						OK:             true,
 					}
+					sess.sendMu.Lock()
+					_ = wsjson.Write(ctx, conn, ackMsg)
+					sess.sendMu.Unlock()
 				}
 			}
 		case "health":

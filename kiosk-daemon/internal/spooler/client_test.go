@@ -2800,6 +2800,9 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UpdateProgress failed: %v", err)
 		}
+		if err := store.MarkOutcomeSynced(ctx, cmd.JobID, 1); err != nil {
+			t.Fatalf("MarkOutcomeSynced failed: %v", err)
+		}
 
 		receivedAck := make(chan wireMessage, 1)
 		var gotProgress atomic.Bool

@@ -129,3 +129,70 @@ func TestFinalizeOrderFailure_AtomicInventoryInvalidationAndSiblingStop(t *testi
 		t.Fatalf("expected 0 pending outcome sync jobs after ack, got %d (err=%v)", len(pendingAfter), err)
 	}
 }
+
+func TestPackage6B_ConcurrentFailureAndSubmissionBarrier_IdempotentDuplicate(t *testing.T) {
+	ctx := context.Background()
+	st, err := OpenWithCapacity(filepath.Join(t.TempDir(), "state6b_conc.db"), 150)
+	if err != nil {
+		t.Fatalf("OpenWithCapacity: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.CalibratePaperTray(ctx, 100); err != nil {
+		t.Fatalf("CalibratePaperTray: %v", err)
+	}
+
+	makeCmd := func(id string, idx int) contracts.PrintJobCommand {
+		return contracts.PrintJobCommand{
+			JobID: id, OrderID: "ord-conc-6b", DocumentIndex: idx, TotalDocuments: 2,
+			KioskID: "kiosk-1", DisplayCode: "5678", DownloadURL: "http://localhost/doc.pdf",
+			SHA256Checksum: "abc", TotalPages: 2, TotalSheets: 2, Copies: 1,
+			Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+		}
+	}
+	if err := st.SaveJob(ctx, makeCmd("cjob-0", 0), contracts.JobStatusDispatched); err != nil {
+		t.Fatalf("SaveJob 0: %v", err)
+	}
+	if err := st.SaveJob(ctx, makeCmd("cjob-1", 1), contracts.JobStatusDispatched); err != nil {
+		t.Fatalf("SaveJob 1: %v", err)
+	}
+
+	ts := time.Now().UTC().Truncate(time.Millisecond)
+	// First FinalizeOrderFailure marks cjob-0 FAILED_REFUNDABLE and stops cjob-1
+	res1, err := st.FinalizeOrderFailure(ctx, "ord-conc-6b", "cjob-0", contracts.JobProgressEvent{
+		JobID: "cjob-0", KioskID: "kiosk-1", Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "download failed", Timestamp: ts,
+	}, false)
+	if err != nil {
+		t.Fatalf("FinalizeOrderFailure 1: %v", err)
+	}
+	v1 := res1[0].OutcomeVersion
+
+	// Duplicate identical FinalizeOrderFailure must be idempotent (no version bump)
+	res2, err := st.FinalizeOrderFailure(ctx, "ord-conc-6b", "cjob-0", contracts.JobProgressEvent{
+		JobID: "cjob-0", KioskID: "kiosk-1", Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "download failed", Timestamp: ts.Add(time.Second),
+	}, false)
+	if err != nil {
+		t.Fatalf("FinalizeOrderFailure 2: %v", err)
+	}
+	if res2[0].OutcomeVersion != v1 {
+		t.Fatalf("expected idempotent duplicate outcome_version=%d, got %d", v1, res2[0].OutcomeVersion)
+	}
+
+	// MarkJobSubmittingWithBaseline must reject both failed job and sibling in failed order
+	if err := st.MarkJobSubmittingWithBaseline(ctx, "cjob-0", true, 100, "1.1", 8, ts); err == nil {
+		t.Fatalf("expected MarkJobSubmittingWithBaseline to reject FAILED_REFUNDABLE job")
+	}
+	if err := st.MarkJobSubmittingWithBaseline(ctx, "cjob-1", true, 100, "1.1", 8, ts); err == nil {
+		t.Fatalf("expected MarkJobSubmittingWithBaseline to reject sibling of FAILED_REFUNDABLE order")
+	}
+
+	// Mismatched orderID must fail validation
+	if _, err := st.FinalizeOrderFailure(ctx, "wrong-order", "cjob-0", contracts.JobProgressEvent{
+		JobID: "cjob-0", KioskID: "kiosk-1", Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "download failed", Timestamp: ts,
+	}, false); err == nil {
+		t.Fatalf("expected FinalizeOrderFailure to reject mismatched orderID")
+	}
+}
