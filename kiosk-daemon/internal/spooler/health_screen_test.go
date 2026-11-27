@@ -1210,6 +1210,8 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 	defer dlServer.Close()
 
 	var jamReported atomic.Bool
+	jamInjected := make(chan struct{})
+	var jamOnce sync.Once
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if jamReported.Load() {
 			return contracts.PrinterHealth{
@@ -1235,6 +1237,7 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 			onPage(1)
 		}
 		jamReported.Store(true)
+		jamOnce.Do(func() { close(jamInjected) })
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -1290,36 +1293,51 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 	}
 
 	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		_ = client.Run(runCtx)
 	}()
+	defer func() {
+		runCancel()
+		<-runDone
+	}()
+
+	select {
+	case <-jamInjected:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for mock CUPS execution and jam injection: %v", ctx.Err())
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	paused := false
+	var finalError ui_ipc.ScreenState
+	found := false
 	for time.Now().Before(deadline) {
-		savedJob, err := store.GetJob(ctx, "ord_coord_456")
-		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
-			paused = true
-			break
+		if !paused {
+			savedJob, err := store.GetJob(ctx, "ord_coord_456")
+			if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+				paused = true
+			}
+		}
+		if paused {
+			history := client.RenderHistory()
+			for i := len(history) - 1; i >= 0; i-- {
+				if history[i].Mode == ui_ipc.ModeError {
+					finalError = history[i]
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
 	if !paused {
 		t.Fatal("expected job ord_coord_456 to be in PAUSED_ERROR state")
-	}
-
-	history := client.RenderHistory()
-	var finalError ui_ipc.ScreenState
-	found := false
-	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Mode == ui_ipc.ModeError {
-			finalError = history[i]
-			found = true
-			break
-		}
 	}
 
 	if !found {
