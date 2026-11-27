@@ -540,10 +540,13 @@ WHERE job_id = ?;`
 		return fmt.Errorf("cannot regress completed job %s to status %s", event.JobID, event.Status)
 	}
 
-	targetSheets := event.SheetsPrinted
-	if targetSheets > totalSheets {
-		targetSheets = totalSheets
+	if event.SheetsPrinted > totalSheets {
+		return fmt.Errorf("sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
 	}
+	if event.PagesPrinted > totalPages {
+		return fmt.Errorf("pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
+	}
+	targetSheets := event.SheetsPrinted
 	// Monotonicity clamp: delayed observations must not regress sheets_printed
 	if targetSheets < currentSheets {
 		targetSheets = currentSheets
@@ -570,9 +573,6 @@ WHERE id = 1
 	}
 
 	targetPages := event.PagesPrinted
-	if targetPages > totalPages {
-		targetPages = totalPages
-	}
 	if targetPages < currentPages {
 		targetPages = currentPages
 	}
@@ -660,7 +660,7 @@ SET submitted_to_printer = 1,
     baseline_counter_unit = CASE WHEN baseline_counter_set = 1 THEN baseline_counter_unit ELSE ? END,
     baseline_observed_at_ns = CASE WHEN baseline_counter_set = 1 THEN baseline_observed_at_ns ELSE ? END,
     updated_at_ns = ?
-WHERE job_id = ?;`
+WHERE job_id = ? AND submitted_to_printer = 0;`
 
 	res, err := s.db.ExecContext(ctx, query, setInt, baselineValue, baselineIndex, baselineUnit, obsNS, nowNS, jobID)
 	if err != nil {
@@ -671,6 +671,10 @@ WHERE job_id = ?;`
 		return fmt.Errorf("failed to check affected rows for %s: %w", jobID, err)
 	}
 	if rows == 0 {
+		var existingSubmitted int
+		if qErr := s.db.QueryRowContext(ctx, "SELECT submitted_to_printer FROM jobs WHERE job_id = ?;", jobID).Scan(&existingSubmitted); qErr == nil && existingSubmitted != 0 {
+			return fmt.Errorf("job %s was already marked submitted to printer", jobID)
+		}
 		return fmt.Errorf("job not found: %s", jobID)
 	}
 	return nil

@@ -883,23 +883,36 @@ func pollHardwareTelemetryWithFactory(
 		}
 	}
 
-	// 3. LifeCount & CounterUnit
-	if pdu, ok := findPDU(packet, oidPrtMarkerLifeCount, 2); ok && isValidPDU(pdu) {
-		if v, okVal := pduToInt64(pdu); okVal {
-			telem.LifeCount = v
+	// 3. Dynamic marker discovery via prtMarkerTable (with direct OID fallback for unit mocks)
+	if markers, mErr := walkPrtMarkerTable(session); mErr == nil && len(markers) > 0 {
+		if m := SelectPrimaryMarker(markers); m != nil && m.HasLifeCount {
+			telem.LifeCount = m.LifeCount
 			telem.HasLife = true
-			telem.CounterIndex = "1.1"
+			telem.CounterIndex = m.Index
+			telem.CounterUnit = m.CounterUnit
+			telem.CounterUnitName = m.CounterUnitName
+			telem.IsPageCounter = m.IsPageCounter
+			telem.HasCounterMeta = m.CounterUnit >= 0
 		}
 	}
-	if telem.HasLife {
-		if unitPkt, uErr := session.Get([]string{oidPrtMarkerCounterUnit}); uErr == nil && unitPkt != nil {
-			if pdu, ok := findPDU(unitPkt, oidPrtMarkerCounterUnit, 0); ok && isValidPDU(pdu) {
-				if v, okVal := pduToInt64(pdu); okVal {
-					unitName, isPage := FormatMarkerCounterUnit(v)
-					telem.CounterUnit = v
-					telem.CounterUnitName = unitName
-					telem.IsPageCounter = isPage
-					telem.HasCounterMeta = true
+	if !telem.HasLife {
+		if pdu, ok := findPDU(packet, oidPrtMarkerLifeCount, 2); ok && isValidPDU(pdu) {
+			if v, okVal := pduToInt64(pdu); okVal {
+				telem.LifeCount = v
+				telem.HasLife = true
+				telem.CounterIndex = "1.1"
+			}
+		}
+		if telem.HasLife {
+			if unitPkt, uErr := session.Get([]string{oidPrtMarkerCounterUnit}); uErr == nil && unitPkt != nil {
+				if pdu, ok := findPDU(unitPkt, oidPrtMarkerCounterUnit, 0); ok && isValidPDU(pdu) {
+					if v, okVal := pduToInt64(pdu); okVal {
+						unitName, isPage := FormatMarkerCounterUnit(v)
+						telem.CounterUnit = v
+						telem.CounterUnitName = unitName
+						telem.IsPageCounter = isPage
+						telem.HasCounterMeta = true
+					}
 				}
 			}
 		}

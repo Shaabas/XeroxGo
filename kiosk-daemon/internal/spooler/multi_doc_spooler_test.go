@@ -2637,9 +2637,15 @@ func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 
 	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: currentLife.Load(),
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      currentLife.Load(),
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 

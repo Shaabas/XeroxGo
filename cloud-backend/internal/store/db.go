@@ -2419,10 +2419,11 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		}
 	}
 
-	// 4. Check existing progress timestamp & completed non-regression
+	// 4. Check existing progress timestamp, completed non-regression, and monotonic counts
 	var existingStatus string
+	var existingPages, existingSheets int
 	var existingTimestampNS int64
-	err = tx.QueryRowContext(ctx, s.rebind("SELECT status, timestamp_ns FROM job_progress WHERE job_id = ?;"), targetJobID).Scan(&existingStatus, &existingTimestampNS)
+	err = tx.QueryRowContext(ctx, s.rebind("SELECT status, pages_printed, sheets_printed, timestamp_ns FROM job_progress WHERE job_id = ?;"), targetJobID).Scan(&existingStatus, &existingPages, &existingSheets, &existingTimestampNS)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("update job progress: query existing progress: %w", err)
 	}
@@ -2432,6 +2433,9 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		}
 		if eventNS < existingTimestampNS {
 			return fmt.Errorf("update job progress: rejected stale event timestamp (%d < %d)", eventNS, existingTimestampNS)
+		}
+		if pagesPrinted < existingPages || sheetsPrinted < existingSheets {
+			return fmt.Errorf("update job progress: rejected progress regression (pages %d < %d or sheets %d < %d)", pagesPrinted, existingPages, sheetsPrinted, existingSheets)
 		}
 	}
 

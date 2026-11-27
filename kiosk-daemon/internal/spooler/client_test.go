@@ -3592,6 +3592,9 @@ job-media-sheets-completed (integer) = 1
 `), nil
 			}
 			if name == "lpstat" {
+				if !lpInvoked.Load() {
+					return []byte(""), nil
+				}
 				return []byte("DCPT310-202 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
 			}
 			return []byte(""), nil
@@ -3605,9 +3608,15 @@ job-media-sheets-completed (integer) = 1
 				life += 1
 			}
 			return printer.HardwareTelemetry{
-				Online:    true,
-				HasLife:   true,
-				LifeCount: life,
+				Online:         true,
+				HasLife:        true,
+				LifeCount:      life,
+				CounterIndex:   "1.1",
+				CounterUnit:    8,
+				HasCounterMeta: true,
+				HasFlags:       true,
+				StatusState:    "IDLE",
+				ObservedAt:     time.Now().UTC(),
 			}
 		}
 
@@ -3712,6 +3721,7 @@ job-media-sheets-completed (integer) = 1
 			StateStore:    store,
 			CUPSQueue:     "DCPT310",
 			CUPSRunner:    runner,
+			SNMPPoller:    func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-c",
@@ -3792,6 +3802,7 @@ job-media-sheets-completed (integer) = 1
 			StateStore:    store,
 			CUPSQueue:     "DCPT310",
 			CUPSRunner:    runner,
+			SNMPPoller:    func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-d",
@@ -3870,6 +3881,7 @@ job-media-sheets-completed (integer) = 1
 			StateStore:    store,
 			CUPSQueue:     "DCPT310",
 			CUPSRunner:    runner,
+			SNMPPoller:    func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 			MockHealth:    testHealthyMockHealth,
 			DownloadDir:   tmpDir,
 			IdleQRContent: "https://kiosk-e",
@@ -4031,8 +4043,10 @@ job-media-sheets-completed (integer) = 1
 		}
 
 		var cancelInvoked atomic.Bool
+		var lpSubmitted atomic.Bool
 		runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			if name == "lp" {
+				lpSubmitted.Store(true)
 				return []byte("request id is DCPT310-701 (1 file(s))"), nil
 			}
 			if name == "cancel" {
@@ -4040,6 +4054,9 @@ job-media-sheets-completed (integer) = 1
 				return []byte(""), nil
 			}
 			if name == "lpstat" {
+				if !lpSubmitted.Load() {
+					return []byte(""), nil
+				}
 				return []byte("DCPT310-701 user 1024 Tue Nov 3 14:00:00 2026\n\tprocessing"), nil
 			}
 			return []byte(""), nil
@@ -4049,7 +4066,22 @@ job-media-sheets-completed (integer) = 1
 		// Cancel after short delay
 		time.AfterFunc(30*time.Millisecond, cancel)
 
-		err = printer.PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, nil)
+		hooks := &printer.CUPSPrintHooks{
+			TelemetryPoller: func(ctx context.Context) printer.HardwareTelemetry {
+				return printer.HardwareTelemetry{
+					Online:         true,
+					HasLife:        true,
+					LifeCount:      1000,
+					CounterIndex:   "1.1",
+					CounterUnit:    8,
+					HasCounterMeta: true,
+					HasFlags:       true,
+					StatusState:    "IDLE",
+					ObservedAt:     time.Now().UTC(),
+				}
+			},
+		}
+		err = printer.PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, hooks)
 		if err == nil {
 			t.Fatal("expected error on context cancellation")
 		}
@@ -4267,6 +4299,7 @@ func TestCUPSHoldOutcomeHandling(t *testing.T) {
 				StateStore:    store,
 				CUPSQueue:     "DCPT310",
 				CUPSRunner:    runner,
+				SNMPPoller:    func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 				MockHealth:    testHealthyMockHealth,
 				DownloadDir:   tmpDir,
 				IdleQRContent: "https://kiosk-hold-test",

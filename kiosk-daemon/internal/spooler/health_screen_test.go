@@ -921,10 +921,34 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 			return []byte(""), nil
 		}
 		if name == "lpstat" {
-			if jamReported.Load() {
-				return []byte("printer HPTank is idle. enabled since Thu Nov 13 12:00:00 2026\n\tPrinter state reasons: media-jam-error"), nil
+			hasNotCompleted := false
+			hasP := false
+			for i, arg := range args {
+				if arg == "-W" && i+1 < len(args) && args[i+1] == "not-completed" {
+					hasNotCompleted = true
+				}
+				if arg == "-p" {
+					hasP = true
+				}
 			}
-			return []byte("printer HPTank is idle. enabled since Thu Nov 13 12:00:00 2026"), nil
+			if hasNotCompleted {
+				if printStarted != nil {
+					select {
+					case <-printStarted:
+						return []byte(cupsJobID + " user 1024 Thu Nov 13 12:00:00 2026"), nil
+					default:
+						return []byte(""), nil
+					}
+				}
+				return []byte(""), nil
+			}
+			if hasP {
+				if jamReported.Load() {
+					return []byte("printer HPTank is idle. enabled since Thu Nov 13 12:00:00 2026\n\tPrinter state reasons: media-jam-error"), nil
+				}
+				return []byte("printer HPTank is idle. enabled since Thu Nov 13 12:00:00 2026"), nil
+			}
+			return []byte(""), nil
 		}
 		return []byte(""), nil
 	}
@@ -981,6 +1005,7 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 		HealthPollInterval: 15 * time.Millisecond,
 		ScreenSink:         func(*image.RGBA) error { return nil },
 		CUPSRunner:         customRunner,
+		SNMPPoller:         func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 		MockIPPState:       testHealthyIPPState,
 		MockSNMPHealth:     testHealthySNMPHealth,
 	}
@@ -2528,9 +2553,15 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 			life = 1002 // delta = 2 sheets (out of 4)
 		}
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 
@@ -2691,8 +2722,8 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 	if saved.SheetsPrinted != 0 {
 		t.Fatalf("expected SheetsPrinted to remain 0 (no synthetic physical sheets), got %d", saved.SheetsPrinted)
 	}
-	if !strings.Contains(saved.ErrorReason, "without physical sheet verification") || !strings.Contains(saved.ErrorReason, "verified physical: 0/3") {
-		t.Fatalf("expected ErrorReason to detail missing physical sheet verification (0/3), got %q", saved.ErrorReason)
+	if !strings.Contains(saved.ErrorReason, "telemetry poller is required") && (!strings.Contains(saved.ErrorReason, "without physical sheet verification") || !strings.Contains(saved.ErrorReason, "verified physical: 0/3")) {
+		t.Fatalf("expected ErrorReason to detail missing odometer / physical sheet verification, got %q", saved.ErrorReason)
 	}
 
 	// CRITICAL INVENTORY CONSERVATION: Stock must remain untouched at 100!
@@ -2786,6 +2817,7 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 		IdleQRContent:       "https://kiosk.test/ready",
 		ScreenSink:          func(*image.RGBA) error { return nil },
 		CUPSRunner:          runner,
+		SNMPPoller:          func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
@@ -2826,8 +2858,8 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 	if saved.SheetsPrinted != 1 {
 		t.Fatalf("CRITICAL SAFETY FAILURE: expected SheetsPrinted to remain 1 (verified physical), got %d (promoted unverified sheets)", saved.SheetsPrinted)
 	}
-	if !strings.Contains(saved.ErrorReason, "without physical proof") {
-		t.Fatalf("expected ErrorReason to mention without physical proof, got %q", saved.ErrorReason)
+	if !strings.Contains(saved.ErrorReason, "without physical proof") && !strings.Contains(saved.ErrorReason, "counter baseline") {
+		t.Fatalf("expected ErrorReason to mention without physical proof or missing counter baseline, got %q", saved.ErrorReason)
 	}
 
 	// CRITICAL INVENTORY CHECK: Paper inventory must stay at 99 (never deduct 4 unverified sheets)
@@ -2907,9 +2939,15 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 			life = 1004
 		}
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 

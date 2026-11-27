@@ -1249,10 +1249,10 @@ func TestSNMPEmulator_AlternateIndexes_FingerprintDiscovery(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// 1. Verify that fixed-index .1.1 queries fail on alternate index configuration
+	// 1. Verify that PollMarkerLifeCount dynamically discovers alternate marker index .2.3
 	life := PollMarkerLifeCount(ctx, cfg)
-	if life != -1 {
-		t.Errorf("expected PollMarkerLifeCount=-1 for fixed index .1.1 when device is at .2.3, got %d", life)
+	if life != 1000 {
+		t.Errorf("expected PollMarkerLifeCount=1000 via dynamic discovery on .2.3, got %d", life)
 	}
 
 	// 2. Verify that dynamic table walk discovers the alternate indexes

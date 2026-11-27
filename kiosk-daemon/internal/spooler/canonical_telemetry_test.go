@@ -244,6 +244,7 @@ func TestSpoolerCanonical_MidPrintExpiry_ConservativeUncertaintyPause_WithoutFab
 	}
 
 	var holdCalled atomic.Bool
+	var lpSubmitted atomic.Bool
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		if name == "lp" {
 			for i, a := range args {
@@ -252,6 +253,7 @@ func TestSpoolerCanonical_MidPrintExpiry_ConservativeUncertaintyPause_WithoutFab
 					return []byte(""), nil
 				}
 			}
+			lpSubmitted.Store(true)
 			return []byte("request id is HPTank-888 (1 file(s))"), nil
 		}
 		if name == "ipptool" {
@@ -263,9 +265,26 @@ func TestSpoolerCanonical_MidPrintExpiry_ConservativeUncertaintyPause_WithoutFab
 			return []byte("job-state (enum) = processing\n"), nil
 		}
 		if name == "lpstat" {
+			if !lpSubmitted.Load() {
+				return []byte(""), nil
+			}
 			return []byte("HPTank-888 user 1024 Tue Nov 3 14:00:00 2026"), nil
 		}
 		return []byte(""), nil
+	}
+
+	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
+		return printer.HardwareTelemetry{
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      1000,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
+		}
 	}
 
 	client, err := NewClient(ClientConfig{
@@ -274,6 +293,7 @@ func TestSpoolerCanonical_MidPrintExpiry_ConservativeUncertaintyPause_WithoutFab
 		StateStore:         st,
 		CUPSQueue:          "HPTank",
 		CUPSRunner:         runner,
+		SNMPPoller:         snmpPoller,
 		DownloadDir:        tmpDir,
 		IdleQRContent:      "https://kiosk.test/exp",
 		HealthPollInterval: 15 * time.Millisecond,

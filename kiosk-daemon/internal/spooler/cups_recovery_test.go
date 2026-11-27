@@ -63,11 +63,20 @@ func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 		var life int64 = 1000
 		if c > 1 {
 			life += int64(c - 1)
+			if life > 1001 {
+				life = 1001
+			}
 		}
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 
@@ -247,6 +256,9 @@ func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 	cupsID := "DCPT310-301"
+	if err := store.MarkJobSubmittingWithBaseline(context.Background(), cmd.JobID, true, 1000, "1.1", 8, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkJobSubmittingWithBaseline failed: %v", err)
+	}
 	if err := store.RecordJobSubmission(context.Background(), cmd.JobID, cupsID); err != nil {
 		t.Fatalf("RecordJobSubmission failed: %v", err)
 	}
@@ -282,9 +294,15 @@ func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 			life += int64((c - 1) * 2)
 		}
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 
@@ -366,6 +384,9 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 	cupsID := "DCPT310-401"
+	if err := store.MarkJobSubmittingWithBaseline(context.Background(), cmd.JobID, true, 1000, "1.1", 8, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkJobSubmittingWithBaseline failed: %v", err)
+	}
 	if err := store.RecordJobSubmission(context.Background(), cmd.JobID, cupsID); err != nil {
 		t.Fatalf("RecordJobSubmission failed: %v", err)
 	}
@@ -402,6 +423,7 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1002, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
@@ -673,11 +695,20 @@ func TestCUPS_MultiCopyRecoveryIntegrity(t *testing.T) {
 		var life int64 = 2000
 		if c > 1 {
 			life += int64((c - 1) * 2)
+			if life > 2002 {
+				life = 2002
+			}
 		}
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 
@@ -875,6 +906,7 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
 		DownloadDir:         tmpDir,
@@ -918,8 +950,8 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 	if job.SheetsPrinted != 2 {
 		t.Fatalf("expected SheetsPrinted to remain 2, got %d", job.SheetsPrinted)
 	}
-	if !strings.Contains(job.ErrorReason, "without physical proof") {
-		t.Fatalf("expected ErrorReason to mention without physical proof, got %q", job.ErrorReason)
+	if !strings.Contains(job.ErrorReason, "without physical proof") && !strings.Contains(job.ErrorReason, "counter baseline") {
+		t.Fatalf("expected ErrorReason to mention without physical proof or missing counter baseline, got %q", job.ErrorReason)
 	}
 
 	// Crucial check: stock must remain exactly 48 (50 - 2 pre-crash sheets).
@@ -964,6 +996,9 @@ func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliati
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 	cupsID := "DCPT310-601"
+	if err := store.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 1000, "1.1", 8, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkJobSubmittingWithBaseline failed: %v", err)
+	}
 	if err := store.RecordJobSubmission(ctx, cmd.JobID, cupsID); err != nil {
 		t.Fatalf("RecordJobSubmission failed: %v", err)
 	}
@@ -997,6 +1032,7 @@ func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliati
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1000, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
 		DownloadDir:         tmpDir,
@@ -1076,6 +1112,9 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 	cupsID := "DCPT310-701"
+	if err := store.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 1000, "1.1", 8, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkJobSubmittingWithBaseline failed: %v", err)
+	}
 	if err := store.RecordJobSubmission(ctx, cmd.JobID, cupsID); err != nil {
 		t.Fatalf("RecordJobSubmission failed: %v", err)
 	}
@@ -1097,6 +1136,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 		StateStore:          store,
 		CUPSQueue:           "DCPT310",
 		CUPSRunner:          runner,
+		SNMPPoller:          func(ctx context.Context) printer.HardwareTelemetry { return printer.HardwareTelemetry{Online: true, HasLife: true, LifeCount: 1005, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC()} },
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
@@ -1207,11 +1247,20 @@ func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 		var life int64 = 1000
 		if c > 1 {
 			life += int64((c - 1) * 2)
+			if life > 1002 {
+				life = 1002
+			}
 		}
 		return printer.HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 

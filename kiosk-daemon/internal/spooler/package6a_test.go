@@ -103,6 +103,7 @@ func TestPackage6A_BaselineDurabilityAndResumedMonitoringIdempotency(t *testing.
 			CounterIndex:   "1.1",
 			CounterUnit:    7,
 			HasCounterMeta: true,
+			HasFlags:       true,
 			StatusState:    "IDLE",
 			ObservedAt:     time.Now().UTC(),
 		}
@@ -172,7 +173,7 @@ func TestPackage6A_AmbiguousSubmissionNeverReplays(t *testing.T) {
 	}
 	poller := func(ctx context.Context) printer.HardwareTelemetry {
 		return printer.HardwareTelemetry{
-			Online: true, HasLife: true, LifeCount: 3000, CounterIndex: "1.1", CounterUnit: 7, HasCounterMeta: true, StatusState: "IDLE",
+			Online: true, HasLife: true, LifeCount: 3000, CounterIndex: "1.1", CounterUnit: 7, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC(),
 		}
 	}
 
@@ -212,5 +213,96 @@ func TestPackage6A_AmbiguousSubmissionNeverReplays(t *testing.T) {
 	saved, _ := st.GetJob(ctx, cmd.JobID)
 	if saved == nil || !saved.SubmittedToPrinter || saved.Status != contracts.JobStatusPausedError {
 		t.Fatalf("expected SubmittedToPrinter=true and PAUSED_ERROR, got %+v", saved)
+	}
+}
+
+func TestPackage6A_StartupReconciliation_CannotBypassBaselineOrVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "package6a_rec.db"))
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-6a-nobase", OrderID: "ord-6a-nobase", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-6a", DisplayCode: "7777", DownloadURL: "https://example.invalid/doc.pdf",
+		SHA256Checksum: strings.Repeat("b", 64), TotalPages: 2, TotalSheets: 2, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	if err := st.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	// Mark submitted WITHOUT baseline
+	if err := st.MarkJobSubmitting(ctx, cmd.JobID); err != nil {
+		t.Fatalf("MarkJobSubmitting failed: %v", err)
+	}
+	if err := st.RecordJobSubmission(ctx, cmd.JobID, "HPTank-777"); err != nil {
+		t.Fatalf("RecordJobSubmission failed: %v", err)
+	}
+
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			for i, a := range args {
+				if a == "-W" && i+1 < len(args) && args[i+1] == "completed" {
+					return []byte("HPTank-777 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully\n"), nil
+				}
+			}
+		}
+		return []byte(""), nil
+	}
+	poller := func(ctx context.Context) printer.HardwareTelemetry {
+		return printer.HardwareTelemetry{
+			Online: true, HasLife: true, LifeCount: 1002, CounterIndex: "1.1", CounterUnit: 8, HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC(),
+		}
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL:         "ws://127.0.0.1:8080/ws",
+		KioskID:          "kiosk-6a",
+		StateStore:       st,
+		CUPSQueue:        "HPTank",
+		DownloadDir:      tmpDir,
+		IdleQRContent:    "https://kiosk.test/ready",
+		ScreenSink:       func(*image.RGBA) error { return nil },
+		CUPSRunner:       runner,
+		SNMPPoller:       poller,
+		MockCUPSHealth:   testHealthyCUPSHealth,
+		MockIPPState:     testHealthyIPPState,
+		MockSNMPHealth:   testHealthySNMPHealth,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	paused := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		j, err := st.GetJob(ctx, cmd.JobID)
+		if err == nil && j != nil && j.Status == contracts.JobStatusPausedError {
+			paused = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	runCancel()
+
+	finalJob, err := st.GetJob(ctx, cmd.JobID)
+	if !paused || err != nil || finalJob == nil || finalJob.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected PAUSED_ERROR when baseline is missing on startup reconciliation, got %+v (err=%v)", finalJob, err)
+	}
+	if !strings.Contains(finalJob.ErrorReason, "counter baseline") {
+		t.Fatalf("expected missing counter baseline error reason, got %q", finalJob.ErrorReason)
+	}
+	remSheets, _ := st.GetEstimatedSheets(ctx)
+	if remSheets != 150 {
+		t.Fatalf("expected inventory conserved at 150, got %d", remSheets)
 	}
 }

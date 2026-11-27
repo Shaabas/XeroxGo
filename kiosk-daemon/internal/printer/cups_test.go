@@ -12,6 +12,32 @@ import (
 	"xeroxgo/pkg/contracts"
 )
 
+func validStaticTestPoller(lifeCount int64, unit int64) func(context.Context) HardwareTelemetry {
+	return func(ctx context.Context) HardwareTelemetry {
+		return HardwareTelemetry{
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      lifeCount,
+			CounterIndex:   "1.1",
+			CounterUnit:    unit,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
+		}
+	}
+}
+
+func validTestBaseline(lifeCount int64, unit int64) CounterBaseline {
+	return CounterBaseline{
+		HasBaseline: true,
+		Value:       lifeCount,
+		Index:       "1.1",
+		Unit:        unit,
+		ObservedAt:  time.Now().UTC(),
+	}
+}
+
 func TestPrintPDFWithCUPS_Validation(t *testing.T) {
 	validCmd := contracts.PrintJobCommand{
 		JobID:       "job-123",
@@ -85,7 +111,8 @@ func TestPrintPDFWithCUPS_Validation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := PrintPDFWithCUPSCustom(tc.ctx, runner, tc.queue, tc.cmd, tc.pdfPath, nil, 10*time.Millisecond)
+			hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+			err := PrintPDFWithCUPSHooksCustom(tc.ctx, runner, tc.queue, tc.cmd, tc.pdfPath, nil, 10*time.Millisecond, hooks)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
 			}
@@ -98,6 +125,7 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 	defer cancel()
 
 	var mu sync.Mutex
+	lpSubmitted := false
 	lpstatCalls := 0
 	var executedCommands []string
 
@@ -109,8 +137,12 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 
 		switch name {
 		case "lp":
+			lpSubmitted = true
 			return []byte("request id is DCPT310-42 (1 file(s))\n"), nil
 		case "lpstat":
+			if !lpSubmitted {
+				return []byte(""), nil
+			}
 			if len(args) > 1 && args[1] == "completed" {
 				return []byte("DCPT310-42 username 1024 Tue Nov 3 20:30:00 2026\n\tAlerts: job-completed-successfully\n\tqueued for DCPT310\n"), nil
 			}
@@ -140,9 +172,10 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 		mu.Unlock()
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/var/kiosk/job-xyz.pdf", onPage, 10*time.Millisecond)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/var/kiosk/job-xyz.pdf", onPage, 10*time.Millisecond, hooks)
+	if err == nil || !strings.Contains(err.Error(), "physical output incomplete") {
+		t.Fatalf("expected physical output incomplete error with zero odometer delta, got: %v", err)
 	}
 
 	mu.Lock()
@@ -152,12 +185,18 @@ func TestPrintPDFWithCUPS_Success(t *testing.T) {
 		t.Fatalf("expected at least 2 commands executed, got %d", len(executedCommands))
 	}
 
-	if !strings.Contains(executedCommands[0], "lp -d DCPT310 -n 2 -t job-xyz -o sides=two-sided-long-edge -o print-color-mode=monochrome -o media=A4 /var/kiosk/job-xyz.pdf") {
-		t.Errorf("unexpected lp invocation: %s", executedCommands[0])
+	foundLP := false
+	for _, c := range executedCommands {
+		if strings.Contains(c, "lp -d DCPT310 -n 2 -t job-xyz -o sides=two-sided-long-edge -o print-color-mode=monochrome -o media=A4 /var/kiosk/job-xyz.pdf") {
+			foundLP = true
+			break
+		}
+	}
+	if !foundLP {
+		t.Errorf("unexpected lp invocations: %v", executedCommands)
 	}
 
-	// Without hardware SNMP odometer or IPP sheets completed counter,
-	// CUPS completion must NOT fabricate full physical sheet progress.
+	// Without hardware SNMP odometer delta, CUPS completion must NOT fabricate full physical sheet progress.
 	if len(completedSheets) != 0 {
 		t.Errorf("expected no synthetic physical sheet progress without hardware proof, got %v", completedSheets)
 	}
@@ -225,7 +264,8 @@ func TestPrintPDFWithCUPS_ColorModes(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
-			_ = PrintPDFWithCUPSCustom(ctx, runner, "TestQueue", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond)
+			hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+			_ = PrintPDFWithCUPSHooksCustom(ctx, runner, "TestQueue", cmd, "/tmp/dummy.pdf", nil, 10*time.Millisecond, hooks)
 
 			if tc.wantFlag != "" && !strings.Contains(recordedCmd, tc.wantFlag) {
 				t.Errorf("expected command to contain %q, got: %s", tc.wantFlag, recordedCmd)
@@ -252,6 +292,8 @@ func TestPrintPDFWithCUPS_Success_IPP(t *testing.T) {
 		switch name {
 		case "lp":
 			return []byte("request id is HL-L5210DN-101 (1 file(s))\n"), nil
+		case "lpstat":
+			return []byte(""), nil
 		case "ipptool":
 			ippCalls++
 			if ippCalls == 1 {
@@ -289,9 +331,10 @@ job-media-sheets-completed (integer) = 4
 		mu.Unlock()
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "HL-L5210DN", cmd, "/var/kiosk/job-ipp.pdf", onPage, 10*time.Millisecond)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "HL-L5210DN", cmd, "/var/kiosk/job-ipp.pdf", onPage, 10*time.Millisecond, hooks)
+	if err == nil || !strings.Contains(err.Error(), "physical output incomplete") {
+		t.Fatalf("expected physical output incomplete error with zero odometer delta, got: %v", err)
 	}
 
 	mu.Lock()
@@ -319,6 +362,8 @@ func TestPrintPDFWithCUPS_Success_IPP_WithHardwareOdometer(t *testing.T) {
 		switch name {
 		case "lp":
 			return []byte("request id is HL-L5210DN-102 (1 file(s))\n"), nil
+		case "lpstat":
+			return []byte(""), nil
 		case "ipptool":
 			ippCalls++
 			if ippCalls == 1 {
@@ -360,11 +405,20 @@ job-media-sheets-completed (integer) = 4
 		var life int64 = 5000
 		if c > 1 {
 			life += int64((c - 1) * 2)
+			if life > 5004 {
+				life = 5004
+			}
 		}
 		return HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 
@@ -392,6 +446,9 @@ job-media-sheets-completed (integer) = 4
 func TestPrintPDFWithCUPS_LPError(t *testing.T) {
 	ctx := context.Background()
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			return []byte(""), nil
+		}
 		return []byte("lp: error - unknown printer"), errors.New("exit status 1")
 	}
 
@@ -402,7 +459,8 @@ func TestPrintPDFWithCUPS_LPError(t *testing.T) {
 		Duplex:      contracts.DuplexSimplex,
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/test.pdf", nil, 10*time.Millisecond)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/test.pdf", nil, 10*time.Millisecond, hooks)
 	if err == nil || !strings.Contains(err.Error(), "failed to submit job to CUPS queue") {
 		t.Fatalf("expected lp error, got %v", err)
 	}
@@ -412,11 +470,16 @@ func TestPrintPDFWithCUPS_QueueStoppedError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	var lpSubmitted atomic.Bool
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		switch name {
 		case "lp":
+			lpSubmitted.Store(true)
 			return []byte("request id is DCPT310-55 (1 file(s))\n"), nil
 		case "lpstat":
+			if !lpSubmitted.Load() {
+				return []byte(""), nil
+			}
 			if len(args) > 0 && args[0] == "-p" {
 				return []byte("printer DCPT310 is stopped; reason: Filter failed"), nil
 			}
@@ -433,7 +496,8 @@ func TestPrintPDFWithCUPS_QueueStoppedError(t *testing.T) {
 		Duplex:      contracts.DuplexSimplex,
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/var/kiosk/job-fail.pdf", nil, 5*time.Millisecond)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/var/kiosk/job-fail.pdf", nil, 5*time.Millisecond, hooks)
 	if err == nil || !strings.Contains(err.Error(), "stopped/disabled") {
 		t.Fatalf("expected stopped/disabled error, got %v", err)
 	}
@@ -465,7 +529,8 @@ job-state-reasons (keyword) = filter-failed
 		Duplex:      contracts.DuplexSimplex,
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "HPTank1020w", cmd, "/tmp/abort.pdf", nil, 5*time.Millisecond)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "HPTank1020w", cmd, "/tmp/abort.pdf", nil, 5*time.Millisecond, hooks)
 	if err == nil || (!strings.Contains(err.Error(), "aborted") && !strings.Contains(err.Error(), "stopped/disabled")) {
 		t.Fatalf("expected aborted error, got %v", err)
 	}
@@ -497,7 +562,8 @@ job-state-reasons (keyword) = job-canceled-by-user
 		Duplex:      contracts.DuplexSimplex,
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/canceled.pdf", nil, 5*time.Millisecond)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/canceled.pdf", nil, 5*time.Millisecond, hooks)
 	if err == nil || !strings.Contains(err.Error(), "canceled") {
 		t.Fatalf("expected canceled error, got %v", err)
 	}
@@ -558,9 +624,10 @@ job-state-reasons (keyword) = job-completed-successfully
 		completedSheets = sheets
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/recover.pdf", onPage, 5*time.Millisecond)
-	if err != nil {
-		t.Fatalf("expected successful recovery and print completion, got %v", err)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/recover.pdf", onPage, 5*time.Millisecond, hooks)
+	if err == nil || !strings.Contains(err.Error(), "physical output incomplete") {
+		t.Fatalf("expected physical output incomplete error with zero odometer delta, got %v", err)
 	}
 
 	// Without hardware odometer or IPP sheets counter, recovering and completing in CUPS
@@ -601,7 +668,8 @@ func TestPrintPDFWithCUPS_DisappearedJob_Unknown(t *testing.T) {
 		completedCalled = true
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/ghost.pdf", onPage, 5*time.Millisecond)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/ghost.pdf", onPage, 5*time.Millisecond, hooks)
 	if err == nil || !strings.Contains(err.Error(), "state unknown") {
 		t.Fatalf("expected state unknown error, got %v", err)
 	}
@@ -661,9 +729,10 @@ job-state-reasons (keyword) = job-completed-successfully
 		mu.Unlock()
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/test.pdf", onPage, 5*time.Millisecond)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/test.pdf", onPage, 5*time.Millisecond, hooks)
+	if err == nil || !strings.Contains(err.Error(), "physical output incomplete") {
+		t.Fatalf("expected physical output incomplete error with zero odometer delta, got %v", err)
 	}
 
 	mu.Lock()
@@ -696,6 +765,9 @@ func TestPrintPDFWithCUPS_TransientPollErrors_Recovers(t *testing.T) {
 			lpCalls.Add(1)
 			return []byte("request id is DCPT310-444 (1 file(s))\n"), nil
 		case "lpstat":
+			if lpCalls.Load() == 0 {
+				return []byte(""), nil
+			}
 			// First 2 polls fail with transient error
 			if pollErrors.Add(1) <= 2 {
 				return nil, errors.New("lpstat: temporary socket connection error")
@@ -716,7 +788,26 @@ func TestPrintPDFWithCUPS_TransientPollErrors_Recovers(t *testing.T) {
 		Duplex:      contracts.DuplexSimplex,
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/transient.pdf", nil, 5*time.Millisecond)
+	hooks := &CUPSPrintHooks{
+		TelemetryPoller: func(ctx context.Context) HardwareTelemetry {
+			life := int64(1000)
+			if lpCalls.Load() > 0 && pollErrors.Load() > 2 {
+				life = 1002
+			}
+			return HardwareTelemetry{
+				Online:         true,
+				HasLife:        true,
+				LifeCount:      life,
+				CounterIndex:   "1.1",
+				CounterUnit:    8,
+				HasCounterMeta: true,
+				HasFlags:       true,
+				StatusState:    "IDLE",
+				ObservedAt:     time.Now().UTC(),
+			}
+		},
+	}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/transient.pdf", nil, 5*time.Millisecond, hooks)
 	if err != nil {
 		t.Fatalf("expected recovery from transient errors, got %v", err)
 	}
@@ -731,6 +822,7 @@ func TestPrintPDFWithCUPS_CancellationCancelsJob(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var mu sync.Mutex
+	lpSubmitted := false
 	canceledJobID := ""
 
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -739,8 +831,12 @@ func TestPrintPDFWithCUPS_CancellationCancelsJob(t *testing.T) {
 
 		switch name {
 		case "lp":
+			lpSubmitted = true
 			return []byte("request id is DCPT310-99 (1 file(s))"), nil
 		case "lpstat":
+			if !lpSubmitted {
+				return []byte(""), nil
+			}
 			// Trigger context cancel on first poll
 			cancel()
 			return []byte("DCPT310-99 still printing"), nil
@@ -761,7 +857,8 @@ func TestPrintPDFWithCUPS_CancellationCancelsJob(t *testing.T) {
 		Duplex:      contracts.DuplexSimplex,
 	}
 
-	err := PrintPDFWithCUPSCustom(ctx, runner, "DCPT310", cmd, "/tmp/test.pdf", nil, 5*time.Millisecond)
+	hooks := &CUPSPrintHooks{TelemetryPoller: validStaticTestPoller(1000, 8)}
+	err := PrintPDFWithCUPSHooksCustom(ctx, runner, "DCPT310", cmd, "/tmp/test.pdf", nil, 5*time.Millisecond, hooks)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
@@ -1206,8 +1303,26 @@ func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {
 
 	var submittingCalled bool
 	var submittedJobID string
+	var lpSubmitted atomic.Bool
 
 	hooks := &CUPSPrintHooks{
+		TelemetryPoller: func(ctx context.Context) HardwareTelemetry {
+			life := int64(1000)
+			if lpSubmitted.Load() {
+				life = 1001
+			}
+			return HardwareTelemetry{
+				Online:         true,
+				HasLife:        true,
+				LifeCount:      life,
+				CounterIndex:   "1.1",
+				CounterUnit:    8,
+				HasCounterMeta: true,
+				HasFlags:       true,
+				StatusState:    "IDLE",
+				ObservedAt:     time.Now().UTC(),
+			}
+		},
 		OnSubmitting: func() error {
 			submittingCalled = true
 			return nil
@@ -1220,6 +1335,7 @@ func TestPrintPDFWithCUPSHooksCustom(t *testing.T) {
 
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		if name == "lp" {
+			lpSubmitted.Store(true)
 			return []byte("request id is DCPT310-777 (1 file(s))"), nil
 		}
 		if name == "lpstat" {
@@ -1259,11 +1375,15 @@ func TestPrintPDFWithCUPSHooks_OnSubmittingError_AbortsBeforeLP(t *testing.T) {
 
 	var runnerInvoked bool
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "lpstat" {
+			return []byte(""), nil
+		}
 		runnerInvoked = true
 		return []byte("request id is DCPT310-999 (1 file(s))"), nil
 	}
 
 	hooks := &CUPSPrintHooks{
+		TelemetryPoller: validStaticTestPoller(1000, 8),
 		OnSubmitting: func() error {
 			return errors.New("simulated store pre-submission error")
 		},
@@ -1308,6 +1428,7 @@ func TestPrintPDFWithCUPSHooks_OnSubmittedError_IdentifiesAcceptedCUPSJob(t *tes
 	}
 
 	hooks := &CUPSPrintHooks{
+		TelemetryPoller: validStaticTestPoller(1000, 8),
 		OnSubmitting: func() error {
 			return nil
 		},
@@ -1363,7 +1484,25 @@ func TestMonitorCUPSJobCustom_ActiveToCompleted(t *testing.T) {
 		return []byte(""), nil
 	}
 
-	err := MonitorCUPSJobCustom(ctx, runner, "DCPT310", cmd, "DCPT310-888", nil, 10*time.Millisecond)
+	poller := func(ctx context.Context) HardwareTelemetry {
+		life := int64(1000)
+		if pollCount >= 2 {
+			life = 1002
+		}
+		return HardwareTelemetry{
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    8,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
+		}
+	}
+
+	err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "DCPT310", cmd, "DCPT310-888", nil, 10*time.Millisecond, poller, validTestBaseline(1000, 8))
 	if err != nil {
 		t.Fatalf("MonitorCUPSJobCustom failed: %v", err)
 	}
@@ -1498,15 +1637,22 @@ func TestMonitorCUPSJobWithTelemetryCustom_PaperJam(t *testing.T) {
 	// Telemetry poller reporting paper jam (bit 0x04)
 	poller := func(ctx context.Context) HardwareTelemetry {
 		return HardwareTelemetry{
-			Online:   true,
-			HasFlags: true,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      1000,
+			CounterIndex:   "1.1",
+			CounterUnit:    7,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "ERROR",
+			ObservedAt:     time.Now().UTC(),
 			Flags: PrinterErrorFlags{
 				Jammed: true,
 			},
 		}
 	}
 
-	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-101", nil, 10*time.Millisecond, poller)
+	err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-101", nil, 10*time.Millisecond, poller, validTestBaseline(1000, 7))
 	if err == nil {
 		t.Fatal("expected error from paper jam, got nil")
 	}
@@ -1533,15 +1679,22 @@ func TestMonitorCUPSJobWithTelemetryCustom_CoverOpen(t *testing.T) {
 
 	poller := func(ctx context.Context) HardwareTelemetry {
 		return HardwareTelemetry{
-			Online:   true,
-			HasFlags: true,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      1000,
+			CounterIndex:   "1.1",
+			CounterUnit:    7,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "ERROR",
+			ObservedAt:     time.Now().UTC(),
 			Flags: PrinterErrorFlags{
 				DoorOpen: true,
 			},
 		}
 	}
 
-	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-102", nil, 10*time.Millisecond, poller)
+	err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-102", nil, 10*time.Millisecond, poller, validTestBaseline(1000, 7))
 	if err == nil {
 		t.Fatal("expected error from cover open, got nil")
 	}
@@ -1568,15 +1721,22 @@ func TestMonitorCUPSJobWithTelemetryCustom_OutOfPaper(t *testing.T) {
 
 	poller := func(ctx context.Context) HardwareTelemetry {
 		return HardwareTelemetry{
-			Online:   true,
-			HasFlags: true,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      1000,
+			CounterIndex:   "1.1",
+			CounterUnit:    7,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "ERROR",
+			ObservedAt:     time.Now().UTC(),
 			Flags: PrinterErrorFlags{
 				NoPaper: true,
 			},
 		}
 	}
 
-	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-103", nil, 10*time.Millisecond, poller)
+	err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-103", nil, 10*time.Millisecond, poller, validTestBaseline(1000, 7))
 	if err == nil {
 		t.Fatal("expected error from out of paper, got nil")
 	}
@@ -1624,16 +1784,21 @@ func TestMonitorCUPSJobWithTelemetryCustom_OdometerTracking(t *testing.T) {
 	var odoCalls int32
 	poller := func(ctx context.Context) HardwareTelemetry {
 		c := atomic.AddInt32(&odoCalls, 1)
-		// Baseline life is sampled on first call (return 1000)
 		// Subsequent calls increment: 1001, 1002, 1003
-		var life int64 = 1000
-		if c > 1 {
-			life += int64(c - 1)
+		life := int64(1000) + int64(c)
+		if life > 1003 {
+			life = 1003
 		}
 		return HardwareTelemetry{
-			Online:    true,
-			HasLife:   true,
-			LifeCount: life,
+			Online:         true,
+			HasLife:        true,
+			LifeCount:      life,
+			CounterIndex:   "1.1",
+			CounterUnit:    7,
+			HasCounterMeta: true,
+			HasFlags:       true,
+			StatusState:    "IDLE",
+			ObservedAt:     time.Now().UTC(),
 		}
 	}
 
@@ -1645,7 +1810,7 @@ func TestMonitorCUPSJobWithTelemetryCustom_OdometerTracking(t *testing.T) {
 		reportedSheets = append(reportedSheets, sheets)
 	}
 
-	err := MonitorCUPSJobWithTelemetryCustom(ctx, runner, "HPTank", cmd, "HPTank-104", onPage, 10*time.Millisecond, poller)
+	err := MonitorCUPSJobWithTelemetryBaselineCustom(ctx, runner, "HPTank", cmd, "HPTank-104", onPage, 10*time.Millisecond, poller, validTestBaseline(1000, 7))
 	if err != nil {
 		t.Fatalf("MonitorCUPSJobWithTelemetryCustom failed: %v", err)
 	}

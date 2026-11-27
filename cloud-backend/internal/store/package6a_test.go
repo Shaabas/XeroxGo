@@ -64,6 +64,50 @@ func TestPackage6A_UpdateJobProgressRejectsInconsistentCompletionAndRegression(t
 	}
 }
 
+func TestPackage6A_UpdateJobProgressRejectsMonotonicCountRegressionWithNewerTimestamp(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	ord := Order{
+		OrderID: "ord-6a-mono", Status: contracts.JobStatusPaidWaiting, PricePaise: 500,
+		TotalPages: 5, TotalSheets: 5, ColorMode: "BW", PINExpiresAt: now.Add(10 * time.Minute),
+		Documents: []OrderDocument{{
+			JobID: "job-6a-mono", OrderID: "ord-6a-mono", DocumentIndex: 0,
+			OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
+			TotalPages: 5, TotalSheets: 5, Copies: 1, PricePaise: 500,
+		}},
+		Command: PrintJobCommandCompat("job-6a-mono", "ord-6a-mono", "kiosk-6a-mono"),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateOrder(ctx, ord); err != nil {
+		t.Fatalf("CreateOrder failed: %v", err)
+	}
+
+	if err := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+		JobID: "job-6a-mono", KioskID: "kiosk-6a-mono", Status: contracts.JobStatusPrinting,
+		PagesPrinted: 3, SheetsPrinted: 3, Timestamp: now.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("initial UpdateJobProgress failed: %v", err)
+	}
+
+	errRegress := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+		JobID: "job-6a-mono", KioskID: "kiosk-6a-mono", Status: contracts.JobStatusPrinting,
+		PagesPrinted: 1, SheetsPrinted: 1, Timestamp: now.Add(5 * time.Second),
+	})
+	if errRegress == nil {
+		t.Fatal("expected error rejecting count regression even with newer timestamp")
+	}
+
+	got, err := s.GetJobProgress(ctx, "job-6a-mono")
+	if err != nil || got == nil {
+		t.Fatalf("GetJobProgress failed: %v", err)
+	}
+	if got.PagesPrinted != 3 || got.SheetsPrinted != 3 {
+		t.Fatalf("expected persisted counts 3/3 preserved, got %d/%d", got.PagesPrinted, got.SheetsPrinted)
+	}
+}
+
 func PrintJobCommandCompat(jobID, orderID, kioskID string) contracts.PrintJobCommand {
 	return contracts.PrintJobCommand{
 		JobID: jobID, OrderID: orderID, KioskID: kioskID, DisplayCode: "6262",

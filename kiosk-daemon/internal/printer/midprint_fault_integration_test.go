@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -682,11 +683,32 @@ func TestMidPrintHardwareFault_DistinguishCompletedFromHeld(t *testing.T) {
 		TotalSheets: 1,
 	}
 
-	hooks := &CUPSPrintHooks{}
 	var cupsJobID string
-	hooks.OnSubmitted = func(id string) error {
-		cupsJobID = id
-		return nil
+	var postSubCount atomic.Int32
+	hooks := &CUPSPrintHooks{
+		OnSubmitted: func(id string) error {
+			cupsJobID = id
+			return nil
+		},
+		TelemetryPoller: func(pollCtx context.Context) HardwareTelemetry {
+			life := int64(1000)
+			if cupsJobID != "" && postSubCount.Add(1) >= 1 {
+				life = 1001
+			}
+			return HardwareTelemetry{
+				Online:          true,
+				HasLife:         true,
+				LifeCount:       life,
+				CounterIndex:    "1.1",
+				CounterUnit:     7,
+				CounterUnitName: "impressions",
+				IsPageCounter:   true,
+				HasCounterMeta:  true,
+				HasFlags:        true,
+				StatusState:     "IDLE",
+				ObservedAt:      time.Now().UTC(),
+			}
+		},
 	}
 
 	err := PrintPDFWithCUPSHooksCustom(ctx, nil, queueName, cmd, samplePDF, nil, 50*time.Millisecond, hooks)
