@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -110,13 +111,23 @@ func TestPackage6A_UpdateJobProgressRejectsMonotonicCountRegressionWithNewerTime
 }
 
 func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocConsistency(t *testing.T) {
-	t.Run("concurrent_progress_updates_in_both_orderings", func(t *testing.T) {
+	runConcurrentUpdateJobProgressSuite(t, func(t *testing.T) *Store {
+		s, _ := newTestStore(t)
+		return s
+	})
+}
+
+func runConcurrentUpdateJobProgressSuite(t *testing.T, makeStore func(t *testing.T) *Store) {
+	t.Helper()
+	t.Run("concurrent_initial_row_creation_and_increasing_decreasing_orderings", func(t *testing.T) {
+		s := makeStore(t)
 		for _, iter := range []int{0, 1, 2, 3, 4} {
-			s, _ := newTestStore(t)
 			ctx := context.Background()
 			now := time.Now().UTC()
-			ordID := "ord-6a-conc-ord"
-			jobID := "job-6a-conc-ord"
+			suffix := fmt.Sprintf("%d-%d", time.Now().UnixNano(), iter)
+			ordID := "ord-6a-conc-ord-" + suffix
+			jobID := "job-6a-conc-ord-" + suffix
+			kioskID := "kiosk-6a-conc-" + suffix
 			ord := Order{
 				OrderID: ordID, Status: contracts.JobStatusPaidWaiting, PricePaise: 500,
 				TotalPages: 5, TotalSheets: 5, ColorMode: "BW", PINExpiresAt: now.Add(10 * time.Minute),
@@ -125,7 +136,7 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 					OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
 					TotalPages: 5, TotalSheets: 5, Copies: 1, PricePaise: 500,
 				}},
-				Command:   PrintJobCommandCompat(jobID, ordID, "kiosk-6a-conc"),
+				Command:   PrintJobCommandCompat(jobID, ordID, kioskID),
 				CreatedAt: now, UpdatedAt: now,
 			}
 			if err := s.CreateOrder(ctx, ord); err != nil {
@@ -134,12 +145,12 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 
 			start := make(chan struct{})
 			var wg sync.WaitGroup
-			wg.Add(2)
+			wg.Add(3)
 			go func() {
 				defer wg.Done()
 				<-start
 				_ = s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-					JobID: jobID, KioskID: "kiosk-6a-conc", Status: contracts.JobStatusPrinting,
+					JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusPrinting,
 					PagesPrinted: 1, SheetsPrinted: 1, Timestamp: now.Add(time.Second),
 				})
 			}()
@@ -147,12 +158,28 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 				defer wg.Done()
 				<-start
 				_ = s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-					JobID: jobID, KioskID: "kiosk-6a-conc", Status: contracts.JobStatusPrinting,
-					PagesPrinted: 3, SheetsPrinted: 3, Timestamp: now.Add(2 * time.Second),
+					JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusPrinting,
+					PagesPrinted: 3, SheetsPrinted: 3, Timestamp: now.Add(3 * time.Second),
+				})
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				_ = s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+					JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusPrinting,
+					PagesPrinted: 2, SheetsPrinted: 2, Timestamp: now.Add(2 * time.Second),
 				})
 			}()
 			close(start)
 			wg.Wait()
+
+			// Decreasing count even with newer timestamp must be rejected and not overwrite 3/3
+			if err := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+				JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusPrinting,
+				PagesPrinted: 2, SheetsPrinted: 2, Timestamp: now.Add(4 * time.Second),
+			}); err == nil {
+				t.Fatalf("iter %d expected decreasing count with newer timestamp to be rejected", iter)
+			}
 
 			got, err := s.GetJobProgress(ctx, jobID)
 			if err != nil || got == nil {
@@ -161,16 +188,22 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 			if got.PagesPrinted != 3 || got.SheetsPrinted != 3 {
 				t.Fatalf("iter %d expected final progress 3/3 regardless of arrival order, got %d/%d", iter, got.PagesPrinted, got.SheetsPrinted)
 			}
+			gotOrd, err := s.GetOrder(ctx, ordID)
+			if err != nil || gotOrd.Status != contracts.JobStatusPrinting {
+				t.Fatalf("iter %d expected order PRINTING, got %v (err=%v)", iter, gotOrd, err)
+			}
 		}
 	})
 
 	t.Run("concurrent_completed_and_printing_never_regress_completed", func(t *testing.T) {
+		s := makeStore(t)
 		for _, iter := range []int{0, 1, 2, 3, 4} {
-			s, _ := newTestStore(t)
 			ctx := context.Background()
 			now := time.Now().UTC()
-			ordID := "ord-6a-conc-comp"
-			jobID := "job-6a-conc-comp"
+			suffix := fmt.Sprintf("%d-%d", time.Now().UnixNano(), iter)
+			ordID := "ord-6a-conc-comp-" + suffix
+			jobID := "job-6a-conc-comp-" + suffix
+			kioskID := "kiosk-6a-conc2-" + suffix
 			ord := Order{
 				OrderID: ordID, Status: contracts.JobStatusPaidWaiting, PricePaise: 200,
 				TotalPages: 2, TotalSheets: 2, ColorMode: "BW", PINExpiresAt: now.Add(10 * time.Minute),
@@ -179,7 +212,7 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 					OriginalFilename: "doc.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
 					TotalPages: 2, TotalSheets: 2, Copies: 1, PricePaise: 200,
 				}},
-				Command:   PrintJobCommandCompat(jobID, ordID, "kiosk-6a-conc2"),
+				Command:   PrintJobCommandCompat(jobID, ordID, kioskID),
 				CreatedAt: now, UpdatedAt: now,
 			}
 			if err := s.CreateOrder(ctx, ord); err != nil {
@@ -193,7 +226,7 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 				defer wg.Done()
 				<-start
 				_ = s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-					JobID: jobID, KioskID: "kiosk-6a-conc2", Status: contracts.JobStatusCompleted,
+					JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusCompleted,
 					PagesPrinted: 2, SheetsPrinted: 2, Timestamp: now.Add(5 * time.Second),
 				})
 			}()
@@ -201,16 +234,17 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 				defer wg.Done()
 				<-start
 				_ = s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-					JobID: jobID, KioskID: "kiosk-6a-conc2", Status: contracts.JobStatusPrinting,
+					JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusPrinting,
 					PagesPrinted: 1, SheetsPrinted: 1, Timestamp: now.Add(2 * time.Second),
 				})
 			}()
 			close(start)
 			wg.Wait()
 
-			// Even a subsequent PRINTING event with a newer timestamp cannot regress COMPLETED.
+			// Even a subsequent PRINTING event with a newer timestamp cannot regress COMPLETED
+			// and must not partially modify job_progress, order_documents, or orders.
 			if err := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-				JobID: jobID, KioskID: "kiosk-6a-conc2", Status: contracts.JobStatusPrinting,
+				JobID: jobID, KioskID: kioskID, Status: contracts.JobStatusPrinting,
 				PagesPrinted: 1, SheetsPrinted: 1, Timestamp: now.Add(10 * time.Second),
 			}); err == nil {
 				t.Fatalf("iter %d expected error regressing COMPLETED to PRINTING", iter)
@@ -223,6 +257,10 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 			if got.Status != contracts.JobStatusCompleted || got.PagesPrinted != 2 || got.SheetsPrinted != 2 {
 				t.Fatalf("iter %d expected COMPLETED 2/2, got %+v", iter, got)
 			}
+			doc, err := s.GetOrderDocument(ctx, jobID)
+			if err != nil || doc == nil || doc.Status != contracts.JobStatusCompleted {
+				t.Fatalf("iter %d expected order_document COMPLETED, got %+v (err=%v)", iter, doc, err)
+			}
 			gotOrd, err := s.GetOrder(ctx, ordID)
 			if err != nil || gotOrd == nil || gotOrd.Status != contracts.JobStatusCompleted {
 				t.Fatalf("iter %d expected order COMPLETED, got %+v (err=%v)", iter, gotOrd, err)
@@ -231,26 +269,30 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 	})
 
 	t.Run("atomic_multi_doc_order_status_consistency", func(t *testing.T) {
-		s, _ := newTestStore(t)
+		s := makeStore(t)
 		ctx := context.Background()
 		now := time.Now().UTC()
-		ordID := "ord-6a-multidoc"
+		suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+		ordID := "ord-6a-multidoc-" + suffix
+		job0 := "job-6a-md-0-" + suffix
+		job1 := "job-6a-md-1-" + suffix
+		kioskID := "kiosk-6a-md-" + suffix
 		ord := Order{
 			OrderID: ordID, Status: contracts.JobStatusPaidWaiting, PricePaise: 400,
 			TotalPages: 4, TotalSheets: 4, ColorMode: "BW", PINExpiresAt: now.Add(10 * time.Minute),
 			Documents: []OrderDocument{
 				{
-					JobID: "job-6a-md-0", OrderID: ordID, DocumentIndex: 0,
+					JobID: job0, OrderID: ordID, DocumentIndex: 0,
 					OriginalFilename: "a.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
 					TotalPages: 2, TotalSheets: 2, Copies: 1, PricePaise: 200,
 				},
 				{
-					JobID: "job-6a-md-1", OrderID: ordID, DocumentIndex: 1,
+					JobID: job1, OrderID: ordID, DocumentIndex: 1,
 					OriginalFilename: "b.pdf", Duplex: contracts.DuplexSimplex, ColorMode: "BW",
 					TotalPages: 2, TotalSheets: 2, Copies: 1, PricePaise: 200,
 				},
 			},
-			Command:   PrintJobCommandCompat("job-6a-md-0", ordID, "kiosk-6a-md"),
+			Command:   PrintJobCommandCompat(job0, ordID, kioskID),
 			CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.CreateOrder(ctx, ord); err != nil {
@@ -264,7 +306,7 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 			defer wg.Done()
 			<-start
 			if err := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-				JobID: "job-6a-md-0", KioskID: "kiosk-6a-md", Status: contracts.JobStatusCompleted,
+				JobID: job0, KioskID: kioskID, Status: contracts.JobStatusCompleted,
 				PagesPrinted: 2, SheetsPrinted: 2, Timestamp: now.Add(time.Second),
 			}); err != nil {
 				t.Errorf("doc 0 complete failed: %v", err)
@@ -274,7 +316,7 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 			defer wg.Done()
 			<-start
 			if err := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-				JobID: "job-6a-md-1", KioskID: "kiosk-6a-md", Status: contracts.JobStatusPrinting,
+				JobID: job1, KioskID: kioskID, Status: contracts.JobStatusPrinting,
 				PagesPrinted: 1, SheetsPrinted: 1, Timestamp: now.Add(2 * time.Second),
 			}); err != nil {
 				t.Errorf("doc 1 printing failed: %v", err)
@@ -289,7 +331,7 @@ func TestPackage6A_ConcurrentUpdateJobProgress_OrderingsImmutabilityAndMultiDocC
 		}
 
 		if err := s.UpdateJobProgress(ctx, contracts.JobProgressEvent{
-			JobID: "job-6a-md-1", KioskID: "kiosk-6a-md", Status: contracts.JobStatusCompleted,
+			JobID: job1, KioskID: kioskID, Status: contracts.JobStatusCompleted,
 			PagesPrinted: 2, SheetsPrinted: 2, Timestamp: now.Add(3 * time.Second),
 		}); err != nil {
 			t.Fatalf("doc 1 complete failed: %v", err)

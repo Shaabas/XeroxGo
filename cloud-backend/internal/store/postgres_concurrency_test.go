@@ -256,3 +256,7 @@ func TestPostgresConcurrency_PaymentVsCancellation_Serialization(t *testing.T) {
 
 	t.Logf("Postgres concurrency serialization verified over %d trials: payment won %d times, cancel won %d times. Zero deadlocks or inconsistent states.", trials, paymentWonCount, cancelWonCount)
 }
+
+func TestPostgresConcurrency_UpdateJobProgress(t *testing.T) {
+	runConcurrentUpdateJobProgressSuite(t, getTestPostgresStore)
+}
