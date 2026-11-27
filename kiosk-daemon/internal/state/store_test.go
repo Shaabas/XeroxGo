@@ -1221,3 +1221,68 @@ func TestPackage5B_CalibratePaperTrayRejectsActiveOrUncertainJobs(t *testing.T) 
 		t.Fatalf("expected inventory untouched (0, false), got (%d, %v, %v)", sheets, calib, err)
 	}
 }
+
+func TestPackage6A_RecordSheetProgress_RejectsOutOfBoundsAndConservesInventory(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	if err := s.ResetPaperTray(ctx, 50); err != nil {
+		t.Fatalf("ResetPaperTray failed: %v", err)
+	}
+	cmd := sampleCommand("job-6a-oob") // TotalPages=10, TotalSheets=5
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusPrinting); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusPrinting,
+		PagesPrinted: 11, SheetsPrinted: 5, Timestamp: time.Now().UTC(),
+	}); err == nil {
+		t.Fatal("expected RecordSheetProgress to reject PagesPrinted > TotalPages")
+	}
+
+	if err := s.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusPrinting,
+		PagesPrinted: 10, SheetsPrinted: 6, Timestamp: time.Now().UTC(),
+	}); err == nil {
+		t.Fatal("expected RecordSheetProgress to reject SheetsPrinted > TotalSheets")
+	}
+
+	got, err := s.GetJob(ctx, cmd.JobID)
+	if err != nil || got == nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if got.SheetsPrinted != 0 || got.PagesPrinted != 0 {
+		t.Fatalf("expected 0/0 progress after rejected updates, got %d/%d", got.PagesPrinted, got.SheetsPrinted)
+	}
+	sheets, err := s.GetEstimatedSheets(ctx)
+	if err != nil || sheets != 50 {
+		t.Fatalf("expected inventory conserved at 50, got %d (err=%v)", sheets, err)
+	}
+}
+
+func TestPackage6A_DuplicateMarkJobSubmittingWithBaselineRejected(t *testing.T) {
+	s, _ := newTestStore(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	cmd := sampleCommand("job-6a-dup-sub")
+	if err := s.SaveJob(ctx, cmd, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := s.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 1000, "1.1", 8, now); err != nil {
+		t.Fatalf("first MarkJobSubmittingWithBaseline failed: %v", err)
+	}
+	if err := s.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 2000, "1.1", 8, now.Add(time.Second)); err == nil {
+		t.Fatal("expected duplicate MarkJobSubmittingWithBaseline to fail")
+	}
+	got, err := s.GetJob(ctx, cmd.JobID)
+	if err != nil || got == nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if got.BaselineCounterValue != 1000 {
+		t.Fatalf("expected original baseline 1000 preserved, got %d", got.BaselineCounterValue)
+	}
+}

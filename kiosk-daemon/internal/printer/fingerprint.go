@@ -708,34 +708,7 @@ func evaluateTelemetry(cups *QueueProbeResult, remote *IPPProbeResult, snmp *SNM
 
 	// 1. Check SNMP Marker Odometer and Counter Unit
 	if snmp != nil && len(snmp.Markers) > 0 {
-		// Sort markers deterministically by row index
-		sortedMarkers := make([]SNMPMarker, len(snmp.Markers))
-		copy(sortedMarkers, snmp.Markers)
-		sort.Slice(sortedMarkers, func(i, j int) bool {
-			return sortedMarkers[i].Index < sortedMarkers[j].Index
-		})
-
-		var selectedMarker *SNMPMarker
-		// Prioritize deterministic valid page counter with verified lifetime count
-		for i := range sortedMarkers {
-			m := &sortedMarkers[i]
-			if m.HasLifeCount && m.LifeCount >= 0 && m.IsPageCounter {
-				selectedMarker = m
-				break
-			}
-		}
-		// If no valid page counter found, fall back to first counter with verified lifetime count for diagnostics
-		if selectedMarker == nil {
-			for i := range sortedMarkers {
-				m := &sortedMarkers[i]
-				if m.HasLifeCount && m.LifeCount >= 0 {
-					selectedMarker = m
-					break
-				}
-			}
-		}
-
-		if selectedMarker != nil {
+		if selectedMarker := SelectPrimaryMarker(snmp.Markers); selectedMarker != nil {
 			summary.HasSNMPMarkerCounter = true
 			summary.SNMPMarkerIndex = selectedMarker.Index
 			summary.SNMPMarkerLifeCount = selectedMarker.LifeCount

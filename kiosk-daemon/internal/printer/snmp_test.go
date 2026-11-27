@@ -279,7 +279,7 @@ func TestDynamicSNMP_MonitorErrorAndSessionLifecycle(t *testing.T) {
 func TestPollHardwareTelemetry(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("valid_telemetry_with_jam_and_lifecount", func(t *testing.T) {
+	t.Run("valid_telemetry_with_jam_and_dynamic_lifecount", func(t *testing.T) {
 		packet := &gosnmp.SnmpPacket{
 			Error: gosnmp.NoError,
 			Variables: []gosnmp.SnmpPDU{
@@ -293,17 +293,19 @@ func TestPollHardwareTelemetry(t *testing.T) {
 					Type:  gosnmp.OctetString,
 					Value: []byte{0x04}, // JAMMED (bit 5)
 				},
-				{
-					Name:  oidPrtMarkerLifeCount,
-					Type:  gosnmp.Counter32,
-					Value: uint32(68544),
-				},
 			},
 		}
 
 		session := &fakeSnmpSession{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				return packet, nil
+			},
+			walkFunc: func(rootOid string, walkFn gosnmp.WalkFunc) error {
+				if rootOid == oidSubtreePrtMarker {
+					_ = walkFn(gosnmp.SnmpPDU{Name: "1.3.6.1.2.1.43.10.2.1.3.2.3", Type: gosnmp.Integer, Value: 8})
+					_ = walkFn(gosnmp.SnmpPDU{Name: "1.3.6.1.2.1.43.10.2.1.4.2.3", Type: gosnmp.Counter32, Value: uint32(68544)})
+				}
+				return nil
 			},
 		}
 		factory := func(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error) {
@@ -329,13 +331,16 @@ func TestPollHardwareTelemetry(t *testing.T) {
 		if telem.LifeCount != 68544 {
 			t.Errorf("LifeCount = %d, want 68544", telem.LifeCount)
 		}
+		if telem.CounterIndex != "2.3" || telem.CounterUnit != 8 {
+			t.Errorf("expected dynamic CounterIndex=2.3, CounterUnit=8, got %q / %d", telem.CounterIndex, telem.CounterUnit)
+		}
 		if !session.closed {
 			t.Error("expected session to be closed")
 		}
 	})
 
-	t.Run("fallback_when_lifecount_unsupported", func(t *testing.T) {
-		fallbackPacket := &gosnmp.SnmpPacket{
+	t.Run("no_fixed_1_1_fallback_when_marker_table_unavailable", func(t *testing.T) {
+		packet := &gosnmp.SnmpPacket{
 			Error: gosnmp.NoError,
 			Variables: []gosnmp.SnmpPDU{
 				{
@@ -348,6 +353,11 @@ func TestPollHardwareTelemetry(t *testing.T) {
 					Type:  gosnmp.OctetString,
 					Value: []byte{0x08}, // DoorOpen (bit 4, 0x08)
 				},
+				{
+					Name:  oidPrtMarkerLifeCount,
+					Type:  gosnmp.Counter32,
+					Value: uint32(99999),
+				},
 			},
 		}
 
@@ -355,10 +365,10 @@ func TestPollHardwareTelemetry(t *testing.T) {
 		session := &fakeSnmpSession{
 			getFunc: func(oids []string) (*gosnmp.SnmpPacket, error) {
 				callCount++
-				if len(oids) == 3 {
-					return nil, errors.New("no such name")
-				}
-				return fallbackPacket, nil
+				return packet, nil
+			},
+			walkFunc: func(rootOid string, walkFn gosnmp.WalkFunc) error {
+				return errors.New("marker table walk unsupported")
 			},
 		}
 		factory := func(ctx context.Context, cfg SNMPConfig) (DynamicSNMPSession, error) {
@@ -367,7 +377,7 @@ func TestPollHardwareTelemetry(t *testing.T) {
 
 		telem := pollHardwareTelemetryWithFactory(ctx, SNMPConfig{}, factory)
 		if !telem.Online {
-			t.Fatal("expected telemetry Online = true via fallback")
+			t.Fatal("expected telemetry Online = true")
 		}
 		if telem.StatusState != "PRINTING" {
 			t.Errorf("StatusState = %q, want PRINTING", telem.StatusState)
@@ -376,10 +386,10 @@ func TestPollHardwareTelemetry(t *testing.T) {
 			t.Errorf("expected Flags.DoorOpen = true")
 		}
 		if telem.HasLife {
-			t.Error("expected HasLife = false on fallback")
+			t.Error("expected HasLife = false (must not fall back to fixed 1.1)")
 		}
-		if callCount != 2 {
-			t.Errorf("expected 2 calls (initial + fallback), got %d", callCount)
+		if callCount != 1 {
+			t.Errorf("expected 1 Get call (no 1.1 fallback), got %d", callCount)
 		}
 	})
 

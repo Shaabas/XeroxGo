@@ -2378,7 +2378,14 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		return fmt.Errorf("update job progress: kiosk ID mismatch: event has %q, order belongs to %q", event.KioskID, orderKioskID)
 	}
 
-	// 3. Verify progress bounds
+	// Serialize concurrent progress updates (including initial row creation and multi-doc order aggregation) per order in PostgreSQL.
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22616, hashtext($1));", orderID); err != nil {
+			return fmt.Errorf("update job progress: acquire order progress lock: %w", err)
+		}
+	}
+
+	// 3. Verify progress bounds and explicit completion counts
 	if isRecovery {
 		if event.PagesPrinted > recRemainingPages {
 			return fmt.Errorf("update job progress: pages_printed (%d) exceeds recovery remaining_pages (%d)", event.PagesPrinted, recRemainingPages)
@@ -2386,12 +2393,20 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		if event.SheetsPrinted > recRemainingSheets {
 			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds recovery remaining_sheets (%d)", event.SheetsPrinted, recRemainingSheets)
 		}
+		if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != recRemainingPages || event.SheetsPrinted != recRemainingSheets) {
+			return fmt.Errorf("update job progress: inconsistent recovery completion counts (pages=%d/%d, sheets=%d/%d)",
+				event.PagesPrinted, recRemainingPages, event.SheetsPrinted, recRemainingSheets)
+		}
 	} else {
 		if event.PagesPrinted > totalPages {
 			return fmt.Errorf("update job progress: pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
 		}
 		if event.SheetsPrinted > totalSheets {
 			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
+		}
+		if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != totalPages || event.SheetsPrinted != totalSheets) {
+			return fmt.Errorf("update job progress: inconsistent completion counts (pages=%d/%d, sheets=%d/%d)",
+				event.PagesPrinted, totalPages, event.SheetsPrinted, totalSheets)
 		}
 	}
 
@@ -2411,17 +2426,31 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 		}
 	}
 
-	// 4. Check existing progress timestamp to reject older/stale events
+	// 4. Check existing progress timestamp, completed non-regression, and monotonic counts
+	var existingStatus string
+	var existingPages, existingSheets int
 	var existingTimestampNS int64
-	err = tx.QueryRowContext(ctx, s.rebind("SELECT timestamp_ns FROM job_progress WHERE job_id = ?;"), targetJobID).Scan(&existingTimestampNS)
+	selectProgressSQL := "SELECT status, pages_printed, sheets_printed, timestamp_ns FROM job_progress WHERE job_id = ?;"
+	if s.dialect == "postgres" {
+		selectProgressSQL = "SELECT status, pages_printed, sheets_printed, timestamp_ns FROM job_progress WHERE job_id = ? FOR UPDATE;"
+	}
+	err = tx.QueryRowContext(ctx, s.rebind(selectProgressSQL), targetJobID).Scan(&existingStatus, &existingPages, &existingSheets, &existingTimestampNS)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("update job progress: query existing progress: %w", err)
 	}
-	if err == nil && eventNS < existingTimestampNS {
-		return fmt.Errorf("update job progress: rejected stale event timestamp (%d < %d)", eventNS, existingTimestampNS)
+	if err == nil {
+		if existingStatus == string(contracts.JobStatusCompleted) && event.Status != contracts.JobStatusCompleted {
+			return fmt.Errorf("update job progress: cannot regress completed job %s to %s", targetJobID, event.Status)
+		}
+		if eventNS < existingTimestampNS {
+			return fmt.Errorf("update job progress: rejected stale event timestamp (%d < %d)", eventNS, existingTimestampNS)
+		}
+		if pagesPrinted < existingPages || sheetsPrinted < existingSheets {
+			return fmt.Errorf("update job progress: rejected progress regression (pages %d < %d or sheets %d < %d)", pagesPrinted, existingPages, sheetsPrinted, existingSheets)
+		}
 	}
 
-	// 5. Upsert latest progress row
+	// 5. Conditional upsert enforcing immutability, ordering, and monotonicity atomically
 	upsertProgress := `
 INSERT INTO job_progress (job_id, kiosk_id, status, pages_printed, sheets_printed, error_reason, timestamp_ns)
 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2431,9 +2460,13 @@ ON CONFLICT(job_id) DO UPDATE SET
     pages_printed = excluded.pages_printed,
     sheets_printed = excluded.sheets_printed,
     error_reason = excluded.error_reason,
-    timestamp_ns = excluded.timestamp_ns;
+    timestamp_ns = excluded.timestamp_ns
+WHERE NOT (job_progress.status = 'COMPLETED' AND excluded.status <> 'COMPLETED')
+  AND excluded.timestamp_ns >= job_progress.timestamp_ns
+  AND excluded.pages_printed >= job_progress.pages_printed
+  AND excluded.sheets_printed >= job_progress.sheets_printed;
 `
-	_, err = tx.ExecContext(ctx, s.rebind(upsertProgress),
+	res, err := tx.ExecContext(ctx, s.rebind(upsertProgress),
 		targetJobID,
 		event.KioskID,
 		string(event.Status),
@@ -2444,6 +2477,9 @@ ON CONFLICT(job_id) DO UPDATE SET
 	)
 	if err != nil {
 		return fmt.Errorf("update job progress: upsert progress: %w", err)
+	}
+	if rows, rErr := res.RowsAffected(); rErr == nil && rows == 0 {
+		return fmt.Errorf("update job progress: rejected concurrent regression or stale update for job %s", targetJobID)
 	}
 
 	if isRecovery {
@@ -2463,8 +2499,8 @@ WHERE recovery_id = ?;
 		_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE order_documents
 SET status = ?, updated_at_ns = ?
-WHERE job_id = ?;
-`), string(event.Status), eventNS, event.JobID)
+WHERE job_id = ? AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED');
+`), string(event.Status), eventNS, event.JobID, string(event.Status))
 		if err != nil {
 			return fmt.Errorf("update job progress: update order_documents status: %w", err)
 		}
@@ -2506,10 +2542,10 @@ WHERE order_id = ?;
 			}
 			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
 		} else if failedDocs > 0 {
-			_, _ = tx.ExecContext(ctx, s.rebind(`
+			_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'FAILED_REFUNDABLE', updated_at_ns = ?
-WHERE order_id = ?;
+WHERE order_id = ? AND status <> 'COMPLETED';
 `), eventNS, orderID)
 		} else if printingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
@@ -2529,8 +2565,8 @@ WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED');
 		_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
-WHERE job_id = ?;
-`), string(event.Status), eventNS, targetJobID)
+WHERE job_id = ? AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED');
+`), string(event.Status), eventNS, targetJobID, string(event.Status))
 		if err != nil {
 			return fmt.Errorf("update job progress: update order status: %w", err)
 		}

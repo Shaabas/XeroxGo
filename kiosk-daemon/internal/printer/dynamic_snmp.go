@@ -1287,6 +1287,32 @@ func FormatHRPrinterStatus(status int64) string {
 	}
 }
 
+// SelectPrimaryMarker deterministically selects the best marker counter from discovered rows,
+// prioritizing valid page/impression counters with a nonnegative life count.
+func SelectPrimaryMarker(markers []SNMPMarker) *SNMPMarker {
+	if len(markers) == 0 {
+		return nil
+	}
+	sorted := make([]SNMPMarker, len(markers))
+	copy(sorted, markers)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Index < sorted[j].Index
+	})
+	for i := range sorted {
+		m := &sorted[i]
+		if m.HasLifeCount && m.LifeCount >= 0 && m.IsPageCounter {
+			return m
+		}
+	}
+	for i := range sorted {
+		m := &sorted[i]
+		if m.HasLifeCount && m.LifeCount >= 0 {
+			return m
+		}
+	}
+	return nil
+}
+
 // FormatMarkerCounterUnit decodes RFC 3805 PrtMarkerCounterUnitTC.
 // Returns unit name and whether this is a recognized page counter unit (sheets or impressions).
 func FormatMarkerCounterUnit(unit int64) (name string, isValidPageUnit bool) {

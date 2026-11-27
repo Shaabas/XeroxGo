@@ -1459,6 +1459,9 @@ for arg in "$@"; do
 done
 
 for i in "$@"; do
+    if [[ "$i" == "not-completed" ]]; then
+        exit 0
+    fi
     if [[ "$i" == "completed" ]] || [[ "$i" == "successful" ]]; then
         cat << 'EOF'
 MockQueue-1 user 1024 Tue Nov 3 14:00:00 2026
