@@ -1463,8 +1463,8 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
-	if saved.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job to remain in PAUSED_ERROR, got %s", saved.Status)
+	if saved.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected quiescent completed CUPS without full physical proof to finalize FAILED_REFUNDABLE, got %s", saved.Status)
 	}
 	if saved.SheetsPrinted != 1 {
 		t.Fatalf("expected SheetsPrinted to remain 1 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
@@ -1475,8 +1475,8 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	if saved.CUPSJobID != "HPTank-999" {
 		t.Fatalf("expected CUPSJobID=HPTank-999, got %s", saved.CUPSJobID)
 	}
-	if !strings.Contains(saved.ErrorReason, "physical output uncertain") {
-		t.Fatalf("expected ErrorReason to mention physical output uncertain, got: %q", saved.ErrorReason)
+	if !strings.Contains(saved.ErrorReason, "without full physical proof") {
+		t.Fatalf("expected ErrorReason to mention without full physical proof, got: %q", saved.ErrorReason)
 	}
 }
 
@@ -2611,8 +2611,8 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
-	if saved.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job to be in PAUSED_ERROR due to incomplete physical output, got %s", saved.Status)
+	if saved.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected quiescent completed CUPS with incomplete physical output to finalize FAILED_REFUNDABLE, got %s", saved.Status)
 	}
 	if saved.SheetsPrinted != 2 {
 		t.Fatalf("expected SheetsPrinted to reflect verified physical progress (2), got %d", saved.SheetsPrinted)
@@ -2856,7 +2856,7 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
-		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
+		if err == nil && job != nil && (job.Status == contracts.JobStatusPausedError || job.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -2864,7 +2864,7 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 	}
 
 	if !paused {
-		t.Fatal("expected startup recovery to preserve job in PAUSED_ERROR without physical proof")
+		t.Fatal("expected startup recovery to stop job in PAUSED_ERROR or FAILED_REFUNDABLE without physical proof")
 	}
 
 	saved, err := store.GetJob(context.Background(), cmd.JobID)

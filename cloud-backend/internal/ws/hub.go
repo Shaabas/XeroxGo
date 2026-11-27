@@ -520,20 +520,10 @@ func (h *Hub) reconcilePendingDispatchOrders(ctx context.Context, kioskID string
 			log.Printf("[HUB] Halting pending dispatch reconciliation for kiosk %s (%s)", kioskID, reason)
 			break
 		}
-		if err := h.sendJobToSession(ctx, sess, jobCmd); err != nil {
+		if err := h.sendJobToSessionWithAuth(ctx, sess, jobCmd, true); err != nil {
 			sess.reconcileRetryNeeded.Store(true)
 			log.Printf("[HUB] Failed to dispatch pending job %s to kiosk %s: %v", jobCmd.JobID, kioskID, err)
 			break
-		}
-		if err := h.db.MarkDispatchIntentSent(ctx, jobCmd.JobID); err != nil {
-			// Bounded retry with background context in case caller ctx was canceled right after wire write.
-			bgCtx, bgCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			retryErr := h.db.MarkDispatchIntentSent(bgCtx, jobCmd.JobID)
-			bgCancel()
-			if retryErr != nil {
-				log.Printf("[HUB] Warning: failed to mark reconciled job %s SENT: %v", jobCmd.JobID, retryErr)
-				break
-			}
 		}
 		log.Printf("[HUB] Reconciled and dispatched pending job %s to kiosk %s", jobCmd.JobID, kioskID)
 	}
@@ -706,6 +696,10 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 }
 
 func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd contracts.PrintJobCommand) error {
+	return h.sendJobToSessionWithAuth(ctx, sess, cmd, false)
+}
+
+func (h *Hub) sendJobToSessionWithAuth(ctx context.Context, sess *kioskSession, cmd contracts.PrintJobCommand, markSent bool) error {
 	if sess == nil {
 		return fmt.Errorf("send job: kiosk %q not connected", cmd.KioskID)
 	}
@@ -737,46 +731,37 @@ func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd cont
 		return fmt.Errorf("send job: invalid start from page %d", cmd.StartFromPage)
 	}
 
-	if h.db != nil {
-		orderID := strings.TrimSpace(cmd.OrderID)
-		if orderID == "" {
-			orderID = cmd.JobID
-		}
-		if ord, oErr := h.db.GetOrder(ctx, orderID); oErr == nil && ord != nil {
-			if ord.Status == contracts.JobStatusPausedError || ord.Status == contracts.JobStatusFailedRefundable || ord.Status == contracts.JobStatusCompleted || string(ord.Status) == "CANCELED" {
-				return fmt.Errorf("send job: order %s is in non-dispatchable status %s", orderID, ord.Status)
-			}
-		}
-		if intentStatus, _, iErr := h.db.GetJobDispatchIntentStatus(ctx, cmd.JobID); iErr == nil && intentStatus == "CANCELED" {
-			return fmt.Errorf("send job: dispatch intent for job %s is CANCELED", cmd.JobID)
-		}
-	}
-
 	msg := wireMessage{
 		Type: "job",
 		Job:  &cmd,
 	}
 
-	sess.sendMu.Lock()
-	defer sess.sendMu.Unlock()
-	if !h.isActiveSession(cmd.KioskID, sess) {
-		return fmt.Errorf("send job: session for kiosk %q is no longer active", cmd.KioskID)
+	writeToSession := func() error {
+		sess.sendMu.Lock()
+		defer sess.sendMu.Unlock()
+		if !h.isActiveSession(cmd.KioskID, sess) {
+			return fmt.Errorf("send job: session for kiosk %q is no longer active", cmd.KioskID)
+		}
+		if ready, reason := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready {
+			sess.reconcileRetryNeeded.Store(true)
+			return fmt.Errorf("send job: kiosk %q not ready (%s)", cmd.KioskID, reason)
+		}
+		if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
+			sess.reconcileRetryNeeded.Store(true)
+			return fmt.Errorf("send job: write to kiosk %q: %w", cmd.KioskID, err)
+		}
+		return nil
 	}
 
-	if !h.isActiveSession(cmd.KioskID, sess) {
-		return fmt.Errorf("send job: kiosk %q connection replaced", cmd.KioskID)
-	}
-	if ready, reason := h.isSessionReadyForDispatch(sess, time.Now().UTC()); !ready {
-		sess.reconcileRetryNeeded.Store(true)
-		return fmt.Errorf("send job: kiosk %q not ready (%s)", cmd.KioskID, reason)
-	}
-
-	if err := wsjson.Write(ctx, sess.conn, msg); err != nil {
-		sess.reconcileRetryNeeded.Store(true)
-		return fmt.Errorf("send job: write to kiosk %q: %w", cmd.KioskID, err)
+	if h.db != nil {
+		orderID := strings.TrimSpace(cmd.OrderID)
+		if orderID == "" {
+			orderID = cmd.JobID
+		}
+		return h.db.AuthorizeAndMarkDispatchSent(ctx, orderID, cmd.JobID, markSent, writeToSession)
 	}
 
-	return nil
+	return writeToSession()
 }
 
 // MarkDispatchRetryNeeded flags the currently active kiosk session so its next verified healthy

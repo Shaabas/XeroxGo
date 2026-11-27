@@ -4039,7 +4039,92 @@ WHERE job_id = ? AND status = 'PENDING'
 	return nil
 }
 
-// MarkDispatchIntentAcknowledged records that the kiosk daemon has durably accepted and persisted a specific job.
+// AuthorizeAndMarkDispatchSent serializes dispatch authorization and transmission against
+// order failure finalization using the per-order advisory lock (22616). It fails closed on
+// order/intent lookup errors, rejects non-dispatchable orders and CANCELED/ACKNOWLEDGED intents,
+// invokes sendFn while holding the per-order lock, and marks the intent SENT when markSent is true
+// only if sendFn succeeds (rolling back on failure so unsent intents remain PENDING).
+func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID string, markSent bool, sendFn func() error) error {
+	if s == nil || s.db == nil {
+		return errors.New("store not initialized")
+	}
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("jobID cannot be empty")
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		orderID = jobID
+	}
+	if sendFn == nil {
+		return errors.New("sendFn cannot be nil")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dispatch authorization tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22616, hashtext($1));", orderID); err != nil {
+			return fmt.Errorf("acquire order dispatch lock: %w", err)
+		}
+	}
+
+	var ordStatus string
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM orders WHERE order_id = ?;`), orderID).Scan(&ordStatus); err != nil {
+		return fmt.Errorf("lookup order %s for dispatch: %w", orderID, err)
+	}
+	switch contracts.JobStatus(ordStatus) {
+	case contracts.JobStatusPausedError, contracts.JobStatusFailedRefundable, contracts.JobStatusCompleted:
+		return fmt.Errorf("order %s is in non-dispatchable status %s", orderID, ordStatus)
+	}
+	if ordStatus == "CANCELED" {
+		return fmt.Errorf("order %s is in non-dispatchable status %s", orderID, ordStatus)
+	}
+
+	var intentStatus string
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM dispatch_intents WHERE job_id = ?;`), jobID).Scan(&intentStatus); err != nil {
+		return fmt.Errorf("lookup dispatch intent %s: %w", jobID, err)
+	}
+	if intentStatus == "CANCELED" || intentStatus == "ACKNOWLEDGED" {
+		return fmt.Errorf("dispatch intent for job %s is %s", jobID, intentStatus)
+	}
+
+	if err := sendFn(); err != nil {
+		return err
+	}
+
+	if markSent {
+		nowNS := time.Now().UTC().UnixNano()
+		res, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE dispatch_intents
+SET status = 'SENT', dispatched_at_ns = ?, updated_at_ns = ?
+WHERE job_id = ? AND status IN ('PENDING', 'SENT')
+  AND NOT EXISTS (
+      SELECT 1 FROM orders o
+      WHERE o.order_id = dispatch_intents.order_id
+        AND o.status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED', 'CANCELED')
+  );
+`), nowNS, nowNS, jobID)
+		if err != nil {
+			return fmt.Errorf("mark dispatch intent SENT: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return fmt.Errorf("dispatch intent %s could not be marked SENT", jobID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit dispatch authorization: %w", err)
+	}
+	return nil
+}
 func (s *Store) MarkDispatchIntentAcknowledged(ctx context.Context, jobID string) error {
 	return s.MarkDispatchIntentAcknowledgedForKiosk(ctx, "", jobID)
 }

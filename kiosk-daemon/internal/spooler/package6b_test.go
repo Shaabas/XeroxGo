@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -547,8 +548,8 @@ func TestPackage6B_CompletedCUPSWithFullVerifiedSheets_WithoutCounterEvidence_Ca
 	if status == contracts.JobStatusCompleted {
 		t.Fatalf("must NOT complete without fresh SNMP counter evidence even when saved sheets == TotalSheets")
 	}
-	if status != contracts.JobStatusPausedError {
-		t.Fatalf("expected completed CUPS without counter proof to remain PAUSED_ERROR for manual reconciliation, got %s", status)
+	if status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected completed CUPS + empty queue + fresh quiescence without counter proof to finalize FAILED_REFUNDABLE, got %s", status)
 	}
 	after, _ := st.GetJob(ctx, cmd.JobID)
 	if after.SheetsPrinted != 2 {
@@ -926,17 +927,144 @@ func TestPackage6B_PendingOutcomeQueryFailure_BlocksAdmission(t *testing.T) {
 	}
 }
 
-func TestPackage6B_ThreeHealthyHardwareCycles_DoNotClearPersistenceBarrier(t *testing.T) {
+type selectiveFailFinalizeStore struct {
+	StateStore
+	mu      sync.Mutex
+	failJob map[string]error
+}
+
+func (s *selectiveFailFinalizeStore) FinalizeOrderFailure(ctx context.Context, orderID, jobID string, event contracts.JobProgressEvent, invalidateInventory bool) ([]state.StoredJob, error) {
+	s.mu.Lock()
+	err := s.failJob[jobID]
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return s.StateStore.FinalizeOrderFailure(ctx, orderID, jobID, event, invalidateInventory)
+}
+
+func TestPackage6B_ThreeHealthyHealthCheckCycles_DoNotClearUnresolvedPersistenceBarrier(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
-	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "barrier_hw.db"))
+	realSt, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "barrier_hw.db"))
 	if err != nil {
 		t.Fatalf("openCalibratedTestStore: %v", err)
 	}
-	defer st.Close()
+	defer realSt.Close()
 
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-bar-1", OrderID: "ord-bar-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "1919", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("c", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = realSt.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+
+	wrapped := &selectiveFailFinalizeStore{
+		StateStore: realSt,
+		failJob:    map[string]error{cmd.JobID: errors.New("forced sqlite finalize failure")},
+	}
+	var faultActive atomic.Bool
+	faultActive.Store(true)
 	client, err := NewClient(ClientConfig{
-		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: wrapped, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		MockHealth: func(_ context.Context, sheets int) contracts.PrinterHealth {
+			now := time.Now().UTC()
+			if faultActive.Load() {
+				return contracts.PrinterHealth{
+					Online: false, State: "ERROR", PaperJam: true, EvaluatedHealth: contracts.EvaluatedHealthFault,
+					EstimatedSheets: sheets, InventoryCalibrated: true, UpdatedAt: now,
+					EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+						CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+						NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+						SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+					},
+				}
+			}
+			return contracts.PrinterHealth{
+				Online: true, State: "IDLE", EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+				EstimatedSheets: sheets, InventoryCalibrated: true, ExecutionSafe: true, UpdatedAt: now,
+				EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+					CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+					NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+					SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				},
+			}
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Drive hardware fault through actual CheckPrinterHealth path, then fail FinalizeOrderFailure.
+	_ = client.CheckPrinterHealth(ctx)
+	client.finalizeAndEmitOrderFailure(ctx, cmd.OrderID, cmd.JobID, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "download failed", Timestamp: time.Now().UTC(),
+	}, false)
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("expected persistence barrier active after FinalizeOrderFailure error")
+	}
+
+	// Run 3 healthy CheckPrinterHealth cycles while FinalizeOrderFailure still fails.
+	faultActive.Store(false)
+	for i := 0; i < 3; i++ {
+		_ = client.CheckPrinterHealth(ctx)
+	}
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("expected persistence barrier to remain active across 3 healthy CheckPrinterHealth cycles while unresolved")
+	}
+	if safe, _ := client.computeExecutionSafety(ctx, ""); safe {
+		t.Fatalf("expected execution safety blocked while persistence barrier unresolved")
+	}
+
+	// Unblock FinalizeOrderFailure and run CheckPrinterHealth -> retry resolves and clears barrier.
+	wrapped.mu.Lock()
+	delete(wrapped.failJob, cmd.JobID)
+	wrapped.mu.Unlock()
+	_ = client.CheckPrinterHealth(ctx)
+
+	if client.isPersistenceBlocked() {
+		t.Fatalf("expected persistence barrier to clear only after FinalizeOrderFailure retry succeeded")
+	}
+	stored, _ := realSt.GetJob(ctx, cmd.JobID)
+	if stored.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected retried job to reach FAILED_REFUNDABLE, got %s", stored.Status)
+	}
+}
+
+func TestPackage6B_UnrelatedFinalization_DoesNotClearPersistenceBarrier(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	realSt, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "barrier_unrelated.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer realSt.Close()
+
+	cmdA := contracts.PrintJobCommand{
+		JobID: "job-bar-a", OrderID: "ord-bar-a", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "2020", DownloadURL: "http://localhost/a.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmdB := contracts.PrintJobCommand{
+		JobID: "job-bar-b", OrderID: "ord-bar-b", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "2021", DownloadURL: "http://localhost/b.pdf",
+		SHA256Checksum: strings.Repeat("b", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = realSt.SaveJob(ctx, cmdA, contracts.JobStatusDispatched)
+	_ = realSt.SaveJob(ctx, cmdB, contracts.JobStatusDispatched)
+
+	wrapped := &selectiveFailFinalizeStore{
+		StateStore: realSt,
+		failJob:    map[string]error{cmdA.JobID: errors.New("sqlite busy for A")},
+	}
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: wrapped, CUPSQueue: "DCPT310",
 		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
 		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
@@ -944,17 +1072,98 @@ func TestPackage6B_ThreeHealthyHardwareCycles_DoNotClearPersistenceBarrier(t *te
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	client.setPersistenceBarrier(true, "SQLite finalize failure")
-	client.setHardwareFault(true, "paper jam", "Paper jam")
-	// Simulate 3 healthy hardware recovery cycles clearing hardwareFault.
-	for i := 0; i < 3; i++ {
-		client.setHardwareFault(false, "", "")
-	}
+	client.finalizeAndEmitOrderFailure(ctx, cmdA.OrderID, cmdA.JobID, contracts.JobProgressEvent{
+		JobID: cmdA.JobID, KioskID: cmdA.KioskID, Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "err A", Timestamp: time.Now().UTC(),
+	}, false)
 	if !client.isPersistenceBlocked() {
-		t.Fatalf("expected persistenceBlocked to remain true after healthy hardware cycles")
+		t.Fatalf("expected barrier active for job A")
 	}
-	safe, _ := client.computeExecutionSafety(ctx, "")
-	if safe {
-		t.Fatalf("expected execution safety to remain blocked while persistenceBlocked is true")
+
+	// Unrelated job B finalizes successfully -> must NOT clear job A's barrier.
+	client.finalizeAndEmitOrderFailure(ctx, cmdB.OrderID, cmdB.JobID, contracts.JobProgressEvent{
+		JobID: cmdB.JobID, KioskID: cmdB.KioskID, Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "err B", Timestamp: time.Now().UTC(),
+	}, false)
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("unrelated job B finalization must NOT clear job A's persistence barrier")
+	}
+}
+
+func TestPackage6B_VerifyPostTerminationQuiescence_NoRecursiveDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "deadlock_quiesce.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-dlq-1", OrderID: "ord-dlq-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "2121", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("d", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+	_ = st.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 100, "1.1", 8, time.Now().UTC())
+	_ = st.RecordJobSubmission(ctx, cmd.JobID, "DCPT310-212")
+
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			return []byte("job-state (enum) = canceled\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		CUPSRunner: runner, DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		MockHealth: func(_ context.Context, sheets int) contracts.PrinterHealth {
+			now := time.Now().UTC()
+			return contracts.PrinterHealth{
+				Online: true, State: "IDLE", EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+				EstimatedSheets: sheets, InventoryCalibrated: true, ExecutionSafe: true, UpdatedAt: now,
+				EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+					CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+					NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+					SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				},
+			}
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			_ = client.CheckPrinterHealth(ctx)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		stored, _ := st.GetJob(ctx, cmd.JobID)
+		status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted", false)
+		if status != contracts.JobStatusFailedRefundable {
+			t.Errorf("expected canceled + empty queue + fresh MockHealth to finalize FAILED_REFUNDABLE, got %s", status)
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("deadlock detected between CheckPrinterHealth and reconcileSubmittedOrInterruptedJob")
 	}
 }

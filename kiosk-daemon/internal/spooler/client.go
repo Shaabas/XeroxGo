@@ -206,10 +206,18 @@ type Client struct {
 	latestSnap      telemetrySnapshot
 	reconcileMu     sync.Mutex
 	reconciling     atomic.Bool
-	persistenceMu      sync.Mutex
-	persistenceBlocked bool
-	persistenceReason  string
-	outcomeSyncCh      chan struct{}
+	persistenceMu        sync.Mutex
+	pendingFinalizations map[string]pendingFinalizeOp
+	persistenceReadErr   string
+	outcomeSyncCh        chan struct{}
+}
+
+type pendingFinalizeOp struct {
+	orderID             string
+	jobID               string
+	evt                 contracts.JobProgressEvent
+	invalidateInventory bool
+	reason              string
 }
 
 const (
@@ -3164,7 +3172,11 @@ func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobComma
 	if err != nil || stored == nil {
 		// Fail closed: never transmit uncommitted outcomes or clear barriers when durable state cannot be read.
 		log.Printf("[SPOOLER] Fail-closed: cannot read durable state for job %s during error handling (%v)", cmd.JobID, err)
-		c.setPersistenceBarrier(true, firstNonEmptyString(reason, "durable state read failure during print error"))
+		readErr := err
+		if readErr == nil {
+			readErr = fmt.Errorf("missing durable job record for %s", cmd.JobID)
+		}
+		c.setPersistenceReadBarrier(readErr)
 		c.syncCustomerServiceState(persistCtx)
 		return
 	}
@@ -3219,13 +3231,24 @@ func (c *Client) finalizeAndEmitOrderFailure(
 
 	updatedJobs, err := c.cfg.StateStore.FinalizeOrderFailure(persistCtx, orderID, jobID, evt, invalidateInventory)
 	if err != nil {
-		// Fail closed: never bypass FinalizeOrderFailure or transmit uncommitted outcomes.
+		// Fail closed: associate this unresolved failure with the exact job and retain the persistence barrier.
 		log.Printf("[SPOOLER] FinalizeOrderFailure failed for %s: %v; retaining fail-closed persistence barrier", jobID, err)
-		c.setPersistenceBarrier(true, firstNonEmptyString(evt.ErrorReason, "failed to persist durable failure state"))
+		c.recordPendingFinalization(pendingFinalizeOp{
+			orderID:             orderID,
+			jobID:               jobID,
+			evt:                 evt,
+			invalidateInventory: invalidateInventory,
+			reason:              firstNonEmptyString(evt.ErrorReason, "failed to persist durable failure state"),
+		})
 		c.syncCustomerServiceState(persistCtx)
 		return
 	}
-	c.setPersistenceBarrier(false, "")
+	c.clearPendingFinalization(jobID)
+	for _, u := range updatedJobs {
+		if u.Status == contracts.JobStatusPausedError || u.Status == contracts.JobStatusFailedRefundable {
+			c.clearPendingFinalization(u.Command.JobID)
+		}
+	}
 
 	for _, job := range updatedJobs {
 		if job.Status != contracts.JobStatusPausedError && job.Status != contracts.JobStatusFailedRefundable {
@@ -3252,30 +3275,71 @@ func (c *Client) finalizeAndEmitOrderFailure(
 	}
 }
 
-func (c *Client) setPersistenceBarrier(blocked bool, reason string) {
+func (c *Client) recordPendingFinalization(op pendingFinalizeOp) {
 	c.persistenceMu.Lock()
-	c.persistenceBlocked = blocked
-	if blocked {
-		c.persistenceReason = strings.TrimSpace(reason)
-		if c.persistenceReason == "" {
-			c.persistenceReason = "durable persistence failure barrier active"
+	if c.pendingFinalizations == nil {
+		c.pendingFinalizations = make(map[string]pendingFinalizeOp)
+	}
+	op.reason = strings.TrimSpace(op.reason)
+	if op.reason == "" {
+		op.reason = "durable persistence failure barrier active"
+	}
+	c.pendingFinalizations[op.jobID] = op
+	c.persistenceMu.Unlock()
+}
+
+func (c *Client) clearPendingFinalization(jobID string) {
+	c.persistenceMu.Lock()
+	delete(c.pendingFinalizations, jobID)
+	c.persistenceMu.Unlock()
+}
+
+func (c *Client) setPersistenceReadBarrier(err error) {
+	c.persistenceMu.Lock()
+	if err != nil {
+		c.persistenceReadErr = strings.TrimSpace(err.Error())
+		if c.persistenceReadErr == "" {
+			c.persistenceReadErr = "durable state read failure"
 		}
 	} else {
-		c.persistenceReason = ""
+		c.persistenceReadErr = ""
 	}
 	c.persistenceMu.Unlock()
+}
+
+func (c *Client) retryPendingFinalizations(ctx context.Context) {
+	c.persistenceMu.Lock()
+	if len(c.pendingFinalizations) == 0 {
+		c.persistenceMu.Unlock()
+		return
+	}
+	ops := make([]pendingFinalizeOp, 0, len(c.pendingFinalizations))
+	for _, op := range c.pendingFinalizations {
+		ops = append(ops, op)
+	}
+	c.persistenceMu.Unlock()
+
+	for _, op := range ops {
+		c.finalizeAndEmitOrderFailure(ctx, op.orderID, op.jobID, op.evt, op.invalidateInventory)
+	}
 }
 
 func (c *Client) isPersistenceBlocked() bool {
 	c.persistenceMu.Lock()
 	defer c.persistenceMu.Unlock()
-	return c.persistenceBlocked
+	return len(c.pendingFinalizations) > 0 || c.persistenceReadErr != ""
 }
 
 func (c *Client) persistenceBlockReason() string {
 	c.persistenceMu.Lock()
 	defer c.persistenceMu.Unlock()
-	return c.persistenceReason
+	if c.persistenceReadErr != "" {
+		return c.persistenceReadErr
+	}
+	for _, op := range c.pendingFinalizations {
+		return op.reason
+	}
+	return ""
 }
 
 func appendReasonOnce(base, addition string) string {
@@ -3313,7 +3377,7 @@ func isQuiescentPostTermination(snap contracts.PrinterHealth, termTime time.Time
 
 func (c *Client) verifyPostTerminationQuiescence(ctx context.Context, termTime time.Time) (bool, contracts.PrinterHealth) {
 	if c.cfg.MockHealth != nil || c.getSNMPConfig() != nil || c.snmpPoller != nil {
-		_ = c.CheckPrinterHealth(ctx)
+		_, _, _ = c.refreshPrinterHealthTelemetry(ctx)
 	}
 	snap := c.CurrentHealthSnapshot(ctx)
 	return !c.isHardwareFaultActive() && isQuiescentPostTermination(snap, termTime, true), snap
@@ -3377,7 +3441,7 @@ func (c *Client) reconcileSubmittedOrInterruptedJob(
 	// Re-read durable state under the reconciliation boundary before acting on a previously loaded snapshot.
 	freshStored, getErr := c.cfg.StateStore.GetJob(reconcileCtx, stored.Command.JobID)
 	if getErr != nil {
-		c.setPersistenceBarrier(true, fmt.Sprintf("reconciliation state read error for %s: %v", stored.Command.JobID, getErr))
+		c.setPersistenceReadBarrier(fmt.Errorf("reconciliation state read error for %s: %w", stored.Command.JobID, getErr))
 		return stored.Status
 	}
 	if freshStored != nil {
@@ -3522,6 +3586,19 @@ func (c *Client) reconcileSubmittedOrInterruptedJob(
 						}
 						reconciledSheets = finalSheets
 						reconciledPages = finalPages
+					}
+				}
+				// When a completed CUPS job lacks successful physical-output proof, never mark it COMPLETED.
+				// If exact terminal state, empty active queue, and fresh quiescent hardware evidence establish
+				// that further output cannot occur, finalize unsuccessfully using only verified physical progress.
+				qCheckErr := printer.VerifyNoUnrelatedActiveCUPSJob(reconcileCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, "")
+				termTime := time.Now().UTC()
+				if qCheckErr == nil {
+					if ok, _ := c.verifyPostTerminationQuiescence(reconcileCtx, termTime); ok {
+						targetStatus = contracts.JobStatusFailedRefundable
+						reason = appendReasonOnce(reason, fmt.Sprintf("CUPS job %s completed without full physical proof and hardware is quiescent (%d/%d sheets verified)",
+							stored.CUPSJobID, reconciledSheets, stored.Command.TotalSheets))
+						break
 					}
 				}
 				reason = appendReasonOnce(reason, fmt.Sprintf("CUPS completed job without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), physical output uncertain, manual reconciliation required",
@@ -3708,8 +3785,39 @@ func firstNonEmptyString(vals ...string) string {
 
 // CheckPrinterHealth runs a serialized canonical telemetry acquisition cycle, applies the 3-cycle
 // recovery barrier before committing the authoritative shared snapshot, publishes over WebSocket
-// in acquisition sequence order, and synchronizes the local screen display when idle.
+// in acquisition sequence order, reconciles interrupted jobs on healthy/recovery transitions,
+// and synchronizes the local screen display when idle.
 func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	effectiveH, wasFault, isNowFault := c.refreshPrinterHealthTelemetry(ctx)
+
+	if wasFault && !isNowFault {
+		log.Printf("[SPOOLER] Printer hardware reliably recovered from fault (consecutive healthy cycles: %d). Refreshing screen cleanly.", c.requiredRecoveryCount)
+		c.idleMu.Lock()
+		if c.idleTimer != nil {
+			c.idleTimer.Stop()
+			c.idleTimer = nil
+		}
+		c.idleMu.Unlock()
+
+		// Reconcile any interrupted CUPS job that was paused during the fault without auto-reprinting.
+		c.reconcileInterruptedCUPSJob(ctx)
+	} else if !c.isHardwareFaultActive() && effectiveH.EvaluatedHealth == contracts.EvaluatedHealthHealthy && !c.reconciling.Load() {
+		// Bounded repeatable reconciliation independent of requiring another hardware-fault transition.
+		c.reconcileInterruptedCUPSJob(ctx)
+	}
+
+	c.syncCustomerServiceState(ctx)
+
+	return effectiveH
+}
+
+// refreshPrinterHealthTelemetry acquires fresh canonical telemetry and commits the authoritative
+// snapshot without triggering reconciliation side effects (safe to call from reconciliation).
+func (c *Client) refreshPrinterHealthTelemetry(ctx context.Context) (contracts.PrinterHealth, bool, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -3824,25 +3932,7 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	c.calibrationMu.Unlock()
 	c.acqMu.Unlock()
 
-	if wasFault && !isNowFault {
-		log.Printf("[SPOOLER] Printer hardware reliably recovered from fault (consecutive healthy cycles: %d). Refreshing screen cleanly.", c.requiredRecoveryCount)
-		c.idleMu.Lock()
-		if c.idleTimer != nil {
-			c.idleTimer.Stop()
-			c.idleTimer = nil
-		}
-		c.idleMu.Unlock()
-
-		// Reconcile any interrupted CUPS job that was paused during the fault without auto-reprinting.
-		c.reconcileInterruptedCUPSJob(ctx)
-	} else if !c.isHardwareFaultActive() && effectiveH.EvaluatedHealth == contracts.EvaluatedHealthHealthy && !c.reconciling.Load() {
-		// Bounded repeatable reconciliation independent of requiring another hardware-fault transition.
-		c.reconcileInterruptedCUPSJob(ctx)
-	}
-
-	c.syncCustomerServiceState(ctx)
-
-	return effectiveH
+	return effectiveH, wasFault, isNowFault
 }
 
 func (c *Client) acquireTelemetryCycleLocked(ctx context.Context) (contracts.PrinterHealth, printer.ReconciledHealthResult, string, uint64, time.Time) {
@@ -4345,6 +4435,16 @@ func (c *Client) setMonitoredJob(jobID string, active bool) {
 	c.activeMu.Unlock()
 }
 
+func (c *Client) isJobActive(jobID string) bool {
+	if strings.TrimSpace(jobID) == "" {
+		return false
+	}
+	c.activeMu.Lock()
+	active := c.activeJobs[jobID]
+	c.activeMu.Unlock()
+	return active
+}
+
 func (c *Client) isLiveMonitoredJob(jobID string) bool {
 	if strings.TrimSpace(jobID) == "" {
 		return false
@@ -4749,13 +4849,15 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 	}
 	defer c.reconciling.Store(false)
 
+	c.retryPendingFinalizations(ctx)
+
 	incList, err := c.cfg.StateStore.GetIncompleteJobs(ctx)
 	if err != nil {
-		c.setPersistenceBarrier(true, fmt.Sprintf("reconciliation state read error: %v", err))
+		c.setPersistenceReadBarrier(fmt.Errorf("reconciliation state read error: %w", err))
 		return
 	}
+	c.setPersistenceReadBarrier(nil)
 	if len(incList) == 0 {
-		c.setPersistenceBarrier(false, "")
 		return
 	}
 
@@ -4763,7 +4865,7 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 		if inc.Status != contracts.JobStatusPausedError {
 			continue
 		}
-		if c.isLiveMonitoredJob(inc.Command.JobID) {
+		if c.isJobActive(inc.Command.JobID) || c.isLiveMonitoredJob(inc.Command.JobID) {
 			continue
 		}
 		if inc.CUPSJobID == "" {

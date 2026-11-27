@@ -286,7 +286,7 @@ func TestPackage6A_StartupReconciliation_CannotBypassBaselineOrVerification(t *t
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		j, err := st.GetJob(ctx, cmd.JobID)
-		if err == nil && j != nil && j.Status == contracts.JobStatusPausedError {
+		if err == nil && j != nil && (j.Status == contracts.JobStatusPausedError || j.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -295,8 +295,8 @@ func TestPackage6A_StartupReconciliation_CannotBypassBaselineOrVerification(t *t
 	runCancel()
 
 	finalJob, err := st.GetJob(ctx, cmd.JobID)
-	if !paused || err != nil || finalJob == nil || finalJob.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected PAUSED_ERROR when baseline is missing on startup reconciliation, got %+v (err=%v)", finalJob, err)
+	if !paused || err != nil || finalJob == nil || finalJob.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected FAILED_REFUNDABLE when baseline is missing on quiescent startup reconciliation, got %+v (err=%v)", finalJob, err)
 	}
 	if !strings.Contains(finalJob.ErrorReason, "counter baseline") {
 		t.Fatalf("expected missing counter baseline error reason, got %q", finalJob.ErrorReason)

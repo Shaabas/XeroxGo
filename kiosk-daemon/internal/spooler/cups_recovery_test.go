@@ -691,12 +691,12 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 	}()
 
 	// Wait for startup reconciliation: without physical proof for sheets 3-5,
-	// startup recovery must preserve PAUSED_ERROR and conserve paper inventory!
+	// startup recovery must never complete and finalizes to FAILED_REFUNDABLE when quiescent.
 	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
-		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
+		if err == nil && job != nil && (job.Status == contracts.JobStatusPausedError || job.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -704,7 +704,7 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 	}
 
 	if !paused {
-		t.Fatal("expected startup recovery to preserve job in PAUSED_ERROR without physical proof")
+		t.Fatal("expected startup recovery to stop job in PAUSED_ERROR or FAILED_REFUNDABLE without physical proof")
 	}
 
 	job, err := store.GetJob(ctx, cmd.JobID)
@@ -923,7 +923,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
-		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
+		if err == nil && job != nil && (job.Status == contracts.JobStatusPausedError || job.Status == contracts.JobStatusFailedRefundable) {
 			if strings.Contains(job.ErrorReason, "insufficient") {
 				paused = true
 				break
@@ -933,7 +933,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 	}
 
 	if !paused {
-		t.Fatal("expected job to be paused in PAUSED_ERROR when tray is empty on completion")
+		t.Fatal("expected job to be stopped in PAUSED_ERROR or FAILED_REFUNDABLE when tray is empty on completion")
 	}
 
 	stk, _ := store.GetEstimatedSheets(ctx)

@@ -3,9 +3,12 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,5 +194,131 @@ func TestHub_ObsoleteSessionAndCrossKioskAckRejected(t *testing.T) {
 	}
 	if ord.Status != contracts.JobStatusDispatched {
 		t.Fatalf("expected obsolete/unauthorized WS to never mutate order status, got %s", ord.Status)
+	}
+}
+
+
+func TestHub_SendJob_FailsClosedOnMissingOrderOrIntent(t *testing.T) {
+	st := newTestStore(t)
+	hub := NewHub(st)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex: true, RequireA4: true, PaperSize: "A4", AllowMultiCopy: true,
+	})
+	server := httptest.NewServer(hub)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, _ := connectTestKiosk(t, hub, server.URL, "kiosk-missing-ord")
+	sendTestReadyHealth(ctx, t, hub, conn, "kiosk-missing-ord")
+
+	err := hub.SendJob(ctx, contracts.PrintJobCommand{
+		JobID: "job-missing-1", OrderID: "ord-missing-1", KioskID: "kiosk-missing-ord",
+		DisplayCode: "1111", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	})
+	if err == nil {
+		t.Fatalf("expected SendJob to fail closed when order/dispatch intent lookup fails")
+	}
+}
+
+func TestHub_ConcurrentDispatchAndFailureFinalization(t *testing.T) {
+	st := newTestStore(t)
+	hub := NewHub(st)
+	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
+		AllowDuplex: true, RequireA4: true, PaperSize: "A4", AllowMultiCopy: true,
+	})
+	server := httptest.NewServer(hub)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	kioskID := "kiosk-conc-disp"
+	orderID := fmt.Sprintf("ord-conc-disp-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+
+	docs := []store.OrderDocument{
+		{JobID: orderID + "-0", OrderID: orderID, DocumentIndex: 0, OriginalFilename: "d0.pdf", TotalPages: 2, TotalSheets: 2, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", PricePaise: 400, Status: contracts.JobStatusPendingPayment, DownloadURL: "http://localhost/0.pdf", SHA256Checksum: "0000"},
+		{JobID: orderID + "-1", OrderID: orderID, DocumentIndex: 1, OriginalFilename: "d1.pdf", TotalPages: 2, TotalSheets: 2, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", PricePaise: 400, Status: contracts.JobStatusPendingPayment, DownloadURL: "http://localhost/1.pdf", SHA256Checksum: "1111"},
+	}
+	cmd0 := contracts.PrintJobCommand{
+		JobID: docs[0].JobID, OrderID: orderID, DocumentIndex: 0, TotalDocuments: 2,
+		KioskID: kioskID, DisplayCode: "9292", DownloadURL: "http://localhost/0.pdf",
+		SHA256Checksum: "0000", TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID: docs[1].JobID, OrderID: orderID, DocumentIndex: 1, TotalDocuments: 2,
+		KioskID: kioskID, DisplayCode: "9292", DownloadURL: "http://localhost/1.pdf",
+		SHA256Checksum: "1111", TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	if err := st.CreateOrder(ctx, store.Order{
+		OrderID: orderID, Command: cmd0, Status: contracts.JobStatusPendingPayment, PricePaise: 800,
+		TotalPages: 4, TotalSheets: 4, Documents: docs, PINExpiresAt: now.Add(10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	sess, err := st.CreateOrGetKioskSession(ctx, kioskID, orderID, 5*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSession: %v", err)
+	}
+	if _, err := st.CapturePaymentAndCheckDispatch(ctx, store.PaymentRecord{
+		PaymentID: "pay-" + orderID, OrderID: orderID, KioskID: kioskID, SessionID: sess.SessionID,
+		AmountPaise: 800, Provider: "mock", Status: "CAPTURED",
+	}, now); err != nil {
+		t.Fatalf("CapturePaymentAndCheckDispatch: %v", err)
+	}
+
+	conn, _ := connectTestKiosk(t, hub, server.URL, kioskID)
+	sendTestReadyHealth(ctx, t, hub, conn, kioskID)
+
+	var sentDoc1 atomic.Bool
+	go func() {
+		for {
+			var m wireMessage
+			if err := wsjson.Read(ctx, conn, &m); err != nil {
+				return
+			}
+			if m.Type == "job" && m.Job != nil && m.Job.JobID == cmd1.JobID {
+				sentDoc1.Store(true)
+			}
+		}
+	}()
+
+	hub.mu.RLock()
+	activeSess := hub.sessions[kioskID]
+	hub.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var sendErr error
+	go func() {
+		defer wg.Done()
+		sendErr = hub.sendJobToSessionWithAuth(ctx, activeSess, cmd1, true)
+	}()
+	go func() {
+		defer wg.Done()
+		_ = st.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+			JobID: cmd0.JobID, KioskID: kioskID, Status: contracts.JobStatusFailedRefundable,
+			ErrorReason: "jam", Timestamp: now.Add(time.Second),
+		})
+		_ = st.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+			JobID: cmd1.JobID, KioskID: kioskID, Status: contracts.JobStatusFailedRefundable,
+			ErrorReason: "stopped", Timestamp: now.Add(time.Second),
+		})
+	}()
+	wg.Wait()
+
+	// If failure finalization won the per-order lock first, sendJobToSessionWithAuth must fail and never write doc1.
+	if sendErr != nil && sentDoc1.Load() {
+		t.Fatalf("wire transmission occurred despite rejected dispatch authorization: %v", sendErr)
+	}
+	// After failure finalization, any subsequent dispatch attempt must be rejected and never transmitted.
+	if err := hub.SendJob(ctx, cmd1); err == nil {
+		t.Fatalf("expected post-failure SendJob to fail closed")
 	}
 }
