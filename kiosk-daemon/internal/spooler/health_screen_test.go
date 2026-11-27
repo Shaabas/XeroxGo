@@ -1043,9 +1043,9 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 		t.Fatal("expected job to be in PAUSED_ERROR state")
 	}
 
-	// 1. Verify cancel was NOT invoked on CUPS
-	if cancelInvoked.Load() {
-		t.Fatal("CUPS cancel was invoked! Jammed job must be preserved in CUPS queue for manual reconciliation")
+	// 1. Verify safe termination (cancel) was attempted on CUPS per Package 6B policy
+	if !cancelInvoked.Load() {
+		t.Fatal("expected CUPS cancel to be attempted on jammed active job")
 	}
 
 	// 2. Verify hold WAS invoked on CUPS to prevent unmonitored printing
@@ -1459,7 +1459,7 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	}
 
 	// 3. Verify state store: job MUST REMAIN in PAUSED_ERROR (never completed), and sheets MUST REMAIN 1 (never promoted to unverified CUPS counter 4)
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -1590,7 +1590,7 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 	}
 
 	// 4. Verify job remains safely in PAUSED_ERROR with verified physical sheets (not promoted to CUPS counter)
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -1873,7 +1873,7 @@ func TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk(t *t
 	}
 
 	// 3. Verify state store: job remains in PAUSED_ERROR, hold failure reported, CUPS ID preserved
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -1992,7 +1992,7 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 	}
 
 	// 3. Verify state store: job remains in PAUSED_ERROR, sheets MUST REMAIN 2 (never promoted to unverified CUPS counter 3 or total 6), risk reported
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2104,7 +2104,7 @@ func TestHealthScreen_UncertainHeldState_PreservesPausedError(t *testing.T) {
 	}
 
 	// 3. Verify state store: job remains in PAUSED_ERROR with sheets not regressed
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2213,7 +2213,7 @@ func TestHealthScreen_CompletedCUPSWithoutPhysicalProof_NeverSynthesizesTotalShe
 	}
 
 	// 3. Verify state store: sheets MUST REMAIN 2 (never synthesized to 10!) and status MUST BE PAUSED_ERROR (never COMPLETED)
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2353,7 +2353,7 @@ func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesiz
 	}
 
 	// Verify paper tray inventory was NOT decremented for unverified CUPS sheets
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("failed to query estimated sheets: %v", err)
 	}
@@ -2474,7 +2474,7 @@ func TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricate
 	}
 
 	// 3. Verify state store: sheets MUST REMAIN 3 (never promoted to 10!) and status MUST BE PAUSED_ERROR
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2607,7 +2607,7 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 
 	client.processJob(ctx, cmd)
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2623,7 +2623,7 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 
 	// CRITICAL INVENTORY CONSERVATION: Stock must be 98 (100 - 2 verified sheets).
 	// The 2 unverified sheets must NEVER be deducted!
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
@@ -2729,7 +2729,7 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 
 	client.processJob(ctx, cmd)
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2744,7 +2744,7 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 	}
 
 	// CRITICAL INVENTORY CONSERVATION: Stock must remain untouched at 100!
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
@@ -2867,7 +2867,7 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 		t.Fatal("expected startup recovery to preserve job in PAUSED_ERROR without physical proof")
 	}
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2990,7 +2990,7 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 
 	client.processJob(ctx, cmd)
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -3005,7 +3005,7 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 	}
 
 	// CRITICAL INVENTORY DEDUCTION: Stock must be accurately decremented: 100 - 4 = 96
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}

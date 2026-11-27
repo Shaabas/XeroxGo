@@ -190,7 +190,7 @@ func TestPackage6B_SubmittedFailure_ActiveFaultPausesAndInvalidatesInventory_The
 
 	// Clear hardware fault -> healthy quiescent snapshot, CUPS already canceled & queue empty
 	client.setHardwareFault(false, "", "")
-	nowFresh := time.Now().UTC()
+	nowFresh := time.Now().UTC().Add(2 * time.Second)
 	client.snapshotMu.Lock()
 	client.latestSnap = telemetrySnapshot{
 		HasSample:  true,
@@ -403,7 +403,7 @@ func TestPackage6B_HealthyButPrinting_And_PreCancellationTelemetry_CannotFinaliz
 	client.snapshotMu.Unlock()
 
 	stored, _ := st.GetJob(ctx, cmd.JobID)
-	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted")
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted", false)
 	if status != contracts.JobStatusPausedError {
 		t.Fatalf("expected healthy-but-PRINTING telemetry to stay PAUSED_ERROR, got %s", status)
 	}
@@ -426,7 +426,7 @@ func TestPackage6B_HealthyButPrinting_And_PreCancellationTelemetry_CannotFinaliz
 	client.snapshotMu.Unlock()
 
 	stored, _ = st.GetJob(ctx, cmd.JobID)
-	status = client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted")
+	status = client.reconcileSubmittedOrInterruptedJob(ctx, stored, "interrupted", false)
 	if status != contracts.JobStatusPausedError {
 		t.Fatalf("expected pre-cancellation telemetry to stay PAUSED_ERROR, got %s", status)
 	}
@@ -478,7 +478,7 @@ func TestPackage6B_ActiveFaultWithResumedProcessingCUPS_AttemptsSafeTermination(
 
 	client.setHardwareFault(true, "paper jam", "Paper jam")
 	stored, _ := st.GetJob(ctx, cmd.JobID)
-	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "paper jam")
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "paper jam", false)
 	if cancelCalled.Load() == 0 {
 		t.Fatalf("expected active resumable processing CUPS job to be canceled even during hardware fault")
 	}
@@ -487,17 +487,17 @@ func TestPackage6B_ActiveFaultWithResumedProcessingCUPS_AttemptsSafeTermination(
 	}
 }
 
-func TestPackage6B_CompletedCUPSWithFullVerifiedSheets_CompletesSafely(t *testing.T) {
+func TestPackage6B_CompletedCUPSWithFullVerifiedSheets_WithoutCounterEvidence_CannotComplete(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
-	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "comp6b.db"))
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "comp6b_nocounter.db"))
 	if err != nil {
 		t.Fatalf("openCalibratedTestStore: %v", err)
 	}
 	defer st.Close()
 
 	cmd := contracts.PrintJobCommand{
-		JobID: "job-comp6b-1", OrderID: "ord-comp6b-1", DocumentIndex: 0, TotalDocuments: 1,
+		JobID: "job-comp6b-nocnt", OrderID: "ord-comp6b-nocnt", DocumentIndex: 0, TotalDocuments: 1,
 		KioskID: "kiosk-1", DisplayCode: "1414", DownloadURL: "http://localhost/doc.pdf",
 		SHA256Checksum: strings.Repeat("e", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
 		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
@@ -526,7 +526,7 @@ func TestPackage6B_CompletedCUPSWithFullVerifiedSheets_CompletesSafely(t *testin
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	now := time.Now().UTC()
+	now := time.Now().UTC().Add(50 * time.Millisecond)
 	client.snapshotMu.Lock()
 	client.latestSnap = telemetrySnapshot{
 		HasSample: true, Seq: 1, AcquiredAt: now,
@@ -543,9 +543,100 @@ func TestPackage6B_CompletedCUPSWithFullVerifiedSheets_CompletesSafely(t *testin
 	client.snapshotMu.Unlock()
 
 	stored, _ := st.GetJob(ctx, cmd.JobID)
-	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "reconcile")
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored, "reconcile", true)
+	if status == contracts.JobStatusCompleted {
+		t.Fatalf("must NOT complete without fresh SNMP counter evidence even when saved sheets == TotalSheets")
+	}
+	if status != contracts.JobStatusPausedError {
+		t.Fatalf("expected completed CUPS without counter proof to remain PAUSED_ERROR for manual reconciliation, got %s", status)
+	}
+	after, _ := st.GetJob(ctx, cmd.JobID)
+	if after.SheetsPrinted != 2 {
+		t.Fatalf("expected saved SheetsPrinted=2 preserved without fabrication, got %d", after.SheetsPrinted)
+	}
+}
+
+func TestPackage6B_InterruptedCUPS_WithValidCounterEvidence_CompletesAndFinalizesSiblings(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "comp6b_valid.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	orderID := "ord-comp6b-valid"
+	cmd0 := contracts.PrintJobCommand{
+		JobID: "job-comp6b-v0", OrderID: orderID, DocumentIndex: 0, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "1415", DownloadURL: "http://localhost/doc0.pdf",
+		SHA256Checksum: strings.Repeat("e", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID: "job-comp6b-v1", OrderID: orderID, DocumentIndex: 1, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "1415", DownloadURL: "http://localhost/doc1.pdf",
+		SHA256Checksum: strings.Repeat("f", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
+	_ = st.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
+	if err := st.MarkJobSubmittingWithBaseline(ctx, cmd0.JobID, true, 100, "1.1", 8, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkJobSubmittingWithBaseline: %v", err)
+	}
+	if err := st.RecordJobSubmission(ctx, cmd0.JobID, "DCPT310-100"); err != nil {
+		t.Fatalf("RecordJobSubmission: %v", err)
+	}
+	_ = st.UpdateProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd1.JobID, KioskID: "kiosk-1", Status: contracts.JobStatusPausedError,
+		ErrorReason: "interrupted", Timestamp: time.Now().UTC(),
+	})
+
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "ipptool" {
+			return []byte("job-state (enum) = completed\njob-state-reasons (keyword) = job-completed-successfully\n"), nil
+		}
+		return []byte(""), nil
+	}
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		CUPSRunner: runner, DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		SNMPPoller: func(_ context.Context) printer.HardwareTelemetry {
+			return printer.HardwareTelemetry{
+				Online: true, HasLife: true, LifeCount: 102, CounterIndex: "1.1", CounterUnit: 8,
+				HasCounterMeta: true, HasFlags: true, StatusState: "IDLE", ObservedAt: time.Now().UTC(),
+			}
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	now := time.Now().UTC().Add(50 * time.Millisecond)
+	client.snapshotMu.Lock()
+	client.latestSnap = telemetrySnapshot{
+		HasSample: true, Seq: 1, AcquiredAt: now,
+		Health: contracts.PrinterHealth{
+			Online: true, State: "IDLE", EvaluatedHealth: contracts.EvaluatedHealthHealthy,
+			ExecutionSafe: true, UpdatedAt: now,
+			EvidenceFreshness: &contracts.HealthEvidenceFreshness{
+				CUPS:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				NativeIPP: contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+				SNMP:      contracts.SourceFreshness{Available: true, Fresh: true, ObservedAt: &now},
+			},
+		},
+	}
+	client.snapshotMu.Unlock()
+
+	stored0, _ := st.GetJob(ctx, cmd0.JobID)
+	status := client.reconcileSubmittedOrInterruptedJob(ctx, stored0, "reconcile", true)
 	if status != contracts.JobStatusCompleted {
-		t.Fatalf("expected verified full-sheet job to reconcile to COMPLETED, got %s", status)
+		t.Fatalf("expected valid counter evidence + completed CUPS to reconcile to COMPLETED, got %s", status)
+	}
+	stored1, _ := st.GetJob(ctx, cmd1.JobID)
+	if stored1.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected unsubmitted PAUSED_ERROR sibling to finalize to FAILED_REFUNDABLE, got %s", stored1.Status)
 	}
 }
 
@@ -590,8 +681,8 @@ func TestPackage6B_FailedSQLiteTx_RetainsFailClosedBarrier(t *testing.T) {
 		ErrorReason: "download failed", Timestamp: time.Now().UTC(),
 	}, false)
 
-	if !client.isHardwareFaultActive() {
-		t.Fatalf("expected fail-closed hardware fault barrier to remain active when FinalizeOrderFailure fails")
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("expected fail-closed persistence barrier to remain active when FinalizeOrderFailure fails")
 	}
 	stored, _ := realSt.GetJob(ctx, cmd.JobID)
 	if stored.Status == contracts.JobStatusFailedRefundable {
@@ -698,4 +789,172 @@ func TestPackage6B_LostCompletedOutcome_RetransmitsWithOriginalTimestamp_And_Sta
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("expected lost COMPLETED outcome to retransmit and clear after connected retry ack")
+}
+
+
+type failingPendingOutcomeStore struct {
+	StateStore
+	failErr error
+}
+
+func (f *failingPendingOutcomeStore) GetPendingOutcomeSyncJobs(ctx context.Context) ([]state.StoredJob, error) {
+	return nil, f.failErr
+}
+
+func TestPackage6B_IdleConnection_ReceivesNewPendingOutcomeViaSignalAndAck(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "idle_signal.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	var acked atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "done")
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), c, &raw); err != nil {
+				return
+			}
+			var m wireMessage
+			if err := json.Unmarshal(raw, &m); err != nil {
+				continue
+			}
+			if m.Type == "progress" && m.Progress != nil && m.OutcomeVersion > 0 {
+				acked.Store(true)
+				_ = wsjson.Write(r.Context(), c, wireMessage{
+					Type:           "progress_ack",
+					Progress:       &contracts.JobProgressEvent{JobID: m.Progress.JobID, KioskID: m.Progress.KioskID, Status: m.Progress.Status},
+					OutcomeVersion: m.OutcomeVersion,
+					OK:             true,
+				})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws" + strings.TrimPrefix(srv.URL, "http"), KioskID: "kiosk-idle-sig", StateStore: st,
+		CUPSQueue: "DCPT310", DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	go client.handleConnection(ctx, conn)
+
+	// Allow initial syncPendingOutcomes pass on idle connection (0 pending outcomes).
+	time.Sleep(150 * time.Millisecond)
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-idle-sig-1", OrderID: "ord-idle-sig-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-idle-sig", DisplayCode: "1717", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusPrinting)
+	if err := st.RecordSheetProgress(ctx, contracts.JobProgressEvent{
+		JobID: cmd.JobID, KioskID: cmd.KioskID, Status: contracts.JobStatusCompleted,
+		PagesPrinted: 1, SheetsPrinted: 1, Timestamp: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("RecordSheetProgress: %v", err)
+	}
+	client.signalOutcomeSync()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p, err := st.GetPendingOutcomeSyncJobs(ctx)
+		if err == nil && len(p) == 0 && acked.Load() {
+			cancel()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected idle connection to wake on signalOutcomeSync and clear pending outcome")
+}
+
+func TestPackage6B_PendingOutcomeQueryFailure_BlocksAdmission(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	realSt, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "penderr.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer realSt.Close()
+
+	wrapped := &failingPendingOutcomeStore{StateStore: realSt, failErr: errors.New("sqlite read error")}
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: wrapped, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	safe, reason := client.computeExecutionSafety(ctx, "")
+	if safe {
+		t.Fatalf("expected computeExecutionSafety to fail closed when GetPendingOutcomeSyncJobs fails")
+	}
+	if !strings.Contains(strings.ToLower(reason), "pending") {
+		t.Fatalf("expected pending-outcome reason, got %q", reason)
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-penderr-1", OrderID: "ord-penderr-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "1818", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("b", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	client.handleIncomingJob(cmd)
+	if j, err := realSt.GetJob(ctx, cmd.JobID); err != nil || j != nil {
+		t.Fatalf("expected handleIncomingJob to refuse admission when GetPendingOutcomeSyncJobs fails (got job=%+v, err=%v)", j, err)
+	}
+}
+
+func TestPackage6B_ThreeHealthyHardwareCycles_DoNotClearPersistenceBarrier(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "barrier_hw.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	client.setPersistenceBarrier(true, "SQLite finalize failure")
+	client.setHardwareFault(true, "paper jam", "Paper jam")
+	// Simulate 3 healthy hardware recovery cycles clearing hardwareFault.
+	for i := 0; i < 3; i++ {
+		client.setHardwareFault(false, "", "")
+	}
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("expected persistenceBlocked to remain true after healthy hardware cycles")
+	}
+	safe, _ := client.computeExecutionSafety(ctx, "")
+	if safe {
+		t.Fatalf("expected execution safety to remain blocked while persistenceBlocked is true")
+	}
 }

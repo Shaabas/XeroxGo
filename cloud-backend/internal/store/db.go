@@ -2455,8 +2455,9 @@ WHERE job_id = ?;
 }
 
 // GetExpiredOrderIDs returns order IDs whose stored PDF artifacts have exceeded retention.
-// - completedThreshold applies to orders in terminal states (COMPLETED, FAILED_REFUNDABLE).
-//   Unresolved PAUSED_ERROR orders are strictly excluded until reconciled.
+// - completedThreshold applies only to orders in COMPLETED status.
+//   Unresolved PAUSED_ERROR orders and FAILED_REFUNDABLE orders (needed for Package 7 refund
+//   reconciliation) are strictly excluded.
 // - pendingThreshold applies to unpaid orders still in PENDING_PAYMENT.
 func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pendingThreshold time.Time) ([]string, error) {
 	if s == nil || s.db == nil {
@@ -2471,7 +2472,7 @@ func (s *Store) GetExpiredOrderIDs(ctx context.Context, completedThreshold, pend
 
 	query := `
 SELECT order_id FROM orders
-WHERE (status IN ('COMPLETED', 'FAILED_REFUNDABLE') AND updated_at_ns <= ?)
+WHERE (status = 'COMPLETED' AND updated_at_ns <= ?)
    OR (status = 'PENDING_PAYMENT' AND created_at_ns <= ?);
 `
 	rows, err := s.db.QueryContext(ctx, s.rebind(query), completedThreshold.UnixNano(), pendingThreshold.UnixNano())
@@ -3184,6 +3185,12 @@ func (s *Store) CapturePaymentAndCheckDispatch(ctx context.Context, p PaymentRec
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22616, hashtext($1));", p.OrderID); err != nil {
+			return nil, fmt.Errorf("capture payment: acquire order lock: %w", err)
+		}
+	}
+
 	// 1. Check if payment record already exists
 	var (
 		existingOrderID  string
@@ -3715,6 +3722,12 @@ func (s *Store) ReleasePaidOrder(ctx context.Context, kioskID, orderID, sessionI
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if s.dialect == "postgres" {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(22616, hashtext($1));", orderID); err != nil {
+			return nil, fmt.Errorf("release paid order: acquire order lock: %w", err)
+		}
+	}
+
 	// 1. Verify order exists, belongs to kiosk, and is in PAID_WAITING status
 	var (
 		orderKioskID string
@@ -3753,15 +3766,23 @@ WHERE session_id = ? AND order_id = ? AND kiosk_id = ? AND status = 'PAYMENT_PEN
 		return nil, fmt.Errorf("release paid order: verify session: %w", err)
 	}
 
-	// 3. Ensure we do not delete or overwrite an acknowledged or completed dispatch intent
+	// 3. Ensure we do not delete or overwrite an acknowledged, completed, or canceled dispatch intent,
+	// or reactivate an order with any stopped/failed/completed document.
 	var existingActiveIntents int
-	queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED');`)
+	queryIntent := s.rebind(`SELECT COUNT(1) FROM dispatch_intents WHERE order_id = ? AND status IN ('ACKNOWLEDGED', 'COMPLETED', 'CANCELED');`)
 	errIntent := tx.QueryRowContext(ctx, queryIntent, orderID).Scan(&existingActiveIntents)
 	if errIntent != nil {
 		return nil, fmt.Errorf("release paid order: check existing dispatch intent: %w", errIntent)
 	}
 	if existingActiveIntents > 0 {
-		return nil, fmt.Errorf("order %s cannot be released: dispatch intent is already active or completed", orderID)
+		return nil, fmt.Errorf("order %s cannot be released: dispatch intent is already active, completed, or canceled", orderID)
+	}
+	var stoppedDocs int
+	if errDoc := tx.QueryRowContext(ctx, s.rebind(`SELECT COUNT(1) FROM order_documents WHERE order_id = ? AND status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED');`), orderID).Scan(&stoppedDocs); errDoc != nil {
+		return nil, fmt.Errorf("release paid order: check order documents: %w", errDoc)
+	}
+	if stoppedDocs > 0 {
+		return nil, fmt.Errorf("order %s cannot be released: one or more documents are already stopped or completed", orderID)
 	}
 
 	// 4. Mark session COMPLETED
@@ -4004,8 +4025,18 @@ WHERE job_id = ? AND status = 'PENDING'
         AND o.status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED', 'CANCELED')
   );
 `)
-	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID)
-	return err
+	res, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("dispatch intent %s is not PENDING or belongs to a stopped/terminal order", jobID)
+	}
+	return nil
 }
 
 // MarkDispatchIntentAcknowledged records that the kiosk daemon has durably accepted and persisted a specific job.

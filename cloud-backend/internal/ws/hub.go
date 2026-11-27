@@ -328,6 +328,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if msg.Progress != nil && msg.Progress.KioskID == kioskID && isValidJobStatus(msg.Progress.Status) && !msg.Progress.Timestamp.IsZero() {
+					if !h.isActiveSession(kioskID, sess) {
+						return
+					}
 					if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err != nil {
 						log.Printf("[HUB] Failed to apply job_ack progress for kiosk %s job %s: %v", kioskID, jobID, err)
 					}
@@ -528,7 +531,6 @@ func (h *Hub) reconcilePendingDispatchOrders(ctx context.Context, kioskID string
 			retryErr := h.db.MarkDispatchIntentSent(bgCtx, jobCmd.JobID)
 			bgCancel()
 			if retryErr != nil {
-				sess.reconcileRetryNeeded.Store(true)
 				log.Printf("[HUB] Warning: failed to mark reconciled job %s SENT: %v", jobCmd.JobID, retryErr)
 				break
 			}
@@ -735,6 +737,21 @@ func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd cont
 		return fmt.Errorf("send job: invalid start from page %d", cmd.StartFromPage)
 	}
 
+	if h.db != nil {
+		orderID := strings.TrimSpace(cmd.OrderID)
+		if orderID == "" {
+			orderID = cmd.JobID
+		}
+		if ord, oErr := h.db.GetOrder(ctx, orderID); oErr == nil && ord != nil {
+			if ord.Status == contracts.JobStatusPausedError || ord.Status == contracts.JobStatusFailedRefundable || ord.Status == contracts.JobStatusCompleted || string(ord.Status) == "CANCELED" {
+				return fmt.Errorf("send job: order %s is in non-dispatchable status %s", orderID, ord.Status)
+			}
+		}
+		if intentStatus, _, iErr := h.db.GetJobDispatchIntentStatus(ctx, cmd.JobID); iErr == nil && intentStatus == "CANCELED" {
+			return fmt.Errorf("send job: dispatch intent for job %s is CANCELED", cmd.JobID)
+		}
+	}
+
 	msg := wireMessage{
 		Type: "job",
 		Job:  &cmd,
@@ -742,6 +759,9 @@ func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd cont
 
 	sess.sendMu.Lock()
 	defer sess.sendMu.Unlock()
+	if !h.isActiveSession(cmd.KioskID, sess) {
+		return fmt.Errorf("send job: session for kiosk %q is no longer active", cmd.KioskID)
+	}
 
 	if !h.isActiveSession(cmd.KioskID, sess) {
 		return fmt.Errorf("send job: kiosk %q connection replaced", cmd.KioskID)

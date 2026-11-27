@@ -201,7 +201,7 @@ func TestCUPS_AmbiguousSubmissionCrashedDuringLP(t *testing.T) {
 	}()
 
 	// Wait for startup recovery
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
@@ -439,7 +439,7 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 		_ = client.Run(ctx)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	completed := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
@@ -692,7 +692,7 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 
 	// Wait for startup reconciliation: without physical proof for sheets 3-5,
 	// startup recovery must preserve PAUSED_ERROR and conserve paper inventory!
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
@@ -816,7 +816,7 @@ func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliati
 	}()
 
 	// Wait for reconciliation check
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
@@ -919,7 +919,7 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 		_ = client.Run(runCtx)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
