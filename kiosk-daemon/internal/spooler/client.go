@@ -1,7 +1,6 @@
 package spooler
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -35,17 +34,18 @@ import (
 )
 
 type wireMessage struct {
-	Type         string                      `json:"type"`
-	Job          *contracts.PrintJobCommand  `json:"job,omitempty"`
-	Progress     *contracts.JobProgressEvent `json:"progress,omitempty"`
-	Health       *contracts.PrinterHealth    `json:"health,omitempty"`
-	Sheets       *int                        `json:"sheets,omitempty"`
-	RequestID    string                      `json:"request_id,omitempty"`
-	OK           bool                        `json:"ok,omitempty"`
-	Calibrated   bool                        `json:"calibrated,omitempty"`
-	InventorySeq uint64                      `json:"inventory_seq,omitempty"`
-	Error        string                      `json:"error,omitempty"`
-	Ads          []contracts.AdItem          `json:"ads,omitempty"`
+	Type           string                      `json:"type"`
+	Job            *contracts.PrintJobCommand  `json:"job,omitempty"`
+	Progress       *contracts.JobProgressEvent `json:"progress,omitempty"`
+	Health         *contracts.PrinterHealth    `json:"health,omitempty"`
+	Sheets         *int                        `json:"sheets,omitempty"`
+	RequestID      string                      `json:"request_id,omitempty"`
+	OK             bool                        `json:"ok,omitempty"`
+	Calibrated     bool                        `json:"calibrated,omitempty"`
+	InventorySeq   uint64                      `json:"inventory_seq,omitempty"`
+	OutcomeVersion int64                       `json:"outcome_version,omitempty"`
+	Error          string                      `json:"error,omitempty"`
+	Ads            []contracts.AdItem          `json:"ads,omitempty"`
 }
 
 // StateStore defines the persistence interface required by the spooler client.
@@ -54,6 +54,9 @@ type StateStore interface {
 	SaveJob(ctx context.Context, cmd contracts.PrintJobCommand, status contracts.JobStatus) error
 	UpdateProgress(ctx context.Context, event contracts.JobProgressEvent) error
 	RecordSheetProgress(ctx context.Context, event contracts.JobProgressEvent) error
+	FinalizeOrderFailure(ctx context.Context, orderID string, jobID string, event contracts.JobProgressEvent, invalidateInventory bool) ([]state.StoredJob, error)
+	GetPendingOutcomeSyncJobs(ctx context.Context) ([]state.StoredJob, error)
+	MarkOutcomeSynced(ctx context.Context, jobID string, version int64) error
 	MarkJobSubmitting(ctx context.Context, jobID string) error
 	MarkJobSubmittingWithBaseline(ctx context.Context, jobID string, baselineSet bool, baselineValue int64, baselineIndex string, baselineUnit int64, baselineObservedAt time.Time) error
 	RecordJobSubmission(ctx context.Context, jobID string, cupsJobID string) error
@@ -97,7 +100,6 @@ type ClientConfig struct {
 	MockCUPSPrint                func(ctx context.Context, queue string, cmd contracts.PrintJobCommand, pdfPath string, onPage func(sheetsCompleted int)) error
 	SNMPPoller                   func(ctx context.Context) printer.HardwareTelemetry
 	CUPSRunner                   printer.CommandRunner
-	EnableCloudRecovery          bool
 	InputSource                  input.Source
 	InactivityTimeout            time.Duration
 	PaymentTimeout               time.Duration
@@ -767,7 +769,7 @@ func (c *Client) Run(ctx context.Context) error {
 					job.SheetsPrinted == 0 &&
 					job.PagesPrinted == 0 &&
 					job.ErrorReason == ""
-				if !jobDefinitelyNotSubmitted && (job.Status == contracts.JobStatusPausedError || job.Status == contracts.JobStatusFailedRefundable) {
+				if job.Status == contracts.JobStatusFailedRefundable || (!jobDefinitelyNotSubmitted && job.Status == contracts.JobStatusPausedError) {
 					orderHasPausedOrError = true
 					break
 				}
@@ -788,7 +790,7 @@ func (c *Client) Run(ctx context.Context) error {
 					} else {
 						reason := fmt.Sprintf("startup recovery: order %s has paused/failed sibling; keeping document %d unprinted", oid, incomplete.Command.DocumentIndex+1)
 						log.Printf("[SPOOLER] %s", reason)
-						evt := contracts.JobProgressEvent{
+						c.finalizeAndEmitOrderFailure(ctx, oid, incomplete.Command.JobID, contracts.JobProgressEvent{
 							JobID:         incomplete.Command.JobID,
 							KioskID:       incomplete.Command.KioskID,
 							Status:        contracts.JobStatusPausedError,
@@ -796,64 +798,15 @@ func (c *Client) Run(ctx context.Context) error {
 							SheetsPrinted: 0,
 							ErrorReason:   reason,
 							Timestamp:     time.Now().UTC(),
-						}
-						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-						c.sendProgress(ctx, evt)
+						}, false)
 					}
 				} else {
 					// Potentially submitted or already partially printed.
 					// Never automatically resubmit.
 					orderHasPausedOrError = true
-					if strings.TrimSpace(c.cfg.CUPSQueue) != "" && incomplete.CUPSJobID != "" {
-						// Reconcile with CUPS using authoritative job status
+					if strings.TrimSpace(c.cfg.CUPSQueue) != "" && incomplete.CUPSJobID != "" && incomplete.Status != contracts.JobStatusPausedError {
 						cupsInfo, qErr := printer.QueryCUPSJobInfo(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, incomplete.CUPSJobID)
-						reconciledSheets, reconciledPages := reconcileSheetsAndPages(
-							incomplete.Command,
-							incomplete.SheetsPrinted,
-							incomplete.PagesPrinted,
-							cupsInfo.SheetsCompleted,
-						)
-
-						if incomplete.Status == contracts.JobStatusPausedError {
-							// Job was previously interrupted and marked PAUSED_ERROR.
-							// Never automatically complete or resume interrupted jobs without manual reconciliation.
-							reason := "interrupted job in PAUSED_ERROR; physical output uncertain, manual reconciliation required"
-							if qErr != nil {
-								reason = fmt.Sprintf("interrupted job in PAUSED_ERROR; error querying CUPS (%v), manual reconciliation required", qErr)
-							} else {
-								switch cupsInfo.State {
-								case printer.CUPSJobStateProcessing, printer.CUPSJobStatePending:
-									holdCtx, holdCancel := context.WithTimeout(ctx, 2*time.Second)
-									holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, incomplete.CUPSJobID)
-									holdCancel()
-									if holdRes.HoldErr != nil {
-										reason = fmt.Sprintf("interrupted job in PAUSED_ERROR; hold request failed (%v), job remains %s in CUPS, unmonitored physical output risk, operator reconciliation required", holdRes.HoldErr, holdRes.State)
-									} else if holdRes.StillProcessing {
-										reason = "interrupted job in PAUSED_ERROR; job remains processing in CUPS after hold request, unmonitored physical output risk, operator reconciliation required"
-									} else {
-										reason = "interrupted job in PAUSED_ERROR; CUPS job placed on hold (buffered sheets may continue printing), operator reconciliation required"
-									}
-								case printer.CUPSJobStateCompleted:
-									reason = fmt.Sprintf("interrupted job in PAUSED_ERROR; CUPS completed job without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), manual reconciliation required",
-										cupsInfo.SheetsCompleted, incomplete.SheetsPrinted, incomplete.Command.TotalSheets)
-								default:
-									reason = fmt.Sprintf("interrupted job in PAUSED_ERROR; CUPS state is %s, physical output uncertain, manual reconciliation required", cupsInfo.State)
-								}
-							}
-
-							log.Printf("[SPOOLER] Startup reconciliation: preserving paused job %s (CUPS ID %s): %s", incomplete.Command.JobID, incomplete.CUPSJobID, reason)
-							evt := contracts.JobProgressEvent{
-								JobID:         incomplete.Command.JobID,
-								KioskID:       incomplete.Command.KioskID,
-								Status:        contracts.JobStatusPausedError,
-								PagesPrinted:  reconciledPages,
-								SheetsPrinted: reconciledSheets,
-								ErrorReason:   reason,
-								Timestamp:     time.Now().UTC(),
-							}
-							_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-							c.sendProgress(ctx, evt)
-						} else if qErr == nil && (cupsInfo.State == printer.CUPSJobStateCompleted ||
+						if qErr == nil && (cupsInfo.State == printer.CUPSJobStateCompleted ||
 							cupsInfo.State == printer.CUPSJobStateProcessing ||
 							cupsInfo.State == printer.CUPSJobStatePending ||
 							cupsInfo.State == printer.CUPSJobStateHeld ||
@@ -866,45 +819,20 @@ func (c *Client) Run(ctx context.Context) error {
 							c.activeMu.Unlock()
 							incCopy := incomplete
 							go c.resumeCUPSMonitoring(ctx, &incCopy)
-						} else {
-							// Reconciliation uncertain or job aborted/canceled in CUPS.
-							reason := "interrupted printer submission; manual reconciliation required"
-							if len(cupsInfo.Reasons) > 0 {
-								reason = fmt.Sprintf("CUPS job %s: %s", cupsInfo.State, strings.Join(cupsInfo.Reasons, ", "))
-							}
-							log.Printf("[SPOOLER] Startup reconciliation: pausing job %s: %s", incomplete.Command.JobID, reason)
-							evt := contracts.JobProgressEvent{
-								JobID:         incomplete.Command.JobID,
-								KioskID:       incomplete.Command.KioskID,
-								Status:        contracts.JobStatusPausedError,
-								PagesPrinted:  reconciledPages,
-								SheetsPrinted: reconciledSheets,
-								ErrorReason:   reason,
-								Timestamp:     time.Now().UTC(),
-							}
-							_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-							c.sendProgress(ctx, evt)
+							continue
 						}
-					} else {
-						// Ambiguous submission (crash during lp submission or PJL stream without CUPS ID)
-						// or partially printed without CUPS reconciliation available:
-						reason := "interrupted during printer submission; physical output uncertain, manual reconciliation required"
+					}
+
+					reason := incomplete.ErrorReason
+					if strings.TrimSpace(reason) == "" {
 						if incomplete.PagesPrinted > 0 || incomplete.SheetsPrinted > 0 {
 							reason = "interrupted by daemon restart; physical output uncertain, reconciliation required"
+						} else {
+							reason = "interrupted during printer submission; physical output uncertain, manual reconciliation required"
 						}
-						log.Printf("[SPOOLER] Startup recovery: job %s potentially submitted; pausing in PAUSED_ERROR (%s)", incomplete.Command.JobID, reason)
-						evt := contracts.JobProgressEvent{
-							JobID:         incomplete.Command.JobID,
-							KioskID:       incomplete.Command.KioskID,
-							Status:        contracts.JobStatusPausedError,
-							PagesPrinted:  incomplete.PagesPrinted,
-							SheetsPrinted: incomplete.SheetsPrinted,
-							ErrorReason:   reason,
-							Timestamp:     time.Now().UTC(),
-						}
-						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-						c.sendProgress(ctx, evt)
 					}
+					incCopy := incomplete
+					c.reconcileSubmittedOrInterruptedJob(ctx, &incCopy, reason)
 				}
 			}
 
@@ -1113,28 +1041,9 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 		}
 	}
 
-	// Synchronize any paused/error job states with the cloud upon connection
-	connWg.Add(1)
-	go func() {
-		defer connWg.Done()
-		incList, err := c.cfg.StateStore.GetIncompleteJobs(connCtx)
-		if err == nil {
-			for _, inc := range incList {
-				if inc.Status == contracts.JobStatusPausedError || inc.Status == contracts.JobStatusFailedRefundable {
-					evt := contracts.JobProgressEvent{
-						JobID:         inc.Command.JobID,
-						KioskID:       c.cfg.KioskID,
-						Status:        inc.Status,
-						PagesPrinted:  inc.PagesPrinted,
-						SheetsPrinted: inc.SheetsPrinted,
-						ErrorReason:   inc.ErrorReason,
-						Timestamp:     time.Now().UTC(),
-					}
-					_ = c.sendWire(connCtx, conn, wireMessage{Type: "progress", Progress: &evt})
-				}
-			}
-		}
-	}()
+	// Synchronize any pending durable job outcomes with the cloud upon connection
+	// before accepting new dispatch commands.
+	c.syncPendingOutcomes(connCtx, conn)
 
 	// Reader loop
 	for {
@@ -1149,6 +1058,8 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 			c.handleSyncAds(msg.Ads)
 		} else if msg.Type == "refill" {
 			c.handleRefillMessage(connCtx, conn, msg)
+		} else if msg.Type == "progress_ack" {
+			c.handleProgressAck(connCtx, msg)
 		}
 	}
 
@@ -1248,6 +1159,10 @@ func (c *Client) sendWire(ctx context.Context, conn *websocket.Conn, msg wireMes
 }
 
 func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEvent) {
+	c.sendProgressWithVersion(ctx, event, 0)
+}
+
+func (c *Client) sendProgressWithVersion(ctx context.Context, event contracts.JobProgressEvent, outcomeVersion int64) {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
@@ -1259,7 +1174,60 @@ func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEv
 		return
 	}
 
-	_ = wsjson.Write(ctx, conn, wireMessage{Type: "progress", Progress: &event})
+	_ = wsjson.Write(ctx, conn, wireMessage{
+		Type:           "progress",
+		Progress:       &event,
+		OutcomeVersion: outcomeVersion,
+	})
+}
+
+func (c *Client) syncPendingOutcomes(ctx context.Context, conn *websocket.Conn) {
+	if c.cfg.StateStore == nil {
+		return
+	}
+	pending, err := c.cfg.StateStore.GetPendingOutcomeSyncJobs(ctx)
+	if err != nil {
+		log.Printf("[SPOOLER] Failed to query pending outcome sync jobs: %v", err)
+		return
+	}
+	for _, inc := range pending {
+		if inc.Status != contracts.JobStatusPausedError && inc.Status != contracts.JobStatusFailedRefundable {
+			continue
+		}
+		ts := inc.OutcomeTimestamp
+		if ts.IsZero() {
+			ts = inc.UpdatedAt
+		}
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+		evt := contracts.JobProgressEvent{
+			JobID:         inc.Command.JobID,
+			KioskID:       c.cfg.KioskID,
+			Status:        inc.Status,
+			PagesPrinted:  inc.PagesPrinted,
+			SheetsPrinted: inc.SheetsPrinted,
+			ErrorReason:   inc.ErrorReason,
+			Timestamp:     ts,
+		}
+		if err := c.sendWire(ctx, conn, wireMessage{
+			Type:           "progress",
+			Progress:       &evt,
+			OutcomeVersion: inc.OutcomeVersion,
+		}); err != nil {
+			log.Printf("[SPOOLER] Pending outcome sync write failed for %s: %s", inc.Command.JobID, c.sanitizeError(err))
+			return
+		}
+	}
+}
+
+func (c *Client) handleProgressAck(ctx context.Context, msg wireMessage) {
+	if c.cfg.StateStore == nil || !msg.OK || msg.Progress == nil || msg.Progress.JobID == "" || msg.OutcomeVersion <= 0 {
+		return
+	}
+	if err := c.cfg.StateStore.MarkOutcomeSynced(ctx, msg.Progress.JobID, msg.OutcomeVersion); err != nil {
+		log.Printf("[SPOOLER] Failed to mark outcome synced for %s v%d: %v", msg.Progress.JobID, msg.OutcomeVersion, err)
+	}
 }
 
 func (c *Client) sendJobAck(ctx context.Context, event contracts.JobProgressEvent) {
@@ -1456,15 +1424,10 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 	}
 
 	// 1. Evaluate sibling error/paused states:
-	// If ANY sibling has an actual error or was paused after submission, the order cannot be admitted for fresh printing.
+	// If ANY sibling is paused or failed, the entire order is stopped and cannot be admitted for fresh printing.
 	for idx := 0; idx < totalDocs; idx++ {
 		sib := docMap[idx]
-		sibDefinitelyNotSubmitted := !sib.SubmittedToPrinter &&
-			sib.CUPSJobID == "" &&
-			sib.SheetsPrinted == 0 &&
-			sib.PagesPrinted == 0 &&
-			sib.ErrorReason == ""
-		if !sibDefinitelyNotSubmitted && (sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable) {
+		if sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable {
 			log.Printf("[SPOOLER] Order %s has paused/failed document %d (%s, status: %s); not admitting for fresh printing",
 				orderID, idx, sib.Command.JobID, sib.Status)
 			return
@@ -2980,7 +2943,14 @@ func (c *Client) completeJob(ctx context.Context, cmd contracts.PrintJobCommand)
 		log.Printf("[WARN] Failed to remove local printed payload %s: %v", finalPath, err)
 	}
 
-	c.sendProgress(ctx, evt)
+	var outcomeVersion int64
+	if stored, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID); err == nil && stored != nil {
+		outcomeVersion = stored.OutcomeVersion
+		if !stored.OutcomeTimestamp.IsZero() {
+			evt.Timestamp = stored.OutcomeTimestamp
+		}
+	}
+	c.sendProgressWithVersion(ctx, evt, outcomeVersion)
 
 	if c.cfg.OnJobCompleted != nil {
 		c.cfg.OnJobCompleted(cmd.JobID)
@@ -3081,27 +3051,215 @@ func formatCustomerError(cmd contracts.PrintJobCommand, pagesPrinted int, reason
 
 func (c *Client) handleJobError(ctx context.Context, cmd contracts.PrintJobCommand, pagesPrinted, sheetsPrinted int, reason string) {
 	log.Printf("[SPOOLER] Job %s error: %s", cmd.JobID, reason)
-	evt := contracts.JobProgressEvent{
-		JobID:         cmd.JobID,
-		KioskID:       cmd.KioskID,
-		Status:        contracts.JobStatusPausedError,
-		PagesPrinted:  pagesPrinted,
-		SheetsPrinted: sheetsPrinted,
-		ErrorReason:   reason,
-		Timestamp:     time.Now().UTC(),
-	}
-	_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-	c.sendProgress(ctx, evt)
 
 	customerMsg, customerDetail := formatCustomerError(cmd, pagesPrinted, reason)
-
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:    ui_ipc.ModeError,
 		Message: customerMsg,
 		Detail:  customerDetail,
 	})
 
+	stored, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID)
+	if err != nil || stored == nil {
+		evt := contracts.JobProgressEvent{
+			JobID:         cmd.JobID,
+			KioskID:       cmd.KioskID,
+			Status:        contracts.JobStatusPausedError,
+			PagesPrinted:  pagesPrinted,
+			SheetsPrinted: sheetsPrinted,
+			ErrorReason:   reason,
+			Timestamp:     time.Now().UTC(),
+		}
+		_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+		c.sendProgress(ctx, evt)
+	} else if stored.Status == contracts.JobStatusCompleted {
+		c.scheduleResetToIdle(c.cfg.ErrorDisplayDuration)
+		return
+	} else {
+		definitelyUnsubmitted := !stored.SubmittedToPrinter &&
+			strings.TrimSpace(stored.CUPSJobID) == "" &&
+			stored.SheetsPrinted == 0 &&
+			stored.Status != contracts.JobStatusPrinting &&
+			pagesPrinted == 0 &&
+			sheetsPrinted == 0
+		if definitelyUnsubmitted {
+			evt := contracts.JobProgressEvent{
+				JobID:         cmd.JobID,
+				KioskID:       cmd.KioskID,
+				Status:        contracts.JobStatusFailedRefundable,
+				PagesPrinted:  pagesPrinted,
+				SheetsPrinted: sheetsPrinted,
+				ErrorReason:   reason,
+				Timestamp:     time.Now().UTC(),
+			}
+			c.finalizeAndEmitOrderFailure(ctx, cmd.OrderID, cmd.JobID, evt, false)
+		} else {
+			storedCopy := *stored
+			if pagesPrinted > storedCopy.PagesPrinted {
+				storedCopy.PagesPrinted = pagesPrinted
+			}
+			if sheetsPrinted > storedCopy.SheetsPrinted {
+				storedCopy.SheetsPrinted = sheetsPrinted
+			}
+			c.reconcileSubmittedOrInterruptedJob(ctx, &storedCopy, reason)
+		}
+	}
+
 	c.scheduleResetToIdle(c.cfg.ErrorDisplayDuration)
+}
+
+func (c *Client) finalizeAndEmitOrderFailure(
+	ctx context.Context,
+	orderID string,
+	jobID string,
+	evt contracts.JobProgressEvent,
+	invalidateInventory bool,
+) {
+	updatedJobs, err := c.cfg.StateStore.FinalizeOrderFailure(ctx, orderID, jobID, evt, invalidateInventory)
+	if err != nil {
+		log.Printf("[SPOOLER] FinalizeOrderFailure failed for %s: %v", jobID, err)
+		_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
+		c.sendProgress(ctx, evt)
+		return
+	}
+
+	for _, job := range updatedJobs {
+		if job.Status != contracts.JobStatusPausedError && job.Status != contracts.JobStatusFailedRefundable {
+			continue
+		}
+		ts := job.OutcomeTimestamp
+		if ts.IsZero() {
+			ts = evt.Timestamp
+		}
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+		c.sendProgressWithVersion(ctx, contracts.JobProgressEvent{
+			JobID:         job.Command.JobID,
+			KioskID:       firstNonEmptyString(job.Command.KioskID, c.cfg.KioskID),
+			Status:        job.Status,
+			PagesPrinted:  job.PagesPrinted,
+			SheetsPrinted: job.SheetsPrinted,
+			ErrorReason:   job.ErrorReason,
+			Timestamp:     ts,
+		}, job.OutcomeVersion)
+	}
+
+	if invalidateInventory {
+		c.syncCustomerServiceState(ctx)
+	}
+}
+
+// reconcileSubmittedOrInterruptedJob is the single canonical reconciliation path for
+// submitted or ambiguous jobs across runtime failure, startup recovery, and printer recovery.
+// It stops active CUPS work, checks fresh quiescent hardware telemetry, finalizes to
+// FAILED_REFUNDABLE only when further physical output is ruled out, preserves PAUSED_ERROR
+// otherwise, stops unsubmitted order siblings, and atomically invalidates inventory calibration
+// when physical consumption is uncertain.
+func (c *Client) reconcileSubmittedOrInterruptedJob(
+	ctx context.Context,
+	stored *state.StoredJob,
+	baseReason string,
+) contracts.JobStatus {
+	if stored == nil {
+		return ""
+	}
+	if stored.Status == contracts.JobStatusCompleted || stored.Status == contracts.JobStatusFailedRefundable {
+		return stored.Status
+	}
+
+	reconciledSheets, reconciledPages := reconcileSheetsAndPages(
+		stored.Command,
+		stored.SheetsPrinted,
+		stored.PagesPrinted,
+		0,
+	)
+
+	invalidateInventory := stored.SubmittedToPrinter ||
+		strings.TrimSpace(stored.CUPSJobID) != "" ||
+		stored.SheetsPrinted > 0
+
+	targetStatus := contracts.JobStatusPausedError
+	reason := strings.TrimSpace(baseReason)
+	if reason == "" {
+		reason = "interrupted printer submission; physical output uncertain, manual reconciliation required"
+	}
+
+	if strings.TrimSpace(c.cfg.CUPSQueue) != "" && strings.TrimSpace(stored.CUPSJobID) != "" {
+		cupsInfo, qErr := printer.QueryCUPSJobInfo(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, stored.CUPSJobID)
+		if qErr != nil {
+			reason = fmt.Sprintf("%s; error querying CUPS job %s (%v), manual reconciliation required", reason, stored.CUPSJobID, qErr)
+		} else {
+			switch cupsInfo.State {
+			case printer.CUPSJobStatePending, printer.CUPSJobStateProcessing, printer.CUPSJobStateHeld, printer.CUPSJobStateProcessingStopped:
+				if c.isHardwareFaultActive() {
+					// During an active hardware fault/jam, preserve the held/active CUPS job for manual reconciliation
+					// without invoking cancel.
+					targetStatus = contracts.JobStatusPausedError
+					break
+				}
+				cancelCtx, cancelCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				cancelRes := printer.CancelAndVerifyCUPSJob(cancelCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, stored.CUPSJobID)
+				cancelCancel()
+
+				if cancelRes.ConfirmedStopped {
+					snap := c.CurrentHealthSnapshot(ctx)
+					if !c.isHardwareFaultActive() && snap.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+						targetStatus = contracts.JobStatusFailedRefundable
+						reason = fmt.Sprintf("%s; CUPS job %s confirmed %s and hardware quiescent (%d/%d sheets verified)",
+							reason, stored.CUPSJobID, cancelRes.State, reconciledSheets, stored.Command.TotalSheets)
+					} else {
+						reason = fmt.Sprintf("%s; CUPS job %s confirmed %s, awaiting quiescent healthy printer before finalization",
+							reason, stored.CUPSJobID, cancelRes.State)
+					}
+				} else if cancelRes.AlreadyCompleted {
+					reason = fmt.Sprintf("%s; CUPS completed job without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), physical output uncertain, manual reconciliation required",
+						reason, cancelRes.JobInfo.SheetsCompleted, reconciledSheets, stored.Command.TotalSheets)
+				} else {
+					reason = fmt.Sprintf("%s; CUPS job %s state is %s after cancel (unmonitored physical output risk), operator reconciliation required",
+						reason, stored.CUPSJobID, cancelRes.State)
+				}
+
+			case printer.CUPSJobStateCanceled, printer.CUPSJobStateAborted:
+				qCheckErr := printer.VerifyNoUnrelatedActiveCUPSJob(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, "")
+				snap := c.CurrentHealthSnapshot(ctx)
+				if qCheckErr == nil && !c.isHardwareFaultActive() && snap.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+					targetStatus = contracts.JobStatusFailedRefundable
+					reason = fmt.Sprintf("%s; CUPS job %s confirmed %s and hardware quiescent (%d/%d sheets verified)",
+						reason, stored.CUPSJobID, cupsInfo.State, reconciledSheets, stored.Command.TotalSheets)
+				} else if qCheckErr != nil {
+					reason = fmt.Sprintf("%s; CUPS job %s is %s but active queue verification failed (%v), manual reconciliation required",
+						reason, stored.CUPSJobID, cupsInfo.State, qCheckErr)
+				} else {
+					reason = fmt.Sprintf("%s; CUPS job %s is %s, awaiting quiescent healthy printer before finalization",
+						reason, stored.CUPSJobID, cupsInfo.State)
+				}
+
+			case printer.CUPSJobStateCompleted:
+				reason = fmt.Sprintf("%s; CUPS completed job without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), physical output uncertain, manual reconciliation required",
+					reason, cupsInfo.SheetsCompleted, reconciledSheets, stored.Command.TotalSheets)
+
+			default:
+				reason = fmt.Sprintf("%s; CUPS job %s state is %s, physical output uncertain, manual reconciliation required",
+					reason, stored.CUPSJobID, cupsInfo.State)
+			}
+		}
+	}
+
+	log.Printf("[SPOOLER] Reconciliation for job %s (CUPS ID %s, status %s): %s",
+		stored.Command.JobID, stored.CUPSJobID, targetStatus, reason)
+
+	evt := contracts.JobProgressEvent{
+		JobID:         stored.Command.JobID,
+		KioskID:       firstNonEmptyString(stored.Command.KioskID, c.cfg.KioskID),
+		Status:        targetStatus,
+		PagesPrinted:  reconciledPages,
+		SheetsPrinted: reconciledSheets,
+		ErrorReason:   reason,
+		Timestamp:     time.Now().UTC(),
+	}
+	c.finalizeAndEmitOrderFailure(ctx, stored.Command.OrderID, stored.Command.JobID, evt, invalidateInventory)
+	return targetStatus
 }
 
 func (c *Client) isHardwareFaultActive() bool {
@@ -4292,100 +4450,8 @@ func (c *Client) reconcileInterruptedCUPSJob(ctx context.Context) {
 		if inc.CUPSJobID == "" || inc.Status != contracts.JobStatusPausedError {
 			continue
 		}
-
-		cupsInfo, qErr := printer.QueryCUPSJobInfo(ctx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, inc.CUPSJobID)
-		if qErr != nil {
-			log.Printf("[SPOOLER] Recovery reconciliation: error querying CUPS job %s: %v", inc.CUPSJobID, qErr)
-			continue
-		}
-
-		log.Printf("[SPOOLER] Recovery reconciliation: interrupted job %s (CUPS ID %s) in state %s (cups sheets completed: %d, verified physical sheets: %d/%d)",
-			inc.Command.JobID, inc.CUPSJobID, cupsInfo.State, cupsInfo.SheetsCompleted, inc.SheetsPrinted, inc.Command.TotalSheets)
-
-		reconciledSheets, reconciledPages := reconcileSheetsAndPages(
-			inc.Command,
-			inc.SheetsPrinted,
-			inc.PagesPrinted,
-			cupsInfo.SheetsCompleted,
-		)
-
-		switch cupsInfo.State {
-		case printer.CUPSJobStateProcessing, printer.CUPSJobStatePending:
-			// CUPS resumed independently! Request hold and verify state to prevent unmonitored printing.
-			log.Printf("[SPOOLER] Interrupted CUPS job %s was active/pending; holding job and verifying state", inc.CUPSJobID)
-			holdCtx, holdCancel := context.WithTimeout(ctx, 2*time.Second)
-			holdRes := printer.HoldAndVerifyCUPSJob(holdCtx, c.cfg.CUPSRunner, c.cfg.CUPSQueue, inc.CUPSJobID)
-			holdCancel()
-
-			reason := "printer recovered; active CUPS job placed on hold (buffered sheets may continue printing), operator reconciliation required"
-			if holdRes.HoldErr != nil {
-				reason = fmt.Sprintf("printer recovered; hold request failed (%v), job remains %s in CUPS, unmonitored physical output risk, operator reconciliation required", holdRes.HoldErr, holdRes.State)
-			} else if holdRes.StillProcessing {
-				reason = "printer recovered; job remains processing in CUPS after hold request, unmonitored physical output risk, operator reconciliation required"
-			}
-
-			evt := contracts.JobProgressEvent{
-				JobID:         inc.Command.JobID,
-				KioskID:       inc.Command.KioskID,
-				Status:        contracts.JobStatusPausedError,
-				PagesPrinted:  reconciledPages,
-				SheetsPrinted: reconciledSheets,
-				ErrorReason:   reason,
-				Timestamp:     time.Now().UTC(),
-			}
-			_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-			c.sendProgress(ctx, evt)
-
-		case printer.CUPSJobStateCompleted:
-			// Printer recovered independently and CUPS reports completed.
-			// Never synthesize full completion or mark completed automatically without physical proof.
-			reason := fmt.Sprintf("printer recovered independently; CUPS completed job without physical proof (CUPS counter: %d sheets, verified physical: %d/%d), physical output uncertain, manual reconciliation required",
-				cupsInfo.SheetsCompleted, inc.SheetsPrinted, inc.Command.TotalSheets)
-			log.Printf("[SPOOLER] Independent printer recovery: %s", reason)
-			evt := contracts.JobProgressEvent{
-				JobID:         inc.Command.JobID,
-				KioskID:       inc.Command.KioskID,
-				Status:        contracts.JobStatusPausedError,
-				PagesPrinted:  reconciledPages,
-				SheetsPrinted: reconciledSheets,
-				ErrorReason:   reason,
-				Timestamp:     time.Now().UTC(),
-			}
-			_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-			c.sendProgress(ctx, evt)
-
-		case printer.CUPSJobStateHeld:
-			log.Printf("[SPOOLER] Interrupted CUPS job %s is safely held in CUPS (buffered sheets may continue printing)", inc.CUPSJobID)
-			if reconciledSheets > inc.SheetsPrinted {
-				evt := contracts.JobProgressEvent{
-					JobID:         inc.Command.JobID,
-					KioskID:       inc.Command.KioskID,
-					Status:        contracts.JobStatusPausedError,
-					PagesPrinted:  reconciledPages,
-					SheetsPrinted: reconciledSheets,
-					ErrorReason:   inc.ErrorReason,
-					Timestamp:     time.Now().UTC(),
-				}
-				_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-				c.sendProgress(ctx, evt)
-			}
-
-		default:
-			// Ambiguous / unknown CUPS state: preserve PAUSED_ERROR with unresolved risk notice
-			reason := fmt.Sprintf("printer recovered; CUPS job %s state is %s (ambiguous), operator reconciliation required", inc.CUPSJobID, cupsInfo.State)
-			log.Printf("[SPOOLER] Independent printer recovery: %s", reason)
-			evt := contracts.JobProgressEvent{
-				JobID:         inc.Command.JobID,
-				KioskID:       inc.Command.KioskID,
-				Status:        contracts.JobStatusPausedError,
-				PagesPrinted:  reconciledPages,
-				SheetsPrinted: reconciledSheets,
-				ErrorReason:   reason,
-				Timestamp:     time.Now().UTC(),
-			}
-			_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-			c.sendProgress(ctx, evt)
-		}
+		incCopy := inc
+		c.reconcileSubmittedOrInterruptedJob(ctx, &incCopy, inc.ErrorReason)
 	}
 }
 
@@ -4641,110 +4707,6 @@ func loadAdsCache(path string) ([]contracts.AdItem, error) {
 		return nil, err
 	}
 	return ads, nil
-}
-
-// RequestCloudRecovery contacts the cloud recovery endpoint to generate an immutable continuation
-// artifact and queues the continuation command for execution without any Pi-side PDF slicing.
-// If outputConfirmed is false, the cloud will reject the recovery per safety constraints.
-func (c *Client) RequestCloudRecovery(
-	ctx context.Context,
-	jobID string,
-	confirmedSheets int,
-	outputConfirmed bool,
-	reason string,
-) (*contracts.PrintJobCommand, error) {
-	if strings.TrimSpace(jobID) == "" {
-		return nil, errors.New("request recovery: jobID cannot be empty")
-	}
-
-	u, err := url.Parse(c.cfg.CloudURL)
-	if err != nil {
-		return nil, fmt.Errorf("request recovery: parse cloud URL: %w", err)
-	}
-	httpScheme := "http"
-	if u.Scheme == "wss" {
-		httpScheme = "https"
-	}
-	baseURL := fmt.Sprintf("%s://%s", httpScheme, u.Host)
-	recoveryEndpoint := fmt.Sprintf("%s/api/k/%s/jobs/%s/recover", baseURL, c.cfg.KioskID, jobID)
-
-	recoveryID := fmt.Sprintf("rec_%s_%d", jobID, time.Now().UnixNano())
-
-	reqBody := map[string]interface{}{
-		"recovery_id":              recoveryID,
-		"confirmed_sheets_printed": confirmedSheets,
-		"output_confirmed":         outputConfirmed,
-		"reason":                   reason,
-	}
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("request recovery: marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, recoveryEndpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, fmt.Errorf("request recovery: create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if strings.TrimSpace(c.cfg.KioskSecret) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(c.cfg.KioskSecret))
-	}
-
-	client := c.cfg.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request recovery: HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBytes, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("recovery failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
-	}
-
-	var recResp struct {
-		Status  string                     `json:"status"`
-		Command *contracts.PrintJobCommand `json:"command"`
-	}
-	if err := json.Unmarshal(respBytes, &recResp); err != nil {
-		return nil, fmt.Errorf("request recovery: decode response: %w", err)
-	}
-
-	// Cloud/operator explicitly reconciled the interrupted job; release its PAUSED_ERROR execution barrier locally.
-	if outputConfirmed && c.cfg.StateStore != nil {
-		if origJob, gErr := c.cfg.StateStore.GetJob(ctx, jobID); gErr == nil && origJob != nil && origJob.Status != contracts.JobStatusCompleted {
-			resolvedStatus := contracts.JobStatusFailedRefundable
-			if recResp.Status == string(contracts.JobStatusCompleted) {
-				resolvedStatus = contracts.JobStatusCompleted
-			}
-			_ = c.cfg.StateStore.UpdateProgress(ctx, contracts.JobProgressEvent{
-				JobID:         jobID,
-				KioskID:       c.cfg.KioskID,
-				Status:        resolvedStatus,
-				PagesPrinted:  origJob.PagesPrinted,
-				SheetsPrinted: origJob.SheetsPrinted,
-				ErrorReason:   origJob.ErrorReason,
-				Timestamp:     time.Now().UTC(),
-			})
-		}
-	}
-
-	if recResp.Status == "COMPLETED" || recResp.Command == nil {
-		return nil, nil
-	}
-
-	cmd := *recResp.Command
-	c.activeMu.Lock()
-	c.activeJobs[cmd.JobID] = true
-	c.activeMu.Unlock()
-
-	c.enqueueJobs([]contracts.PrintJobCommand{cmd})
-	return &cmd, nil
 }
 
 func (c *Client) resolveHealthURL() string {

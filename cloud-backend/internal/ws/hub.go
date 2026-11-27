@@ -35,9 +35,10 @@ type wireMessage struct {
 	Sheets       *int                        `json:"sheets,omitempty"`
 	RequestID    string                      `json:"request_id,omitempty"`
 	OK           bool                        `json:"ok,omitempty"`
-	Calibrated   bool                        `json:"calibrated,omitempty"`
-	InventorySeq uint64                      `json:"inventory_seq,omitempty"`
-	Error        string                      `json:"error,omitempty"`
+	Calibrated     bool                        `json:"calibrated,omitempty"`
+	InventorySeq   uint64                      `json:"inventory_seq,omitempty"`
+	OutcomeVersion int64                       `json:"outcome_version,omitempty"`
+	Error          string                      `json:"error,omitempty"`
 }
 
 type pendingRefillOp struct {
@@ -332,7 +333,29 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if h.db != nil {
-				_ = h.db.UpdateJobProgress(ctx, *msg.Progress)
+				if err := h.db.UpdateJobProgress(ctx, *msg.Progress); err != nil {
+					continue
+				}
+				if msg.OutcomeVersion > 0 {
+					h.mu.RLock()
+					active := h.sessions[kioskID] == sess
+					h.mu.RUnlock()
+					if active {
+						ackMsg := wireMessage{
+							Type: "progress_ack",
+							Progress: &contracts.JobProgressEvent{
+								JobID:   msg.Progress.JobID,
+								KioskID: kioskID,
+								Status:  msg.Progress.Status,
+							},
+							OutcomeVersion: msg.OutcomeVersion,
+							OK:             true,
+						}
+						sess.sendMu.Lock()
+						_ = wsjson.Write(ctx, conn, ackMsg)
+						sess.sendMu.Unlock()
+					}
+				}
 			}
 		case "health":
 			h.handleHealthMessage(ctx, kioskID, sess, msg.Health)

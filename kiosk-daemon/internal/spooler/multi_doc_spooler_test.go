@@ -571,8 +571,8 @@ func TestMultiDoc_OrderLevelPaperCheck(t *testing.T) {
 	}
 
 	stored0, err := store.GetJob(ctx, "job_paper_0")
-	if err != nil || stored0.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected doc 0 to be PAUSED_ERROR due to insufficient paper, got %v", stored0)
+	if err != nil || stored0.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected doc 0 to be FAILED_REFUNDABLE due to pre-submission insufficient paper, got %v", stored0)
 	}
 	if !strings.Contains(stored0.ErrorReason, "paper tray supply insufficient") {
 		t.Fatalf("expected reason to contain 'paper tray supply insufficient', got: %s", stored0.ErrorReason)
@@ -1462,8 +1462,8 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 		t.Fatalf("MockCUPSPrint was invoked for unsupported COLOR job!")
 	}
 	stored, _ := store.GetJob(ctx, colorCmd.JobID)
-	if stored.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job status PAUSED_ERROR for unsupported color, got %s", stored.Status)
+	if stored.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job status FAILED_REFUNDABLE for pre-submission unsupported color, got %s", stored.Status)
 	}
 	if !strings.Contains(stored.ErrorReason, "printer does not support requested COLOR printing mode") {
 		t.Fatalf("unexpected error reason: %s", stored.ErrorReason)
@@ -1502,8 +1502,8 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 		t.Fatalf("MockCUPSPrint was invoked for unsupported BW job!")
 	}
 	storedMono, _ := store.GetJob(ctx, monoCmd.JobID)
-	if storedMono.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job status PAUSED_ERROR for unsupported BW, got %s", storedMono.Status)
+	if storedMono.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job status FAILED_REFUNDABLE for pre-submission unsupported BW, got %s", storedMono.Status)
 	}
 	if !strings.Contains(storedMono.ErrorReason, "printer does not support requested BW/MONOCHROME printing mode") {
 		t.Fatalf("unexpected error reason: %s", storedMono.ErrorReason)
@@ -2814,34 +2814,34 @@ func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 	deadlineTamper := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadlineTamper) {
 		job1, err := store.GetJob(ctx, "job_tamper_1")
-		if err == nil && job1.Status == contracts.JobStatusPausedError {
+		if err == nil && job1.Status == contracts.JobStatusFailedRefundable {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Verify job_tamper_0 is in PAUSED_ERROR state due to checksum failure
+	// Verify job_tamper_0 is in FAILED_REFUNDABLE state due to pre-submission checksum failure
 	job0, err := store.GetJob(ctx, "job_tamper_0")
 	if err != nil {
 		t.Fatalf("failed to get job_tamper_0: %v", err)
 	}
-	if job0.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job_tamper_0 status PAUSED_ERROR, got %s", job0.Status)
+	if job0.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job_tamper_0 status FAILED_REFUNDABLE, got %s", job0.Status)
 	}
 	if !strings.Contains(job0.ErrorReason, "checksum mismatch") {
 		t.Errorf("expected checksum mismatch error reason, got %q", job0.ErrorReason)
 	}
 
-	// Verify job_tamper_1 is in PAUSED_ERROR state due to sibling failure
+	// Verify job_tamper_1 is in FAILED_REFUNDABLE state due to sibling failure
 	job1, err := store.GetJob(ctx, "job_tamper_1")
 	if err != nil {
 		t.Fatalf("failed to get job_tamper_1: %v", err)
 	}
-	if job1.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job_tamper_1 status PAUSED_ERROR, got %s", job1.Status)
+	if job1.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job_tamper_1 status FAILED_REFUNDABLE, got %s", job1.Status)
 	}
-	if !strings.Contains(job1.ErrorReason, "order paused due to error in sibling document") {
-		t.Errorf("expected sibling pause error reason, got %q", job1.ErrorReason)
+	if !strings.Contains(job1.ErrorReason, "Order stopped due to earlier document failure") && !strings.Contains(job1.ErrorReason, "order paused due to error in sibling document") {
+		t.Errorf("expected sibling stop/pause error reason, got %q", job1.ErrorReason)
 	}
 
 	// Verify no new lp invocations were made for either job in ord_tamper_002

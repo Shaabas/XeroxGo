@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -142,21 +141,6 @@ type Order struct {
 	UpdatedAt    time.Time
 	PINExpiresAt time.Time
 	ClaimToken   string
-}
-
-type RecoveryRecord struct {
-	RecoveryID             string
-	JobID                  string
-	KioskID                string
-	SequenceID             int
-	ConfirmedSheetsPrinted int
-	RemainingPages         int
-	RemainingSheets        int
-	DownloadURL            string
-	SHA256Checksum         string
-	Status                 string
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
 }
 
 type KioskSessionStatus string
@@ -296,23 +280,6 @@ CREATE TABLE IF NOT EXISTS job_progress (
     error_reason TEXT NOT NULL DEFAULT '',
     timestamp_ns BIGINT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS recovery_records (
-    recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL,
-    kiosk_id TEXT NOT NULL,
-    sequence_id INTEGER NOT NULL,
-    confirmed_sheets_printed INTEGER NOT NULL,
-    remaining_pages INTEGER NOT NULL,
-    remaining_sheets INTEGER NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(job_id, sequence_id)
-);
-CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS ads (
     id TEXT PRIMARY KEY,
@@ -471,8 +438,6 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"CREATE TABLE IF NOT EXISTS conversions (id TEXT PRIMARY KEY, token TEXT NOT NULL, original_filename TEXT NOT NULL, file_size BIGINT NOT NULL, status TEXT NOT NULL, error_message TEXT NOT NULL DEFAULT '', input_path TEXT NOT NULL, output_path TEXT NOT NULL DEFAULT '', created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, expires_at_ns BIGINT NOT NULL);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);",
 			"CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);",
-			"CREATE TABLE IF NOT EXISTS recovery_records (recovery_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, kiosk_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, confirmed_sheets_printed INTEGER NOT NULL, remaining_pages INTEGER NOT NULL, remaining_sheets INTEGER NOT NULL, download_url TEXT NOT NULL, sha256_checksum TEXT NOT NULL, status TEXT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL, UNIQUE(job_id, sequence_id));",
-			"CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);",
 			"CREATE TABLE IF NOT EXISTS pin_reservations (kiosk_id TEXT NOT NULL, pin TEXT NOT NULL, order_id TEXT NOT NULL, expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, PRIMARY KEY (kiosk_id, pin));",
 			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_order ON pin_reservations (order_id);",
 			"CREATE INDEX IF NOT EXISTS idx_pin_reservations_expiry ON pin_reservations (kiosk_id, expires_at_ns);",
@@ -490,7 +455,6 @@ CREATE INDEX IF NOT EXISTS idx_payment_attempts_demo_token ON payment_attempts (
 			"CREATE INDEX IF NOT EXISTS idx_dispatch_intents_order ON dispatch_intents (order_id);",
 			"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_name = 'dispatch_intents' AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = 'job_id') THEN ALTER TABLE dispatch_intents DROP CONSTRAINT IF EXISTS dispatch_intents_pkey; ALTER TABLE dispatch_intents ADD PRIMARY KEY (job_id); END IF; END $$;",
 			"ALTER TABLE job_progress DROP CONSTRAINT IF EXISTS job_progress_job_id_fkey;",
-			"ALTER TABLE recovery_records DROP CONSTRAINT IF EXISTS recovery_records_job_id_fkey;",
 			"CREATE TABLE IF NOT EXISTS payment_attempts (attempt_id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE, kiosk_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES kiosk_sessions(session_id) ON DELETE CASCADE, provider TEXT NOT NULL, provider_order_id TEXT NOT NULL DEFAULT '', provider_payment_id TEXT NOT NULL DEFAULT '', amount_paise BIGINT NOT NULL, currency TEXT NOT NULL DEFAULT 'INR', status TEXT NOT NULL, qr_payload TEXT NOT NULL DEFAULT '', qr_image_url TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', demo_token TEXT NOT NULL DEFAULT '', expires_at_ns BIGINT NOT NULL, created_at_ns BIGINT NOT NULL, updated_at_ns BIGINT NOT NULL);",
 			"ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS demo_token TEXT NOT NULL DEFAULT '';",
 			"CREATE INDEX IF NOT EXISTS idx_payment_attempts_order ON payment_attempts (order_id);",
@@ -669,23 +633,6 @@ CREATE TABLE IF NOT EXISTS job_progress (
     error_reason TEXT NOT NULL DEFAULT '',
     timestamp_ns BIGINT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS recovery_records (
-    recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL,
-    kiosk_id TEXT NOT NULL,
-    sequence_id INTEGER NOT NULL,
-    confirmed_sheets_printed INTEGER NOT NULL,
-    remaining_pages INTEGER NOT NULL,
-    remaining_sheets INTEGER NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(job_id, sequence_id)
-);
-CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS ads (
     id TEXT PRIMARY KEY,
@@ -894,23 +841,6 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE INDEX IF NOT EXISTS idx_conversions_status_created ON conversions(status, created_at_ns);
 CREATE INDEX IF NOT EXISTS idx_conversions_expires ON conversions(expires_at_ns);
-
-CREATE TABLE IF NOT EXISTS recovery_records (
-    recovery_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL,
-    kiosk_id TEXT NOT NULL,
-    sequence_id INTEGER NOT NULL,
-    confirmed_sheets_printed INTEGER NOT NULL,
-    remaining_pages INTEGER NOT NULL,
-    remaining_sheets INTEGER NOT NULL,
-    download_url TEXT NOT NULL,
-    sha256_checksum TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at_ns BIGINT NOT NULL,
-    updated_at_ns BIGINT NOT NULL,
-    UNIQUE(job_id, sequence_id)
-);
-CREATE INDEX IF NOT EXISTS idx_recovery_job_seq ON recovery_records(job_id, sequence_id);
 
 CREATE TABLE IF NOT EXISTS pin_reservations (
     kiosk_id TEXT NOT NULL,
@@ -2031,163 +1961,6 @@ DELETE FROM pin_rate_limits;
 	return err
 }
 
-// CreateRecoveryRecord persists an immutable recovery attempt record.
-func (s *Store) CreateRecoveryRecord(ctx context.Context, rec RecoveryRecord) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("create recovery record: store is closed or nil")
-	}
-	if ctx == nil {
-		return fmt.Errorf("create recovery record: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("create recovery record: %w", err)
-	}
-	if strings.TrimSpace(rec.RecoveryID) == "" {
-		return fmt.Errorf("create recovery record: recovery_id cannot be empty")
-	}
-	if strings.TrimSpace(rec.JobID) == "" {
-		return fmt.Errorf("create recovery record: job_id cannot be empty")
-	}
-	if strings.TrimSpace(rec.KioskID) == "" {
-		return fmt.Errorf("create recovery record: kiosk_id cannot be empty")
-	}
-	if rec.SequenceID < 1 {
-		return fmt.Errorf("create recovery record: sequence_id must be >= 1, got %d", rec.SequenceID)
-	}
-	if rec.ConfirmedSheetsPrinted < 0 {
-		return fmt.Errorf("create recovery record: confirmed_sheets_printed must be >= 0, got %d", rec.ConfirmedSheetsPrinted)
-	}
-	if rec.RemainingPages < 1 {
-		return fmt.Errorf("create recovery record: remaining_pages must be >= 1, got %d", rec.RemainingPages)
-	}
-	if rec.RemainingSheets < 1 {
-		return fmt.Errorf("create recovery record: remaining_sheets must be >= 1, got %d", rec.RemainingSheets)
-	}
-	if strings.TrimSpace(rec.DownloadURL) == "" {
-		return fmt.Errorf("create recovery record: download_url cannot be empty")
-	}
-	if strings.TrimSpace(rec.SHA256Checksum) == "" {
-		return fmt.Errorf("create recovery record: sha256_checksum cannot be empty")
-	}
-
-	createdAt := rec.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = time.Now().UTC()
-	}
-	updatedAt := rec.UpdatedAt
-	if updatedAt.IsZero() {
-		updatedAt = createdAt
-	}
-
-	query := `
-INSERT INTO recovery_records (
-    recovery_id, job_id, kiosk_id, sequence_id, confirmed_sheets_printed,
-    remaining_pages, remaining_sheets, download_url, sha256_checksum, status,
-    created_at_ns, updated_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-`
-	_, err := s.db.ExecContext(ctx, s.rebind(query),
-		rec.RecoveryID, rec.JobID, rec.KioskID, rec.SequenceID, rec.ConfirmedSheetsPrinted,
-		rec.RemainingPages, rec.RemainingSheets, rec.DownloadURL, rec.SHA256Checksum, rec.Status,
-		createdAt.UnixNano(), updatedAt.UnixNano(),
-	)
-	if err != nil {
-		return fmt.Errorf("create recovery record: %w", err)
-	}
-	return nil
-}
-
-// GetRecoveryRecord retrieves a recovery record by recoveryID.
-func (s *Store) GetRecoveryRecord(ctx context.Context, recoveryID string) (*RecoveryRecord, error) {
-	if s == nil || s.db == nil {
-		return nil, fmt.Errorf("get recovery record: store is closed or nil")
-	}
-	if ctx == nil {
-		return nil, fmt.Errorf("get recovery record: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("get recovery record: %w", err)
-	}
-	if strings.TrimSpace(recoveryID) == "" {
-		return nil, fmt.Errorf("get recovery record: recoveryID cannot be empty")
-	}
-
-	query := `
-SELECT
-    recovery_id, job_id, kiosk_id, sequence_id, confirmed_sheets_printed,
-    remaining_pages, remaining_sheets, download_url, sha256_checksum, status,
-    created_at_ns, updated_at_ns
-FROM recovery_records
-WHERE recovery_id = ?;
-`
-	row := s.db.QueryRowContext(ctx, s.rebind(query), recoveryID)
-
-	var (
-		recID       string
-		jobID       string
-		kioskID     string
-		seqID       int
-		confSheets  int
-		remPages    int
-		remSheets   int
-		downloadURL string
-		sha256Check string
-		status      string
-		createdNS   int64
-		updatedNS   int64
-	)
-	err := row.Scan(
-		&recID, &jobID, &kioskID, &seqID, &confSheets,
-		&remPages, &remSheets, &downloadURL, &sha256Check, &status,
-		&createdNS, &updatedNS,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get recovery record: scan: %w", err)
-	}
-
-	return &RecoveryRecord{
-		RecoveryID:             recID,
-		JobID:                  jobID,
-		KioskID:                kioskID,
-		SequenceID:             seqID,
-		ConfirmedSheetsPrinted: confSheets,
-		RemainingPages:         remPages,
-		RemainingSheets:        remSheets,
-		DownloadURL:            downloadURL,
-		SHA256Checksum:         sha256Check,
-		Status:                 status,
-		CreatedAt:              time.Unix(0, createdNS).UTC(),
-		UpdatedAt:              time.Unix(0, updatedNS).UTC(),
-	}, nil
-}
-
-// GetLatestRecoverySequence returns the maximum sequence_id for the given jobID (0 if none exist).
-func (s *Store) GetLatestRecoverySequence(ctx context.Context, jobID string) (int, error) {
-	if s == nil || s.db == nil {
-		return 0, fmt.Errorf("get latest recovery sequence: store is closed or nil")
-	}
-	if ctx == nil {
-		return 0, fmt.Errorf("get latest recovery sequence: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("get latest recovery sequence: %w", err)
-	}
-	if strings.TrimSpace(jobID) == "" {
-		return 0, fmt.Errorf("get latest recovery sequence: jobID cannot be empty")
-	}
-
-	query := `SELECT COALESCE(MAX(sequence_id), 0) FROM recovery_records WHERE job_id = ?;`
-	row := s.db.QueryRowContext(ctx, s.rebind(query), jobID)
-	var maxSeq int
-	if err := row.Scan(&maxSeq); err != nil {
-		return 0, fmt.Errorf("get latest recovery sequence: scan: %w", err)
-	}
-	return maxSeq, nil
-}
-
 // UpdateOrderStatus updates an existing order's status and updated_at_ns.
 func (s *Store) UpdateOrderStatus(ctx context.Context, orderID string, status contracts.JobStatus) error {
 	if s == nil || s.db == nil {
@@ -2309,19 +2082,13 @@ func (s *Store) UpdateJobProgress(ctx context.Context, event contracts.JobProgre
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 1. Check if job is a child document in order_documents, or directly on orders, or recovery
+	// 1. Check if job is a child document in order_documents, or directly on orders
 	var (
-		orderID            string
-		orderKioskID       string
-		totalPages         int
-		totalSheets        int
-		isDocJob           bool
-		isRecovery         bool
-		parentJobID        string
-		recoveryID         string
-		recRemainingPages  int
-		recRemainingSheets int
-		recConfirmedSheets int
+		orderID      string
+		orderKioskID string
+		totalPages   int
+		totalSheets  int
+		isDocJob     bool
 	)
 
 	// Check order_documents first
@@ -2335,7 +2102,7 @@ WHERE d.job_id = ?;
 	if err == nil {
 		isDocJob = true
 	} else if errors.Is(err, sql.ErrNoRows) {
-		// Fallback to legacy orders / recovery
+		// Fallback to legacy orders
 		queryOrder := `
 SELECT o.order_id, o.kiosk_id, p.total_pages, p.total_sheets
 FROM orders o
@@ -2343,29 +2110,8 @@ JOIN print_configs p ON o.order_id = p.order_id
 WHERE o.job_id = ?;
 `
 		err = tx.QueryRowContext(ctx, s.rebind(queryOrder), event.JobID).Scan(&orderID, &orderKioskID, &totalPages, &totalSheets)
-		if err == sql.ErrNoRows {
-			if idx := strings.LastIndex(event.JobID, "-rec"); idx != -1 {
-				pJobID := event.JobID[:idx]
-				seqStr := event.JobID[idx+4:]
-				if seqID, parseErr := strconv.Atoi(seqStr); parseErr == nil && pJobID != "" {
-					queryRec := `
-SELECT r.recovery_id, r.job_id, r.kiosk_id, r.confirmed_sheets_printed, r.remaining_pages, r.remaining_sheets, p.total_pages, p.total_sheets, o.order_id
-FROM recovery_records r
-JOIN orders o ON r.job_id = o.job_id
-JOIN print_configs p ON o.order_id = p.order_id
-WHERE r.job_id = ? AND r.sequence_id = ?;
-`
-					recErr := tx.QueryRowContext(ctx, s.rebind(queryRec), pJobID, seqID).Scan(
-						&recoveryID, &parentJobID, &orderKioskID, &recConfirmedSheets, &recRemainingPages, &recRemainingSheets, &totalPages, &totalSheets, &orderID,
-					)
-					if recErr == nil {
-						isRecovery = true
-					}
-				}
-			}
-			if !isRecovery {
-				return fmt.Errorf("update job progress: job %q not found in orders or order_documents", event.JobID)
-			}
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("update job progress: job %q not found in orders or order_documents", event.JobID)
 		} else if err != nil {
 			return fmt.Errorf("update job progress: query order: %w", err)
 		}
@@ -2386,45 +2132,20 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 	}
 
 	// 3. Verify progress bounds and explicit completion counts
-	if isRecovery {
-		if event.PagesPrinted > recRemainingPages {
-			return fmt.Errorf("update job progress: pages_printed (%d) exceeds recovery remaining_pages (%d)", event.PagesPrinted, recRemainingPages)
-		}
-		if event.SheetsPrinted > recRemainingSheets {
-			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds recovery remaining_sheets (%d)", event.SheetsPrinted, recRemainingSheets)
-		}
-		if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != recRemainingPages || event.SheetsPrinted != recRemainingSheets) {
-			return fmt.Errorf("update job progress: inconsistent recovery completion counts (pages=%d/%d, sheets=%d/%d)",
-				event.PagesPrinted, recRemainingPages, event.SheetsPrinted, recRemainingSheets)
-		}
-	} else {
-		if event.PagesPrinted > totalPages {
-			return fmt.Errorf("update job progress: pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
-		}
-		if event.SheetsPrinted > totalSheets {
-			return fmt.Errorf("update job progress: sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
-		}
-		if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != totalPages || event.SheetsPrinted != totalSheets) {
-			return fmt.Errorf("update job progress: inconsistent completion counts (pages=%d/%d, sheets=%d/%d)",
-				event.PagesPrinted, totalPages, event.SheetsPrinted, totalSheets)
-		}
+	if event.PagesPrinted > totalPages {
+		return fmt.Errorf("update job progress: pages_printed (%d) exceeds total_pages (%d)", event.PagesPrinted, totalPages)
+	}
+	if event.SheetsPrinted > totalSheets {
+		return fmt.Errorf("update job progress: sheets_printed (%d) exceeds total_sheets (%d)", event.SheetsPrinted, totalSheets)
+	}
+	if event.Status == contracts.JobStatusCompleted && (event.PagesPrinted != totalPages || event.SheetsPrinted != totalSheets) {
+		return fmt.Errorf("update job progress: inconsistent completion counts (pages=%d/%d, sheets=%d/%d)",
+			event.PagesPrinted, totalPages, event.SheetsPrinted, totalSheets)
 	}
 
 	targetJobID := event.JobID
 	pagesPrinted := event.PagesPrinted
 	sheetsPrinted := event.SheetsPrinted
-
-	if isRecovery {
-		targetJobID = parentJobID
-		sheetsPrinted = recConfirmedSheets + event.SheetsPrinted
-		if sheetsPrinted > totalSheets {
-			sheetsPrinted = totalSheets
-		}
-		pagesPrinted = (totalPages - recRemainingPages) + event.PagesPrinted
-		if pagesPrinted > totalPages {
-			pagesPrinted = totalPages
-		}
-	}
 
 	// 4. Check existing progress timestamp, completed non-regression, and monotonic counts
 	var existingStatus string
@@ -2441,6 +2162,9 @@ WHERE r.job_id = ? AND r.sequence_id = ?;
 	if err == nil {
 		if existingStatus == string(contracts.JobStatusCompleted) && event.Status != contracts.JobStatusCompleted {
 			return fmt.Errorf("update job progress: cannot regress completed job %s to %s", targetJobID, event.Status)
+		}
+		if existingStatus == string(contracts.JobStatusFailedRefundable) && event.Status != contracts.JobStatusFailedRefundable {
+			return fmt.Errorf("update job progress: cannot transition terminal FAILED_REFUNDABLE job %s to %s", targetJobID, event.Status)
 		}
 		if eventNS < existingTimestampNS {
 			return fmt.Errorf("update job progress: rejected stale event timestamp (%d < %d)", eventNS, existingTimestampNS)
@@ -2462,6 +2186,7 @@ ON CONFLICT(job_id) DO UPDATE SET
     error_reason = excluded.error_reason,
     timestamp_ns = excluded.timestamp_ns
 WHERE NOT (job_progress.status = 'COMPLETED' AND excluded.status <> 'COMPLETED')
+  AND NOT (job_progress.status = 'FAILED_REFUNDABLE' AND excluded.status <> 'FAILED_REFUNDABLE')
   AND excluded.timestamp_ns >= job_progress.timestamp_ns
   AND excluded.pages_printed >= job_progress.pages_printed
   AND excluded.sheets_printed >= job_progress.sheets_printed;
@@ -2482,25 +2207,15 @@ WHERE NOT (job_progress.status = 'COMPLETED' AND excluded.status <> 'COMPLETED')
 		return fmt.Errorf("update job progress: rejected concurrent regression or stale update for job %s", targetJobID)
 	}
 
-	if isRecovery {
-		recStatus := string(event.Status)
-		if event.Status == contracts.JobStatusCompleted {
-			recStatus = "COMPLETED"
-		}
-		_, _ = tx.ExecContext(ctx, s.rebind(`
-UPDATE recovery_records
-SET status = ?, updated_at_ns = ?
-WHERE recovery_id = ?;
-`), recStatus, eventNS, recoveryID)
-	}
-
 	// 6. Update document / order status
 	if isDocJob {
 		_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE order_documents
 SET status = ?, updated_at_ns = ?
-WHERE job_id = ? AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED');
-`), string(event.Status), eventNS, event.JobID, string(event.Status))
+WHERE job_id = ?
+  AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED')
+  AND NOT (status = 'FAILED_REFUNDABLE' AND ? <> 'FAILED_REFUNDABLE');
+`), string(event.Status), eventNS, event.JobID, string(event.Status), string(event.Status))
 		if err != nil {
 			return fmt.Errorf("update job progress: update order_documents status: %w", err)
 		}
@@ -2510,6 +2225,7 @@ WHERE job_id = ? AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED');
 		var (
 			totalDocs     int
 			completedDocs int
+			pausedDocs    int
 			failedDocs    int
 			printingDocs  int
 			spoolingDocs  int
@@ -2518,6 +2234,7 @@ WHERE job_id = ? AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED');
 SELECT
     COUNT(1),
     COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN status = 'PAUSED_ERROR' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'FAILED_REFUNDABLE' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'PRINTING' THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN status = 'SPOOLING' THEN 1 ELSE 0 END), 0)
@@ -2525,7 +2242,7 @@ FROM order_documents
 WHERE order_id = ?;
 `
 		err = tx.QueryRowContext(ctx, s.rebind(queryCounts), orderID).Scan(
-			&totalDocs, &completedDocs, &failedDocs, &printingDocs, &spoolingDocs,
+			&totalDocs, &completedDocs, &pausedDocs, &failedDocs, &printingDocs, &spoolingDocs,
 		)
 		if err != nil {
 			return fmt.Errorf("update job progress: query order document counts: %w", err)
@@ -2541,23 +2258,38 @@ WHERE order_id = ?;
 				return fmt.Errorf("update job progress: update order completed: %w", err)
 			}
 			_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
+		} else if pausedDocs > 0 {
+			_, err = tx.ExecContext(ctx, s.rebind(`
+UPDATE orders
+SET status = 'PAUSED_ERROR', updated_at_ns = ?
+WHERE order_id = ? AND status <> 'COMPLETED';
+`), eventNS, orderID)
+			if err != nil {
+				return fmt.Errorf("update job progress: update order paused_error: %w", err)
+			}
 		} else if failedDocs > 0 {
 			_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'FAILED_REFUNDABLE', updated_at_ns = ?
 WHERE order_id = ? AND status <> 'COMPLETED';
 `), eventNS, orderID)
+			if err != nil {
+				return fmt.Errorf("update job progress: update order failed_refundable: %w", err)
+			}
+			if totalDocs > 0 && completedDocs+failedDocs == totalDocs {
+				_, _ = tx.ExecContext(ctx, s.rebind("DELETE FROM pin_reservations WHERE order_id = ?;"), orderID)
+			}
 		} else if printingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'PRINTING', updated_at_ns = ?
-WHERE order_id = ? AND status NOT IN ('COMPLETED');
+WHERE order_id = ? AND status NOT IN ('COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE');
 `), eventNS, orderID)
 		} else if spoolingDocs > 0 {
 			_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = 'SPOOLING', updated_at_ns = ?
-WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED');
+WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED', 'PAUSED_ERROR', 'FAILED_REFUNDABLE');
 `), eventNS, orderID)
 		}
 	} else {
@@ -2565,8 +2297,10 @@ WHERE order_id = ? AND status NOT IN ('PRINTING', 'COMPLETED');
 		_, err = tx.ExecContext(ctx, s.rebind(`
 UPDATE orders
 SET status = ?, updated_at_ns = ?
-WHERE job_id = ? AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED');
-`), string(event.Status), eventNS, targetJobID, string(event.Status))
+WHERE job_id = ?
+  AND NOT (status = 'COMPLETED' AND ? <> 'COMPLETED')
+  AND NOT (status = 'FAILED_REFUNDABLE' AND ? <> 'FAILED_REFUNDABLE');
+`), string(event.Status), eventNS, targetJobID, string(event.Status), string(event.Status))
 		if err != nil {
 			return fmt.Errorf("update job progress: update order status: %w", err)
 		}
@@ -2583,6 +2317,12 @@ UPDATE dispatch_intents
 SET status = 'COMPLETED', updated_at_ns = ?
 WHERE job_id = ?;
 `), eventNS, event.JobID)
+	} else if event.Status == contracts.JobStatusPausedError || event.Status == contracts.JobStatusFailedRefundable {
+		_, _ = tx.ExecContext(ctx, s.rebind(`
+UPDATE dispatch_intents
+SET status = 'CANCELED', updated_at_ns = ?
+WHERE order_id = ? AND status IN ('PENDING', 'SENT');
+`), eventNS, orderID)
 	} else if event.Status == contracts.JobStatusSpooling || event.Status == contracts.JobStatusPrinting {
 		_, _ = tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
@@ -4207,7 +3947,12 @@ func (s *Store) MarkDispatchIntentSent(ctx context.Context, jobID string) error 
 	query := s.rebind(`
 UPDATE dispatch_intents
 SET status = 'SENT', dispatched_at_ns = ?, updated_at_ns = ?
-WHERE job_id = ? AND status = 'PENDING';
+WHERE job_id = ? AND status = 'PENDING'
+  AND NOT EXISTS (
+      SELECT 1 FROM orders o
+      WHERE o.order_id = dispatch_intents.order_id
+        AND o.status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED', 'CANCELED')
+  );
 `)
 	_, err := s.db.ExecContext(ctx, query, nowNS, nowNS, jobID)
 	return err
@@ -4374,7 +4119,12 @@ func (s *Store) ResetUnacknowledgedDispatchIntents(ctx context.Context, kioskID 
 	query := s.rebind(`
 UPDATE dispatch_intents
 SET status = 'PENDING', updated_at_ns = ?
-WHERE kiosk_id = ? AND status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL);
+WHERE kiosk_id = ? AND status = 'SENT' AND (acknowledged_at_ns = 0 OR acknowledged_at_ns IS NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM orders o
+      WHERE o.order_id = dispatch_intents.order_id
+        AND o.status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED', 'CANCELED')
+  );
 `)
 	_, err := s.db.ExecContext(ctx, query, nowNS, kioskID)
 	return err
@@ -4452,10 +4202,10 @@ ORDER BY created_at_ns ASC;
 			return nil, fmt.Errorf("get pending dispatch orders: order %s not found", cand.orderID)
 		}
 
-		// Never dispatch unpaid, canceled, expired, or unauthorized orders
+		// Never dispatch unpaid, paused, failed, canceled, expired, or unauthorized orders
 		if ord.Status != contracts.JobStatusDispatched {
-			if ord.Status == contracts.JobStatusFailedRefundable || string(ord.Status) == "CANCELED" {
-				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE job_id = ?;`), nowNS, cand.jobID)
+			if ord.Status == contracts.JobStatusPausedError || ord.Status == contracts.JobStatusFailedRefundable || ord.Status == contracts.JobStatusCompleted || string(ord.Status) == "CANCELED" {
+				_, _ = s.db.ExecContext(ctx, s.rebind(`UPDATE dispatch_intents SET status = 'CANCELED', updated_at_ns = ? WHERE order_id = ? AND status IN ('PENDING', 'SENT');`), nowNS, cand.orderID)
 			}
 			continue
 		}

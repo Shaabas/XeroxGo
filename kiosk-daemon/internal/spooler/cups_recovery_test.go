@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -93,7 +92,6 @@ func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -189,7 +187,6 @@ func TestCUPS_AmbiguousSubmissionCrashedDuringLP(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -319,7 +316,6 @@ func TestCUPS_RestartReconcilesActiveJobInQueue(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -430,7 +426,6 @@ func TestCUPS_RestartReconcilesAlreadyCompletedJob(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -511,7 +506,6 @@ func TestCUPS_DuplicateCommandsIgnored(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -526,235 +520,6 @@ func TestCUPS_DuplicateCommandsIgnored(t *testing.T) {
 	}
 	if lpCalled.Load() != 0 {
 		t.Errorf("expected 0 lp calls for duplicate completed job, got %d", lpCalled.Load())
-	}
-}
-
-// TestCUPS_CloudRecoveryOutageLeavesJobPaused verifies that if cloud recovery fails due to
-// backend outage / network error, the job remains safely paused in PAUSED_ERROR without duplicate prints.
-func TestCUPS_CloudRecoveryOutageLeavesJobPaused(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "cups_outage.db")
-	store, err := openCalibratedTestStore(t, dbPath)
-	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
-	}
-	defer store.Close()
-
-	cmd := contracts.PrintJobCommand{
-		JobID:          "job-outage-01",
-		KioskID:        "kiosk-test",
-		DisplayCode:    "6666",
-		DownloadURL:    "https://example.invalid/print.pdf",
-		SHA256Checksum: strings.Repeat("d", 64),
-		TotalPages:     4,
-		TotalSheets:    2,
-		Copies:         1,
-		Duplex:         contracts.DuplexLongEdge,
-		StartFromPage:  1,
-	}
-
-	if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusPausedError); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
-
-	// Cloud server simulates 503 outage
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
-	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "/ws"
-	client, err := NewClient(ClientConfig{
-		CloudURL:            wsURL,
-		KioskID:             "kiosk-test",
-		KioskSecret:         "secret",
-		StateStore:          store,
-		CUPSQueue:           "DCPT310",
-		DownloadDir:         tmpDir,
-		IdleQRContent:       "https://example.com/qr",
-		ScreenSink:          noopSink,
-		HTTPClient:          server.Client(),
-		EnableCloudRecovery: true,
-	})
-	if err != nil {
-		t.Fatalf("NewClient failed: %v", err)
-	}
-
-	// Attempt cloud recovery during outage
-	recoveryCmd, recErr := client.RequestCloudRecovery(context.Background(), cmd.JobID, 1, true, "jam cleared")
-	if recErr == nil {
-		t.Fatal("expected RequestCloudRecovery to fail during cloud outage, got nil error")
-	}
-	if recoveryCmd != nil {
-		t.Fatal("expected nil recoveryCmd on failure")
-	}
-
-	// Verify job remains in PAUSED_ERROR in store, safe for future retry
-	job, err := store.GetJob(context.Background(), cmd.JobID)
-	if err != nil {
-		t.Fatalf("GetJob failed: %v", err)
-	}
-	if job == nil || job.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job to remain in PAUSED_ERROR, got %v", job)
-	}
-}
-
-// TestCUPS_MultiCopyRecoveryIntegrity verifies that recovering a multi-copy print job
-// maintains exact copies, sheet calculation, and page progression.
-func TestCUPS_MultiCopyRecoveryIntegrity(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "cups_multicopy.db")
-	store, err := openCalibratedTestStore(t, dbPath)
-	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
-	}
-	defer store.Close()
-
-	pdfContent := []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
-	hasher := sha256.Sum256(pdfContent)
-	pdfChecksum := hex.EncodeToString(hasher[:])
-
-	// Original job: 2 copies of 2 pages = 4 pages, 4 sheets simplex
-	origCmd := contracts.PrintJobCommand{
-		JobID:          "job-multicopy-orig",
-		KioskID:        "kiosk-test",
-		DisplayCode:    "7777",
-		DownloadURL:    "https://example.invalid/orig.pdf",
-		SHA256Checksum: strings.Repeat("e", 64),
-		TotalPages:     4,
-		TotalSheets:    4,
-		Copies:         2,
-		Duplex:         contracts.DuplexSimplex,
-		StartFromPage:  1,
-	}
-	if err := store.SaveJob(context.Background(), origCmd, contracts.JobStatusPausedError); err != nil {
-		t.Fatalf("SaveJob failed: %v", err)
-	}
-	_ = store.UpdateProgress(context.Background(), contracts.JobProgressEvent{
-		JobID:         origCmd.JobID,
-		KioskID:       origCmd.KioskID,
-		Status:        contracts.JobStatusPausedError,
-		PagesPrinted:  2,
-		SheetsPrinted: 2,
-		ErrorReason:   "paper jam on copy 2",
-		Timestamp:     time.Now().UTC(),
-	})
-
-	// Server returns continuation artifact for the remaining 2 sheets
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/recover"):
-			w.Header().Set("Content-Type", "application/json")
-			resp := map[string]interface{}{
-				"recovery_id": "rec_multi_01",
-				"sequence_id": 1,
-				"job_id":      "job-multicopy-cont",
-				"command": contracts.PrintJobCommand{
-					JobID:          "job-multicopy-cont",
-					KioskID:        "kiosk-test",
-					DisplayCode:    "7777",
-					DownloadURL:    "http://" + r.Host + "/cont.pdf",
-					SHA256Checksum: pdfChecksum,
-					TotalPages:     2,
-					TotalSheets:    2,
-					Copies:         1,
-					Duplex:         contracts.DuplexSimplex,
-					StartFromPage:  1,
-				},
-			}
-			_ = json.NewEncoder(w).Encode(resp)
-		case strings.HasSuffix(r.URL.Path, "/cont.pdf"):
-			w.Header().Set("Content-Type", "application/pdf")
-			_, _ = w.Write(pdfContent)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	var lpCalls atomic.Int32
-	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		if name == "lp" {
-			lpCalls.Add(1)
-			return []byte("request id is DCPT310-701 (1 file(s))"), nil
-		}
-		if name == "lpstat" {
-			for i, arg := range args {
-				if arg == "-W" && i+1 < len(args) && args[i+1] == "completed" {
-					return []byte("DCPT310-701 user 1024 Tue Nov 3 14:00:00 2026\n\tjob-completed-successfully"), nil
-				}
-			}
-		}
-		return []byte(""), nil
-	}
-
-	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "/ws"
-	var odoCalls int32
-	snmpPoller := func(ctx context.Context) printer.HardwareTelemetry {
-		c := atomic.AddInt32(&odoCalls, 1)
-		var life int64 = 2000
-		if c > 1 {
-			life += int64((c - 1) * 2)
-			if life > 2002 {
-				life = 2002
-			}
-		}
-		return printer.HardwareTelemetry{
-			Online:         true,
-			HasLife:        true,
-			LifeCount:      life,
-			CounterIndex:   "1.1",
-			CounterUnit:    8,
-			HasCounterMeta: true,
-			HasFlags:       true,
-			StatusState:    "IDLE",
-			ObservedAt:     time.Now().UTC(),
-		}
-	}
-
-	client, err := NewClient(ClientConfig{
-		CloudURL:            wsURL,
-		KioskID:             "kiosk-test",
-		KioskSecret:         "secret",
-		StateStore:          store,
-		CUPSQueue:           "DCPT310",
-		CUPSRunner:          runner,
-		SNMPPoller:          snmpPoller,
-		MockCUPSHealth:      testHealthyCUPSHealth,
-		MockIPPState:        testHealthyIPPState,
-		MockSNMPHealth:      testHealthySNMPHealth,
-		DownloadDir:         tmpDir,
-		IdleQRContent:       "https://example.com/qr",
-		ScreenSink:          noopSink,
-		HTTPClient:          server.Client(),
-		EnableCloudRecovery: true,
-	})
-	if err != nil {
-		t.Fatalf("NewClient failed: %v", err)
-	}
-
-	// Request continuation from sheet 3 (first unprinted sheet of copy 2)
-	contCmd, err := client.RequestCloudRecovery(context.Background(), origCmd.JobID, 3, true, "jam cleared")
-	if err != nil {
-		t.Fatalf("RequestCloudRecovery failed: %v", err)
-	}
-	if contCmd.TotalSheets != 2 || contCmd.StartFromPage != 1 {
-		t.Fatalf("unexpected continuation command parameters: %+v", contCmd)
-	}
-
-	// Process the continuation job
-	client.processJob(context.Background(), *contCmd)
-
-	if lpCalls.Load() != 1 {
-		t.Fatalf("expected 1 lp call for continuation job, got %d", lpCalls.Load())
-	}
-
-	contJob, err := store.GetJob(context.Background(), contCmd.JobID)
-	if err != nil || contJob == nil {
-		t.Fatalf("failed to get continuation job from store: %v", err)
-	}
-	if contJob.Status != contracts.JobStatusCompleted {
-		t.Errorf("expected continuation job status COMPLETED, got %v", contJob.Status)
 	}
 }
 
@@ -912,7 +677,6 @@ func TestCUPS_RestartWithCompletedJob_ReconcilesRemainingSheets(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -1038,7 +802,6 @@ func TestCUPS_RestartWithCompletedJob_PrinterHardwareError_PausesForReconciliati
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -1143,7 +906,6 @@ func TestCUPS_RestartWithCompletedJob_InsufficientStock_PausesForReconciliation(
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -1277,7 +1039,6 @@ func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
@@ -1348,7 +1109,6 @@ func TestSpooler_DuplicateCompletion_NeverDoubleDeducts(t *testing.T) {
 		DownloadDir:         tmpDir,
 		IdleQRContent:       "https://example.com/qr",
 		ScreenSink:          noopSink,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {

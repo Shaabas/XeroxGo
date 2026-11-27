@@ -3530,8 +3530,8 @@ func TestCUPSSubmissionPersistence(t *testing.T) {
 		if saved.SubmittedToPrinter {
 			t.Error("submitted_to_printer must NOT be set when MarkJobSubmitting failed")
 		}
-		if saved.Status != contracts.JobStatusPausedError {
-			t.Errorf("expected status PAUSED_ERROR, got %s", saved.Status)
+		if saved.Status != contracts.JobStatusFailedRefundable {
+			t.Errorf("expected status FAILED_REFUNDABLE for pre-submission failure, got %s", saved.Status)
 		}
 	})
 
