@@ -98,6 +98,7 @@ func sendTestHealthyStatus(ctx context.Context, t *testing.T, hub *ws.Hub, conn 
 		Online:              true,
 		State:               "IDLE",
 		EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:  contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:     "OK",
 		EstimatedSheets:        250,
 		ConfiguredTrayCapacity: 250,
@@ -234,6 +235,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "UNKNOWN",
 		EstimatedSheets:        100,
 		ConfiguredTrayCapacity: 250,
@@ -265,6 +267,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "OK",
 		EstimatedSheets:        0,
 		ConfiguredTrayCapacity: 250,
@@ -296,6 +299,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "LOW",
 		EstimatedSheets:        5,
 		ConfiguredTrayCapacity: 250,
@@ -327,6 +331,7 @@ func TestPaperAvailability_OrderClaim_Guards(t *testing.T) {
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "OK",
 		EstimatedSheets:        50,
 		ConfiguredTrayCapacity: 250,
@@ -365,10 +370,11 @@ func TestPaperAvailability_PaymentInitiation_Revalidation(t *testing.T) {
 
 	// Connect kiosk with 20 sheets
 	conn, cancel := connectKioskWithHealth(t, server.URL, kioskID, contracts.PrinterHealth{
-		Online:          true,
-		State:           "IDLE",
-		PaperTrayStatus: "OK",
-		EstimatedSheets: 20,
+		Online:             true,
+		State:              "IDLE",
+		NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+		PaperTrayStatus:    "OK",
+		EstimatedSheets:    20,
 		UpdatedAt:       time.Now().UTC(),
 	})
 	defer func() {

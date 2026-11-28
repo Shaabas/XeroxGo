@@ -118,6 +118,13 @@ func IsHealthAvailable(h PrinterHealth, now time.Time, maxAge time.Duration) (bo
 	if EffectiveInventorySheets(h.EstimatedSheets, h.ConfiguredTrayCapacity, h.InputTrayCapacity, h.InputTrayCapacityKnown) <= 0 {
 		return false, "effective verified tray inventory is zero"
 	}
+	adm := h.EffectiveNativeIPPAdmission()
+	if adm == AcceptingJobsUnknown {
+		return false, "native IPP job admission is unknown"
+	}
+	if adm == AcceptingJobsNotAccepting && strings.ToUpper(strings.TrimSpace(h.State)) != "PRINTING" {
+		return false, "printer is not accepting jobs while idle"
+	}
 	return true, ""
 }
 

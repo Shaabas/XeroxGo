@@ -208,6 +208,31 @@ func (s *appServer) checkPrinterCondition(kioskID string) (int, *printerConditio
 		}
 	}
 
+	switch health.EffectiveNativeIPPAdmission() {
+	case contracts.AcceptingJobsUnknown:
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "TELEMETRY_UNVERIFIED",
+			Message:    "native IPP job admission is unknown",
+		}
+	case contracts.AcceptingJobsNotAccepting:
+		if strings.ToUpper(strings.TrimSpace(health.State)) != "PRINTING" {
+			return 0, &printerConditionError{
+				StatusCode: http.StatusConflict,
+				Code:       "PRINTER_NOT_ACCEPTING",
+				Message:    "printer is not accepting jobs while idle",
+			}
+		}
+	}
+
+	if availOK, availReason := contracts.IsHealthAvailable(health, time.Now().UTC(), contracts.DefaultTelemetryMaxAge); !availOK {
+		return 0, &printerConditionError{
+			StatusCode: http.StatusConflict,
+			Code:       "PRINTER_ERROR",
+			Message:    firstNonEmptySessionErr(availReason, "printer is not available"),
+		}
+	}
+
 	// Conservative capacity enforcement: contradictory physical capacity must not permit
 	// inventory or reservations above the verified physical limit.
 	effectiveStock := contracts.EffectiveInventorySheets(

@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"xeroxgo/pkg/contracts"
 )
 
 // IPPPrinterState represents the normalized operational state of a CUPS/IPP printer.
@@ -19,13 +21,13 @@ const (
 	IPPPrinterStateUnknown    IPPPrinterState = "unknown"
 )
 
-// AcceptingJobsStatus represents the job admission state of a CUPS/IPP queue.
-type AcceptingJobsStatus string
+// AcceptingJobsStatus aliases the canonical job admission state in pkg/contracts.
+type AcceptingJobsStatus = contracts.AcceptingJobsStatus
 
 const (
-	AcceptingJobsUnknown      AcceptingJobsStatus = "UNKNOWN"
-	AcceptingJobsAccepting    AcceptingJobsStatus = "ACCEPTING"
-	AcceptingJobsNotAccepting AcceptingJobsStatus = "NOT_ACCEPTING"
+	AcceptingJobsUnknown      = contracts.AcceptingJobsUnknown
+	AcceptingJobsAccepting    = contracts.AcceptingJobsAccepting
+	AcceptingJobsNotAccepting = contracts.AcceptingJobsNotAccepting
 )
 
 // ReasonSeverity represents the severity level of an IPP printer-state-reason.

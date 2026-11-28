@@ -454,6 +454,7 @@ func main() {
 				Online:                 true,
 				State:                  "IDLE",
 				EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+				NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 				PaperTrayStatus:        "OK",
 				EstimatedSheets:        estimatedSheets,
 				ConfiguredTrayCapacity: *trayCapacity,
