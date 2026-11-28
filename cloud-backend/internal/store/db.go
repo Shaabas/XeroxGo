@@ -4041,10 +4041,11 @@ WHERE job_id = ? AND status = 'PENDING'
 
 // AuthorizeAndMarkDispatchSent serializes dispatch authorization and transmission against
 // order failure finalization using the per-order advisory lock (22616). It fails closed on
-// order/intent lookup errors, rejects non-dispatchable orders and CANCELED/ACKNOWLEDGED intents,
-// invokes sendFn while holding the per-order lock, and marks the intent SENT when markSent is true
-// only if sendFn succeeds (rolling back on failure so unsent intents remain PENDING).
-func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID string, markSent bool, sendFn func() error) error {
+// order/intent lookup errors, validates order/job/kiosk ownership, rejects non-dispatchable
+// orders and CANCELED/ACKNOWLEDGED intents, invokes sendFn while holding the per-order lock,
+// and marks the intent SENT when markSent is true only if sendFn succeeds (rolling back on
+// failure so unsent intents remain PENDING, and preserving fast ACKNOWLEDGED transitions).
+func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID, kioskID string, markSent bool, sendFn func() error) error {
 	if s == nil || s.db == nil {
 		return errors.New("store not initialized")
 	}
@@ -4055,6 +4056,10 @@ func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID
 	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {
 		orderID = jobID
+	}
+	kioskID = strings.TrimSpace(kioskID)
+	if kioskID == "" {
+		return errors.New("kioskID cannot be empty")
 	}
 	if sendFn == nil {
 		return errors.New("sendFn cannot be nil")
@@ -4072,9 +4077,12 @@ func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID
 		}
 	}
 
-	var ordStatus string
-	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM orders WHERE order_id = ?;`), orderID).Scan(&ordStatus); err != nil {
+	var ordStatus, ordKioskID string
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT status, kiosk_id FROM orders WHERE order_id = ?;`), orderID).Scan(&ordStatus, &ordKioskID); err != nil {
 		return fmt.Errorf("lookup order %s for dispatch: %w", orderID, err)
+	}
+	if ordKioskID != kioskID {
+		return fmt.Errorf("order %s belongs to kiosk %q, not %q", orderID, ordKioskID, kioskID)
 	}
 	switch contracts.JobStatus(ordStatus) {
 	case contracts.JobStatusPausedError, contracts.JobStatusFailedRefundable, contracts.JobStatusCompleted:
@@ -4084,9 +4092,12 @@ func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID
 		return fmt.Errorf("order %s is in non-dispatchable status %s", orderID, ordStatus)
 	}
 
-	var intentStatus string
-	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM dispatch_intents WHERE job_id = ?;`), jobID).Scan(&intentStatus); err != nil {
+	var intentOrderID, intentKioskID, intentStatus string
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT order_id, kiosk_id, status FROM dispatch_intents WHERE job_id = ?;`), jobID).Scan(&intentOrderID, &intentKioskID, &intentStatus); err != nil {
 		return fmt.Errorf("lookup dispatch intent %s: %w", jobID, err)
+	}
+	if intentOrderID != orderID || intentKioskID != kioskID {
+		return fmt.Errorf("dispatch intent %s ownership mismatch (order=%q/%q, kiosk=%q/%q)", jobID, intentOrderID, orderID, intentKioskID, kioskID)
 	}
 	if intentStatus == "CANCELED" || intentStatus == "ACKNOWLEDGED" {
 		return fmt.Errorf("dispatch intent for job %s is %s", jobID, intentStatus)
@@ -4101,13 +4112,13 @@ func (s *Store) AuthorizeAndMarkDispatchSent(ctx context.Context, orderID, jobID
 		res, err := tx.ExecContext(ctx, s.rebind(`
 UPDATE dispatch_intents
 SET status = 'SENT', dispatched_at_ns = ?, updated_at_ns = ?
-WHERE job_id = ? AND status IN ('PENDING', 'SENT')
+WHERE job_id = ? AND order_id = ? AND kiosk_id = ? AND status IN ('PENDING', 'SENT')
   AND NOT EXISTS (
       SELECT 1 FROM orders o
       WHERE o.order_id = dispatch_intents.order_id
         AND o.status IN ('PAUSED_ERROR', 'FAILED_REFUNDABLE', 'COMPLETED', 'CANCELED')
   );
-`), nowNS, nowNS, jobID)
+`), nowNS, nowNS, jobID, orderID, kioskID)
 		if err != nil {
 			return fmt.Errorf("mark dispatch intent SENT: %w", err)
 		}
@@ -4116,7 +4127,12 @@ WHERE job_id = ? AND status IN ('PENDING', 'SENT')
 			return err
 		}
 		if affected == 0 {
-			return fmt.Errorf("dispatch intent %s could not be marked SENT", jobID)
+			var postStatus string
+			if qErr := tx.QueryRowContext(ctx, s.rebind(`SELECT status FROM dispatch_intents WHERE job_id = ?;`), jobID).Scan(&postStatus); qErr == nil && postStatus == "ACKNOWLEDGED" {
+				// Fast job_ack arrived and committed ACKNOWLEDGED right after wire write; preserve ACKNOWLEDGED.
+			} else {
+				return fmt.Errorf("dispatch intent %s could not be marked SENT", jobID)
+			}
 		}
 	}
 

@@ -1676,6 +1676,11 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 		if sib.Command.JobID == cmd.JobID {
 			continue
 		}
+		if sib.Status == contracts.JobStatusPausedError || sib.Status == contracts.JobStatusFailedRefundable || strings.TrimSpace(sib.ErrorReason) != "" {
+			log.Printf("[SPOOLER] Rejecting job %s: order %s has stopped/failed sibling %s (status=%s, reason=%q)",
+				cmd.JobID, orderID, sib.Command.JobID, sib.Status, sib.ErrorReason)
+			return
+		}
 		if sib.Command.TotalDocuments != cmd.TotalDocuments {
 			log.Printf("[SPOOLER] Rejecting job %s: conflicting total_documents %d (expected %d from sibling %s)",
 				cmd.JobID, cmd.TotalDocuments, sib.Command.TotalDocuments, sib.Command.JobID)
@@ -3232,7 +3237,18 @@ func (c *Client) finalizeAndEmitOrderFailure(
 	updatedJobs, err := c.cfg.StateStore.FinalizeOrderFailure(persistCtx, orderID, jobID, evt, invalidateInventory)
 	if err != nil {
 		// Fail closed: associate this unresolved failure with the exact job and retain the persistence barrier.
+		// Also persist a durable PAUSED_ERROR marker via UpdateProgress so a restarted daemon with a fresh
+		// in-memory Client can never treat an unresolved unsubmitted job/order as eligible for printing.
 		log.Printf("[SPOOLER] FinalizeOrderFailure failed for %s: %v; retaining fail-closed persistence barrier", jobID, err)
+		_ = c.cfg.StateStore.UpdateProgress(persistCtx, contracts.JobProgressEvent{
+			JobID:         jobID,
+			KioskID:       firstNonEmptyString(evt.KioskID, c.cfg.KioskID),
+			Status:        contracts.JobStatusPausedError,
+			PagesPrinted:  evt.PagesPrinted,
+			SheetsPrinted: evt.SheetsPrinted,
+			ErrorReason:   firstNonEmptyString(evt.ErrorReason, "failed to persist durable failure state"),
+			Timestamp:     evt.Timestamp,
+		})
 		c.recordPendingFinalization(pendingFinalizeOp{
 			orderID:             orderID,
 			jobID:               jobID,

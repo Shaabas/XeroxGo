@@ -1167,3 +1167,112 @@ func TestPackage6B_VerifyPostTerminationQuiescence_NoRecursiveDeadlock(t *testin
 		t.Fatal("deadlock detected between CheckPrinterHealth and reconcileSubmittedOrInterruptedJob")
 	}
 }
+
+
+func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "restart_unsub.db")
+
+	st1, err := openCalibratedTestStore(t, dbPath)
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore #1: %v", err)
+	}
+
+	orderID := "ord-restart-unsub"
+	cmd0 := contracts.PrintJobCommand{
+		JobID: "job-ru-0", OrderID: orderID, DocumentIndex: 0, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://localhost/0.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID: "job-ru-1", OrderID: orderID, DocumentIndex: 1, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://localhost/1.pdf",
+		SHA256Checksum: strings.Repeat("b", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st1.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
+	_ = st1.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
+
+	wrapped1 := &selectiveFailFinalizeStore{
+		StateStore: st1,
+		failJob:    map[string]error{cmd0.JobID: errors.New("forced FinalizeOrderFailure error before restart")},
+	}
+	client1, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: wrapped1, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient #1: %v", err)
+	}
+
+	// Definitely unsubmitted failure where FinalizeOrderFailure fails.
+	client1.handleJobError(ctx, cmd0, 0, 0, "download failed: 404")
+	_ = st1.Close()
+
+	// Reopen SQLite DB with a fresh Client (in-memory pendingFinalizations is empty).
+	st2, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open #2: %v", err)
+	}
+	defer st2.Close()
+
+	var printed atomic.Bool
+	client2, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st2, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
+			printed.Store(true)
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient #2: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer runCancel()
+	go func() {
+		_ = client2.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		j0, _ := st2.GetJob(ctx, cmd0.JobID)
+		j1, _ := st2.GetJob(ctx, cmd1.JobID)
+		if j0 != nil && j1 != nil &&
+			(j0.Status == contracts.JobStatusPausedError || j0.Status == contracts.JobStatusFailedRefundable) &&
+			(j1.Status == contracts.JobStatusPausedError || j1.Status == contracts.JobStatusFailedRefundable) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	runCancel()
+	if printed.Load() {
+		t.Fatalf("unresolved failed order must NEVER be printed again after restart")
+	}
+
+	j0, _ := st2.GetJob(ctx, cmd0.JobID)
+	j1, _ := st2.GetJob(ctx, cmd1.JobID)
+	if j0 == nil || (j0.Status != contracts.JobStatusPausedError && j0.Status != contracts.JobStatusFailedRefundable) {
+		t.Fatalf("expected job-ru-0 stopped after restart, got %+v", j0)
+	}
+	if j1 == nil || (j1.Status != contracts.JobStatusPausedError && j1.Status != contracts.JobStatusFailedRefundable) {
+		t.Fatalf("expected sibling job-ru-1 stopped after restart, got %+v", j1)
+	}
+
+	// Subsequent incoming sibling/re-dispatch for the failed order must also be rejected.
+	cmd2 := contracts.PrintJobCommand{
+		JobID: "job-ru-2", OrderID: orderID, DocumentIndex: 2, TotalDocuments: 3,
+		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://localhost/2.pdf",
+		SHA256Checksum: strings.Repeat("c", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	client2.handleIncomingJob(cmd2)
+	if j2, _ := st2.GetJob(ctx, cmd2.JobID); j2 != nil {
+		t.Fatalf("expected incoming job for failed order to be rejected after restart, got %+v", j2)
+	}
+}

@@ -696,7 +696,7 @@ func (h *Hub) SendJob(ctx context.Context, cmd contracts.PrintJobCommand) error 
 }
 
 func (h *Hub) sendJobToSession(ctx context.Context, sess *kioskSession, cmd contracts.PrintJobCommand) error {
-	return h.sendJobToSessionWithAuth(ctx, sess, cmd, false)
+	return h.sendJobToSessionWithAuth(ctx, sess, cmd, true)
 }
 
 func (h *Hub) sendJobToSessionWithAuth(ctx context.Context, sess *kioskSession, cmd contracts.PrintJobCommand, markSent bool) error {
@@ -758,7 +758,7 @@ func (h *Hub) sendJobToSessionWithAuth(ctx context.Context, sess *kioskSession, 
 		if orderID == "" {
 			orderID = cmd.JobID
 		}
-		return h.db.AuthorizeAndMarkDispatchSent(ctx, orderID, cmd.JobID, markSent, writeToSession)
+		return h.db.AuthorizeAndMarkDispatchSent(ctx, orderID, cmd.JobID, cmd.KioskID, markSent, writeToSession)
 	}
 
 	return writeToSession()

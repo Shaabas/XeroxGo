@@ -281,18 +281,6 @@ func (s *appServer) dispatchAuthorizedCommands(ctx context.Context, tag string, 
 			s.hub.MarkDispatchRetryNeeded(cmd.KioskID)
 			break
 		}
-		if s.db != nil {
-			if err := s.db.MarkDispatchIntentSent(ctx, cmd.JobID); err != nil {
-				bgCtx, bgCancel := context.WithTimeout(context.Background(), 2*time.Second)
-				retryErr := s.db.MarkDispatchIntentSent(bgCtx, cmd.JobID)
-				bgCancel()
-				if retryErr != nil {
-					log.Printf("%s Warning: failed to mark job %s SENT: %v", tag, cmd.JobID, retryErr)
-					s.hub.MarkDispatchRetryNeeded(cmd.KioskID)
-					break
-				}
-			}
-		}
 	}
 }
 
