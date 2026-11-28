@@ -90,6 +90,11 @@ func TestSpooler_CompletionSoundTriggeredExactlyOnce(t *testing.T) {
 		StartFromPage:  1,
 	}
 
+	// Persist as DISPATCHED before processJob
+	if err := st.SaveJob(ctx, cmd, contracts.JobStatusDispatched); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
 	// Run processJob
 	client.processJob(ctx, cmd)
 

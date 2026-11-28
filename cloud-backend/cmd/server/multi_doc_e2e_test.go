@@ -943,12 +943,12 @@ func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 		}
 	}()
 
-	// Wait for order to become COMPLETED in cloud
+	// Wait for order to become FAILED_REFUNDABLE in cloud (Package 6B: interrupted SPOOLING order never reprints)
 	orderDeadline := time.Now().Add(15 * time.Second)
 	var finalDone bool
 	for time.Now().Before(orderDeadline) {
 		ord, getErr := st.GetOrder(ctx, orderID)
-		if getErr == nil && ord.Status == "COMPLETED" {
+		if getErr == nil && ord.Status == "FAILED_REFUNDABLE" {
 			finalDone = true
 			break
 		}
@@ -956,17 +956,21 @@ func TestMultiDoc_E2E_CrashRecovery_InterruptedBeforeSubmission(t *testing.T) {
 	}
 
 	if !finalDone {
-		t.Fatalf("order did not reach COMPLETED after recovery.\nLogs2:\n%s", logs2.String())
+		t.Fatalf("order did not reach FAILED_REFUNDABLE after recovery.\nLogs2:\n%s", logs2.String())
 	}
 
 	_ = cmd2.Process.Signal(syscall.SIGTERM)
 	_ = cmd2.Wait()
 
-	// Verify both dispatch intents are COMPLETED
+	// Verify zero physical submissions occurred in daemon 2 and both dispatch intents are CANCELED
+	logsPostRestart := logs2.String()
+	if strings.Contains(logsPostRestart, "Streaming job") || strings.Contains(logsPostRestart, "Sending job") {
+		t.Fatalf("interrupted SPOOLING order must never reprint after restart:\n%s", logsPostRestart)
+	}
 	st0, _, _ := st.GetJobDispatchIntentStatus(ctx, job0ID)
 	st1, _, _ := st.GetJobDispatchIntentStatus(ctx, job1ID)
-	if st0 != "COMPLETED" || st1 != "COMPLETED" {
-		t.Fatalf("expected both jobs COMPLETED, got doc0=%s, doc1=%s", st0, st1)
+	if st0 != "CANCELED" || st1 != "CANCELED" {
+		t.Fatalf("expected both dispatch intents CANCELED, got doc0=%s, doc1=%s", st0, st1)
 	}
 }
 

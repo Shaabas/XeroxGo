@@ -1275,7 +1275,7 @@ func TestClientStartupRecovery(t *testing.T) {
 		}
 
 		// Save incomplete job in store before starting client
-		if err := store.SaveJob(context.Background(), job0, contracts.JobStatusPausedError); err != nil {
+		if err := store.SaveJob(context.Background(), job0, contracts.JobStatusDispatched); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -2387,8 +2387,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 					saved, err := store.GetJob(context.Background(), cmd.JobID)
 					if err != nil || saved == nil {
 						t.Errorf("expected job %s to be persisted in store upon job_ack, got saved=%v, err=%v", cmd.JobID, saved, err)
-					} else if saved.Status != contracts.JobStatusSpooling {
-						t.Errorf("expected persisted status SPOOLING, got %s", saved.Status)
+					} else if saved.Status != contracts.JobStatusDispatched {
+						t.Errorf("expected persisted status DISPATCHED, got %s", saved.Status)
 					}
 					receivedAck <- msg
 				}
@@ -2438,8 +2438,8 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			if ack.Progress == nil || ack.Progress.JobID != cmd.JobID {
 				t.Fatalf("unexpected job_ack payload: %+v", ack)
 			}
-			if ack.Progress.Status != contracts.JobStatusSpooling {
-				t.Fatalf("expected job_ack status SPOOLING, got %s", ack.Progress.Status)
+			if ack.Progress.Status != contracts.JobStatusDispatched {
+				t.Fatalf("expected job_ack status DISPATCHED, got %s", ack.Progress.Status)
 			}
 		default:
 			t.Fatal("expected job_ack message")
@@ -3098,14 +3098,14 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			t.Fatal("timeout waiting for job_ack under queue saturation")
 		}
 
-		// Assert: durable record preserved in store in SPOOLING status
+		// Assert: durable record preserved in store in DISPATCHED status
 		ctx := context.Background()
 		saved, err := store.GetJob(ctx, cmd.JobID)
 		if err != nil || saved == nil {
 			t.Fatalf("expected saved record in store, got: %v, err: %v", saved, err)
 		}
-		if saved.Status != contracts.JobStatusSpooling {
-			t.Errorf("expected saved status SPOOLING, got %s", saved.Status)
+		if saved.Status != contracts.JobStatusDispatched {
+			t.Errorf("expected saved status DISPATCHED, got %s", saved.Status)
 		}
 
 		// Assert: admitted and buffered by ordered producer under queue saturation
@@ -3126,13 +3126,13 @@ func TestDurableJobAcceptanceAndAck(t *testing.T) {
 			t.Errorf("expected job to be pending or handled by ordered producer")
 		}
 
-		// Assert: GetIncompleteJob finds this job for startup recovery
-		incomplete, err := store.GetIncompleteJob(ctx)
-		if err != nil || incomplete == nil {
-			t.Fatalf("expected GetIncompleteJob to find the job for recovery, got: %v, err: %v", incomplete, err)
+		// Assert: GetIncompleteJobs finds this DISPATCHED job for startup recovery
+		incompleteList, err := store.GetIncompleteJobs(ctx)
+		if err != nil || len(incompleteList) == 0 {
+			t.Fatalf("expected GetIncompleteJobs to find the job for recovery, got: %v, err: %v", incompleteList, err)
 		}
-		if incomplete.Command.JobID != cmd.JobID {
-			t.Errorf("expected incomplete job ID %s, got %s", cmd.JobID, incomplete.Command.JobID)
+		if incompleteList[0].Command.JobID != cmd.JobID {
+			t.Errorf("expected incomplete job ID %s, got %s", cmd.JobID, incompleteList[0].Command.JobID)
 		}
 	})
 
@@ -3481,7 +3481,7 @@ func TestCUPSSubmissionPersistence(t *testing.T) {
 			StartFromPage:  1,
 		}
 
-		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -3563,7 +3563,7 @@ func TestCUPSSubmissionPersistence(t *testing.T) {
 			StartFromPage:  1,
 		}
 
-		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -3694,7 +3694,7 @@ job-media-sheets-completed (integer) = 1
 			StartFromPage:  1,
 		}
 
-		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -3794,7 +3794,7 @@ job-media-sheets-completed (integer) = 1
 			StartFromPage:  1,
 		}
 
-		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -3873,7 +3873,7 @@ job-media-sheets-completed (integer) = 1
 			StartFromPage:  1,
 		}
 
-		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+		if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 			t.Fatalf("SaveJob failed: %v", err)
 		}
 
@@ -4125,7 +4125,7 @@ job-media-sheets-completed (integer) = 1
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched)
 
 		rawDB, err := sql.Open("sqlite", dbPath)
 		if err != nil {
@@ -4263,7 +4263,7 @@ func TestCUPSHoldOutcomeHandling(t *testing.T) {
 				StartFromPage:  1,
 			}
 
-			if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+			if err := store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 				t.Fatalf("SaveJob failed: %v", err)
 			}
 
@@ -5261,7 +5261,7 @@ func TestClient_IncompleteJobSync_ReconnectWhileSendMuLocked(t *testing.T) {
 	// Wait for connection 1 to connect to the server
 	select {
 	case <-conn1Established:
-	case <-time.After(1 * time.Second):
+	case <-time.After(3 * time.Second):
 		client.sendMu.Unlock()
 		t.Fatal("connection 1 was not established")
 	}

@@ -52,6 +52,7 @@ type wireMessage struct {
 // In production, *state.Store implements this interface against local SQLite.
 type StateStore interface {
 	SaveJob(ctx context.Context, cmd contracts.PrintJobCommand, status contracts.JobStatus) error
+	BeginJobSpooling(ctx context.Context, jobID string) error
 	UpdateProgress(ctx context.Context, event contracts.JobProgressEvent) error
 	RecordSheetProgress(ctx context.Context, event contracts.JobProgressEvent) error
 	FinalizeOrderFailure(ctx context.Context, orderID string, jobID string, event contracts.JobProgressEvent, invalidateInventory bool) ([]state.StoredJob, error)
@@ -206,10 +207,11 @@ type Client struct {
 	latestSnap      telemetrySnapshot
 	reconcileMu     sync.Mutex
 	reconciling     atomic.Bool
-	persistenceMu        sync.Mutex
-	pendingFinalizations map[string]pendingFinalizeOp
-	persistenceReadErr   string
-	outcomeSyncCh        chan struct{}
+	persistenceMu         sync.Mutex
+	pendingFinalizations  map[string]pendingFinalizeOp
+	persistenceReadErr    string
+	startupRecoveryFailed bool
+	outcomeSyncCh         chan struct{}
 }
 
 type pendingFinalizeOp struct {
@@ -686,7 +688,13 @@ func (c *Client) Run(ctx context.Context) error {
 
 	// 2. Startup recovery check
 	incompleteJobs, err := c.cfg.StateStore.GetIncompleteJobs(ctx)
-	if err == nil && len(incompleteJobs) > 0 {
+	if err != nil {
+		log.Printf("[SPOOLER] Startup recovery failed to read incomplete jobs: %v; failing closed", err)
+		c.persistenceMu.Lock()
+		c.startupRecoveryFailed = true
+		c.persistenceMu.Unlock()
+		c.setPersistenceReadBarrier(fmt.Errorf("startup recovery read failed: %w", err))
+	} else if len(incompleteJobs) > 0 {
 		// Group incomplete jobs by order_id
 		orderIncompleteMap := make(map[string][]state.StoredJob)
 		var orderIDs []string
@@ -776,45 +784,65 @@ func (c *Client) Run(ctx context.Context) error {
 				continue
 			}
 
-			// Check if any job in this order had an actual error or was partially submitted/printed
+			// Evaluate the entire order before enqueueing any documents.
 			orderHasPausedOrError := false
+			hasUncertainSubmitted := false
 			for _, job := range allOrderJobs {
-				jobDefinitelyNotSubmitted := !job.SubmittedToPrinter &&
-					job.CUPSJobID == "" &&
-					job.SheetsPrinted == 0 &&
-					job.PagesPrinted == 0 &&
-					job.ErrorReason == ""
-				if job.Status == contracts.JobStatusFailedRefundable || (!jobDefinitelyNotSubmitted && job.Status == contracts.JobStatusPausedError) {
+				if job.Status == contracts.JobStatusCompleted {
+					continue
+				}
+				if job.SubmittedToPrinter || job.CUPSJobID != "" || job.SheetsPrinted > 0 || job.PagesPrinted > 0 {
+					hasUncertainSubmitted = true
+				}
+				if job.Status == contracts.JobStatusFailedRefundable ||
+					job.Status == contracts.JobStatusPausedError ||
+					job.Status == contracts.JobStatusSpooling ||
+					job.Status == contracts.JobStatusPrinting ||
+					job.SubmittedToPrinter ||
+					job.CUPSJobID != "" ||
+					job.SheetsPrinted > 0 ||
+					job.PagesPrinted > 0 ||
+					strings.TrimSpace(job.ErrorReason) != "" {
 					orderHasPausedOrError = true
-					break
 				}
 			}
 
 			var jobsToResume []contracts.PrintJobCommand
 
 			for _, incomplete := range incList {
-				isDefinitelyNotSubmitted := !incomplete.SubmittedToPrinter &&
+				isUntouchedDispatched := incomplete.Status == contracts.JobStatusDispatched &&
+					!incomplete.SubmittedToPrinter &&
 					incomplete.CUPSJobID == "" &&
 					incomplete.SheetsPrinted == 0 &&
 					incomplete.PagesPrinted == 0 &&
-					incomplete.ErrorReason == ""
+					strings.TrimSpace(incomplete.ErrorReason) == ""
+				isUnsubmittedStarted := (incomplete.Status == contracts.JobStatusSpooling || incomplete.Status == contracts.JobStatusDispatched) &&
+					!incomplete.SubmittedToPrinter &&
+					incomplete.CUPSJobID == "" &&
+					incomplete.SheetsPrinted == 0 &&
+					incomplete.PagesPrinted == 0
 
-				if isDefinitelyNotSubmitted {
-					if !orderHasPausedOrError {
-						jobsToResume = append(jobsToResume, incomplete.Command)
-					} else {
-						reason := fmt.Sprintf("startup recovery: order %s has paused/failed sibling; keeping document %d unprinted", oid, incomplete.Command.DocumentIndex+1)
-						log.Printf("[SPOOLER] %s", reason)
-						c.finalizeAndEmitOrderFailure(ctx, oid, incomplete.Command.JobID, contracts.JobProgressEvent{
-							JobID:         incomplete.Command.JobID,
-							KioskID:       incomplete.Command.KioskID,
-							Status:        contracts.JobStatusPausedError,
-							PagesPrinted:  0,
-							SheetsPrinted: 0,
-							ErrorReason:   reason,
-							Timestamp:     time.Now().UTC(),
-						}, false)
+				if isUntouchedDispatched && !orderHasPausedOrError {
+					jobsToResume = append(jobsToResume, incomplete.Command)
+				} else if isUnsubmittedStarted {
+					targetStatus := contracts.JobStatusPausedError
+					reason := fmt.Sprintf("startup recovery: order %s has paused/failed sibling; keeping document %d unprinted", oid, incomplete.Command.DocumentIndex+1)
+					if !hasUncertainSubmitted {
+						targetStatus = contracts.JobStatusFailedRefundable
+						if incomplete.Status == contracts.JobStatusSpooling {
+							reason = firstNonEmptyString(incomplete.ErrorReason, "startup recovery: interrupted during document preparation before printer submission")
+						}
 					}
+					log.Printf("[SPOOLER] %s", reason)
+					c.finalizeAndEmitOrderFailure(ctx, oid, incomplete.Command.JobID, contracts.JobProgressEvent{
+						JobID:         incomplete.Command.JobID,
+						KioskID:       incomplete.Command.KioskID,
+						Status:        targetStatus,
+						PagesPrinted:  0,
+						SheetsPrinted: 0,
+						ErrorReason:   reason,
+						Timestamp:     time.Now().UTC(),
+					}, false)
 				} else {
 					// Potentially submitted or already partially printed.
 					// Never automatically resubmit.
@@ -1186,9 +1214,6 @@ func (c *Client) sendProgress(ctx context.Context, event contracts.JobProgressEv
 }
 
 func (c *Client) sendProgressWithVersion(ctx context.Context, event contracts.JobProgressEvent, outcomeVersion int64) {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-
 	c.connMu.Lock()
 	conn := c.conn
 	c.connMu.Unlock()
@@ -1196,6 +1221,9 @@ func (c *Client) sendProgressWithVersion(ctx context.Context, event contracts.Jo
 	if conn == nil {
 		return
 	}
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 
 	_ = wsjson.Write(ctx, conn, wireMessage{
 		Type:           "progress",
@@ -1383,7 +1411,7 @@ func (c *Client) handleDuplicateDelivery(existing *state.StoredJob, cmd contract
 	}
 
 	// Stored, paused or ambiguous: Never automatically resubmit; preserve recovery requirements via job_ack and progress
-	if existing.Status == contracts.JobStatusPausedError || existing.Status == contracts.JobStatusFailedRefundable {
+	if existing.Status == contracts.JobStatusPausedError || existing.Status == contracts.JobStatusFailedRefundable || strings.TrimSpace(existing.ErrorReason) != "" {
 		log.Printf("[SPOOLER] Acknowledging duplicate command for paused/failed job %s (status %s)", cmd.JobID, existing.Status)
 		evt := contracts.JobProgressEvent{
 			JobID:         cmd.JobID,
@@ -1418,7 +1446,7 @@ func (c *Client) handleDuplicateDelivery(existing *state.StoredJob, cmd contract
 		log.Printf("[SPOOLER] Acknowledging duplicate command for in-memory active/deferred job %s", cmd.JobID)
 		status := existing.Status
 		if status == "" {
-			status = contracts.JobStatusSpooling
+			status = contracts.JobStatusDispatched
 		}
 		c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 			JobID:         cmd.JobID,
@@ -1539,13 +1567,13 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 		}
 	}
 
-	// 3. Evaluate uncompleted documents for prior submission or physical uncertainty:
-	// Never requeue already-submitted, CUPS-queued, or physically started jobs for fresh printing.
+	// 3. Evaluate uncompleted documents for prior submission, started processing, or physical uncertainty:
+	// Never requeue started, already-submitted, CUPS-queued, or physically started jobs for fresh printing.
 	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
 		sib := docMap[idx]
-		if sib.SubmittedToPrinter || sib.CUPSJobID != "" || sib.SheetsPrinted > 0 {
-			log.Printf("[SPOOLER] Order %s doc %d (%s) already submitted or physically started (submitted=%v, cupsID=%s, sheets=%d); not admitting for fresh printing",
-				orderID, idx, sib.Command.JobID, sib.SubmittedToPrinter, sib.CUPSJobID, sib.SheetsPrinted)
+		if sib.Status != contracts.JobStatusDispatched || sib.SubmittedToPrinter || sib.CUPSJobID != "" || sib.SheetsPrinted > 0 || strings.TrimSpace(sib.ErrorReason) != "" {
+			log.Printf("[SPOOLER] Order %s doc %d (%s) not eligible for fresh admission (status=%s, submitted=%v, cupsID=%s, sheets=%d)",
+				orderID, idx, sib.Command.JobID, sib.Status, sib.SubmittedToPrinter, sib.CUPSJobID, sib.SheetsPrinted)
 			return
 		}
 	}
@@ -1749,8 +1777,8 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	}
 	c.activeMu.Unlock()
 
-	// 3. Durably persist job in SQLite
-	if err := c.cfg.StateStore.SaveJob(context.Background(), cmd, contracts.JobStatusSpooling); err != nil {
+	// 3. Durably persist job in SQLite as DISPATCHED (queued, processing not started)
+	if err := c.cfg.StateStore.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched); err != nil {
 		log.Printf("[SPOOLER] Failed to persist initial job %s: %v", cmd.JobID, err)
 		return
 	}
@@ -1759,7 +1787,7 @@ func (c *Client) handleIncomingJob(cmd contracts.PrintJobCommand) {
 	c.sendJobAck(context.Background(), contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
 		KioskID:       cmd.KioskID,
-		Status:        contracts.JobStatusSpooling,
+		Status:        contracts.JobStatusDispatched,
 		PagesPrinted:  0,
 		SheetsPrinted: 0,
 		Timestamp:     time.Now().UTC(),
@@ -2327,6 +2355,21 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		orderID = cmd.JobID
 	}
 
+	// Durable processing boundary: atomically transition DISPATCHED -> SPOOLING before
+	// capability validation, downloading, preparation, or any processing-related failure handling.
+	if c.cfg.StateStore == nil {
+		log.Printf("[SPOOLER] Rejecting job %s: StateStore not configured", cmd.JobID)
+		c.setPersistenceReadBarrier(errors.New("state store not configured"))
+		c.syncCustomerServiceState(ctx)
+		return
+	}
+	if err := c.cfg.StateStore.BeginJobSpooling(ctx, cmd.JobID); err != nil {
+		log.Printf("[SPOOLER] Failed to transition job %s DISPATCHED -> SPOOLING: %v; failing closed", cmd.JobID, err)
+		c.setPersistenceReadBarrier(fmt.Errorf("processing boundary persistence failed for %s: %w", cmd.JobID, err))
+		c.syncCustomerServiceState(ctx)
+		return
+	}
+
 	// 0. Printer Capability Validation
 	caps := c.Capabilities()
 	colorMode := strings.ToUpper(strings.TrimSpace(cmd.ColorMode))
@@ -2439,10 +2482,13 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		Detail:          docDetail,
 	})
 
-	// 2. Persist initial job record if not already stored
-	savedJob, _ := c.cfg.StateStore.GetJob(ctx, cmd.JobID)
-	if savedJob == nil {
-		_ = c.cfg.StateStore.SaveJob(ctx, cmd, contracts.JobStatusPausedError)
+	// 2. Read durable job record (guaranteed present by BeginJobSpooling)
+	savedJob, err := c.cfg.StateStore.GetJob(ctx, cmd.JobID)
+	if err != nil || savedJob == nil {
+		log.Printf("[SPOOLER] Failed to read durable job %s after BeginJobSpooling (%v); failing closed", cmd.JobID, err)
+		c.setPersistenceReadBarrier(fmt.Errorf("durable job read failed for %s: %w", cmd.JobID, err))
+		c.syncCustomerServiceState(ctx)
+		return
 	}
 
 	// 3. Download & verify PDF
@@ -2472,13 +2518,9 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		Detail:          docDetail,
 	})
 
-	// 4. Update progress: SPOOLING
-	pagesPrinted := 0
-	sheetsPrinted := 0
-	if savedJob != nil {
-		pagesPrinted = savedJob.PagesPrinted
-		sheetsPrinted = savedJob.SheetsPrinted
-	}
+	// 4. Report SPOOLING progress using durable progress counters
+	pagesPrinted := savedJob.PagesPrinted
+	sheetsPrinted := savedJob.SheetsPrinted
 
 	spoolEvt := contracts.JobProgressEvent{
 		JobID:         cmd.JobID,
@@ -2488,7 +2530,6 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		SheetsPrinted: sheetsPrinted,
 		Timestamp:     time.Now().UTC(),
 	}
-	_ = c.cfg.StateStore.UpdateProgress(ctx, spoolEvt)
 	c.sendProgress(ctx, spoolEvt)
 
 	// 5. Calculate start page and check paper supply
@@ -3237,18 +3278,7 @@ func (c *Client) finalizeAndEmitOrderFailure(
 	updatedJobs, err := c.cfg.StateStore.FinalizeOrderFailure(persistCtx, orderID, jobID, evt, invalidateInventory)
 	if err != nil {
 		// Fail closed: associate this unresolved failure with the exact job and retain the persistence barrier.
-		// Also persist a durable PAUSED_ERROR marker via UpdateProgress so a restarted daemon with a fresh
-		// in-memory Client can never treat an unresolved unsubmitted job/order as eligible for printing.
 		log.Printf("[SPOOLER] FinalizeOrderFailure failed for %s: %v; retaining fail-closed persistence barrier", jobID, err)
-		_ = c.cfg.StateStore.UpdateProgress(persistCtx, contracts.JobProgressEvent{
-			JobID:         jobID,
-			KioskID:       firstNonEmptyString(evt.KioskID, c.cfg.KioskID),
-			Status:        contracts.JobStatusPausedError,
-			PagesPrinted:  evt.PagesPrinted,
-			SheetsPrinted: evt.SheetsPrinted,
-			ErrorReason:   firstNonEmptyString(evt.ErrorReason, "failed to persist durable failure state"),
-			Timestamp:     evt.Timestamp,
-		})
 		c.recordPendingFinalization(pendingFinalizeOp{
 			orderID:             orderID,
 			jobID:               jobID,
@@ -3343,12 +3373,15 @@ func (c *Client) retryPendingFinalizations(ctx context.Context) {
 func (c *Client) isPersistenceBlocked() bool {
 	c.persistenceMu.Lock()
 	defer c.persistenceMu.Unlock()
-	return len(c.pendingFinalizations) > 0 || c.persistenceReadErr != ""
+	return len(c.pendingFinalizations) > 0 || c.persistenceReadErr != "" || c.startupRecoveryFailed
 }
 
 func (c *Client) persistenceBlockReason() string {
 	c.persistenceMu.Lock()
 	defer c.persistenceMu.Unlock()
+	if c.startupRecoveryFailed {
+		return "startup durable state recovery failed"
+	}
 	if c.persistenceReadErr != "" {
 		return c.persistenceReadErr
 	}

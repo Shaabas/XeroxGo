@@ -2,6 +2,8 @@ package spooler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -1182,13 +1184,13 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 	orderID := "ord-restart-unsub"
 	cmd0 := contracts.PrintJobCommand{
 		JobID: "job-ru-0", OrderID: orderID, DocumentIndex: 0, TotalDocuments: 2,
-		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://localhost/0.pdf",
+		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://127.0.0.1:1/0.pdf",
 		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
 		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
 	}
 	cmd1 := contracts.PrintJobCommand{
 		JobID: "job-ru-1", OrderID: orderID, DocumentIndex: 1, TotalDocuments: 2,
-		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://localhost/1.pdf",
+		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://127.0.0.1:1/1.pdf",
 		SHA256Checksum: strings.Repeat("b", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
 		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
 	}
@@ -1200,16 +1202,18 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 		failJob:    map[string]error{cmd0.JobID: errors.New("forced FinalizeOrderFailure error before restart")},
 	}
 	client1, err := NewClient(ClientConfig{
-		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: wrapped1, CUPSQueue: "DCPT310",
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: wrapped1, CUPSQueue: "DCPT310",
 		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		TrustedOrigins: []string{"http://127.0.0.1:1"},
+		MockHealth:     testHealthyMockHealth,
 		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient #1: %v", err)
 	}
 
-	// Definitely unsubmitted failure where FinalizeOrderFailure fails.
-	client1.handleJobError(ctx, cmd0, 0, 0, "download failed: 404")
+	// Processing starts (DISPATCHED -> SPOOLING), download fails, and FinalizeOrderFailure fails.
+	client1.processJob(ctx, cmd0)
 	_ = st1.Close()
 
 	// Reopen SQLite DB with a fresh Client (in-memory pendingFinalizations is empty).
@@ -1274,5 +1278,398 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 	client2.handleIncomingJob(cmd2)
 	if j2, _ := st2.GetJob(ctx, cmd2.JobID); j2 != nil {
 		t.Fatalf("expected incoming job for failed order to be rejected after restart, got %+v", j2)
+	}
+}
+
+
+type failSpoolBoundaryStore struct {
+	StateStore
+	failSpoolErr error
+	failIncErr   error
+}
+
+func (f *failSpoolBoundaryStore) BeginJobSpooling(ctx context.Context, jobID string) error {
+	if f.failSpoolErr != nil {
+		return f.failSpoolErr
+	}
+	return f.StateStore.BeginJobSpooling(ctx, jobID)
+}
+
+func (f *failSpoolBoundaryStore) GetIncompleteJobs(ctx context.Context) ([]state.StoredJob, error) {
+	if f.failIncErr != nil {
+		return nil, f.failIncErr
+	}
+	return f.StateStore.GetIncompleteJobs(ctx)
+}
+
+func TestPackage6B_Restart_UntouchedDispatchedJobs_ResumeNormally(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "resume_dispatched.db")
+	st, err := openCalibratedTestStore(t, dbPath)
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+
+	pdfBytes := []byte("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+	sum := sha256.Sum256(pdfBytes)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(pdfBytes)
+	}))
+	defer srv.Close()
+
+	orderID := "ord-resume-disp"
+	cmd0 := contracts.PrintJobCommand{
+		JobID: "job-rd-0", OrderID: orderID, DocumentIndex: 0, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "2424", DownloadURL: srv.URL + "/0.pdf",
+		SHA256Checksum: hex.EncodeToString(sum[:]), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID: "job-rd-1", OrderID: orderID, DocumentIndex: 1, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "2424", DownloadURL: srv.URL + "/1.pdf",
+		SHA256Checksum: hex.EncodeToString(sum[:]), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd0, contracts.JobStatusCompleted)
+	_ = st.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
+	_ = st.Close()
+
+	st2, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer st2.Close()
+
+	var printedDoc1 atomic.Bool
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: st2, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		TrustedOrigins: []string{srv.URL},
+		MockHealth:     testHealthyMockHealth,
+		MockCUPSPrint: func(_ context.Context, _ string, cmd contracts.PrintJobCommand, _ string, onPage func(int)) error {
+			if cmd.JobID == cmd1.JobID {
+				printedDoc1.Store(true)
+			}
+			if onPage != nil {
+				onPage(cmd.TotalSheets)
+			}
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		j1, _ := st2.GetJob(ctx, cmd1.JobID)
+		if j1 != nil && j1.Status == contracts.JobStatusCompleted && printedDoc1.Load() {
+			runCancel()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected untouched DISPATCHED job to resume and complete after restart (printed=%v)", printedDoc1.Load())
+}
+
+func TestPackage6B_ProcessingBoundaryFailure_PreventsDownloadAndPrint(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "boundary_fail.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	var downloaded, printed atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloaded.Store(true)
+		_, _ = w.Write([]byte("%PDF-1.4\n"))
+	}))
+	defer srv.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-bf-1", OrderID: "ord-bf-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "2525", DownloadURL: srv.URL + "/doc.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+
+	wrapped := &failSpoolBoundaryStore{StateStore: st, failSpoolErr: errors.New("sqlite busy on BeginJobSpooling")}
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: wrapped, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		TrustedOrigins: []string{srv.URL},
+		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
+			printed.Store(true)
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	client.processJob(ctx, cmd)
+	if downloaded.Load() || printed.Load() {
+		t.Fatalf("expected BeginJobSpooling failure to prevent downloading (%v) and printing (%v)", downloaded.Load(), printed.Load())
+	}
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("expected persistence barrier active after BeginJobSpooling failure")
+	}
+	if safe, _ := client.computeExecutionSafety(ctx, ""); safe {
+		t.Fatalf("expected execution safety blocked after BeginJobSpooling failure")
+	}
+}
+
+func TestPackage6B_Restart_CompletedPrefixPreserved_StartedOrderStopsWithoutReprint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "started_prefix.db")
+	st, err := openCalibratedTestStore(t, dbPath)
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+
+	orderID := "ord-started-pfx"
+	cmd0 := contracts.PrintJobCommand{
+		JobID: "job-sp-0", OrderID: orderID, DocumentIndex: 0, TotalDocuments: 3,
+		KioskID: "kiosk-1", DisplayCode: "2626", DownloadURL: "http://localhost/0.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID: "job-sp-1", OrderID: orderID, DocumentIndex: 1, TotalDocuments: 3,
+		KioskID: "kiosk-1", DisplayCode: "2626", DownloadURL: "http://localhost/1.pdf",
+		SHA256Checksum: strings.Repeat("b", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd2 := contracts.PrintJobCommand{
+		JobID: "job-sp-2", OrderID: orderID, DocumentIndex: 2, TotalDocuments: 3,
+		KioskID: "kiosk-1", DisplayCode: "2626", DownloadURL: "http://localhost/2.pdf",
+		SHA256Checksum: strings.Repeat("c", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd0, contracts.JobStatusCompleted)
+	_ = st.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+	_ = st.SaveJob(ctx, cmd2, contracts.JobStatusDispatched)
+	_ = st.Close()
+
+	st2, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer st2.Close()
+
+	var printed atomic.Bool
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: st2, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		MockHealth: testHealthyMockHealth,
+		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
+			printed.Store(true)
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+
+	deadline := time.Now().Add(1800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		j1, _ := st2.GetJob(ctx, cmd1.JobID)
+		j2, _ := st2.GetJob(ctx, cmd2.JobID)
+		if j1 != nil && j2 != nil && j1.Status == contracts.JobStatusFailedRefundable && j2.Status == contracts.JobStatusFailedRefundable {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	runCancel()
+
+	if printed.Load() {
+		t.Fatalf("started SPOOLING order must never reprint on restart")
+	}
+	j0, _ := st2.GetJob(ctx, cmd0.JobID)
+	j1, _ := st2.GetJob(ctx, cmd1.JobID)
+	j2, _ := st2.GetJob(ctx, cmd2.JobID)
+	if j0.Status != contracts.JobStatusCompleted {
+		t.Fatalf("expected completed prefix doc 0 preserved, got %s", j0.Status)
+	}
+	if j1.Status != contracts.JobStatusFailedRefundable || j2.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected unsubmitted SPOOLING + DISPATCHED docs finalized FAILED_REFUNDABLE, got %s and %s", j1.Status, j2.Status)
+	}
+	_, cal, _ := st2.GetPaperSupply(ctx)
+	if !cal {
+		t.Fatalf("expected paper calibration preserved on definitely unsubmitted interruption")
+	}
+}
+
+func TestPackage6B_Restart_PotentiallySubmittedJob_NeverAutoReprints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "pot_submitted.db")
+	st, err := openCalibratedTestStore(t, dbPath)
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-ps-1", OrderID: "ord-ps-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "2727", DownloadURL: "http://localhost/doc.pdf",
+		SHA256Checksum: strings.Repeat("d", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+	_ = st.MarkJobSubmittingWithBaseline(ctx, cmd.JobID, true, 100, "1.1", 8, time.Now().UTC())
+	_ = st.Close()
+
+	st2, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer st2.Close()
+
+	var printed atomic.Bool
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: st2, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		MockHealth: testHealthyMockHealth,
+		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
+			printed.Store(true)
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer runCancel()
+	go func() {
+		_ = client.Run(runCtx)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	runCancel()
+
+	if printed.Load() {
+		t.Fatalf("potentially submitted job must NEVER automatically reprint")
+	}
+	j, _ := st2.GetJob(ctx, cmd.JobID)
+	if j.Status != contracts.JobStatusPausedError {
+		t.Fatalf("expected potentially submitted job without CUPS ID to remain PAUSED_ERROR, got %s", j.Status)
+	}
+}
+
+func TestPackage6B_DuplicateAndLateSibling_CannotRestartFailedOrder(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "dup_late.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	orderID := "ord-duplate"
+	cmd0 := contracts.PrintJobCommand{
+		JobID: "job-dl-0", OrderID: orderID, DocumentIndex: 0, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "2828", DownloadURL: "https://example.com/0.pdf",
+		SHA256Checksum: strings.Repeat("e", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	cmd1 := contracts.PrintJobCommand{
+		JobID: "job-dl-1", OrderID: orderID, DocumentIndex: 1, TotalDocuments: 2,
+		KioskID: "kiosk-1", DisplayCode: "2828", DownloadURL: "https://example.com/1.pdf",
+		SHA256Checksum: strings.Repeat("f", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+	_, _ = st.FinalizeOrderFailure(ctx, orderID, cmd0.JobID, contracts.JobProgressEvent{
+		JobID: cmd0.JobID, KioskID: "kiosk-1", Status: contracts.JobStatusFailedRefundable,
+		ErrorReason: "download failed", Timestamp: time.Now().UTC(),
+	}, false)
+
+	var printed atomic.Bool
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		TrustedOrigins: []string{"https://example.com"},
+		MockHealth:     testHealthyMockHealth,
+		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
+			printed.Store(true)
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Valid duplicate cmd0 and valid late sibling cmd1 (passes URL/checksum/policy/index validation).
+	client.handleIncomingJob(cmd0)
+	client.handleIncomingJob(cmd1)
+
+	if printed.Load() {
+		t.Fatalf("duplicate/late sibling must never print for failed order")
+	}
+	if j1, _ := st.GetJob(ctx, cmd1.JobID); j1 != nil {
+		t.Fatalf("expected late sibling for failed order to be rejected before saving, got %+v", j1)
+	}
+}
+
+func TestPackage6B_FailedStartupStateRead_BlocksReadinessAndPrinting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "startup_read_fail.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	wrapped := &failSpoolBoundaryStore{StateStore: st, failIncErr: errors.New("sqlite disk I/O error")}
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: wrapped, CUPSQueue: "DCPT310",
+		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		MockHealth: testHealthyMockHealth,
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	defer runCancel()
+	_ = client.Run(runCtx)
+
+	if safe, _ := client.computeExecutionSafety(context.Background(), ""); safe {
+		t.Fatalf("expected execution safety blocked when startup GetIncompleteJobs failed")
+	}
+	ready, _, h := client.effectiveCustomerServiceReadiness(context.Background())
+	if ready || h.ExecutionSafe {
+		t.Fatalf("expected readiness and ExecutionSafe=false when startup recovery failed (ready=%v, safe=%v)", ready, h.ExecutionSafe)
 	}
 }

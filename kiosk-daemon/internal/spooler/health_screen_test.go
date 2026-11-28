@@ -2605,6 +2605,7 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	saved, err := store.GetJob(context.Background(), cmd.JobID)
@@ -2727,6 +2728,7 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	saved, err := store.GetJob(context.Background(), cmd.JobID)
@@ -2988,6 +2990,7 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	saved, err := store.GetJob(context.Background(), cmd.JobID)

@@ -203,6 +203,7 @@ func TestPackage6A_AmbiguousSubmissionNeverReplays(t *testing.T) {
 		TotalPages: 1, TotalSheets: 1, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", StartFromPage: 1,
 	}
 	ctx := context.Background()
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 	// Second invocation must refuse to replay after ambiguous submission!
 	client.processJob(ctx, cmd)

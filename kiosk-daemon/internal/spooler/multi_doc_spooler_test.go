@@ -359,6 +359,7 @@ func TestMultiDoc_SingleCopyReplicationViaCUPS(t *testing.T) {
 		StartFromPage:  1,
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	if receivedCmd.Copies != 3 {
@@ -648,10 +649,10 @@ func TestMultiDoc_StartupRecoveryUnsubmitted(t *testing.T) {
 	}
 
 	// Persist both as unsubmitted SPOOLING jobs
-	if err := store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling); err != nil {
+	if err := store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched); err != nil {
 		t.Fatalf("failed to save cmd0: %v", err)
 	}
-	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched); err != nil {
 		t.Fatalf("failed to save cmd1: %v", err)
 	}
 
@@ -884,7 +885,7 @@ func TestMultiDoc_DuplicateDispatchAfterRestart(t *testing.T) {
 	})
 
 	// Doc 1 was saved as Spooling before daemon stopped/restarted (unsubmitted)
-	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched); err != nil {
 		t.Fatalf("SaveJob doc 1 failed: %v", err)
 	}
 
@@ -1263,14 +1264,17 @@ func TestMultiDoc_PreSubmissionSafety_UncertainSubmission(t *testing.T) {
 		StartFromPage:  1,
 	}
 
-	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
-	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
 
 	// Simulate uncertain state: SubmittedToPrinter is set, but no CUPS job ID
 	_ = store.MarkJobSubmitting(ctx, cmd0.JobID)
 
-	// Attempt to process doc 0
+	// Attempt to process doc 0 -> BeginJobSpooling rejects, then reconciliation pauses doc 0 & doc 1
 	client.processJob(ctx, cmd0)
+	if stored0, _ := store.GetJob(ctx, cmd0.JobID); stored0 != nil {
+		client.reconcileSubmittedOrInterruptedJob(ctx, stored0, "interrupted during submission; manual reconciliation required", false)
+	}
 
 	// MockCUPSPrint must NOT have been called
 	if mockCalled {
@@ -1374,8 +1378,11 @@ func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPrinting)
 	_ = store.RecordJobSubmission(ctx, cmd.JobID, "TestQueue-99")
 
-	// Call processJob on this existing CUPS job
+	// Call processJob on this existing CUPS job -> rejected at processing boundary; resumeCUPSMonitoring monitors it
 	client.processJob(ctx, cmd)
+	if stored, _ := store.GetJob(ctx, cmd.JobID); stored != nil {
+		client.resumeCUPSMonitoring(ctx, stored)
+	}
 
 	// lp must NOT have been called!
 	if lpCalled.Load() {
@@ -1455,7 +1462,7 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 		StartFromPage:  1,
 	}
 
-	_ = store.SaveJob(ctx, colorCmd, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, colorCmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, colorCmd)
 
 	if mockCalled {
@@ -1495,7 +1502,7 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 	}
 
 	mockCalled = false
-	_ = store.SaveJob(ctx, monoCmd, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, monoCmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, monoCmd)
 
 	if mockCalled {
@@ -1586,7 +1593,7 @@ func TestMultiDoc_FailClosedOnStoreErrorsAndInconsistency(t *testing.T) {
 		StartFromPage:  1,
 	}
 
-	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
 	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusCompleted)
 
 	// checkAndAdmitOrder must fail closed and refuse to queue because doc 1 is completed while doc 0 is not
@@ -1670,7 +1677,7 @@ func TestMultiDoc_QueueSaturation_FIFOOrder(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 		cmds = append(cmds, cmd)
 	}
 
@@ -1760,7 +1767,7 @@ func TestMultiDoc_DeferredOrder_Sequencing(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	}
 	client.checkAndAdmitOrder(orderA, 3)
 
@@ -1839,7 +1846,7 @@ func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
 			StartFromPage:  1,
 		}
 		// Save doc 0 as COMPLETED, and docs 1, 2, 3 as unsubmitted SPOOLING
-		status := contracts.JobStatusSpooling
+		status := contracts.JobStatusDispatched
 		if i == 0 {
 			status = contracts.JobStatusCompleted
 		}
@@ -1992,8 +1999,8 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
-		_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
+		_ = store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
 
 		fStore := &failureInjectedStore{
 			StateStore:         store,
@@ -2086,7 +2093,7 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 
 		fStore := &failureInjectedStore{
 			StateStore:           store,

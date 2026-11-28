@@ -713,6 +713,97 @@ func (s *Store) MarkJobSubmitting(
 	return s.MarkJobSubmittingWithBaseline(ctx, jobID, false, 0, "", 0, time.Time{})
 }
 
+// BeginJobSpooling atomically transitions an untouched DISPATCHED job to SPOOLING before
+// capability validation, downloading, or preparation begins. It rejects missing records,
+// non-DISPATCHED jobs, submitted/physically started jobs, and orders with durable failure barriers.
+func (s *Store) BeginJobSpooling(ctx context.Context, jobID string) error {
+	if s == nil || s.db == nil {
+		return errors.New("store is not open")
+	}
+	if ctx == nil {
+		return errors.New("context cannot be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(jobID) == "" {
+		return errors.New("job_id cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin spooling tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var orderID, status, cupsJobID, errorReason string
+	var submitted, pagesPrinted, sheetsPrinted, docIdx int
+	err = tx.QueryRowContext(ctx, `
+SELECT order_id, status, submitted_to_printer, cups_job_id, pages_printed, sheets_printed, error_reason, document_index
+FROM jobs
+WHERE job_id = ?;`, jobID).Scan(&orderID, &status, &submitted, &cupsJobID, &pagesPrinted, &sheetsPrinted, &errorReason, &docIdx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("job not found: %s", jobID)
+		}
+		return fmt.Errorf("query job %s before spooling: %w", jobID, err)
+	}
+	if status != string(contracts.JobStatusDispatched) {
+		return fmt.Errorf("cannot begin spooling job %s in status %s", jobID, status)
+	}
+	if submitted != 0 || strings.TrimSpace(cupsJobID) != "" || pagesPrinted > 0 || sheetsPrinted > 0 || strings.TrimSpace(errorReason) != "" {
+		return fmt.Errorf("cannot begin spooling job %s: already started or errored", jobID)
+	}
+
+	resolvedOrderID := strings.TrimSpace(orderID)
+	if resolvedOrderID == "" {
+		resolvedOrderID = jobID
+	}
+	var blockingSiblings int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM jobs
+WHERE order_id = ?
+  AND (
+    status IN (?, ?, ?, ?)
+    OR TRIM(error_reason) != ''
+    OR (document_index < ? AND status != ?)
+  );`,
+		resolvedOrderID,
+		string(contracts.JobStatusPausedError),
+		string(contracts.JobStatusFailedRefundable),
+		string(contracts.JobStatusSpooling),
+		string(contracts.JobStatusPrinting),
+		docIdx,
+		string(contracts.JobStatusCompleted),
+	).Scan(&blockingSiblings); err != nil {
+		return fmt.Errorf("query order failure barrier for %s: %w", resolvedOrderID, err)
+	}
+	if blockingSiblings > 0 {
+		return fmt.Errorf("order %s has an active failure barrier or incomplete prior document", resolvedOrderID)
+	}
+
+	nowNS := time.Now().UTC().UnixNano()
+	res, err := tx.ExecContext(ctx, `
+UPDATE jobs
+SET status = ?, updated_at_ns = ?
+WHERE job_id = ? AND status = ?;`,
+		string(contracts.JobStatusSpooling), nowNS, jobID, string(contracts.JobStatusDispatched))
+	if err != nil {
+		return fmt.Errorf("update job %s to SPOOLING: %w", jobID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("job %s could not transition from DISPATCHED to SPOOLING", jobID)
+	}
+	return tx.Commit()
+}
+
 // MarkJobSubmittingWithBaseline atomically marks a job as submitted_to_printer = 1
 // and persists the original pre-submission hardware counter baseline before lp runs.
 // It atomically rejects terminal/paused jobs and orders with a durable failure barrier.
@@ -991,7 +1082,7 @@ SELECT job_id, order_id, document_index, total_documents, original_filename, col
        baseline_counter_set, baseline_counter_value, baseline_counter_index, baseline_counter_unit, baseline_observed_at_ns,
        outcome_version, outcome_synced_version, outcome_timestamp_ns, updated_at_ns
 FROM jobs
-WHERE status IN ('SPOOLING', 'PRINTING', 'PAUSED_ERROR')
+WHERE status IN ('DISPATCHED', 'SPOOLING', 'PRINTING', 'PAUSED_ERROR')
 ORDER BY order_id ASC, document_index ASC, updated_at_ns ASC;`
 
 	rows, err := s.db.QueryContext(ctx, query)

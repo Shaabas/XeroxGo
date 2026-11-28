@@ -335,6 +335,9 @@ func TestHub_ConcurrentDispatchAndFailureFinalization(t *testing.T) {
 		t.Fatalf("failure-first SendJob must never transmit wire frame for %s", fCmd1.JobID)
 	}
 	mu.Unlock()
+	if fStatus, _, fErr := st.GetJobDispatchIntentStatus(ctx, fCmd1.JobID); fErr != nil || fStatus != "CANCELED" {
+		t.Fatalf("expected failure-first intent CANCELED, got %q (err=%v)", fStatus, fErr)
+	}
 
 	// Case 2: Dispatch-first interleaving + fast acknowledgement -> SendJob succeeds and preserves ACKNOWLEDGED.
 	_, _, aCmd1 := seedOrder(kioskID, "fastack", "9292")
@@ -342,29 +345,40 @@ func TestHub_ConcurrentDispatchAndFailureFinalization(t *testing.T) {
 	if err := hub.SendJob(ctx, aCmd1); err != nil {
 		t.Fatalf("dispatch-first SendJob with fast ack failed: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	status, _, err := st.GetJobDispatchIntentStatus(ctx, aCmd1.JobID)
-	if err != nil || (status != "SENT" && status != "ACKNOWLEDGED") {
-		t.Fatalf("expected SENT or ACKNOWLEDGED after fast ack, got %q (err=%v)", status, err)
+	ackDeadline := time.Now().Add(2 * time.Second)
+	var ackStatus string
+	var ackErr error
+	for time.Now().Before(ackDeadline) {
+		ackStatus, _, ackErr = st.GetJobDispatchIntentStatus(ctx, aCmd1.JobID)
+		if ackErr == nil && ackStatus == "ACKNOWLEDGED" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if ackErr != nil || ackStatus != "ACKNOWLEDGED" {
+		t.Fatalf("expected ACKNOWLEDGED after fast ack (never regressed to SENT), got %q (err=%v)", ackStatus, ackErr)
 	}
 
 	// Case 3: Concurrent race between SendJob and UpdateJobProgress -> never transmit if SendJob returned error.
 	_, cCmd0, cCmd1 := seedOrder(kioskID, "race", "9293")
 	var wg sync.WaitGroup
 	wg.Add(2)
-	var sendErr error
+	var sendErr, progErr error
 	go func() {
 		defer wg.Done()
 		sendErr = hub.SendJob(ctx, cCmd1)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = st.UpdateJobProgress(ctx, contracts.JobProgressEvent{
+		progErr = st.UpdateJobProgress(ctx, contracts.JobProgressEvent{
 			JobID: cCmd0.JobID, KioskID: kioskID, Status: contracts.JobStatusFailedRefundable,
 			ErrorReason: "jam", Timestamp: time.Now().UTC(),
 		})
 	}()
 	wg.Wait()
+	if progErr != nil {
+		t.Fatalf("concurrent UpdateJobProgress failed: %v", progErr)
+	}
 	if sendErr != nil {
 		mu.Lock()
 		sent := receivedJobs[cCmd1.JobID]
@@ -372,6 +386,12 @@ func TestHub_ConcurrentDispatchAndFailureFinalization(t *testing.T) {
 		if sent {
 			t.Fatalf("wire transmission occurred despite rejected dispatch authorization: %v", sendErr)
 		}
+	}
+	if cStatus, _, cErr := st.GetJobDispatchIntentStatus(ctx, cCmd1.JobID); cErr != nil || cStatus != "CANCELED" {
+		t.Fatalf("expected post-failure intent CANCELED, got %q (err=%v)", cStatus, cErr)
+	}
+	if err := hub.SendJob(ctx, cCmd1); err == nil {
+		t.Fatalf("expected post-failure SendJob to fail closed")
 	}
 
 	// Case 4: Transmission failure -> rolls back, leaving dispatch intent PENDING.

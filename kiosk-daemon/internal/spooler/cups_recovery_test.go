@@ -111,6 +111,7 @@ func TestCUPS_SuccessfulSubmissionAndIdempotentTracking(t *testing.T) {
 		StartFromPage:  1,
 	}
 
+	_ = store.SaveJob(context.Background(), cmd, contracts.JobStatusDispatched)
 	client.processJob(context.Background(), cmd)
 
 	if lpCalled.Load() != 1 {
@@ -1048,6 +1049,7 @@ func TestSpooler_PrePrintInventoryCheck_HonorsCloudTotalSheets(t *testing.T) {
 	// Under the old naive math, duplex remainingPages = 4, remainingSheets = ((4+1)/2)*1 = 3 sheets!
 	// With 2 sheets in tray, old logic would reject with "paper tray supply insufficient".
 	// With corrected logic, remainingSheets = cmd.TotalSheets - 0 = 2 sheets, matching tray supply.
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	if lpCalled.Load() != 1 {

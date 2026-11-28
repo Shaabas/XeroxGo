@@ -328,6 +328,7 @@ func TestSpoolerCanonical_MidPrintExpiry_ConservativeUncertaintyPause_WithoutFab
 		Duplex:         contracts.DuplexSimplex,
 		StartFromPage:  1,
 	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	saved, err := st.GetJob(ctx, cmd.JobID)
