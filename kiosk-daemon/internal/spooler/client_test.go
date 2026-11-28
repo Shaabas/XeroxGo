@@ -476,6 +476,7 @@ func TestClientProcessesJobEndToEnd(t *testing.T) {
 			Online:              true,
 			State:               "IDLE",
 			EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+			NativeIPPAdmission:  contracts.AcceptingJobsAccepting,
 			PaperTrayStatus:     "OK",
 			EstimatedSheets:     sheets,
 			TonerLevelPercent:   90,
@@ -866,9 +867,10 @@ func TestClientHeartbeat(t *testing.T) {
 	client.heartbeatInterval = 20 * time.Millisecond
 	client.healthPoller = func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		return contracts.PrinterHealth{
-			State:             "IDLE",
-			PaperTrayStatus:   "OK",
-			TonerLevelPercent: 77,
+			State:              "IDLE",
+			NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+			PaperTrayStatus:    "OK",
+			TonerLevelPercent:  77,
 		}
 	}
 
@@ -960,6 +962,7 @@ func TestClientRefill_OverWebSocket(t *testing.T) {
 			Online:              true,
 			State:               "IDLE",
 			EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+			NativeIPPAdmission:  contracts.AcceptingJobsAccepting,
 			PaperTrayStatus:     "OK",
 			EstimatedSheets:     sheets,
 			TonerLevelPercent:   80,
@@ -5296,6 +5299,7 @@ func testHealthyMockHealth(ctx context.Context, estimatedSheets int) contracts.P
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "OK",
 		EstimatedSheets:        estimatedSheets,
 		TonerLevelPercent:      80,
@@ -5340,6 +5344,7 @@ func testHealthySNMPHealth(ctx context.Context, estimatedSheets int) contracts.P
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "OK",
 		EstimatedSheets:        estimatedSheets,
 		TonerLevelPercent:      80,

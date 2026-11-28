@@ -542,6 +542,11 @@ func validateHealthPayload(h *contracts.PrinterHealth, now time.Time) error {
 	if !isValidTrayState(h.PaperTrayStatus) {
 		return fmt.Errorf("invalid paper_tray_status %q", h.PaperTrayStatus)
 	}
+	switch h.NativeIPPAdmission {
+	case "", contracts.AcceptingJobsUnknown, contracts.AcceptingJobsAccepting, contracts.AcceptingJobsNotAccepting:
+	default:
+		return fmt.Errorf("invalid native_ipp_admission %q", h.NativeIPPAdmission)
+	}
 	if h.UpdatedAt.IsZero() {
 		return errors.New("updated_at must be non-zero")
 	}

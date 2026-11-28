@@ -362,9 +362,10 @@ func TestMockPrinter_FailureTiming_ReadyBeforeScheduledSheet(t *testing.T) {
 func buildMockHealthPoller(mockState *mockPrinterState) func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
 	return func(ctx context.Context, estimatedSheets int) contracts.PrinterHealth {
 		h := contracts.PrinterHealth{
-			Online:            true,
-			State:             "IDLE",
-			PaperTrayStatus:   "OK",
+			Online:             true,
+			State:              "IDLE",
+			NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+			PaperTrayStatus:    "OK",
 			EstimatedSheets:   estimatedSheets,
 			TonerLevelPercent: 95,
 			DrumLifePercent:   98,

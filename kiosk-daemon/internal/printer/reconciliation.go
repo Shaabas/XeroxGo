@@ -102,6 +102,9 @@ type ReconciledHealthResult struct {
 	// EvaluatedHealth is the canonical dispatch readiness state ("HEALTHY", "FAULT", "UNVERIFIED").
 	EvaluatedHealth contracts.EvaluatedHealthStatus `json:"evaluated_health"`
 
+	// NativeIPPAdmission is the canonical native IPP printer-is-accepting-jobs state.
+	NativeIPPAdmission contracts.AcceptingJobsStatus `json:"native_ipp_admission,omitempty"`
+
 	Online bool `json:"online"`
 
 	BlockingFaults      []string `json:"blocking_faults"`
@@ -211,6 +214,7 @@ func (r ReconciledHealthResult) ToContract(
 		Online:                 r.EvaluatedHealth == contracts.EvaluatedHealthHealthy,
 		State:                  state,
 		EvaluatedHealth:        r.EvaluatedHealth,
+		NativeIPPAdmission:     r.NativeIPPAdmission,
 		PaperTrayStatus:        trayStatus,
 		EstimatedSheets:        effectiveSheets,
 		InventoryCalibrated:    inventoryCalibrated,
@@ -729,10 +733,7 @@ func (e *evaluatorState) analyzeIPP() {
 		}
 	}
 
-	if e.in.IPP.AcceptingJobs == AcceptingJobsNotAccepting {
-		e.ippFaults = append(e.ippFaults, "queue is not accepting jobs")
-		e.addDiagnostic(CategoryFault, FaultQueueStopped, "Printer/queue is not accepting jobs", SourceIPP, "", "BLOCKING")
-	} else if e.in.IPP.State == IPPPrinterStateStopped && len(e.ippFaults) == 0 {
+	if e.in.IPP.State == IPPPrinterStateStopped && len(e.ippFaults) == 0 {
 		e.ippFaults = append(e.ippFaults, "printer reports stopped state via IPP")
 		e.addDiagnostic(CategoryFault, FaultQueueStopped, "Printer reports stopped state via IPP", SourceIPP, "", "BLOCKING")
 	}
@@ -757,9 +758,6 @@ func (e *evaluatorState) detectContradictions(paperJam, coverOpen, outputFull, p
 		}
 		if e.in.CUPS.Online && e.in.IPP.State == IPPPrinterStateStopped {
 			record(ContradictionOnlineStatus, "contradiction: CUPS reports queue online while IPP explicitly reports printer-state stopped")
-		}
-		if e.in.CUPS.Online && e.in.IPP.AcceptingJobs == AcceptingJobsNotAccepting {
-			record(ContradictionOnlineStatus, "contradiction: CUPS reports queue online while IPP explicitly reports printer-is-accepting-jobs false")
 		}
 	}
 
@@ -1024,9 +1022,18 @@ func (e *evaluatorState) run() ReconciledHealthResult {
 		}
 	}
 
+	nativeIPPAdmission := contracts.AcceptingJobsUnknown
+	if e.ippValid && e.in.IPP.Source == CapabilitySourceNativeIPP {
+		switch e.in.IPP.AcceptingJobs {
+		case contracts.AcceptingJobsAccepting, contracts.AcceptingJobsNotAccepting:
+			nativeIPPAdmission = e.in.IPP.AcceptingJobs
+		}
+	}
+
 	return ReconciledHealthResult{
 		EffectiveState:         effectiveState,
 		EvaluatedHealth:        evaluatedHealth,
+		NativeIPPAdmission:     nativeIPPAdmission,
 		Online:                 online,
 		BlockingFaults:         e.blockingFaults,
 		NonblockingWarnings:    e.nonblockingWarnings,

@@ -321,6 +321,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 				Online:              true,
 				State:               "IDLE",
 				EvaluatedHealth:     contracts.EvaluatedHealthHealthy,
+				NativeIPPAdmission:  contracts.AcceptingJobsAccepting,
 				PaperTrayStatus:     "OK",
 				EstimatedSheets:     estimatedSheets,
 				InventoryCalibrated: true,
@@ -899,13 +900,19 @@ func (c *Client) Run(ctx context.Context) error {
 				}
 
 				if canResume {
-					c.activeMu.Lock()
-					for _, j := range jobsToResume {
-						c.activeJobs[j.JobID] = true
-					}
-					c.activeMu.Unlock()
+					if deferAdm, adm := c.shouldDeferForNativeIPPAdmission(ctx); deferAdm {
+						c.deferJobsInOrder(jobsToResume)
+						log.Printf("[SPOOLER] Startup recovery: deferred %d untouched job(s) for order %s (native IPP admission=%s)",
+							len(jobsToResume), oid, adm)
+					} else {
+						c.activeMu.Lock()
+						for _, j := range jobsToResume {
+							c.activeJobs[j.JobID] = true
+						}
+						c.activeMu.Unlock()
 
-					c.enqueueJobs(jobsToResume)
+						c.enqueueJobs(jobsToResume)
+					}
 				} else if len(jobsToResume) > 0 {
 					reason := fmt.Sprintf("startup recovery: order %s has non-contiguous completion gap; manual reconciliation required", oid)
 					log.Printf("[SPOOLER] %s", reason)
@@ -1556,7 +1563,11 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 		}
 	}
 
-	// 4. Check in-memory state:
+	// 4. Defer untouched DISPATCHED jobs when printer is healthy/safe but native IPP admission is not yet ACCEPTING.
+	// (Hardware faults or uninitialized test queues still proceed to processJob/jobQueue so existing error handling runs.)
+	deferForAdmission, admState := c.shouldDeferForNativeIPPAdmission(context.Background())
+
+	// 5. Check in-memory state:
 	// Check if any of the uncompleted jobs are already in activeJobs
 	c.activeMu.Lock()
 	for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
@@ -1581,15 +1592,20 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 	}
 
 	isBusy := len(c.activeJobs) > 0
-	if isBusy {
+	if isBusy || deferForAdmission {
 		// Defer uncompleted documents in strict index order
 		for idx := firstUncompletedIdx; idx < totalDocs; idx++ {
 			c.deferredJobs = append(c.deferredJobs, docMap[idx].Command)
 		}
 		c.deferredMu.Unlock()
 		c.activeMu.Unlock()
-		log.Printf("[SPOOLER] Order %s uncompleted documents (%d..%d of %d) deferred; kiosk is busy",
-			orderID, firstUncompletedIdx+1, totalDocs, totalDocs)
+		if isBusy {
+			log.Printf("[SPOOLER] Order %s uncompleted documents (%d..%d of %d) deferred; kiosk is busy",
+				orderID, firstUncompletedIdx+1, totalDocs, totalDocs)
+		} else {
+			log.Printf("[SPOOLER] Order %s uncompleted documents (%d..%d of %d) deferred; native IPP job admission is %s",
+				orderID, firstUncompletedIdx+1, totalDocs, totalDocs, admState)
+		}
 		return
 	}
 	c.deferredMu.Unlock()
@@ -2171,6 +2187,71 @@ func (c *Client) validateDownloadURL(rawURL string) error {
 	return nil
 }
 
+func (c *Client) shouldDeferForNativeIPPAdmission(ctx context.Context) (bool, contracts.AcceptingJobsStatus) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	snap := c.ensureOrCurrentHealthSnapshot(ctx)
+	if c.isHardwareFaultActive() || snap.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !snap.ExecutionSafe {
+		return false, snap.EffectiveNativeIPPAdmission()
+	}
+	adm := snap.EffectiveNativeIPPAdmission()
+	return adm != contracts.AcceptingJobsAccepting, adm
+}
+
+func (c *Client) hasDeferredOrder(orderID string) bool {
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+	for _, dj := range c.deferredJobs {
+		djOrderID := dj.OrderID
+		if djOrderID == "" {
+			djOrderID = dj.JobID
+		}
+		if djOrderID == orderID {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) deferJobsInOrder(cmds []contracts.PrintJobCommand) {
+	if len(cmds) == 0 {
+		return
+	}
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+	existing := make(map[string]bool, len(c.deferredJobs))
+	for _, dj := range c.deferredJobs {
+		existing[dj.JobID] = true
+	}
+	for _, cmd := range cmds {
+		if !existing[cmd.JobID] {
+			c.deferredJobs = append(c.deferredJobs, cmd)
+			existing[cmd.JobID] = true
+		}
+	}
+}
+
+func (c *Client) canAdmitFreshPhysicalSubmission(ctx context.Context) (bool, string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	snap := c.ensureOrCurrentHealthSnapshot(ctx)
+	if c.isHardwareFaultActive() {
+		return false, firstNonEmptyString(c.getFaultReason(), "active hardware fault")
+	}
+	if ok, reason := contracts.ValidateReadyHealth(snap, time.Now().UTC(), DefaultTelemetryMaxAge); !ok {
+		return false, reason
+	}
+	if adm := snap.EffectiveNativeIPPAdmission(); adm != contracts.AcceptingJobsAccepting {
+		return false, fmt.Sprintf("native IPP job admission is %s", adm)
+	}
+	if safe, safeReason := c.computeExecutionSafety(ctx, ""); !safe {
+		return false, safeReason
+	}
+	return true, ""
+}
+
 func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 	c.deferredMu.Lock()
 	hasDeferred := len(c.deferredJobs) > 0
@@ -2191,13 +2272,9 @@ func (c *Client) drainDeferredJobsIfSafe(ctx context.Context) {
 		return
 	}
 
-	// Gate deferred admission on canonical printer readiness, absence of active fault, and durable SQLite execution safety
-	// BEFORE locking deferredMu so CheckPrinterHealth -> syncCustomerServiceState cannot self-deadlock.
-	snap := c.ensureOrCurrentHealthSnapshot(ctx)
-	if c.isHardwareFaultActive() || snap.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !snap.ExecutionSafe {
-		return
-	}
-	if safe, _ := c.computeExecutionSafety(ctx, ""); !safe {
+	// Gate deferred admission on canonical printer readiness, native IPP admission, absence of active fault,
+	// and durable SQLite execution safety BEFORE locking deferredMu so CheckPrinterHealth -> syncCustomerServiceState cannot self-deadlock.
+	if ok, _ := c.canAdmitFreshPhysicalSubmission(ctx); !ok {
 		return
 	}
 
@@ -2340,6 +2417,22 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		c.setPersistenceReadBarrier(errors.New("state store not configured"))
 		c.syncCustomerServiceState(ctx)
 		return
+	}
+	if preStored, preErr := c.cfg.StateStore.GetJob(ctx, cmd.JobID); preErr == nil && preStored != nil {
+		isUntouchedDispatched := preStored.Status == contracts.JobStatusDispatched &&
+			!preStored.SubmittedToPrinter &&
+			preStored.CUPSJobID == "" &&
+			preStored.SheetsPrinted == 0 &&
+			preStored.PagesPrinted == 0 &&
+			strings.TrimSpace(preStored.ErrorReason) == ""
+		if isUntouchedDispatched {
+			if deferAdm, adm := c.shouldDeferForNativeIPPAdmission(ctx); deferAdm || c.hasDeferredOrder(orderID) {
+				c.deferJobsInOrder([]contracts.PrintJobCommand{cmd})
+				log.Printf("[SPOOLER] Deferring untouched job %s (order %s, doc %d/%d) before BeginJobSpooling (native IPP admission=%s)",
+					cmd.JobID, orderID, cmd.DocumentIndex+1, cmd.TotalDocuments, adm)
+				return
+			}
+		}
 	}
 	if err := c.cfg.StateStore.BeginJobSpooling(ctx, cmd.JobID); err != nil {
 		log.Printf("[SPOOLER] Failed to transition job %s DISPATCHED -> SPOOLING: %v; failing closed", cmd.JobID, err)
@@ -2591,6 +2684,11 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer readiness gate rejected submission: %s", reason))
 		return
 	}
+	if adm := admHealth.EffectiveNativeIPPAdmission(); adm != contracts.AcceptingJobsAccepting {
+		c.calibrationMu.Unlock()
+		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("printer admission gate rejected submission: native IPP job admission is %s", adm))
+		return
+	}
 	if safe, safeReason := c.computeExecutionSafety(ctx, cmd.JobID); !safe {
 		c.calibrationMu.Unlock()
 		c.handleJobError(ctx, cmd, pagesPrinted, sheetsPrinted, fmt.Sprintf("execution-safety barrier blocks submission: %s", safeReason))
@@ -2606,20 +2704,10 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 	printPath := finalPath
 	streamCmd := cmd
 
-	// 7. Update progress: PRINTING and register genuine live physical monitoring
+	// 7. Register genuine live physical monitoring (PRINTING state is recorded only once pre-submission persistence succeeds)
 	c.setMonitoredJob(cmd.JobID, true)
 	c.calibrationMu.Unlock()
 	defer c.setMonitoredJob(cmd.JobID, false)
-	printEvt := contracts.JobProgressEvent{
-		JobID:         cmd.JobID,
-		KioskID:       cmd.KioskID,
-		Status:        contracts.JobStatusPrinting,
-		PagesPrinted:  pagesPrinted,
-		SheetsPrinted: sheetsPrinted,
-		Timestamp:     time.Now().UTC(),
-	}
-	_ = c.cfg.StateStore.RecordSheetProgress(ctx, printEvt)
-	c.sendProgress(ctx, printEvt)
 
 	_ = c.renderScreen(ui_ipc.ScreenState{
 		Mode:            ui_ipc.ModePrinting,
@@ -2853,19 +2941,41 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		}
 	}
 
+	emitPrinting := func() {
+		progressMu.Lock()
+		curP, curS := pagesPrinted, sheetsPrinted
+		progressMu.Unlock()
+		printEvt := contracts.JobProgressEvent{
+			JobID:         cmd.JobID,
+			KioskID:       cmd.KioskID,
+			Status:        contracts.JobStatusPrinting,
+			PagesPrinted:  curP,
+			SheetsPrinted: curS,
+			Timestamp:     time.Now().UTC(),
+		}
+		_ = c.cfg.StateStore.RecordSheetProgress(jobCtx, printEvt)
+		c.sendProgress(jobCtx, printEvt)
+	}
+
 	var printErr error
 	if strings.TrimSpace(c.cfg.CUPSQueue) != "" {
 		log.Printf("[SPOOLER] Sending job %s to CUPS queue %s", cmd.JobID, c.cfg.CUPSQueue)
 		if c.cfg.MockCUPSPrint != nil {
-			if err := c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID); err != nil {
+			if ok, admitReason := c.canAdmitFreshPhysicalSubmission(jobCtx); !ok {
+				printErr = fmt.Errorf("printer admission gate rejected mock CUPS submission: %s", admitReason)
+			} else if err := c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID); err != nil {
 				printErr = fmt.Errorf("pre-submission persistence failed for mock CUPS print: %w", err)
 			} else {
+				emitPrinting()
 				printErr = c.cfg.MockCUPSPrint(jobCtx, c.cfg.CUPSQueue, streamCmd, printPath, onPage)
 			}
 		} else {
 			hooks := &printer.CUPSPrintHooks{
 				OnSubmittingWithBaseline: func(baseline printer.CounterBaseline) error {
-					return c.cfg.StateStore.MarkJobSubmittingWithBaseline(
+					if ok, admitReason := c.canAdmitFreshPhysicalSubmission(jobCtx); !ok {
+						return fmt.Errorf("printer admission gate rejected CUPS submission: %s", admitReason)
+					}
+					if err := c.cfg.StateStore.MarkJobSubmittingWithBaseline(
 						jobCtx,
 						cmd.JobID,
 						baseline.HasBaseline,
@@ -2873,7 +2983,11 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 						baseline.Index,
 						baseline.Unit,
 						baseline.ObservedAt,
-					)
+					); err != nil {
+						return err
+					}
+					emitPrinting()
+					return nil
 				},
 				OnSubmitted: func(cupsJobID string) error {
 					cupsJobIDMu.Lock()
@@ -2897,9 +3011,12 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		}
 	} else {
 		log.Printf("[SPOOLER] Streaming job %s to PJL printer %s", cmd.JobID, c.cfg.PrinterAddr)
-		if err := c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID); err != nil {
+		if ok, admitReason := c.canAdmitFreshPhysicalSubmission(jobCtx); !ok {
+			printErr = fmt.Errorf("printer admission gate rejected PJL submission: %s", admitReason)
+		} else if err := c.cfg.StateStore.MarkJobSubmitting(jobCtx, cmd.JobID); err != nil {
 			printErr = fmt.Errorf("pre-submission persistence failed for PJL print: %w", err)
 		} else {
+			emitPrinting()
 			printErr = printer.StreamPDFWithPJL(jobCtx, c.cfg.PrinterAddr, streamCmd, f, onPage)
 		}
 	}
@@ -3852,6 +3969,9 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	}
 
 	c.syncCustomerServiceState(ctx)
+	if !c.isHardwareFaultActive() && effectiveH.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+		c.drainDeferredJobsIfSafe(ctx)
+	}
 
 	return effectiveH
 }
@@ -3997,6 +4117,7 @@ func (c *Client) acquireTelemetryCycleLocked(ctx context.Context) (contracts.Pri
 		// Explicit mock simulation or white-box test poller
 		h = c.healthPoller(ctx, sheets)
 		rawTrayStatus = h.PaperTrayStatus
+		h.NativeIPPAdmission = h.EffectiveNativeIPPAdmission()
 		h.EstimatedSheets = sheets
 		h.InventoryCalibrated = calibrated
 		h.ExecutionSafe = execSafe
@@ -4396,6 +4517,7 @@ func (c *Client) CurrentHealthSnapshot(ctx context.Context) contracts.PrinterHea
 	if ok, _, freshReason := contracts.ValidateHealthEvidenceFreshness(h, now, DefaultTelemetryMaxAge); !ok {
 		// Preserve original timestamps so reading expired telemetry never extends age.
 		h.Online = false
+		h.NativeIPPAdmission = contracts.AcceptingJobsUnknown
 		if h.EvaluatedHealth != contracts.EvaluatedHealthFault {
 			h.EvaluatedHealth = contracts.EvaluatedHealthUnverified
 		}
@@ -4574,8 +4696,8 @@ func (c *Client) syncCustomerServiceState(ctx context.Context) {
 				QRContent: c.cfg.IdleQRContent,
 				Message:   "Ready to print",
 			})
-			c.drainDeferredJobsIfSafe(ctx)
 		}
+		c.drainDeferredJobsIfSafe(ctx)
 		return
 	}
 

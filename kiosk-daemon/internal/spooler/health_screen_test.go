@@ -66,9 +66,10 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 			}
 		}
 		return contracts.PrinterHealth{
-			Online:          true,
-			State:           "IDLE",
-			PaperTrayStatus: "OK",
+			Online:             true,
+			State:              "IDLE",
+			NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+			PaperTrayStatus:    "OK",
 			EstimatedSheets: sheets,
 			UpdatedAt:       time.Now().UTC(),
 		}
@@ -439,9 +440,10 @@ func TestHealthScreen_Recovery_RefreshesScreenWithoutReprintingOrCompleting(t *t
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -620,9 +622,10 @@ func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
 			}
 		}
 		return contracts.PrinterHealth{
-			Online:          true,
-			State:           "IDLE",
-			PaperTrayStatus: "OK",
+			Online:             true,
+			State:              "IDLE",
+			NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+			PaperTrayStatus:    "OK",
 			EstimatedSheets: sheets,
 			UpdatedAt:       time.Now().UTC(),
 		}
@@ -1122,7 +1125,7 @@ func TestHealthScreen_UnstableRecovery_TransientAndSNMPTimeoutRejected(t *testin
 
 	// Case A: Single transient healthy reading
 	stateMu.Lock()
-	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", NativeIPPAdmission: contracts.AcceptingJobsAccepting, PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
 	stateMu.Unlock()
 
 	client.CheckPrinterHealth(ctx)
@@ -1142,7 +1145,7 @@ func TestHealthScreen_UnstableRecovery_TransientAndSNMPTimeoutRejected(t *testin
 
 	// Case C: Sensor flapping (healthy -> jam -> healthy -> healthy)
 	stateMu.Lock()
-	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", NativeIPPAdmission: contracts.AcceptingJobsAccepting, PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
 	stateMu.Unlock()
 	client.CheckPrinterHealth(ctx) // healthy 1
 
@@ -1157,7 +1160,7 @@ func TestHealthScreen_UnstableRecovery_TransientAndSNMPTimeoutRejected(t *testin
 
 	// Case D: Reliable recovery with 3 consecutive healthy readings
 	stateMu.Lock()
-	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
+	currentHealth = contracts.PrinterHealth{Online: true, State: "IDLE", NativeIPPAdmission: contracts.AcceptingJobsAccepting, PaperTrayStatus: "OK", UpdatedAt: time.Now().UTC()}
 	stateMu.Unlock()
 
 	client.CheckPrinterHealth(ctx) // healthy 1
@@ -1224,9 +1227,10 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 			}
 		}
 		return contracts.PrinterHealth{
-			Online:          true,
-			State:           "IDLE",
-			PaperTrayStatus: "OK",
+			Online:             true,
+			State:              "IDLE",
+			NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+			PaperTrayStatus:    "OK",
 			EstimatedSheets: sheets,
 			UpdatedAt:       time.Now().UTC(),
 		}
@@ -1405,9 +1409,10 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -1540,9 +1545,10 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -1828,9 +1834,10 @@ func TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk(t *t
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -1947,9 +1954,10 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -2059,9 +2067,10 @@ func TestHealthScreen_UncertainHeldState_PreservesPausedError(t *testing.T) {
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -2168,9 +2177,10 @@ func TestHealthScreen_CompletedCUPSWithoutPhysicalProof_NeverSynthesizesTotalShe
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: 100,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -2428,9 +2438,10 @@ func TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricate
 	healthMock := func(ctx context.Context, sheets int) contracts.PrinterHealth {
 		if isRecovered.Load() {
 			return contracts.PrinterHealth{
-				Online:          true,
-				State:           "IDLE",
-				PaperTrayStatus: "OK",
+				Online:             true,
+				State:              "IDLE",
+				NativeIPPAdmission: contracts.AcceptingJobsAccepting,
+				PaperTrayStatus:    "OK",
 				EstimatedSheets: sheets,
 				UpdatedAt:       time.Now().UTC(),
 			}
@@ -2735,8 +2746,8 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
-	if saved.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job to be in PAUSED_ERROR due to missing odometer proof, got %s", saved.Status)
+	if saved.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job to be in FAILED_REFUNDABLE due to missing pre-submission odometer proof, got %s", saved.Status)
 	}
 	if saved.SheetsPrinted != 0 {
 		t.Fatalf("expected SheetsPrinted to remain 0 (no synthetic physical sheets), got %d", saved.SheetsPrinted)

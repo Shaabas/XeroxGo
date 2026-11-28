@@ -23,6 +23,7 @@ func TestPackage03_InitiatePayment_PaperCommitmentQueryError_FailsClosed(t *test
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "OK",
 		EstimatedSheets:        500,
 		ConfiguredTrayCapacity: 500,

@@ -69,6 +69,7 @@ func makeHealthyHealth(sheets int, capacity int, now time.Time) contracts.Printe
 		Online:                 true,
 		State:                  "IDLE",
 		EvaluatedHealth:        contracts.EvaluatedHealthHealthy,
+		NativeIPPAdmission:     contracts.AcceptingJobsAccepting,
 		PaperTrayStatus:        "OK",
 		EstimatedSheets:        sheets,
 		ConfiguredTrayCapacity: capacity,

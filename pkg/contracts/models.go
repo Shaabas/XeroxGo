@@ -38,6 +38,15 @@ const (
 	EvaluatedHealthUnverified EvaluatedHealthStatus = "UNVERIFIED"
 )
 
+// AcceptingJobsStatus represents native IPP printer-is-accepting-jobs admission state.
+type AcceptingJobsStatus string
+
+const (
+	AcceptingJobsUnknown      AcceptingJobsStatus = "UNKNOWN"
+	AcceptingJobsAccepting    AcceptingJobsStatus = "ACCEPTING"
+	AcceptingJobsNotAccepting AcceptingJobsStatus = "NOT_ACCEPTING"
+)
+
 // HealthReason represents a structured blocking fault or non-blocking warning.
 type HealthReason struct {
 	Code    string `json:"code"`
@@ -66,6 +75,7 @@ type PrinterHealth struct {
 	Online                 bool                     `json:"online"`
 	State                  string                   `json:"state"`                     // Operational state: "IDLE", "PRINTING", "WARMING_UP", "ERROR", "OFFLINE", "UNKNOWN"
 	EvaluatedHealth        EvaluatedHealthStatus    `json:"evaluated_health"`          // Canonical readiness: "HEALTHY", "FAULT", "UNVERIFIED"
+	NativeIPPAdmission   AcceptingJobsStatus      `json:"native_ipp_admission,omitempty"` // Native IPP printer-is-accepting-jobs state ("ACCEPTING", "NOT_ACCEPTING", "UNKNOWN")
 	PaperTrayStatus        string                   `json:"paper_tray_status"`         // "OK", "LOW", "EMPTY", "UNKNOWN"
 	EstimatedSheets        int                      `json:"estimated_sheets"`          // Tracked remaining sheets in tray
 	ConfiguredTrayCapacity int                      `json:"configured_tray_capacity,omitempty"` // Configured physical tray capacity on the kiosk
@@ -89,6 +99,17 @@ type PrinterHealth struct {
 	EvidenceFreshness      *HealthEvidenceFreshness `json:"evidence_freshness,omitempty"`
 	ErrorMessage           string                   `json:"error_message,omitempty"`
 	UpdatedAt              time.Time                `json:"updated_at"`
+}
+
+// EffectiveNativeIPPAdmission returns the normalized native IPP admission state,
+// defaulting missing or unrecognized values to AcceptingJobsUnknown.
+func (h PrinterHealth) EffectiveNativeIPPAdmission() AcceptingJobsStatus {
+	switch h.NativeIPPAdmission {
+	case AcceptingJobsAccepting, AcceptingJobsNotAccepting:
+		return h.NativeIPPAdmission
+	default:
+		return AcceptingJobsUnknown
+	}
 }
 
 type PrintJobCommand struct {
