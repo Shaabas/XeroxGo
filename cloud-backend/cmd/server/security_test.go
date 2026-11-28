@@ -136,21 +136,21 @@ func TestIngressHandlerProxySecret(t *testing.T) {
 		}
 	})
 
-	t.Run("Production mode exempts signed recovery PDF download and recover routes", func(t *testing.T) {
+	t.Run("Production mode rejects removed continuation recovery routes without proxy secret", func(t *testing.T) {
 		h := createIngressHandler(dummyMux, secret, false)
 
 		req1 := httptest.NewRequest(http.MethodGet, "/api/recovery/rec-123/pdf", nil)
 		rec1 := httptest.NewRecorder()
 		h.ServeHTTP(rec1, req1)
-		if rec1.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for recovery pdf route, got %d", rec1.Code)
+		if rec1.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 NotFound for removed recovery pdf route, got %d", rec1.Code)
 		}
 
 		req2 := httptest.NewRequest(http.MethodPost, "/api/k/kiosk-1/jobs/job-1/recover", nil)
 		rec2 := httptest.NewRecorder()
 		h.ServeHTTP(rec2, req2)
-		if rec2.Code != http.StatusOK {
-			t.Fatalf("expected 200 OK for kiosk recover route, got %d", rec2.Code)
+		if rec2.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 NotFound for removed kiosk recover route, got %d", rec2.Code)
 		}
 	})
 

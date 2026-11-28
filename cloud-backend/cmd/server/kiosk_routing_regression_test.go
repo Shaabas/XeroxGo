@@ -61,8 +61,6 @@ func setupRoutingRegressionServer(t *testing.T) (*appServer, *httptest.Server, *
 		switch {
 		case strings.HasSuffix(path, "/upload"):
 			app.handleUpload(w, r)
-		case strings.HasSuffix(path, "/recover"):
-			app.handleRecoverJob(w, r)
 		case strings.HasSuffix(path, "/orders/lookup"), strings.HasSuffix(path, "/pin/lookup"):
 			app.handlePINLookup(w, r)
 		case strings.HasSuffix(path, "/claim"), strings.HasSuffix(path, "/confirm"):

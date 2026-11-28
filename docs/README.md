@@ -12,7 +12,7 @@ The documentation suite is structured into the following navigable references:
   - Distributed multi-tier topology (Client, Edge, Cloud, Persistence, Edge Kiosk).
   - End-to-end workflow tracing (Upload $\rightarrow$ Preview $\rightarrow$ PIN $\rightarrow$ Claim $\rightarrow$ Payment $\rightarrow$ Dispatch $\rightarrow$ CUPS $\rightarrow$ Completion).
   - State machine models (`JobStatus`, `KioskSessionStatus`, `ConversionStatus`).
-  - Cloud-owned continuation recovery architecture via `qpdf` and hardware telemetry.
+  - Fail-closed failure handling, CUPS termination verification, and durable outcome reconciliation.
   
 - 🧱 **[Module Boundaries & Ownership](file:///home/shabas/Projects/XeroxGo/docs/architecture/module-boundaries.md)**
   - Formal definitions for all 10 logical modules: Frontend, Documents, Pricing, Orders, Payments, Dispatch, Kiosk Core, Printing, Recovery, Infrastructure.

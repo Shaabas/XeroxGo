@@ -137,8 +137,8 @@ func readJobMessage(ctx context.Context, t *testing.T, conn *websocket.Conn) wir
 
 // Test A — TestHubRegistersAndSendsJob
 func TestHubRegistersAndSendsJob(t *testing.T) {
-	db := newTestStore(t)
-	hub := NewHub(db)
+	_ = newTestStore(t)
+	hub := NewHub(nil)
 	hub.SetProductPolicy(contracts.ProductCapabilityPolicy{
 		AllowDuplex:    true,
 		RequireA4:      true,

@@ -266,7 +266,6 @@ func main() {
 	paymentURLBase := flag.String("payment-url-base", "https://xeroxgo.vercel.app/pay", "Base URL for payment QR codes (e.g. https://xeroxgo.vercel.app/pay). If non-empty, wraps payment tokens in this URL")
 	paymentURL := flag.String("payment-url", "", "Alias for -payment-url-base")
 	adsCachePath := flag.String("ads-cache-path", "/var/kiosk/ads_cache.json", "Local cache file path for promotional ads")
-	enableCloudRecovery := flag.Bool("enable-cloud-recovery", true, "Enable cloud-owned print recovery and continuation artifacts (disables Pi-side slicer)")
 	enableKeypad := flag.Bool("enable-keypad", true, "Enable keyboard/keypad input for PIN entry (default true)")
 	keypadDevice := flag.String("keypad-device", "", "Path to keyboard TTY device (e.g. /dev/tty1). If specified, reads from device; otherwise reads from stdin")
 	pinInactivityTimeout := flag.Duration("pin-timeout", 60*time.Second, "Inactivity timeout for PIN entry screen before returning to idle")
@@ -599,7 +598,6 @@ func main() {
 		ScreenSink:               screenSink,
 		HTTPClient:               nil,
 		MockHealth:               mockHealthPoller,
-		EnableCloudRecovery:      *enableCloudRecovery,
 		InputSource:              inputSource,
 		InactivityTimeout:        *pinInactivityTimeout,
 		PaymentTimeout:           *paymentPendingTimeout,

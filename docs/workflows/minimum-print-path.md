@@ -444,10 +444,9 @@ To maintain deterministic accounting when hardware failures or crashes occur, th
      * Reads `oidPrtMarkerLifeCount` (physical mechanical sheet ejection odometer).
      * Inspects `oidHrPrinterDetectedErrorState` for paper feed jams (bit 5) or empty paper trays (bit 1).
      * If an error occurs, transitions order to `PAUSED_ERROR` and halts printing.
-4. **Cloud-Owned Continuation Slicing (`GenerateContinuationPDF`):**
-   - If printing is interrupted after sheet 0 of 1 (or sheet $K$ of $N$ in a larger job), the kiosk calls `POST /api/k/{id}/jobs/{id}/recover` with confirmed printed sheets ([`cloud-backend/cmd/server/recovery_handler.go:49`](file:///home/shabas/Projects/XeroxGo/cloud-backend/cmd/server/recovery_handler.go#L49)).
-   - Cloud invokes `qpdf` continuation generator ([`cloud-backend/internal/pdf/recovery.go:26`](file:///home/shabas/Projects/XeroxGo/cloud-backend/internal/pdf/recovery.go#L26)), producing a continuation PDF starting at the exact interrupted sheet boundary.
-   - Dispatches continuation with `start_from_page=1`, requiring zero slicing logic on the Raspberry Pi.
+4. **Canonical Failure Reconciliation (No Continuation Printing):**
+   - On interruption or pre-submission failure, remaining unsubmitted order documents are stopped while preserving any `COMPLETED` prefix.
+   - Submitted or ambiguous jobs are held/canceled via CUPS and remain in `PAUSED_ERROR` (with `printer_state.is_calibrated = 0` when consumption is uncertain) until CUPS termination, empty active queue, and fresh quiescent hardware telemetry are verified, at which point unresolved jobs finalize to `FAILED_REFUNDABLE`.
 
 ---
 

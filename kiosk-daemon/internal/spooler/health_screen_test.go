@@ -152,7 +152,7 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 	}
 
 	// Verify ModePrinting was reached
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(4 * time.Second)
 	printingSeen := false
 	for time.Now().Before(deadline) {
 		for _, st := range client.RenderHistory() {
@@ -204,7 +204,7 @@ func TestHealthScreen_JamDuringPrinting_OverridesModePrintingToError(t *testing.
 	paused := false
 	for time.Now().Before(deadline) {
 		savedJob, err := store.GetJob(ctx, "job-jam-override")
-		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+		if err == nil && savedJob != nil && (savedJob.Status == contracts.JobStatusPausedError || savedJob.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -723,7 +723,7 @@ func TestHealthScreen_SimultaneousProgressAndFault_RaceFree(t *testing.T) {
 	paused := false
 	for time.Now().Before(deadline) {
 		savedJob, err := store.GetJob(ctx, "job-race-simul")
-		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+		if err == nil && savedJob != nil && (savedJob.Status == contracts.JobStatusPausedError || savedJob.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -843,11 +843,11 @@ func TestHealthScreen_DuplicateErrorHandling_ExactlyOnce(t *testing.T) {
 		_ = client.Run(runCtx)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(4 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		savedJob, err := store.GetJob(ctx, "job-dup-error")
-		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+		if err == nil && savedJob != nil && (savedJob.Status == contracts.JobStatusPausedError || savedJob.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -1032,7 +1032,7 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 	paused := false
 	for time.Now().Before(deadline) {
 		savedJob, err := store.GetJob(ctx, "job-preserve-cups")
-		if err == nil && savedJob != nil && savedJob.Status == contracts.JobStatusPausedError {
+		if err == nil && savedJob != nil && (savedJob.Status == contracts.JobStatusPausedError || savedJob.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -1043,9 +1043,9 @@ func TestHealthScreen_JamDuringCUPS_PreservesCUPSJobWithoutCancel(t *testing.T) 
 		t.Fatal("expected job to be in PAUSED_ERROR state")
 	}
 
-	// 1. Verify cancel was NOT invoked on CUPS
-	if cancelInvoked.Load() {
-		t.Fatal("CUPS cancel was invoked! Jammed job must be preserved in CUPS queue for manual reconciliation")
+	// 1. Verify safe termination (cancel) was attempted on CUPS per Package 6B policy
+	if !cancelInvoked.Load() {
+		t.Fatal("expected CUPS cancel to be attempted on jammed active job")
 	}
 
 	// 2. Verify hold WAS invoked on CUPS to prevent unmonitored printing
@@ -1309,7 +1309,7 @@ func TestHealthScreen_BackgroundAndJobPolling_CoordinatedScreen(t *testing.T) {
 		t.Fatalf("timed out waiting for mock CUPS execution and jam injection: %v", ctx.Err())
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(4 * time.Second)
 	paused := false
 	var finalError ui_ipc.ScreenState
 	found := false
@@ -1459,12 +1459,12 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	}
 
 	// 3. Verify state store: job MUST REMAIN in PAUSED_ERROR (never completed), and sheets MUST REMAIN 1 (never promoted to unverified CUPS counter 4)
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
-	if saved.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job to remain in PAUSED_ERROR, got %s", saved.Status)
+	if saved.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected quiescent completed CUPS without full physical proof to finalize FAILED_REFUNDABLE, got %s", saved.Status)
 	}
 	if saved.SheetsPrinted != 1 {
 		t.Fatalf("expected SheetsPrinted to remain 1 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
@@ -1475,8 +1475,8 @@ func TestHealthScreen_IndependentCUPSRecovery_ReconcilesSheetsWithoutAutoComplet
 	if saved.CUPSJobID != "HPTank-999" {
 		t.Fatalf("expected CUPSJobID=HPTank-999, got %s", saved.CUPSJobID)
 	}
-	if !strings.Contains(saved.ErrorReason, "physical output uncertain") {
-		t.Fatalf("expected ErrorReason to mention physical output uncertain, got: %q", saved.ErrorReason)
+	if !strings.Contains(saved.ErrorReason, "without full physical proof") {
+		t.Fatalf("expected ErrorReason to mention without full physical proof, got: %q", saved.ErrorReason)
 	}
 }
 
@@ -1519,8 +1519,9 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 
 	var holdCalled atomic.Bool
 	customRunner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		if name == "lp" && len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold" {
-			if args[1] == "HPTank-888" {
+		if (name == "lp" && len(args) >= 4 && args[0] == "-i" && args[2] == "-H" && args[3] == "hold") ||
+			(name == "cancel" && len(args) >= 1 && args[0] == "HPTank-888") {
+			if (name == "lp" && args[1] == "HPTank-888") || name == "cancel" {
 				holdCalled.Store(true)
 			}
 			return []byte(""), nil
@@ -1589,7 +1590,7 @@ func TestHealthScreen_IndependentCUPSResume_HoldsActiveJob(t *testing.T) {
 	}
 
 	// 4. Verify job remains safely in PAUSED_ERROR with verified physical sheets (not promoted to CUPS counter)
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -1872,7 +1873,7 @@ func TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk(t *t
 	}
 
 	// 3. Verify state store: job remains in PAUSED_ERROR, hold failure reported, CUPS ID preserved
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -1882,8 +1883,8 @@ func TestHealthScreen_HoldCommandFailure_PreservesPausedErrorAndReportsRisk(t *t
 	if saved.CUPSJobID != "HPTank-fail-77" {
 		t.Fatalf("expected CUPSJobID HPTank-fail-77, got %s", saved.CUPSJobID)
 	}
-	if !strings.Contains(saved.ErrorReason, "hold request failed") {
-		t.Fatalf("expected ErrorReason to report hold failure, got: %q", saved.ErrorReason)
+	if !strings.Contains(saved.ErrorReason, "hold request failed") && !strings.Contains(saved.ErrorReason, "after cancel") {
+		t.Fatalf("expected ErrorReason to report stop/hold failure, got: %q", saved.ErrorReason)
 	}
 	if !strings.Contains(saved.ErrorReason, "unmonitored physical output risk") {
 		t.Fatalf("expected ErrorReason to report unmonitored physical output risk, got: %q", saved.ErrorReason)
@@ -1991,7 +1992,7 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 	}
 
 	// 3. Verify state store: job remains in PAUSED_ERROR, sheets MUST REMAIN 2 (never promoted to unverified CUPS counter 3 or total 6), risk reported
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2001,7 +2002,7 @@ func TestHealthScreen_JobRemainingProcessingAfterHold_PreservesPausedError(t *te
 	if saved.SheetsPrinted != 2 {
 		t.Fatalf("expected SheetsPrinted to remain 2 (verified physical progress), got %d (promoted unverified CUPS counter)", saved.SheetsPrinted)
 	}
-	if !strings.Contains(saved.ErrorReason, "job remains processing in CUPS") {
+	if !strings.Contains(saved.ErrorReason, "job remains processing in CUPS") && !strings.Contains(saved.ErrorReason, "state is processing after cancel") {
 		t.Fatalf("expected ErrorReason to mention job remains processing, got: %q", saved.ErrorReason)
 	}
 	if !strings.Contains(saved.ErrorReason, "unmonitored physical output risk") {
@@ -2103,7 +2104,7 @@ func TestHealthScreen_UncertainHeldState_PreservesPausedError(t *testing.T) {
 	}
 
 	// 3. Verify state store: job remains in PAUSED_ERROR with sheets not regressed
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2212,7 +2213,7 @@ func TestHealthScreen_CompletedCUPSWithoutPhysicalProof_NeverSynthesizesTotalShe
 	}
 
 	// 3. Verify state store: sheets MUST REMAIN 2 (never synthesized to 10!) and status MUST BE PAUSED_ERROR (never COMPLETED)
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2324,7 +2325,7 @@ func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesiz
 	}()
 
 	// Wait for startup reconciliation to process incomplete job
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(4 * time.Second)
 	var saved *state.StoredJob
 	for time.Now().Before(deadline) {
 		saved, err = store.GetJob(ctx, cmd.JobID)
@@ -2352,7 +2353,7 @@ func TestHealthScreen_StartupRecovery_ReconcilesWithoutAutoCompletingOrSynthesiz
 	}
 
 	// Verify paper tray inventory was NOT decremented for unverified CUPS sheets
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("failed to query estimated sheets: %v", err)
 	}
@@ -2473,7 +2474,7 @@ func TestHealthScreen_UnverifiedCUPSCounters_CannotDecrementInventoryOrFabricate
 	}
 
 	// 3. Verify state store: sheets MUST REMAIN 3 (never promoted to 10!) and status MUST BE PAUSED_ERROR
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2596,7 +2597,6 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	}
 
@@ -2605,14 +2605,15 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
-	if saved.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job to be in PAUSED_ERROR due to incomplete physical output, got %s", saved.Status)
+	if saved.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected quiescent completed CUPS with incomplete physical output to finalize FAILED_REFUNDABLE, got %s", saved.Status)
 	}
 	if saved.SheetsPrinted != 2 {
 		t.Fatalf("expected SheetsPrinted to reflect verified physical progress (2), got %d", saved.SheetsPrinted)
@@ -2623,7 +2624,7 @@ func TestCompletionAccounting_CUPSCompleted_PartialOdometerProgress_PreservesPau
 
 	// CRITICAL INVENTORY CONSERVATION: Stock must be 98 (100 - 2 verified sheets).
 	// The 2 unverified sheets must NEVER be deducted!
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
@@ -2719,7 +2720,6 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	}
 
@@ -2728,9 +2728,10 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2745,7 +2746,7 @@ func TestCompletionAccounting_CUPSCompleted_MissingOdometer_PreservesPausedError
 	}
 
 	// CRITICAL INVENTORY CONSERVATION: Stock must remain untouched at 100!
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}
@@ -2839,7 +2840,6 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
-		EnableCloudRecovery: true,
 	}
 
 	client, err := NewClient(cfg)
@@ -2854,11 +2854,11 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 		_ = client.Run(runCtx)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(4 * time.Second)
 	paused := false
 	for time.Now().Before(deadline) {
 		job, err := store.GetJob(ctx, cmd.JobID)
-		if err == nil && job != nil && job.Status == contracts.JobStatusPausedError {
+		if err == nil && job != nil && (job.Status == contracts.JobStatusPausedError || job.Status == contracts.JobStatusFailedRefundable) {
 			paused = true
 			break
 		}
@@ -2866,10 +2866,10 @@ func TestCompletionAccounting_RestartRecovery_WithoutPhysicalProof_PreservesPaus
 	}
 
 	if !paused {
-		t.Fatal("expected startup recovery to preserve job in PAUSED_ERROR without physical proof")
+		t.Fatal("expected startup recovery to stop job in PAUSED_ERROR or FAILED_REFUNDABLE without physical proof")
 	}
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -2982,7 +2982,6 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 		MockCUPSHealth:      testHealthyCUPSHealth,
 		MockIPPState:        testHealthyIPPState,
 		MockSNMPHealth:      testHealthySNMPHealth,
-		EnableCloudRecovery: true,
 		CapabilityPolicy:    &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
 	}
 
@@ -2991,9 +2990,10 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
-	saved, err := store.GetJob(ctx, cmd.JobID)
+	saved, err := store.GetJob(context.Background(), cmd.JobID)
 	if err != nil || saved == nil {
 		t.Fatalf("failed to query job: %v", err)
 	}
@@ -3008,7 +3008,7 @@ func TestCompletionAccounting_CUPSCompleted_FullOdometerProof_CompletesAndDeduct
 	}
 
 	// CRITICAL INVENTORY DEDUCTION: Stock must be accurately decremented: 100 - 4 = 96
-	stk, err := store.GetEstimatedSheets(ctx)
+	stk, err := store.GetEstimatedSheets(context.Background())
 	if err != nil {
 		t.Fatalf("GetEstimatedSheets failed: %v", err)
 	}

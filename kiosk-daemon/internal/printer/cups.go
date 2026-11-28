@@ -173,6 +173,95 @@ func HoldAndVerifyCUPSJob(ctx context.Context, runner CommandRunner, queue strin
 	return res
 }
 
+// CancelCUPSJob requests that CUPS cancel an active or queued CUPS job.
+func CancelCUPSJob(ctx context.Context, runner CommandRunner, cupsJobID string) error {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	if ctx == nil {
+		return errors.New("context cannot be nil")
+	}
+	if strings.TrimSpace(cupsJobID) == "" {
+		return errors.New("cupsJobID cannot be empty")
+	}
+	out, err := runner(ctx, "cancel", cupsJobID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel CUPS job %s: %w (output: %s)", cupsJobID, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// CancelResult represents the verified outcome of attempting to cancel a CUPS job.
+type CancelResult struct {
+	CancelRequested  bool
+	CancelErr        error
+	State            CUPSJobState
+	JobInfo          CUPSJobInfo
+	QueryErr         error
+	QueueCheckErr    error
+	ConfirmedStopped bool
+	AlreadyCompleted bool
+	StillActive      bool
+	IsUnknown        bool
+}
+
+// CancelAndVerifyCUPSJob cancels the CUPS job, queries the exact CUPS job state,
+// and verifies no active jobs remain on the queue. Cancel command success or job
+// disappearance alone is treated as insufficient (IsUnknown).
+func CancelAndVerifyCUPSJob(ctx context.Context, runner CommandRunner, queue string, cupsJobID string) CancelResult {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+	res := CancelResult{CancelRequested: true}
+
+	if strings.TrimSpace(cupsJobID) == "" {
+		res.CancelErr = errors.New("cupsJobID cannot be empty")
+		res.IsUnknown = true
+		return res
+	}
+
+	res.CancelErr = CancelCUPSJob(ctx, runner, cupsJobID)
+	if res.CancelErr != nil {
+		log.Printf("[CUPS] Warning: cancel request for job %s failed: %v", cupsJobID, res.CancelErr)
+	}
+
+	info, qErr := QueryCUPSJobInfo(ctx, runner, queue, cupsJobID)
+	res.QueryErr = qErr
+	res.JobInfo = info
+	res.State = info.State
+
+	if qErr != nil {
+		log.Printf("[CUPS] Warning: error querying job %s state after cancel request: %v", cupsJobID, qErr)
+		res.IsUnknown = true
+		return res
+	}
+
+	res.QueueCheckErr = VerifyNoUnrelatedActiveCUPSJob(ctx, runner, queue, "")
+
+	switch info.State {
+	case CUPSJobStateCanceled, CUPSJobStateAborted:
+		if res.QueueCheckErr == nil {
+			res.ConfirmedStopped = true
+			log.Printf("[CUPS] Job %s confirmed %s and queue %q has no active jobs", cupsJobID, info.State, queue)
+		} else {
+			res.StillActive = true
+			log.Printf("[CUPS] Warning: job %s is %s but queue %q verification failed: %v", cupsJobID, info.State, queue, res.QueueCheckErr)
+		}
+	case CUPSJobStateCompleted:
+		res.AlreadyCompleted = true
+		log.Printf("[CUPS] Job %s was already COMPLETED in CUPS before or during cancel request", cupsJobID)
+	case CUPSJobStatePending, CUPSJobStateProcessing, CUPSJobStateHeld, CUPSJobStateProcessingStopped:
+		res.StillActive = true
+		log.Printf("[CUPS] Warning: job %s remains %s after cancel request", cupsJobID, info.State)
+	default:
+		// Disappearance (CUPSJobStateUnknown) alone is insufficient to prove cancellation.
+		res.IsUnknown = true
+		log.Printf("[CUPS] Warning: job %s state is %s after cancel request; disappearance alone cannot confirm stop", cupsJobID, info.State)
+	}
+
+	return res
+}
+
 func extractJobNumber(cupsJobID string) string {
 	parts := strings.Split(cupsJobID, "-")
 	last := parts[len(parts)-1]

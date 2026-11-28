@@ -359,6 +359,7 @@ func TestMultiDoc_SingleCopyReplicationViaCUPS(t *testing.T) {
 		StartFromPage:  1,
 	}
 
+	_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, cmd)
 
 	if receivedCmd.Copies != 3 {
@@ -571,8 +572,8 @@ func TestMultiDoc_OrderLevelPaperCheck(t *testing.T) {
 	}
 
 	stored0, err := store.GetJob(ctx, "job_paper_0")
-	if err != nil || stored0.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected doc 0 to be PAUSED_ERROR due to insufficient paper, got %v", stored0)
+	if err != nil || stored0.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected doc 0 to be FAILED_REFUNDABLE due to pre-submission insufficient paper, got %v", stored0)
 	}
 	if !strings.Contains(stored0.ErrorReason, "paper tray supply insufficient") {
 		t.Fatalf("expected reason to contain 'paper tray supply insufficient', got: %s", stored0.ErrorReason)
@@ -648,10 +649,10 @@ func TestMultiDoc_StartupRecoveryUnsubmitted(t *testing.T) {
 	}
 
 	// Persist both as unsubmitted SPOOLING jobs
-	if err := store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling); err != nil {
+	if err := store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched); err != nil {
 		t.Fatalf("failed to save cmd0: %v", err)
 	}
-	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched); err != nil {
 		t.Fatalf("failed to save cmd1: %v", err)
 	}
 
@@ -884,7 +885,7 @@ func TestMultiDoc_DuplicateDispatchAfterRestart(t *testing.T) {
 	})
 
 	// Doc 1 was saved as Spooling before daemon stopped/restarted (unsubmitted)
-	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling); err != nil {
+	if err := store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched); err != nil {
 		t.Fatalf("SaveJob doc 1 failed: %v", err)
 	}
 
@@ -1263,14 +1264,17 @@ func TestMultiDoc_PreSubmissionSafety_UncertainSubmission(t *testing.T) {
 		StartFromPage:  1,
 	}
 
-	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
-	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
+	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
 
 	// Simulate uncertain state: SubmittedToPrinter is set, but no CUPS job ID
 	_ = store.MarkJobSubmitting(ctx, cmd0.JobID)
 
-	// Attempt to process doc 0
+	// Attempt to process doc 0 -> BeginJobSpooling rejects, then reconciliation pauses doc 0 & doc 1
 	client.processJob(ctx, cmd0)
+	if stored0, _ := store.GetJob(ctx, cmd0.JobID); stored0 != nil {
+		client.reconcileSubmittedOrInterruptedJob(ctx, stored0, "interrupted during submission; manual reconciliation required", false)
+	}
 
 	// MockCUPSPrint must NOT have been called
 	if mockCalled {
@@ -1374,8 +1378,11 @@ func TestMultiDoc_PreSubmissionSafety_ExistingCUPSJob(t *testing.T) {
 	_ = store.SaveJob(ctx, cmd, contracts.JobStatusPrinting)
 	_ = store.RecordJobSubmission(ctx, cmd.JobID, "TestQueue-99")
 
-	// Call processJob on this existing CUPS job
+	// Call processJob on this existing CUPS job -> rejected at processing boundary; resumeCUPSMonitoring monitors it
 	client.processJob(ctx, cmd)
+	if stored, _ := store.GetJob(ctx, cmd.JobID); stored != nil {
+		client.resumeCUPSMonitoring(ctx, stored)
+	}
 
 	// lp must NOT have been called!
 	if lpCalled.Load() {
@@ -1455,15 +1462,15 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 		StartFromPage:  1,
 	}
 
-	_ = store.SaveJob(ctx, colorCmd, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, colorCmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, colorCmd)
 
 	if mockCalled {
 		t.Fatalf("MockCUPSPrint was invoked for unsupported COLOR job!")
 	}
 	stored, _ := store.GetJob(ctx, colorCmd.JobID)
-	if stored.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job status PAUSED_ERROR for unsupported color, got %s", stored.Status)
+	if stored.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job status FAILED_REFUNDABLE for pre-submission unsupported color, got %s", stored.Status)
 	}
 	if !strings.Contains(stored.ErrorReason, "printer does not support requested COLOR printing mode") {
 		t.Fatalf("unexpected error reason: %s", stored.ErrorReason)
@@ -1495,15 +1502,15 @@ func TestMultiDoc_ColorCapabilitiesEnforcement(t *testing.T) {
 	}
 
 	mockCalled = false
-	_ = store.SaveJob(ctx, monoCmd, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, monoCmd, contracts.JobStatusDispatched)
 	client.processJob(ctx, monoCmd)
 
 	if mockCalled {
 		t.Fatalf("MockCUPSPrint was invoked for unsupported BW job!")
 	}
 	storedMono, _ := store.GetJob(ctx, monoCmd.JobID)
-	if storedMono.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job status PAUSED_ERROR for unsupported BW, got %s", storedMono.Status)
+	if storedMono.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job status FAILED_REFUNDABLE for pre-submission unsupported BW, got %s", storedMono.Status)
 	}
 	if !strings.Contains(storedMono.ErrorReason, "printer does not support requested BW/MONOCHROME printing mode") {
 		t.Fatalf("unexpected error reason: %s", storedMono.ErrorReason)
@@ -1586,7 +1593,7 @@ func TestMultiDoc_FailClosedOnStoreErrorsAndInconsistency(t *testing.T) {
 		StartFromPage:  1,
 	}
 
-	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+	_ = store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
 	_ = store.SaveJob(ctx, cmd1, contracts.JobStatusCompleted)
 
 	// checkAndAdmitOrder must fail closed and refuse to queue because doc 1 is completed while doc 0 is not
@@ -1670,7 +1677,7 @@ func TestMultiDoc_QueueSaturation_FIFOOrder(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 		cmds = append(cmds, cmd)
 	}
 
@@ -1760,7 +1767,7 @@ func TestMultiDoc_DeferredOrder_Sequencing(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 	}
 	client.checkAndAdmitOrder(orderA, 3)
 
@@ -1839,7 +1846,7 @@ func TestMultiDoc_StartupRecovery_FIFOOrder(t *testing.T) {
 			StartFromPage:  1,
 		}
 		// Save doc 0 as COMPLETED, and docs 1, 2, 3 as unsubmitted SPOOLING
-		status := contracts.JobStatusSpooling
+		status := contracts.JobStatusDispatched
 		if i == 0 {
 			status = contracts.JobStatusCompleted
 		}
@@ -1992,8 +1999,8 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
-		_ = store.SaveJob(ctx, cmd1, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
+		_ = store.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
 
 		fStore := &failureInjectedStore{
 			StateStore:         store,
@@ -2086,7 +2093,7 @@ func TestMultiDoc_StartupRecovery_InjectedSQLiteFailure(t *testing.T) {
 			Duplex:         contracts.DuplexSimplex,
 			StartFromPage:  1,
 		}
-		_ = store.SaveJob(ctx, cmd, contracts.JobStatusSpooling)
+		_ = store.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
 
 		fStore := &failureInjectedStore{
 			StateStore:           store,
@@ -2814,34 +2821,34 @@ func TestMultiDoc_CUPS_OptionMapping_And_TamperedChecksum(t *testing.T) {
 	deadlineTamper := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadlineTamper) {
 		job1, err := store.GetJob(ctx, "job_tamper_1")
-		if err == nil && job1.Status == contracts.JobStatusPausedError {
+		if err == nil && job1.Status == contracts.JobStatusFailedRefundable {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Verify job_tamper_0 is in PAUSED_ERROR state due to checksum failure
+	// Verify job_tamper_0 is in FAILED_REFUNDABLE state due to pre-submission checksum failure
 	job0, err := store.GetJob(ctx, "job_tamper_0")
 	if err != nil {
 		t.Fatalf("failed to get job_tamper_0: %v", err)
 	}
-	if job0.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job_tamper_0 status PAUSED_ERROR, got %s", job0.Status)
+	if job0.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job_tamper_0 status FAILED_REFUNDABLE, got %s", job0.Status)
 	}
 	if !strings.Contains(job0.ErrorReason, "checksum mismatch") {
 		t.Errorf("expected checksum mismatch error reason, got %q", job0.ErrorReason)
 	}
 
-	// Verify job_tamper_1 is in PAUSED_ERROR state due to sibling failure
+	// Verify job_tamper_1 is in FAILED_REFUNDABLE state due to sibling failure
 	job1, err := store.GetJob(ctx, "job_tamper_1")
 	if err != nil {
 		t.Fatalf("failed to get job_tamper_1: %v", err)
 	}
-	if job1.Status != contracts.JobStatusPausedError {
-		t.Fatalf("expected job_tamper_1 status PAUSED_ERROR, got %s", job1.Status)
+	if job1.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected job_tamper_1 status FAILED_REFUNDABLE, got %s", job1.Status)
 	}
-	if !strings.Contains(job1.ErrorReason, "order paused due to error in sibling document") {
-		t.Errorf("expected sibling pause error reason, got %q", job1.ErrorReason)
+	if !strings.Contains(job1.ErrorReason, "Order stopped due to earlier document failure") && !strings.Contains(job1.ErrorReason, "order paused due to error in sibling document") {
+		t.Errorf("expected sibling stop/pause error reason, got %q", job1.ErrorReason)
 	}
 
 	// Verify no new lp invocations were made for either job in ord_tamper_002

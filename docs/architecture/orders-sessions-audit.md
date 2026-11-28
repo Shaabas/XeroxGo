@@ -146,7 +146,7 @@ flowchart TD
     Spooling -->|Checksum verified, submitted to printer| Printing
     Printing -->|All sheets confirmed printed| Completed
     Printing -->|Paper jam / printer offline| PausedError
-    PausedError -->|Cloud continuation slicing / recover| Printing
+    PausedError -->|Verified CUPS stop + quiescent hardware| FailedRefundable
 ```
 
 ### 3.2 State Transition Matrix
@@ -161,7 +161,7 @@ flowchart TD
 | **`DISPATCHED`** | **`SPOOLING`** | Kiosk spooler receives command | Spooler validates URL origin, path, and SHA256 hex format. | `UPDATE orders SET status='SPOOLING'`<br/>`INSERT INTO job_progress` | Local SQLite checks `StoredJob.Status`. Ignores command if already completed or submitted. |
 | **`SPOOLING`** | **`PRINTING`** | PDF downloaded, verified, and sent to printer | SHA256 checksum matches byte-for-byte; CUPS/PJL accepts stream. | `UPDATE orders SET status='PRINTING'`<br/>`UPDATE job_progress SET pages_printed=0` | Atomic state transition; local store records `SubmittedToPrinter = true` with CUPS job ID. |
 | **`PRINTING`** | **`COMPLETED`** | Hardware printer confirms all sheets printed | Telemetry confirms physical sheet count matches `TotalSheets`. | `UPDATE orders SET status='COMPLETED'`<br/>`DELETE FROM pin_reservations WHERE order_id=?`<br/>`UPDATE dispatch_intents SET status='COMPLETED'` | Final completion releases PIN reservation back to kiosk pool. Local spooler chimes and resets. |
-| **`PRINTING`** | **`PAUSED_ERROR`** | Printer reports paper jam, cover open, or stall | Hardware telemetry error reported by CUPS or SNMP. | `UPDATE orders SET status='PAUSED_ERROR'`<br/>`UPDATE job_progress SET error_reason=?` | Confirmed printed sheets recorded. Job eligible for cloud continuation recovery. |
+| **`PRINTING`** | **`PAUSED_ERROR`** | Printer reports paper jam, cover open, or stall | Hardware telemetry error reported by CUPS or SNMP. | `UPDATE orders SET status='PAUSED_ERROR'`<br/>`UPDATE job_progress SET error_reason=?` | Confirmed printed sheets recorded. Unsubmitted siblings stopped; job awaits verified stop + quiescent hardware reconciliation to `FAILED_REFUNDABLE` (no continuation printing). |
 
 ---
 

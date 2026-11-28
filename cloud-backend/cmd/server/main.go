@@ -1183,8 +1183,6 @@ func (app *appServer) routes() *http.ServeMux {
 		switch {
 		case strings.HasSuffix(path, "/upload"):
 			app.handleUpload(w, r)
-		case strings.HasSuffix(path, "/recover"):
-			app.handleRecoverJob(w, r)
 		case strings.HasSuffix(path, "/orders/lookup"), strings.HasSuffix(path, "/pin/lookup"):
 			app.handlePINLookup(w, r)
 		case strings.HasSuffix(path, "/claim"), strings.HasSuffix(path, "/confirm"):
@@ -1206,13 +1204,6 @@ func (app *appServer) routes() *http.ServeMux {
 		default:
 			http.NotFound(w, r)
 		}
-	})
-	mux.HandleFunc("/api/recovery/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/pdf") {
-			app.handleDownloadRecoveryPDF(w, r)
-			return
-		}
-		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/api/orders/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -1274,8 +1265,7 @@ func createIngressHandler(mux http.Handler, proxySecret string, devMode bool) ht
 			isExempt := path == "/healthz" ||
 				path == "/ws" ||
 				(strings.HasPrefix(path, "/api/orders/") && (strings.HasSuffix(path, "/pdf") || strings.HasSuffix(path, "/recovery-pin"))) ||
-				(strings.HasPrefix(path, "/api/recovery/") && strings.HasSuffix(path, "/pdf")) ||
-				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/recover") || strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.Contains(path, "/sessions/")))
+				(strings.HasPrefix(path, "/api/k/") && (strings.HasSuffix(path, "/orders/lookup") || strings.HasSuffix(path, "/pin/lookup") || strings.HasSuffix(path, "/claim") || strings.HasSuffix(path, "/confirm") || strings.HasSuffix(path, "/release") || strings.HasSuffix(path, "/recovery-pin") || strings.Contains(path, "/sessions/")))
 
 			if !isExempt && strings.HasPrefix(path, "/api/") {
 				reqSecret := strings.TrimSpace(r.Header.Get("X-XeroxGo-Proxy-Secret"))
