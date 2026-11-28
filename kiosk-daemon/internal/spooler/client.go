@@ -900,13 +900,19 @@ func (c *Client) Run(ctx context.Context) error {
 				}
 
 				if canResume {
-					c.activeMu.Lock()
-					for _, j := range jobsToResume {
-						c.activeJobs[j.JobID] = true
-					}
-					c.activeMu.Unlock()
+					if deferAdm, adm := c.shouldDeferForNativeIPPAdmission(ctx); deferAdm {
+						c.deferJobsInOrder(jobsToResume)
+						log.Printf("[SPOOLER] Startup recovery: deferred %d untouched job(s) for order %s (native IPP admission=%s)",
+							len(jobsToResume), oid, adm)
+					} else {
+						c.activeMu.Lock()
+						for _, j := range jobsToResume {
+							c.activeJobs[j.JobID] = true
+						}
+						c.activeMu.Unlock()
 
-					c.enqueueJobs(jobsToResume)
+						c.enqueueJobs(jobsToResume)
+					}
 				} else if len(jobsToResume) > 0 {
 					reason := fmt.Sprintf("startup recovery: order %s has non-contiguous completion gap; manual reconciliation required", oid)
 					log.Printf("[SPOOLER] %s", reason)
@@ -1559,11 +1565,7 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 
 	// 4. Defer untouched DISPATCHED jobs when printer is healthy/safe but native IPP admission is not yet ACCEPTING.
 	// (Hardware faults or uninitialized test queues still proceed to processJob/jobQueue so existing error handling runs.)
-	snap := c.ensureOrCurrentHealthSnapshot(context.Background())
-	deferForAdmission := !c.isHardwareFaultActive() &&
-		snap.EvaluatedHealth == contracts.EvaluatedHealthHealthy &&
-		snap.ExecutionSafe &&
-		snap.EffectiveNativeIPPAdmission() != contracts.AcceptingJobsAccepting
+	deferForAdmission, admState := c.shouldDeferForNativeIPPAdmission(context.Background())
 
 	// 5. Check in-memory state:
 	// Check if any of the uncompleted jobs are already in activeJobs
@@ -1602,7 +1604,7 @@ func (c *Client) checkAndAdmitOrder(orderID string, totalDocs int) {
 				orderID, firstUncompletedIdx+1, totalDocs, totalDocs)
 		} else {
 			log.Printf("[SPOOLER] Order %s uncompleted documents (%d..%d of %d) deferred; native IPP job admission is %s",
-				orderID, firstUncompletedIdx+1, totalDocs, totalDocs, snap.EffectiveNativeIPPAdmission())
+				orderID, firstUncompletedIdx+1, totalDocs, totalDocs, admState)
 		}
 		return
 	}
@@ -2185,6 +2187,51 @@ func (c *Client) validateDownloadURL(rawURL string) error {
 	return nil
 }
 
+func (c *Client) shouldDeferForNativeIPPAdmission(ctx context.Context) (bool, contracts.AcceptingJobsStatus) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	snap := c.ensureOrCurrentHealthSnapshot(ctx)
+	if c.isHardwareFaultActive() || snap.EvaluatedHealth != contracts.EvaluatedHealthHealthy || !snap.ExecutionSafe {
+		return false, snap.EffectiveNativeIPPAdmission()
+	}
+	adm := snap.EffectiveNativeIPPAdmission()
+	return adm != contracts.AcceptingJobsAccepting, adm
+}
+
+func (c *Client) hasDeferredOrder(orderID string) bool {
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+	for _, dj := range c.deferredJobs {
+		djOrderID := dj.OrderID
+		if djOrderID == "" {
+			djOrderID = dj.JobID
+		}
+		if djOrderID == orderID {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) deferJobsInOrder(cmds []contracts.PrintJobCommand) {
+	if len(cmds) == 0 {
+		return
+	}
+	c.deferredMu.Lock()
+	defer c.deferredMu.Unlock()
+	existing := make(map[string]bool, len(c.deferredJobs))
+	for _, dj := range c.deferredJobs {
+		existing[dj.JobID] = true
+	}
+	for _, cmd := range cmds {
+		if !existing[cmd.JobID] {
+			c.deferredJobs = append(c.deferredJobs, cmd)
+			existing[cmd.JobID] = true
+		}
+	}
+}
+
 func (c *Client) canAdmitFreshPhysicalSubmission(ctx context.Context) (bool, string) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -2370,6 +2417,22 @@ func (c *Client) processJob(ctx context.Context, cmd contracts.PrintJobCommand) 
 		c.setPersistenceReadBarrier(errors.New("state store not configured"))
 		c.syncCustomerServiceState(ctx)
 		return
+	}
+	if preStored, preErr := c.cfg.StateStore.GetJob(ctx, cmd.JobID); preErr == nil && preStored != nil {
+		isUntouchedDispatched := preStored.Status == contracts.JobStatusDispatched &&
+			!preStored.SubmittedToPrinter &&
+			preStored.CUPSJobID == "" &&
+			preStored.SheetsPrinted == 0 &&
+			preStored.PagesPrinted == 0 &&
+			strings.TrimSpace(preStored.ErrorReason) == ""
+		if isUntouchedDispatched {
+			if deferAdm, adm := c.shouldDeferForNativeIPPAdmission(ctx); deferAdm || c.hasDeferredOrder(orderID) {
+				c.deferJobsInOrder([]contracts.PrintJobCommand{cmd})
+				log.Printf("[SPOOLER] Deferring untouched job %s (order %s, doc %d/%d) before BeginJobSpooling (native IPP admission=%s)",
+					cmd.JobID, orderID, cmd.DocumentIndex+1, cmd.TotalDocuments, adm)
+				return
+			}
+		}
 	}
 	if err := c.cfg.StateStore.BeginJobSpooling(ctx, cmd.JobID); err != nil {
 		log.Printf("[SPOOLER] Failed to transition job %s DISPATCHED -> SPOOLING: %v; failing closed", cmd.JobID, err)
@@ -3906,6 +3969,9 @@ func (c *Client) CheckPrinterHealth(ctx context.Context) contracts.PrinterHealth
 	}
 
 	c.syncCustomerServiceState(ctx)
+	if !c.isHardwareFaultActive() && effectiveH.EvaluatedHealth == contracts.EvaluatedHealthHealthy {
+		c.drainDeferredJobsIfSafe(ctx)
+	}
 
 	return effectiveH
 }
@@ -4451,6 +4517,7 @@ func (c *Client) CurrentHealthSnapshot(ctx context.Context) contracts.PrinterHea
 	if ok, _, freshReason := contracts.ValidateHealthEvidenceFreshness(h, now, DefaultTelemetryMaxAge); !ok {
 		// Preserve original timestamps so reading expired telemetry never extends age.
 		h.Online = false
+		h.NativeIPPAdmission = contracts.AcceptingJobsUnknown
 		if h.EvaluatedHealth != contracts.EvaluatedHealthFault {
 			h.EvaluatedHealth = contracts.EvaluatedHealthUnverified
 		}
@@ -4629,8 +4696,8 @@ func (c *Client) syncCustomerServiceState(ctx context.Context) {
 				QRContent: c.cfg.IdleQRContent,
 				Message:   "Ready to print",
 			})
-			c.drainDeferredJobsIfSafe(ctx)
 		}
+		c.drainDeferredJobsIfSafe(ctx)
 		return
 	}
 
