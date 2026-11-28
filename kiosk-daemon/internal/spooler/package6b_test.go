@@ -1650,7 +1650,9 @@ func TestPackage6B_DuplicateAndLateSibling_CannotRestartFailedOrder(t *testing.T
 		SHA256Checksum: strings.Repeat("f", 64), TotalPages: 2, TotalSheets: 2, Copies: 1,
 		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
 	}
-	_ = st.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
+	if err := st.SaveJob(ctx, cmd0, contracts.JobStatusSpooling); err != nil {
+		t.Fatalf("SaveJob cmd0: %v", err)
+	}
 	updated, err := st.FinalizeOrderFailure(ctx, orderID, cmd0.JobID, contracts.JobProgressEvent{
 		JobID: cmd0.JobID, KioskID: "kiosk-1", Status: contracts.JobStatusFailedRefundable,
 		ErrorReason: "download failed", Timestamp: time.Now().UTC(),
@@ -1662,15 +1664,20 @@ func TestPackage6B_DuplicateAndLateSibling_CannotRestartFailedOrder(t *testing.T
 	// independently of pending outcome synchronization.
 	for _, u := range updated {
 		if u.OutcomeVersion > 0 {
-			_ = st.MarkOutcomeSynced(ctx, u.Command.JobID, u.OutcomeVersion)
+			if err := st.MarkOutcomeSynced(ctx, u.Command.JobID, u.OutcomeVersion); err != nil {
+				t.Fatalf("MarkOutcomeSynced(%s): %v", u.Command.JobID, err)
+			}
 		}
+	}
+	if pending, err := st.GetPendingOutcomeSyncJobs(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("expected 0 pending outcome sync barriers before delivery, got %d (err=%v)", len(pending), err)
 	}
 
 	var printed atomic.Bool
 	client, err := NewClient(ClientConfig{
 		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: st, CUPSQueue: "DCPT310",
 		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
-		TrustedOrigins: []string{"https://example.com"},
+		TrustedOrigins: []string{"example.com"},
 		MockHealth:     testHealthyMockHealth,
 		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
 			printed.Store(true)
@@ -1682,6 +1689,13 @@ func TestPackage6B_DuplicateAndLateSibling_CannotRestartFailedOrder(t *testing.T
 		t.Fatalf("NewClient: %v", err)
 	}
 
+	if err := client.validateDownloadURL(cmd0.DownloadURL); err != nil {
+		t.Fatalf("expected cmd0 download URL to pass validateDownloadURL: %v", err)
+	}
+	if err := client.validateDownloadURL(cmd1.DownloadURL); err != nil {
+		t.Fatalf("expected cmd1 download URL to pass validateDownloadURL: %v", err)
+	}
+
 	// Valid duplicate cmd0 and valid late sibling cmd1 (passes URL/checksum/policy/index validation).
 	client.handleIncomingJob(cmd0)
 	client.handleIncomingJob(cmd1)
@@ -1689,8 +1703,23 @@ func TestPackage6B_DuplicateAndLateSibling_CannotRestartFailedOrder(t *testing.T
 	if printed.Load() {
 		t.Fatalf("duplicate/late sibling must never print for failed order")
 	}
-	if j1, _ := st.GetJob(ctx, cmd1.JobID); j1 != nil {
-		t.Fatalf("expected late sibling for failed order to be rejected before saving, got %+v", j1)
+	if j0, err := st.GetJob(ctx, cmd0.JobID); err != nil || j0 == nil || j0.Status != contracts.JobStatusFailedRefundable {
+		t.Fatalf("expected failed job cmd0 to remain FAILED_REFUNDABLE, got %+v (err=%v)", j0, err)
+	}
+	if j1, err := st.GetJob(ctx, cmd1.JobID); err != nil || j1 != nil {
+		t.Fatalf("expected late sibling for failed order to be rejected before saving, got %+v (err=%v)", j1, err)
+	}
+
+	// Positive control: a valid job for a different order with identical host/client config is accepted.
+	okCmd := contracts.PrintJobCommand{
+		JobID: "job-dl-ok-0", OrderID: "ord-duplate-ok", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-1", DisplayCode: "2829", DownloadURL: "https://example.com/ok.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	client.handleIncomingJob(okCmd)
+	if okJob, err := st.GetJob(ctx, okCmd.JobID); err != nil || okJob == nil || okJob.Status != contracts.JobStatusDispatched {
+		t.Fatalf("expected positive-control valid order to be persisted as DISPATCHED, got %+v (err=%v)", okJob, err)
 	}
 }
 

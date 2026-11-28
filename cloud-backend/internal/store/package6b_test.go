@@ -402,11 +402,12 @@ func TestPackage6B_AuthorizeAndMarkDispatchSent_FastAckAndSendFailure_Postgres(t
 	}
 
 	// 2. Force sendFn to fail after dispatch authorization has succeeded -> must roll back and leave intent PENDING.
+	errSimulatedSendFailure := errors.New("simulated ws write failure")
 	err = st.AuthorizeAndMarkDispatchSent(ctx, orderID, docs[1].JobID, kioskID, true, func() error {
-		return errors.New("simulated ws write failure")
+		return errSimulatedSendFailure
 	})
-	if err == nil {
-		t.Fatalf("expected AuthorizeAndMarkDispatchSent to fail when sendFn fails")
+	if !errors.Is(err, errSimulatedSendFailure) {
+		t.Fatalf("expected AuthorizeAndMarkDispatchSent to return %v, got %v", errSimulatedSendFailure, err)
 	}
 	st1, _, err := st.GetJobDispatchIntentStatus(ctx, docs[1].JobID)
 	if err != nil || st1 != "PENDING" {
