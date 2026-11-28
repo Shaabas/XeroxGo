@@ -1171,6 +1171,45 @@ func TestPackage6B_VerifyPostTerminationQuiescence_NoRecursiveDeadlock(t *testin
 }
 
 
+type failAllFailurePersistenceStore struct {
+	StateStore
+	failJobID     string
+	finalizeCalls atomic.Int32
+	recordedSpool atomic.Bool
+}
+
+func (f *failAllFailurePersistenceStore) BeginJobSpooling(ctx context.Context, jobID string) error {
+	if err := f.StateStore.BeginJobSpooling(ctx, jobID); err != nil {
+		return err
+	}
+	if j, err := f.StateStore.GetJob(ctx, jobID); err == nil && j != nil && j.Status == contracts.JobStatusSpooling {
+		f.recordedSpool.Store(true)
+	}
+	return nil
+}
+
+func (f *failAllFailurePersistenceStore) FinalizeOrderFailure(ctx context.Context, orderID, jobID string, event contracts.JobProgressEvent, invalidateInventory bool) ([]state.StoredJob, error) {
+	if jobID == f.failJobID {
+		f.finalizeCalls.Add(1)
+		return nil, errors.New("forced FinalizeOrderFailure error before restart")
+	}
+	return f.StateStore.FinalizeOrderFailure(ctx, orderID, jobID, event, invalidateInventory)
+}
+
+func (f *failAllFailurePersistenceStore) UpdateProgress(ctx context.Context, event contracts.JobProgressEvent) error {
+	if event.JobID == f.failJobID {
+		return errors.New("forced UpdateProgress failure")
+	}
+	return f.StateStore.UpdateProgress(ctx, event)
+}
+
+func (f *failAllFailurePersistenceStore) RecordSheetProgress(ctx context.Context, event contracts.JobProgressEvent) error {
+	if event.JobID == f.failJobID {
+		return errors.New("forced RecordSheetProgress failure")
+	}
+	return f.StateStore.RecordSheetProgress(ctx, event)
+}
+
 func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -1197,9 +1236,9 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 	_ = st1.SaveJob(ctx, cmd0, contracts.JobStatusDispatched)
 	_ = st1.SaveJob(ctx, cmd1, contracts.JobStatusDispatched)
 
-	wrapped1 := &selectiveFailFinalizeStore{
+	wrapped1 := &failAllFailurePersistenceStore{
 		StateStore: st1,
-		failJob:    map[string]error{cmd0.JobID: errors.New("forced FinalizeOrderFailure error before restart")},
+		failJobID:  cmd0.JobID,
 	}
 	client1, err := NewClient(ClientConfig{
 		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: wrapped1, CUPSQueue: "DCPT310",
@@ -1212,8 +1251,14 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 		t.Fatalf("NewClient #1: %v", err)
 	}
 
-	// Processing starts (DISPATCHED -> SPOOLING), download fails, and FinalizeOrderFailure fails.
+	// Processing starts (DISPATCHED -> SPOOLING), download fails, and all failure persistence writes fail.
 	client1.processJob(ctx, cmd0)
+	if !wrapped1.recordedSpool.Load() {
+		t.Fatalf("expected BeginJobSpooling to durably record SPOOLING before failure")
+	}
+	if wrapped1.finalizeCalls.Load() == 0 {
+		t.Fatalf("expected FinalizeOrderFailure to be exercised and fail")
+	}
 	_ = st1.Close()
 
 	// Reopen SQLite DB with a fresh Client (in-memory pendingFinalizations is empty).
@@ -1225,8 +1270,10 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 
 	var printed atomic.Bool
 	client2, err := NewClient(ClientConfig{
-		CloudURL: "ws://127.0.0.1:8080/ws", KioskID: "kiosk-1", StateStore: st2, CUPSQueue: "DCPT310",
+		CloudURL: "ws://127.0.0.1:1/ws", KioskID: "kiosk-1", StateStore: st2, CUPSQueue: "DCPT310",
 		DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		TrustedOrigins: []string{"http://127.0.0.1:1"},
+		MockHealth:     testHealthyMockHealth,
 		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
 			printed.Store(true)
 			return nil
@@ -1248,8 +1295,8 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 		j0, _ := st2.GetJob(ctx, cmd0.JobID)
 		j1, _ := st2.GetJob(ctx, cmd1.JobID)
 		if j0 != nil && j1 != nil &&
-			(j0.Status == contracts.JobStatusPausedError || j0.Status == contracts.JobStatusFailedRefundable) &&
-			(j1.Status == contracts.JobStatusPausedError || j1.Status == contracts.JobStatusFailedRefundable) {
+			j0.Status == contracts.JobStatusFailedRefundable &&
+			j1.Status == contracts.JobStatusFailedRefundable {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -1261,23 +1308,21 @@ func TestPackage6B_RestartSafety_UnsubmittedFinalizeFailure_CannotReprint(t *tes
 
 	j0, _ := st2.GetJob(ctx, cmd0.JobID)
 	j1, _ := st2.GetJob(ctx, cmd1.JobID)
-	if j0 == nil || (j0.Status != contracts.JobStatusPausedError && j0.Status != contracts.JobStatusFailedRefundable) {
-		t.Fatalf("expected job-ru-0 stopped after restart, got %+v", j0)
+	if j0 == nil || j0.Status != contracts.JobStatusFailedRefundable || j0.SubmittedToPrinter {
+		t.Fatalf("expected job-ru-0 FAILED_REFUNDABLE and unsubmitted after restart, got %+v", j0)
 	}
-	if j1 == nil || (j1.Status != contracts.JobStatusPausedError && j1.Status != contracts.JobStatusFailedRefundable) {
-		t.Fatalf("expected sibling job-ru-1 stopped after restart, got %+v", j1)
+	if j1 == nil || j1.Status != contracts.JobStatusFailedRefundable || j1.SubmittedToPrinter {
+		t.Fatalf("expected sibling job-ru-1 FAILED_REFUNDABLE and unsubmitted after restart, got %+v", j1)
+	}
+	_, cal, _ := st2.GetPaperSupply(ctx)
+	if !cal {
+		t.Fatalf("expected paper calibration preserved for definitely unsubmitted failure")
 	}
 
-	// Subsequent incoming sibling/re-dispatch for the failed order must also be rejected.
-	cmd2 := contracts.PrintJobCommand{
-		JobID: "job-ru-2", OrderID: orderID, DocumentIndex: 2, TotalDocuments: 3,
-		KioskID: "kiosk-1", DisplayCode: "2323", DownloadURL: "http://localhost/2.pdf",
-		SHA256Checksum: strings.Repeat("c", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
-		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
-	}
-	client2.handleIncomingJob(cmd2)
-	if j2, _ := st2.GetJob(ctx, cmd2.JobID); j2 != nil {
-		t.Fatalf("expected incoming job for failed order to be rejected after restart, got %+v", j2)
+	// Re-delivery of valid sibling command for the failed order must be rejected.
+	client2.handleIncomingJob(cmd1)
+	if printed.Load() {
+		t.Fatalf("re-delivered sibling must never print after restart")
 	}
 }
 
@@ -1606,10 +1651,20 @@ func TestPackage6B_DuplicateAndLateSibling_CannotRestartFailedOrder(t *testing.T
 		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
 	}
 	_ = st.SaveJob(ctx, cmd0, contracts.JobStatusSpooling)
-	_, _ = st.FinalizeOrderFailure(ctx, orderID, cmd0.JobID, contracts.JobProgressEvent{
+	updated, err := st.FinalizeOrderFailure(ctx, orderID, cmd0.JobID, contracts.JobProgressEvent{
 		JobID: cmd0.JobID, KioskID: "kiosk-1", Status: contracts.JobStatusFailedRefundable,
 		ErrorReason: "download failed", Timestamp: time.Now().UTC(),
 	}, false)
+	if err != nil {
+		t.Fatalf("FinalizeOrderFailure: %v", err)
+	}
+	// Mark outcome synced so handleIncomingJob exercises the durable order/job barrier directly,
+	// independently of pending outcome synchronization.
+	for _, u := range updated {
+		if u.OutcomeVersion > 0 {
+			_ = st.MarkOutcomeSynced(ctx, u.Command.JobID, u.OutcomeVersion)
+		}
+	}
 
 	var printed atomic.Bool
 	client, err := NewClient(ClientConfig{
@@ -1671,5 +1726,108 @@ func TestPackage6B_FailedStartupStateRead_BlocksReadinessAndPrinting(t *testing.
 	ready, _, h := client.effectiveCustomerServiceReadiness(context.Background())
 	if ready || h.ExecutionSafe {
 		t.Fatalf("expected readiness and ExecutionSafe=false when startup recovery failed (ready=%v, safe=%v)", ready, h.ExecutionSafe)
+	}
+}
+
+
+type failGetJobsOrderStore struct {
+	StateStore
+	failOrderErr    error
+	failFinalizeErr error
+}
+
+func (f *failGetJobsOrderStore) GetJobsByOrderID(ctx context.Context, orderID string) ([]state.StoredJob, error) {
+	if f.failOrderErr != nil {
+		return nil, f.failOrderErr
+	}
+	return f.StateStore.GetJobsByOrderID(ctx, orderID)
+}
+
+func (f *failGetJobsOrderStore) FinalizeOrderFailure(ctx context.Context, orderID, jobID string, event contracts.JobProgressEvent, invalidateInventory bool) ([]state.StoredJob, error) {
+	if f.failFinalizeErr != nil {
+		return nil, f.failFinalizeErr
+	}
+	return f.StateStore.FinalizeOrderFailure(ctx, orderID, jobID, event, invalidateInventory)
+}
+
+func TestPackage6B_StartupGetJobsByOrderIDFailure_RetainsBarrierAndNeverEmitsUncommitted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	st, err := openCalibratedTestStore(t, filepath.Join(tmpDir, "startup_getorder_fail.db"))
+	if err != nil {
+		t.Fatalf("openCalibratedTestStore: %v", err)
+	}
+	defer st.Close()
+
+	cmd := contracts.PrintJobCommand{
+		JobID: "job-sgbo-1", OrderID: "ord-sgbo-1", DocumentIndex: 0, TotalDocuments: 1,
+		KioskID: "kiosk-sgbo", DisplayCode: "2929", DownloadURL: "https://example.com/doc.pdf",
+		SHA256Checksum: strings.Repeat("a", 64), TotalPages: 1, TotalSheets: 1, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	_ = st.SaveJob(ctx, cmd, contracts.JobStatusDispatched)
+
+	var emittedProgress atomic.Int32
+	wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "done")
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), c, &raw); err != nil {
+				return
+			}
+			var m wireMessage
+			if err := json.Unmarshal(raw, &m); err == nil && m.Type == "progress" {
+				emittedProgress.Add(1)
+			}
+		}
+	}))
+	defer wsSrv.Close()
+
+	wrapped := &failGetJobsOrderStore{
+		StateStore:      st,
+		failOrderErr:    errors.New("sqlite order query failed"),
+		failFinalizeErr: errors.New("sqlite finalize failed"),
+	}
+	var printed atomic.Bool
+	client, err := NewClient(ClientConfig{
+		CloudURL: "ws" + strings.TrimPrefix(wsSrv.URL, "http"), KioskID: "kiosk-sgbo", StateStore: wrapped,
+		CUPSQueue: "DCPT310", DownloadDir: tmpDir, IdleQRContent: "https://example.com/qr", ScreenSink: noopSink,
+		TrustedOrigins: []string{"https://example.com"},
+		MockHealth:     testHealthyMockHealth,
+		MockCUPSPrint: func(_ context.Context, _ string, _ contracts.PrintJobCommand, _ string, _ func(int)) error {
+			printed.Store(true)
+			return nil
+		},
+		CapabilityPolicy: &printer.PrinterCapabilityPolicy{AllowColor: true, AllowDuplex: true, RequireA4: true, AllowMultiCopy: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	defer runCancel()
+	_ = client.Run(runCtx)
+
+	if printed.Load() {
+		t.Fatalf("must never print when startup GetJobsByOrderID fails")
+	}
+	if emittedProgress.Load() > 0 {
+		t.Fatalf("must never emit uncommitted progress when startup recovery persistence fails (emitted=%d)", emittedProgress.Load())
+	}
+	if !client.isPersistenceBlocked() {
+		t.Fatalf("expected fail-closed startup persistence barrier retained")
+	}
+	if safe, _ := client.computeExecutionSafety(context.Background(), ""); safe {
+		t.Fatalf("expected execution safety blocked when startup GetJobsByOrderID failed")
+	}
+	ready, _, h := client.effectiveCustomerServiceReadiness(context.Background())
+	if ready || h.ExecutionSafe {
+		t.Fatalf("expected readiness and ExecutionSafe=false when startup GetJobsByOrderID failed (ready=%v, safe=%v)", ready, h.ExecutionSafe)
 	}
 }

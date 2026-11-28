@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -344,5 +346,70 @@ func TestPackage6B_ConcurrentDispatchAuthorizationAndFailureFinalization(t *test
 	}
 	if err := st.MarkDispatchIntentSent(ctx, docs[1].JobID); err == nil {
 		t.Fatalf("expected MarkDispatchIntentSent on canceled/stopped order to fail")
+	}
+}
+
+
+func TestPackage6B_AuthorizeAndMarkDispatchSent_FastAckAndSendFailure_Postgres(t *testing.T) {
+	ctx := context.Background()
+	st, cleanup := openConcurrencyTestStore(t, "pkg6b_auth_send")
+	defer cleanup()
+
+	now := time.Now().UTC()
+	suffix := fmt.Sprintf("%d", now.UnixNano())
+	orderID := "ord-6b-auth-" + suffix
+	kioskID := "kiosk-6b-auth-" + suffix
+
+	docs := []OrderDocument{
+		{JobID: orderID + "-0", OrderID: orderID, DocumentIndex: 0, OriginalFilename: "d0.pdf", TotalPages: 2, TotalSheets: 2, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", PricePaise: 400, Status: contracts.JobStatusPendingPayment, DownloadURL: "http://localhost/0.pdf", SHA256Checksum: "0000"},
+		{JobID: orderID + "-1", OrderID: orderID, DocumentIndex: 1, OriginalFilename: "d1.pdf", TotalPages: 2, TotalSheets: 2, Copies: 1, Duplex: contracts.DuplexSimplex, ColorMode: "BW", PricePaise: 400, Status: contracts.JobStatusPendingPayment, DownloadURL: "http://localhost/1.pdf", SHA256Checksum: "1111"},
+	}
+	cmd := contracts.PrintJobCommand{
+		JobID: orderID, OrderID: orderID, TotalDocuments: 2, KioskID: kioskID, DisplayCode: "9393",
+		DownloadURL: "http://localhost/0.pdf", SHA256Checksum: "0000", TotalPages: 4, TotalSheets: 4, Copies: 1,
+		Duplex: contracts.DuplexSimplex, StartFromPage: 1,
+	}
+	if err := st.CreateOrder(ctx, Order{
+		OrderID: orderID, Command: cmd, Status: contracts.JobStatusPendingPayment, PricePaise: 800,
+		TotalPages: 4, TotalSheets: 4, Documents: docs, PINExpiresAt: now.Add(10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateOrder: %v", err)
+	}
+	sess, err := st.CreateOrGetKioskSession(ctx, kioskID, orderID, 5*time.Minute, now)
+	if err != nil {
+		t.Fatalf("CreateOrGetKioskSession: %v", err)
+	}
+	if _, err := st.CapturePaymentAndCheckDispatch(ctx, PaymentRecord{
+		PaymentID: "pay-" + suffix, OrderID: orderID, KioskID: kioskID, SessionID: sess.SessionID,
+		AmountPaise: 800, Provider: "mock", Status: "CAPTURED",
+	}, now); err != nil {
+		t.Fatalf("CapturePaymentAndCheckDispatch: %v", err)
+	}
+
+	// 1. Deterministically force ACKNOWLEDGED to commit before the SENT update inside AuthorizeAndMarkDispatchSent.
+	// Requires multi-connection PostgreSQL pool (SQLite test store uses SetMaxOpenConns(1)).
+	if os.Getenv("XEROXGO_TEST_POSTGRES_URL") != "" {
+		err = st.AuthorizeAndMarkDispatchSent(ctx, orderID, docs[0].JobID, kioskID, true, func() error {
+			return st.MarkDispatchIntentAcknowledgedForKiosk(ctx, kioskID, docs[0].JobID)
+		})
+		if err != nil {
+			t.Fatalf("AuthorizeAndMarkDispatchSent with fast ACKNOWLEDGED failed: %v", err)
+		}
+		st0, _, err := st.GetJobDispatchIntentStatus(ctx, docs[0].JobID)
+		if err != nil || st0 != "ACKNOWLEDGED" {
+			t.Fatalf("expected ACKNOWLEDGED preserved, got %q (err=%v)", st0, err)
+		}
+	}
+
+	// 2. Force sendFn to fail after dispatch authorization has succeeded -> must roll back and leave intent PENDING.
+	err = st.AuthorizeAndMarkDispatchSent(ctx, orderID, docs[1].JobID, kioskID, true, func() error {
+		return errors.New("simulated ws write failure")
+	})
+	if err == nil {
+		t.Fatalf("expected AuthorizeAndMarkDispatchSent to fail when sendFn fails")
+	}
+	st1, _, err := st.GetJobDispatchIntentStatus(ctx, docs[1].JobID)
+	if err != nil || st1 != "PENDING" {
+		t.Fatalf("expected failed sendFn to roll back and leave intent PENDING, got %q (err=%v)", st1, err)
 	}
 }

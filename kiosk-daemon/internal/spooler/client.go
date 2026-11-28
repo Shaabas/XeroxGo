@@ -715,19 +715,11 @@ func (c *Client) Run(ctx context.Context) error {
 			if err != nil || len(allOrderJobs) == 0 {
 				reason := fmt.Sprintf("startup recovery: failed to read order %s jobs (err: %v, count: %d); database inconsistency, manual reconciliation required", oid, err, len(allOrderJobs))
 				log.Printf("[SPOOLER] %s", reason)
-				for _, incomplete := range incList {
-					evt := contracts.JobProgressEvent{
-						JobID:         incomplete.Command.JobID,
-						KioskID:       incomplete.Command.KioskID,
-						Status:        contracts.JobStatusPausedError,
-						PagesPrinted:  incomplete.PagesPrinted,
-						SheetsPrinted: incomplete.SheetsPrinted,
-						ErrorReason:   reason,
-						Timestamp:     time.Now().UTC(),
-					}
-					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-					c.sendProgress(ctx, evt)
-				}
+				c.persistenceMu.Lock()
+				c.startupRecoveryFailed = true
+				c.persistenceMu.Unlock()
+				c.setPersistenceReadBarrier(errors.New(reason))
+				c.pauseStartupOrderInconsistency(ctx, oid, incList, reason)
 				continue
 			}
 
@@ -739,19 +731,11 @@ func (c *Client) Run(ctx context.Context) error {
 			if len(allOrderJobs) != totalDocs {
 				reason := fmt.Sprintf("startup recovery: order %s has inconsistent document count (expected %d, found %d); database inconsistency, manual reconciliation required", oid, totalDocs, len(allOrderJobs))
 				log.Printf("[SPOOLER] %s", reason)
-				for _, incomplete := range incList {
-					evt := contracts.JobProgressEvent{
-						JobID:         incomplete.Command.JobID,
-						KioskID:       incomplete.Command.KioskID,
-						Status:        contracts.JobStatusPausedError,
-						PagesPrinted:  incomplete.PagesPrinted,
-						SheetsPrinted: incomplete.SheetsPrinted,
-						ErrorReason:   reason,
-						Timestamp:     time.Now().UTC(),
-					}
-					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-					c.sendProgress(ctx, evt)
-				}
+				c.persistenceMu.Lock()
+				c.startupRecoveryFailed = true
+				c.persistenceMu.Unlock()
+				c.setPersistenceReadBarrier(errors.New(reason))
+				c.pauseStartupOrderInconsistency(ctx, oid, incList, reason)
 				continue
 			}
 
@@ -768,19 +752,11 @@ func (c *Client) Run(ctx context.Context) error {
 			if !validIndices || len(docIdxMap) != totalDocs {
 				reason := fmt.Sprintf("startup recovery: order %s has invalid or duplicate document indices; database inconsistency, manual reconciliation required", oid)
 				log.Printf("[SPOOLER] %s", reason)
-				for _, incomplete := range incList {
-					evt := contracts.JobProgressEvent{
-						JobID:         incomplete.Command.JobID,
-						KioskID:       incomplete.Command.KioskID,
-						Status:        contracts.JobStatusPausedError,
-						PagesPrinted:  incomplete.PagesPrinted,
-						SheetsPrinted: incomplete.SheetsPrinted,
-						ErrorReason:   reason,
-						Timestamp:     time.Now().UTC(),
-					}
-					_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-					c.sendProgress(ctx, evt)
-				}
+				c.persistenceMu.Lock()
+				c.startupRecoveryFailed = true
+				c.persistenceMu.Unlock()
+				c.setPersistenceReadBarrier(errors.New(reason))
+				c.pauseStartupOrderInconsistency(ctx, oid, incList, reason)
 				continue
 			}
 
@@ -933,8 +909,12 @@ func (c *Client) Run(ctx context.Context) error {
 				} else if len(jobsToResume) > 0 {
 					reason := fmt.Sprintf("startup recovery: order %s has non-contiguous completion gap; manual reconciliation required", oid)
 					log.Printf("[SPOOLER] %s", reason)
+					c.persistenceMu.Lock()
+					c.startupRecoveryFailed = true
+					c.persistenceMu.Unlock()
+					c.setPersistenceReadBarrier(errors.New(reason))
 					for _, j := range jobsToResume {
-						evt := contracts.JobProgressEvent{
+						c.finalizeAndEmitOrderFailure(ctx, oid, j.JobID, contracts.JobProgressEvent{
 							JobID:         j.JobID,
 							KioskID:       j.KioskID,
 							Status:        contracts.JobStatusPausedError,
@@ -942,9 +922,7 @@ func (c *Client) Run(ctx context.Context) error {
 							SheetsPrinted: 0,
 							ErrorReason:   reason,
 							Timestamp:     time.Now().UTC(),
-						}
-						_ = c.cfg.StateStore.RecordSheetProgress(ctx, evt)
-						c.sendProgress(ctx, evt)
+						}, false)
 					}
 				}
 			}
@@ -3821,6 +3799,20 @@ func faultSourcesCleared(faultSources map[string]bool, h contracts.PrinterHealth
 		}
 	}
 	return true
+}
+
+func (c *Client) pauseStartupOrderInconsistency(ctx context.Context, orderID string, incList []state.StoredJob, reason string) {
+	for _, incomplete := range incList {
+		c.finalizeAndEmitOrderFailure(ctx, orderID, incomplete.Command.JobID, contracts.JobProgressEvent{
+			JobID:         incomplete.Command.JobID,
+			KioskID:       firstNonEmptyString(incomplete.Command.KioskID, c.cfg.KioskID),
+			Status:        contracts.JobStatusPausedError,
+			PagesPrinted:  incomplete.PagesPrinted,
+			SheetsPrinted: incomplete.SheetsPrinted,
+			ErrorReason:   reason,
+			Timestamp:     time.Now().UTC(),
+		}, false)
+	}
 }
 
 func firstNonEmptyString(vals ...string) string {
